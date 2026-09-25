@@ -77,10 +77,10 @@ export function extendSubtypeRegistry(extensions: unknown, base: SubtypeRegistry
     const result = Object.fromEntries(SEMANTIC_CLASSES.map((kind) => [kind, [...base[kind]]])) as
       Record<SemanticClass, string[]>;
     for (const [kind, values] of Object.entries(fields)) {
-      if (!inSet(kind, SEMANTIC_CLASSES) || !Array.isArray(values) || values.length > 128) {
-        throw new TypeError('Invalid subtype extension');
-      }
-      for (const subtype of values) {
+      if (!inSet(kind, SEMANTIC_CLASSES)) throw new TypeError('Invalid subtype extension');
+      const subtypes = arrayItems(values);
+      if (subtypes.invalid || subtypes.values.length > 128) throw new TypeError('Invalid subtype extension');
+      for (const subtype of subtypes.values) {
         if (typeof subtype !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(subtype) ||
           result[kind].includes(subtype)) throw new TypeError('Invalid subtype extension');
         result[kind].push(subtype);

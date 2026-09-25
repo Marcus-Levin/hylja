@@ -105,6 +105,16 @@ test('initial subtype registry recognizes examples and extensions are explicit, 
   assert.throws(() => extendSubtypeRegistry({ UNKNOWN: ['CUSTOM'] }), TypeError);
   assert.throws(() => extendSubtypeRegistry({ PERSON: ['EMAIL'] }), TypeError);
   assert.throws(() => extendSubtypeRegistry({ PERSON: ['__proto__'] }), TypeError);
+  let extensionLengthReads = 0;
+  const changingLength = new Proxy(['ALIAS'], {
+    get(target, key) {
+      if (key === 'length') return ++extensionLengthReads === 1 ? 0 : 129;
+      return Reflect.get(target, key);
+    },
+  });
+  const extended = extendSubtypeRegistry({ PERSON: changingLength });
+  assert.ok(extended.PERSON.includes('ALIAS'));
+  assert.equal(extensionLengthReads, 0, 'subtype arrays use a bounded descriptor snapshot');
   assert.equal(Object.isFrozen(registry.PERSON), true);
   assert.equal(DEFAULT_SUBTYPES.PERSON.includes('EMPLOYEE_ALIAS'), false);
 });
