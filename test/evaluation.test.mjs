@@ -68,6 +68,31 @@ test('independent oracle validates source byte offsets and exact planted UTF-8 b
   }]), TypeError);
 });
 
+test('CREDENTIAL_OR_SECRET oracle cannot label a planted credential below SECRET or allow KEEP', () => {
+  for (const sensitivity of ['PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'RESTRICTED']) {
+    for (const treatment of ['KEEP', 'BLOCK']) {
+      const evals = createDevelopmentEvaluation();
+      evals.registerCase(developmentCase());
+      const contradictory = { ...oracle().occurrences[0], sensitivity,
+        expectedBySink: [{ sinkId: 'sink-remote', treatment }, { sinkId: 'sink-judge', treatment }] };
+      assert.throws(() => evals.registerOracle(oracle({ occurrences: [contradictory] })),
+        (error) => error instanceof TypeError && !error.message.includes(planted),
+        `${sensitivity}/${treatment} must not erase a credential from SECRET escape controls`);
+    }
+  }
+  const legitimateNoncredential = createDevelopmentEvaluation();
+  legitimateNoncredential.registerCase(developmentCase());
+  legitimateNoncredential.registerOracle(oracle({ occurrences: [{ ...oracle().occurrences[0],
+    semanticType: 'PERSON', subtype: 'NAME', sensitivity: 'PUBLIC', critical: false,
+    expectedBySink: [{ sinkId: 'sink-remote', treatment: 'KEEP' },
+      { sinkId: 'sink-judge', treatment: 'KEEP' }] }] }));
+  const capture = createInMemorySinkCapture();
+  capture.capture({ caseId: 'synthetic-config-01', sinkId: 'sink-remote', body: bytes(planted), metadata: bytes('') });
+  const report = legitimateNoncredential.report('synthetic-config-01', capture);
+  assert.equal(report.privacy.secretPlanted, 0);
+  assert.equal(findUntested(report, 'secret-plaintext-escape', 'sink-remote').reason, 'no-secret-control');
+});
+
 test('plant cannot coincide with allowlisted IDs emitted by an ordinary report', () => {
   const value = 'synthetic-ambiguous-plant';
   const caseId = value;
