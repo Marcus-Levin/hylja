@@ -226,7 +226,9 @@ function canonicalField(leaves) {
 function hostBounds(url) {
   // This bounded public D05 URL subset excludes userinfo, percent-encoding, fragments,
   // escaped/non-ASCII forms and alternate/ambiguous authorities. The HOST is not a full URL.
-  const match = /^https:\/\/((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+invalid)(?::([1-9][0-9]{0,4}))?(?:\/[a-zA-Z0-9/._-]*)?$/u.exec(url);
+  // Nonempty path segments cannot start with a network-path-like // or use . / ..
+  // traversal segments; this is a small, explicit public syntax, not URL parsing.
+  const match = /^https:\/\/((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+invalid)(?::([1-9][0-9]{0,4}))?(?:\/[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*(?:\/[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*)*)?$/u.exec(url);
   if (!match || match[2] !== undefined && Number(match[2]) > 65535) invalid();
   return { start: 'https://'.length, end: 'https://'.length + match[1].length };
 }
@@ -275,8 +277,13 @@ export function createPublicD05SpanProjector(options) {
           if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
             start < 0 || end <= start || end >= leaf.boundaries.length ||
             normalized.start !== start || normalized.end !== end) invalid();
-          if (key === 'endpointUrl' &&
-            (start !== endpointHost.start || end !== endpointHost.end)) invalid();
+          if (key === 'endpointUrl') {
+            if (start !== endpointHost.start || end !== endpointHost.end) invalid();
+          } else if (start !== 0 || end !== leaf.boundaries.length - 1) {
+            // These three fixed public planted controls are WHOLE decoded leaves;
+            // a truthful fragment is still a different, unplanted occurrence.
+            invalid();
+          }
           const decoded = Array.from(leaf.decoded).slice(start, end).join('');
           if (occurrence.sourceOriginalText !== decoded) invalid();
           const byteStart = leaf.boundaries[start];
