@@ -1,0 +1,562 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { composeClassification, SEMANTIC_CLASSES, TRUST_LEVELS } from '../dist/classification.js';
+import {
+  decidePolicy, decideReviewedPolicy, digestPolicyBundle, digestClassification,
+  POLICY_TREATMENTS, POLICY_OPERATIONS, KNOWN_POLICY_BUNDLE,
+} from '../dist/policy.js';
+
+const copy = (value) => structuredClone(value);
+const subject = { principalId: 'principal-a.invalid', workloadId: 'workload-a.invalid' };
+const context = {
+  tenantId: 'tenant-a.invalid', projectId: 'project-a.invalid',
+  sessionId: 'session-a.invalid', purpose: 'diagnostic-a.invalid',
+};
+const source = { kind: 'tool.result', ref: 'tool-source-a.invalid', trustZone: 'LOCAL' };
+const sinks = {
+  local: { kind: 'local.tool', ref: 'tool-local.example.invalid', trustZone: 'LOCAL', profileId: 'local.invalid' },
+  enterprise: { kind: 'model', ref: 'enterprise.example.invalid', trustZone: 'EXTERNAL', profileId: 'enterprise.invalid' },
+  web: { kind: 'web', ref: 'web.example.invalid', trustZone: 'EXTERNAL', profileId: 'web.invalid' },
+};
+const sensitivities = ['PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'RESTRICTED', 'SECRET'];
+const ALL_TRUST = [...TRUST_LEVELS];
+const release = ['KEEP', 'MASK', 'TOKENIZE', 'SYNTHETIC', 'GENERALIZE', 'REMOVE'];
+const profiles = [
+  { id: 'local.invalid', sink: sinks.local, exposure: 'LOCAL', permittedTreatments: release,
+    maxCleartextSensitivity: 'SECRET' },
+  { id: 'enterprise.invalid', sink: sinks.enterprise, exposure: 'EXTERNAL', permittedTreatments: release,
+    maxCleartextSensitivity: 'INTERNAL' },
+  { id: 'web.invalid', sink: sinks.web, exposure: 'EXTERNAL', permittedTreatments: ['KEEP', 'MASK', 'REMOVE'],
+    maxCleartextSensitivity: 'PUBLIC' },
+];
+function rule(id, profileId, semanticType, values, operations, decision, sourceTrust = ALL_TRUST, reviewTreatments) {
+  return { id: `${id}.invalid`, profileId, semanticType, sensitivities: values,
+    sourceTrust, operations, decision, ...(reviewTreatments ? { reviewTreatments } : {}) };
+}
+function bundle() {
+  const rules = [];
+  for (const semanticType of SEMANTIC_CLASSES) {
+    rules.push(rule(`local-use-${semanticType}`, 'local.invalid', semanticType, sensitivities, ['USE'], 'KEEP'));
+    rules.push(rule(`local-display-${semanticType}`, 'local.invalid', semanticType, sensitivities, ['DISPLAY'], 'MASK'));
+    rules.push(rule(`enterprise-public-${semanticType}`, 'enterprise.invalid', semanticType,
+      ['PUBLIC'], ['SEND'], 'KEEP'));
+    rules.push(rule(`enterprise-internal-${semanticType}`, 'enterprise.invalid', semanticType,
+      ['INTERNAL'], ['SEND'], 'TOKENIZE'));
+    rules.push(rule(`enterprise-confidential-${semanticType}`, 'enterprise.invalid', semanticType,
+      ['CONFIDENTIAL'], ['SEND'], 'SYNTHETIC'));
+    rules.push(rule(`enterprise-review-${semanticType}`, 'enterprise.invalid', semanticType,
+      ['RESTRICTED'], ['SEND'], 'REQUIRE_REVIEW', ALL_TRUST, ['GENERALIZE', 'REMOVE']));
+    rules.push(rule(`web-public-${semanticType}`, 'web.invalid', semanticType,
+      ['PUBLIC'], ['SEND'], 'KEEP'));
+  }
+  rules.push(rule('enterprise-credential-remove', 'enterprise.invalid', 'CREDENTIAL_OR_SECRET',
+    ['SECRET'], ['SEND'], 'REMOVE'));
+  return { ...KNOWN_POLICY_BUNDLE, profiles: copy(profiles), rules };
+}
+function classification(semanticType = 'PERSON', sensitivity = 'CONFIDENTIAL', trust = 'TRUSTED') {
+  return composeClassification({ detectorEvidence: [{
+    version: 1, id: 'detector-a.invalid', status: 'FOUND',
+    provenance: { inputRef: 'field-a.invalid', producerId: 'detector-a.invalid', producerVersion: 'pack-1' },
+    claim: { semanticType, sensitivity },
+  }] }, { interactionRef: 'interaction-a.invalid', sourceRef: source.ref, trust });
+}
+function scenario({ destination = sinks.enterprise, semanticType = 'PERSON', sensitivity = 'CONFIDENTIAL',
+  trust = 'TRUSTED', operation = 'SEND', candidateRef = 'unit-a.invalid',
+  evidence = classification(semanticType, sensitivity, trust) } = {}) {
+  const policy = bundle();
+  const boundary = {
+    interactionRef: 'interaction-a.invalid', candidateRef,
+    classificationDigest: evidence === undefined ? '0'.repeat(64) : digestClassification(evidence),
+    authenticated: { subject: copy(subject), context: copy(context) },
+    observed: { source: { ...source, trust }, destination: copy(destination) },
+    policy: { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(policy) },
+  };
+  const request = {
+    version: 1, interactionRef: boundary.interactionRef, candidateRef,
+    subject: copy(subject), context: copy(context),
+    source: copy(source), destination: copy(destination), classification: evidence, operation,
+    policy: copy(KNOWN_POLICY_BUNDLE),
+  };
+  return { request, boundary, policy };
+}
+// Re-pin only in tests explicitly modeling a newly authorized control-plane policy snapshot.
+function pin(s) { s.boundary.policy.digest = digestPolicyBundle(s.policy); }
+function evaluate(s) { return decidePolicy(s.request, s.boundary, s.policy); }
+function expectDecision(value, state, treatment) {
+  assert.equal(value.version, 1);
+  assert.equal(value.state, state);
+  assert.equal(value.treatment, treatment);
+  assert.ok(typeof value.reason === 'string' && value.reason.length);
+  assert.equal(Object.hasOwn(value, 'payload'), false, 'a decision never carries bytes');
+  assert.equal(Object.hasOwn(value, 'effect'), false, 'a decision never performs effects');
+}
+function outcome(s, held, treatment = 'GENERALIZE') {
+  return { version: 1, decisionRef: held.decisionRef, policy: copy(s.boundary.policy),
+    binding: { interactionRef: s.boundary.interactionRef, candidateRef: s.boundary.candidateRef,
+      classificationDigest: s.boundary.classificationDigest,
+      subject: copy(s.boundary.authenticated.subject),
+      context: copy(s.boundary.authenticated.context), source: copy(s.boundary.observed.source),
+      destination: copy(s.boundary.observed.destination) },
+    reviewerRef: 'reviewer-a.invalid', treatment };
+}
+
+test('vocabulary includes all eight policy treatments and distinct SEND/USE/DISPLAY/EXPORT', () => {
+  assert.deepEqual(POLICY_TREATMENTS,
+    ['KEEP', 'MASK', 'TOKENIZE', 'SYNTHETIC', 'GENERALIZE', 'REMOVE', 'BLOCK', 'REQUIRE_REVIEW']);
+  assert.deepEqual(POLICY_OPERATIONS, ['SEND', 'USE', 'DISPLAY', 'EXPORT']);
+});
+
+test('synthetic class × source trust × actual sink matrix selects explicit rule, not unknown fallback', () => {
+  let checked = 0;
+  for (const semanticType of SEMANTIC_CLASSES) for (const trust of TRUST_LEVELS) {
+    const credential = semanticType === 'CREDENTIAL_OR_SECRET';
+    for (const [destination, operation, state, treatment] of [
+      [sinks.local, 'USE', 'SELECTED', 'KEEP'],
+      [sinks.enterprise, 'SEND', 'SELECTED', credential ? 'REMOVE' : 'SYNTHETIC'],
+      [sinks.web, 'SEND', 'DENIED', 'BLOCK'],
+    ]) {
+      const s = scenario({ destination, semanticType, sensitivity: credential ? 'SECRET' : 'CONFIDENTIAL',
+        trust, operation });
+      assert.equal(s.request.classification.status, 'RESOLVED', semanticType);
+      expectDecision(evaluate(s), state, treatment);
+      checked++;
+    }
+  }
+  assert.equal(checked, 180);
+});
+
+test('operation separation requires independent explicit USE, DISPLAY and EXPORT rules', () => {
+  for (const operation of POLICY_OPERATIONS) {
+    const s = scenario({ destination: sinks.local, operation });
+    expectDecision(evaluate(s), operation === 'USE' || operation === 'DISPLAY' ? 'SELECTED' : 'DENIED',
+      operation === 'USE' ? 'KEEP' : operation === 'DISPLAY' ? 'MASK' : 'BLOCK');
+  }
+  const s = scenario({ destination: sinks.local, operation: 'EXPORT' });
+  s.policy.rules.push(rule('explicit-export', 'local.invalid', 'PERSON', ['CONFIDENTIAL'], ['EXPORT'], 'REMOVE'));
+  pin(s);
+  expectDecision(evaluate(s), 'SELECTED', 'REMOVE');
+  assert.equal(evaluate(scenario({ destination: sinks.enterprise, operation: 'EXPORT' })).state, 'DENIED');
+});
+
+test('actual route, claim, profile sink and exposure must all agree, including redirects', () => {
+  const original = scenario();
+  expectDecision(evaluate(original), 'SELECTED', 'SYNTHETIC');
+  for (const mutate of [
+    s => { s.boundary.observed.destination = copy(sinks.web); },
+    s => { s.request.destination.profileId = 'unknown.invalid'; },
+    s => { delete s.boundary.observed.destination.profileId; },
+    s => { s.policy.profiles[1].sink.ref = 'redirect.example.invalid'; },
+    s => { s.policy.profiles[1].exposure = 'LOCAL'; },
+    s => { s.policy.profiles.splice(1, 1); },
+    s => { s.policy.profiles[1].id = 'unknown.invalid'; },
+    s => { s.policy.profiles.push(copy(s.policy.profiles[1])); },
+  ]) {
+    const s = scenario();
+    mutate(s);
+    expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  }
+});
+
+test('no missing, unknown, stale or conflicting bundle ID/version permits protected release', () => {
+  expectDecision(evaluate(scenario()), 'SELECTED', 'SYNTHETIC');
+  for (const mutate of [
+    s => { delete s.request.policy; },
+    s => { delete s.boundary.policy; },
+    s => { s.request.policy.version = '2'; },
+    s => { s.boundary.policy.id = 'unknown.invalid'; },
+    s => { s.policy.version = '2'; },
+    s => { s.policy.id = 'unknown.invalid'; },
+    s => { s.policy.rules.push(copy(s.policy.rules[0])); },
+  ]) {
+    const s = scenario();
+    mutate(s);
+    expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  }
+});
+
+test('binding mismatches for authenticated principal/workload/tenant/project/session/purpose and source fail closed', () => {
+  expectDecision(evaluate(scenario()), 'SELECTED', 'SYNTHETIC');
+  const fields = [
+    s => { s.request.subject.principalId = 'principal-b.invalid'; },
+    s => { s.request.subject.workloadId = 'workload-b.invalid'; },
+    s => { s.request.context.tenantId = 'tenant-b.invalid'; },
+    s => { s.request.context.projectId = 'project-b.invalid'; },
+    s => { delete s.request.context.projectId; },
+    s => { s.request.context.sessionId = 'session-b.invalid'; },
+    s => { s.request.context.purpose = 'other-purpose.invalid'; },
+    s => { s.request.interactionRef = 'interaction-b.invalid'; },
+    s => { delete s.request.candidateRef; },
+    s => { delete s.boundary.candidateRef; },
+    s => { delete s.boundary.classificationDigest; },
+    s => { s.boundary.authenticated.context.tenantId = 'tenant-b.invalid'; },
+    s => { s.request.source.ref = 'other-source.invalid'; },
+    s => { s.boundary.observed.source.trust = 'UNTRUSTED'; },
+  ];
+  for (const mutate of fields) {
+    const s = scenario();
+    mutate(s);
+    expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  }
+});
+
+test('trusted source influence is separate from sensitivity; payload CONTROL and semantic KEEP grant nothing', () => {
+  expectDecision(evaluate(scenario({ trust: 'HOSTILE' })), 'SELECTED', 'SYNTHETIC');
+  const s = scenario({ trust: 'HOSTILE' });
+  s.policy.rules = s.policy.rules.map(r => r.profileId === 'enterprise.invalid' ?
+    { ...r, sourceTrust: ['TRUSTED'] } : r);
+  pin(s);
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  s.request.semanticRecommendation = 'KEEP';
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  const injection = scenario();
+  injection.request.payload = { trust: 'CONTROL', policy: 'KEEP', destination: copy(sinks.local) };
+  expectDecision(evaluate(injection), 'DENIED', 'BLOCK');
+  const protectedCase = scenario({ destination: sinks.web });
+  protectedCase.request.semanticRecommendation = 'KEEP';
+  expectDecision(evaluate(protectedCase), 'DENIED', 'BLOCK');
+  // Even an explicit rule cannot place above-ceiling original plaintext into the web profile.
+  protectedCase.policy.rules.push(rule('web-confidential-keep', 'web.invalid', 'PERSON',
+    ['CONFIDENTIAL'], ['SEND'], 'KEEP'));
+  pin(protectedCase);
+  expectDecision(evaluate(protectedCase), 'DENIED', 'BLOCK');
+});
+
+test('SECRET and credentials reject external KEEP, reversible treatments and semantic declassification', () => {
+  const s = scenario({ semanticType: 'CREDENTIAL_OR_SECRET', sensitivity: 'SECRET' });
+  expectDecision(evaluate(s), 'SELECTED', 'REMOVE');
+  s.request.semanticRecommendation = 'KEEP';
+  expectDecision(evaluate(s), 'SELECTED', 'REMOVE');
+  for (const decision of ['KEEP', 'TOKENIZE', 'SYNTHETIC', 'GENERALIZE']) {
+    const attempt = scenario({ semanticType: 'CREDENTIAL_OR_SECRET', sensitivity: 'SECRET' });
+    attempt.policy.rules.at(-1).decision = decision;
+    pin(attempt);
+    expectDecision(evaluate(attempt), 'DENIED', 'BLOCK');
+  }
+  const unknown = scenario({ semanticType: 'CREDENTIAL_OR_SECRET', sensitivity: 'PUBLIC' });
+  assert.equal(unknown.request.classification.status, 'UNRESOLVED');
+  expectDecision(evaluate(unknown), 'DENIED', 'BLOCK');
+});
+
+test('UNKNOWN, conflict, parser failure and absent classifications never allow protected external egress', () => {
+  const known = scenario();
+  expectDecision(evaluate(known), 'SELECTED', 'SYNTHETIC');
+  for (const evidence of [
+    composeClassification({}, { interactionRef: 'interaction-a.invalid', sourceRef: source.ref, trust: 'TRUSTED' }),
+    classification('UNKNOWN', 'PUBLIC'),
+    composeClassification({ parserEvidence: [{ version: 1, id: 'parser-a.invalid', status: 'FAILURE',
+      provenance: { inputRef: 'field-a.invalid', producerId: 'parser-a.invalid', producerVersion: 'pack-1' } }] },
+    { interactionRef: 'interaction-a.invalid', sourceRef: source.ref, trust: 'TRUSTED' }),
+    undefined,
+  ]) {
+    const s = scenario();
+    s.request.classification = evidence;
+    expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  }
+});
+
+test('trusted composer classification digest prevents PUBLIC substitution under identical boundary and policy', () => {
+  const s = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-a.invalid' });
+  expectDecision(evaluate(s), 'HELD', 'REQUIRE_REVIEW');
+  const trustedDigest = s.boundary.classificationDigest;
+  const forged = copy(s.request.classification);
+  forged.status = 'RESOLVED';
+  forged.semanticType = 'PERSON';
+  forged.sensitivity = 'PUBLIC';
+  forged.reasons = [];
+  forged.evidence = [];
+  s.request.classification = forged; // same principal/tenant/candidate/route/policy and provenance
+  assert.equal(s.boundary.classificationDigest, trustedDigest);
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  s.request.classification = classification('PERSON', 'PUBLIC'); // valid shape, wrong trusted content
+  const substituted = evaluate(s);
+  expectDecision(substituted, 'DENIED', 'BLOCK');
+  assert.equal(substituted.reason, 'CLASSIFICATION_MISMATCH');
+  const genuinePublic = scenario({ sensitivity: 'PUBLIC', candidateRef: 'unit-a.invalid' });
+  expectDecision(evaluate(genuinePublic), 'SELECTED', 'KEEP');
+});
+
+test('RESOLVED needs nonempty, detector-sourced and internally consistent evidence', () => {
+  const s = scenario({ sensitivity: 'PUBLIC' });
+  expectDecision(evaluate(s), 'SELECTED', 'KEEP');
+  const genuine = copy(s.request.classification);
+  for (const corrupt of [
+    record => { record.evidence = []; },
+    record => { record.evidence[0].source = 'parser'; },
+    record => { record.evidence[0].claim.sensitivity = 'SECRET'; },
+    record => { record.evidence[0].status = 'ABSTAIN'; delete record.evidence[0].claim; },
+  ]) {
+    const malformed = copy(genuine);
+    corrupt(malformed);
+    s.request.classification = malformed;
+    assert.throws(() => digestClassification(malformed), TypeError);
+    expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  }
+});
+
+test('two candidate units in one interaction have distinct held review fingerprints', () => {
+  const a = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-a.invalid' });
+  const b = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-b.invalid' });
+  const heldA = evaluate(a);
+  const heldB = evaluate(b);
+  expectDecision(heldA, 'HELD', 'REQUIRE_REVIEW');
+  expectDecision(heldB, 'HELD', 'REQUIRE_REVIEW');
+  assert.notEqual(heldA.decisionRef, heldB.decisionRef);
+  assert.equal(JSON.stringify(heldA).includes('unit-a.invalid'), false);
+  assert.equal(JSON.stringify(heldB).includes('unit-b.invalid'), false);
+});
+
+test('approval for candidate A cannot select treatment for candidate B in the same context', () => {
+  const a = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-a.invalid' });
+  const b = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-b.invalid' });
+  const heldA = evaluate(a);
+  const heldB = evaluate(b);
+  expectDecision(heldA, 'HELD', 'REQUIRE_REVIEW');
+  expectDecision(heldB, 'HELD', 'REQUIRE_REVIEW');
+  const approvedA = outcome(a, heldA);
+  expectDecision(decideReviewedPolicy(b.request, b.boundary, b.policy, heldB, approvedA),
+    'HELD', 'REQUIRE_REVIEW');
+  expectDecision(decideReviewedPolicy(a.request, a.boundary, a.policy, heldA, approvedA),
+    'SELECTED', 'GENERALIZE');
+});
+
+test('64 synthetic candidate units cannot borrow one review inside a shared interaction', () => {
+  const first = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-0.invalid' });
+  const heldFirst = evaluate(first);
+  expectDecision(heldFirst, 'HELD', 'REQUIRE_REVIEW');
+  const seen = new Set([heldFirst.decisionRef]);
+  for (let index = 1; index <= 64; index++) {
+    const current = scenario({ sensitivity: 'RESTRICTED', candidateRef: `unit-${index}.invalid` });
+    const held = evaluate(current);
+    expectDecision(held, 'HELD', 'REQUIRE_REVIEW');
+    assert.equal(seen.has(held.decisionRef), false);
+    seen.add(held.decisionRef);
+    expectDecision(decideReviewedPolicy(current.request, current.boundary, current.policy,
+      held, outcome(first, heldFirst)), 'HELD', 'REQUIRE_REVIEW');
+    expectDecision(decideReviewedPolicy(current.request, current.boundary, current.policy,
+      held, outcome(current, held)), 'SELECTED', 'GENERALIZE');
+  }
+  assert.equal(seen.size, 65);
+});
+
+test('candidate identity cannot be replaced by untrusted request-side text', () => {
+  const s = scenario({ sensitivity: 'RESTRICTED' });
+  expectDecision(evaluate(s), 'HELD', 'REQUIRE_REVIEW');
+  s.request.candidateRef = 'unit-b.invalid';
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+});
+
+test('review is held, separate, attributable and bounded to current policy approved treatments', () => {
+  const s = scenario({ sensitivity: 'RESTRICTED' });
+  const held = evaluate(s);
+  expectDecision(held, 'HELD', 'REQUIRE_REVIEW');
+  assert.match(held.decisionRef, /^[a-f0-9]{64}$/u);
+  expectDecision(decideReviewedPolicy(s.request, s.boundary, s.policy, held, undefined), 'HELD', 'REQUIRE_REVIEW');
+  expectDecision(decideReviewedPolicy(s.request, s.boundary, s.policy, held,
+    { ...outcome(s, held), treatment: 'KEEP' }), 'HELD', 'REQUIRE_REVIEW');
+  expectDecision(decideReviewedPolicy(s.request, s.boundary, s.policy, held,
+    outcome(s, held)), 'SELECTED', 'GENERALIZE');
+  expectDecision(decideReviewedPolicy(s.request, s.boundary, s.policy, held,
+    outcome(s, held, 'REMOVE')), 'SELECTED', 'REMOVE');
+  expectDecision(evaluate(s), 'HELD', 'REQUIRE_REVIEW');
+});
+
+test('review cannot borrow another tenant, route, action, version or decision; stale rules fail closed', () => {
+  const s = scenario({ sensitivity: 'RESTRICTED' });
+  const held = evaluate(s);
+  expectDecision(held, 'HELD', 'REQUIRE_REVIEW');
+  for (const mutate of [
+    r => { r.binding.context.tenantId = 'tenant-b.invalid'; },
+    r => { r.binding.subject.principalId = 'principal-b.invalid'; },
+    r => { r.binding.context.projectId = 'project-b.invalid'; },
+    r => { r.binding.context.sessionId = 'session-b.invalid'; },
+    r => { r.binding.context.purpose = 'other-purpose.invalid'; },
+    r => { r.binding.candidateRef = 'unit-b.invalid'; },
+    r => { r.binding.classificationDigest = '0'.repeat(64); },
+    r => { r.binding.source.ref = 'other-source.invalid'; },
+    r => { r.binding.destination = copy(sinks.web); },
+    r => { r.policy.version = '2'; },
+    r => { r.decisionRef = '0'.repeat(64); },
+    r => { delete r.reviewerRef; },
+  ]) {
+    const review = outcome(s, held);
+    mutate(review);
+    expectDecision(decideReviewedPolicy(s.request, s.boundary, s.policy, held, review), 'HELD', 'REQUIRE_REVIEW');
+  }
+  const changed = scenario({ sensitivity: 'RESTRICTED' });
+  changed.policy.rules = changed.policy.rules.filter(r => r.id !== 'enterprise-review-PERSON.invalid');
+  pin(changed);
+  expectDecision(decideReviewedPolicy(changed.request, changed.boundary, changed.policy, held,
+    outcome(s, held)), 'DENIED', 'BLOCK');
+  const widened = scenario({ sensitivity: 'RESTRICTED' });
+  widened.policy.rules.find(r => r.id === 'enterprise-review-PERSON.invalid').reviewTreatments.push('MASK');
+  pin(widened);
+  expectDecision(decideReviewedPolicy(widened.request, widened.boundary, widened.policy, held,
+    outcome(s, held)), 'DENIED', 'BLOCK');
+  const otherAction = scenario({ sensitivity: 'RESTRICTED', operation: 'EXPORT' });
+  expectDecision(decideReviewedPolicy(otherAction.request, otherAction.boundary, otherAction.policy,
+    held, outcome(s, held)), 'DENIED', 'BLOCK');
+});
+
+test('duplicate matching rules, malformed profiles, and profile treatment ceilings deny rather than first match', () => {
+  expectDecision(evaluate(scenario()), 'SELECTED', 'SYNTHETIC');
+  const s = scenario();
+  s.policy.rules.push(rule('overlap', 'enterprise.invalid', 'PERSON',
+    ['CONFIDENTIAL'], ['SEND'], 'KEEP'));
+  pin(s);
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  for (const [mutate, validConfiguration] of [
+    [policy => { policy.profiles[1].permittedTreatments = ['KEEP']; }, true],
+    [policy => { policy.profiles[1].maxCleartextSensitivity = 'PUBLIC';
+      policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').decision = 'KEEP'; }, true],
+    [policy => { policy.profiles[1].permittedTreatments = ['KEEP', 'BLOCK']; }, false],
+    [policy => { policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').sourceTrust = []; }, false],
+  ]) {
+    const attempt = scenario();
+    mutate(attempt.policy);
+    if (validConfiguration) pin(attempt);
+    expectDecision(evaluate(attempt), 'DENIED', 'BLOCK');
+  }
+});
+
+test('one sensitivity matrix exercises KEEP ceiling, TOKENIZE, SYNTHETIC, review, BLOCK and secret removal', () => {
+  for (const [sensitivity, expectedState, expectedTreatment] of [
+    ['PUBLIC', 'SELECTED', 'KEEP'], ['INTERNAL', 'SELECTED', 'TOKENIZE'],
+    ['CONFIDENTIAL', 'SELECTED', 'SYNTHETIC'], ['RESTRICTED', 'HELD', 'REQUIRE_REVIEW'],
+    ['SECRET', 'DENIED', 'BLOCK'],
+  ]) {
+    const s = scenario({ sensitivity });
+    assert.equal(s.request.classification.status, 'RESOLVED');
+    expectDecision(evaluate(s), expectedState, expectedTreatment);
+  }
+  const protectedPublic = scenario({ destination: sinks.web, sensitivity: 'PUBLIC' });
+  expectDecision(evaluate(protectedPublic), 'SELECTED', 'KEEP');
+  const restrictive = scenario({ destination: sinks.web, sensitivity: 'INTERNAL' });
+  expectDecision(evaluate(restrictive), 'DENIED', 'BLOCK');
+});
+
+test('exact BLOCK rule defeats semantic KEEP and unknown context never upgrades an external sink', () => {
+  const s = scenario();
+  expectDecision(evaluate(s), 'SELECTED', 'SYNTHETIC');
+  s.policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').decision = 'BLOCK';
+  pin(s);
+  s.request.semanticRecommendation = 'KEEP';
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  for (const mutate of [
+    t => { t.boundary = undefined; },
+    t => { t.policy = undefined; },
+    t => { t.request.destination.profileId = 'not-registered.invalid'; },
+    t => { t.boundary.observed.destination.trustZone = 'UNKNOWN'; },
+  ]) {
+    const attempt = scenario();
+    mutate(attempt);
+    expectDecision(evaluate(attempt), 'DENIED', 'BLOCK');
+  }
+});
+
+test('synthetic tenant variations are isolated for both policy and pending review', () => {
+  const original = scenario({ sensitivity: 'RESTRICTED' });
+  const held = evaluate(original);
+  expectDecision(held, 'HELD', 'REQUIRE_REVIEW');
+  let checked = 0;
+  for (let i = 0; i < 64; i++) {
+    const tenant = `tenant-${i}.invalid`;
+    const other = scenario({ sensitivity: 'RESTRICTED' });
+    other.request.context.tenantId = tenant;
+    other.boundary.authenticated.context.tenantId = tenant;
+    const current = evaluate(other);
+    expectDecision(current, 'HELD', 'REQUIRE_REVIEW');
+    assert.notEqual(current.decisionRef, held.decisionRef);
+    expectDecision(decideReviewedPolicy(other.request, other.boundary, other.policy, current,
+      outcome(original, held)), 'HELD', 'REQUIRE_REVIEW');
+    expectDecision(decideReviewedPolicy(other.request, other.boundary, other.policy, current,
+      outcome(other, current)), 'SELECTED', 'GENERALIZE');
+    checked++;
+  }
+  assert.equal(checked, 64);
+});
+
+test('malicious getters, proxies and unsupported input never echo planted private text', () => {
+  const planted = 'private-synthetic-value.invalid';
+  const baseline = scenario();
+  expectDecision(evaluate(baseline), 'SELECTED', 'SYNTHETIC');
+  const poisoned = scenario();
+  Object.defineProperty(poisoned.request.context, 'purpose', {
+    enumerable: true, get() { throw new Error(planted); },
+  });
+  const trapped = scenario();
+  trapped.policy = new Proxy({}, { ownKeys() { throw new Error(planted); } });
+  for (const testCase of [poisoned, trapped]) {
+    const decision = evaluate(testCase);
+    expectDecision(decision, 'DENIED', 'BLOCK');
+    assert.equal(JSON.stringify(decision).includes(planted), false);
+  }
+});
+
+test('same ID/version rule substitution cannot turn independently trusted BLOCK into KEEP', () => {
+  const s = scenario({ sensitivity: 'PUBLIC' });
+  s.policy.rules.find(r => r.id === 'enterprise-public-PERSON.invalid').decision = 'BLOCK';
+  pin(s); // independently trusted commitment to the approved BLOCK snapshot
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  // After this approved snapshot, attacker swaps only policy CONTENT; both labels stay unchanged.
+  s.policy.rules.find(r => r.id === 'enterprise-public-PERSON.invalid').decision = 'KEEP';
+  const substituted = evaluate(s);
+  expectDecision(substituted, 'DENIED', 'BLOCK');
+  assert.equal(substituted.reason, 'BUNDLE_MISMATCH');
+  assert.equal(digestPolicyBundle(s.policy) === s.boundary.policy.digest, false);
+  const alteredPin = scenario();
+  alteredPin.boundary.policy.digest = '0'.repeat(64);
+  assert.equal(evaluate(alteredPin).reason, 'BUNDLE_MISMATCH');
+});
+
+test('object reflection uses one capped own-key snapshot before descriptor access', () => {
+  const oneShot = scenario();
+  let ownKeysCalls = 0;
+  oneShot.request = new Proxy(oneShot.request, {
+    ownKeys(target) {
+      if (++ownKeysCalls !== 1) throw new Error('second-reflection.invalid');
+      return Reflect.ownKeys(target);
+    },
+  });
+  expectDecision(evaluate(oneShot), 'SELECTED', 'SYNTHETIC');
+  assert.equal(ownKeysCalls, 1);
+  const overflowing = scenario();
+  let descriptorCalls = 0;
+  overflowing.request = new Proxy(overflowing.request, {
+    ownKeys(target) { return [...Reflect.ownKeys(target), ...Array.from({ length: 65 }, (_, i) => `extra-${i}`)]; },
+    getOwnPropertyDescriptor(target, key) {
+      descriptorCalls++;
+      return Reflect.getOwnPropertyDescriptor(target, key) ?? { configurable: true, enumerable: true,
+        writable: true, value: 'synthetic.invalid' };
+    },
+  });
+  expectDecision(evaluate(overflowing), 'DENIED', 'BLOCK');
+  assert.equal(descriptorCalls, 0, 'oversized object rejects before reflecting descriptors');
+});
+
+test('array validation snapshots descriptor length rather than trusting a changing Proxy length', () => {
+  const s = scenario();
+  let lengthGets = 0;
+  s.policy.rules = new Proxy(s.policy.rules, {
+    get(target, key, receiver) {
+      if (key === 'length') return ++lengthGets === 1 ? target.length : 1_000_000;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  expectDecision(evaluate(s), 'SELECTED', 'SYNTHETIC');
+  assert.equal(lengthGets, 0, 'array length property reads cannot extend validation loop');
+});
+
+test('decisions replay exactly from durable non-secret policy/context/classification, regardless rule order', () => {
+  const s = scenario({ destination: sinks.enterprise, sensitivity: 'RESTRICTED' });
+  const held = evaluate(s);
+  expectDecision(held, 'HELD', 'REQUIRE_REVIEW');
+  const replay = copy(s);
+  replay.policy.rules.reverse();
+  replay.policy.profiles.reverse();
+  assert.deepEqual(evaluate(replay), held);
+  assert.deepEqual(decideReviewedPolicy(replay.request, replay.boundary, replay.policy,
+    copy(held), copy(outcome(s, held))),
+  decideReviewedPolicy(s.request, s.boundary, s.policy, held, outcome(s, held)));
+  assert.equal(JSON.stringify(held).includes('field-a.invalid'), false);
+  assert.equal(JSON.stringify(held).includes('principal-a.invalid'), false);
+});
