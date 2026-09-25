@@ -1,0 +1,219 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { test } from "node:test";
+import { runReferenceCandidate } from "./reference.mjs";
+
+// Public development inputs only. No planted oracle, expectedAnswer or blind material.
+const development = JSON.parse(readFileSync(
+  new URL("../../docs/research/issue-39-public-development-fixtures-p0.1.json", import.meta.url),
+  "utf8",
+));
+const fixture = (id) => development.fixtures.find((entry) => entry.fixtureId === id);
+const sinkId = "CAPTURE-DEMO-MODEL"; // A proposed local capture ID, NOT a trusted route.
+const run = (fields, taskPrompt) => runReferenceCandidate({ sinkId, fields, taskPrompt });
+
+function assertByteSpan(text, event, spelling) {
+  const start = text.indexOf(spelling);
+  assert.ok(start >= 0, "test input has a synthetic example");
+  assert.equal(event.startByte, Buffer.byteLength(text.slice(0, start), "utf8"));
+  assert.equal(event.endByte, Buffer.byteLength(text.slice(0, start + spelling.length), "utf8"));
+}
+
+test("D01 proposed text: basic identities and roles survive irreversible masking", () => {
+  const sample = fixture("D01-DEV-001");
+  const { disposition, events, transformedFields, taskResponse } = run(
+    [{ id: "f0", text: sample.input.text }],
+    sample.taskControl.prompt,
+  );
+  assert.equal(disposition, "TRANSFORMED");
+  assert.ok(events.some((event) => event.semanticType === "PERSON" && event.subtype === "NAME"));
+  assert.ok(events.some((event) => event.semanticType === "PERSON" && event.subtype === "EMAIL"));
+  assert.ok(events.some((event) => event.semanticType === "PERSON" && event.subtype === "PHONE"));
+  assert.ok(events.some((event) => event.semanticType === "CUSTOMER_OR_PARTNER"));
+  assert.ok(events.some((event) => event.semanticType === "PROJECT_OR_CONTRACT"));
+  assert.ok(events.every((event) => event.fieldId === "f0" && event.endByte > event.startByte));
+  const visible = transformedFields[0].text;
+  assert.ok(!visible.includes("person.alpha@example.invalid"), "no original email in transformed field");
+  assert.ok(!visible.includes("202-555-0101"), "no original phone in transformed field");
+  assert.ok(visible.includes("primary on-call") && visible.includes("backup"));
+  assert.ok(visible.includes("approved internal channel"));
+  assert.equal(taskResponse, undefined);
+});
+
+test("UTF-8 byte spans point into their own field, not UTF-16 offsets", () => {
+  const text = "🌐 customer=Customer Demo-South contact=unit@example.invalid callback=+1 202-555-0102";
+  const result = run([{ id: "f0", text }]);
+  assert.equal(result.disposition, "TRANSFORMED");
+  const email = result.events.find((event) => event.subtype === "EMAIL");
+  const phone = result.events.find((event) => event.subtype === "PHONE");
+  assert.ok(email && phone);
+  assertByteSpan(text, email, "unit@example.invalid");
+  assertByteSpan(text, phone, "+1 202-555-0102");
+});
+
+test("D02 proposed log: even obviously nonlive token means BLOCK and no field text", () => {
+  const sample = fixture("D02-DEV-001");
+  const result = run(sample.input.lines.map((text, index) => ({ id: `f${index}`, text })));
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.transformedFields, undefined);
+  assert.equal(result.taskResponse, undefined);
+  const secret = result.events.find((event) => event.semanticType === "CREDENTIAL_OR_SECRET");
+  assert.ok(secret, "candidate reports secret detector event independently of blocking");
+  assert.equal(secret.fieldId, "f0");
+  assert.ok(secret.endByte > secret.startByte);
+});
+
+test("D02 non-secret log keeps HTTPS /health, attempted 443 and expected 8443", () => {
+  const sample = fixture("D02-DEV-001");
+  const result = run(sample.input.lines.slice(1).map((text, index) => ({ id: `f${index}`, text })));
+  assert.equal(result.disposition, "TRANSFORMED");
+  const visible = result.transformedFields.map((field) => field.text).join("\n");
+  assert.ok(visible.includes("https://") && visible.includes(":443/health"));
+  assert.ok(visible.includes("expected_service_port=8443"));
+  assert.ok(visible.includes('"port":443') && visible.includes('"port":8443'));
+  assert.ok(!visible.includes("diag-node.example.invalid"));
+  assert.ok(!result.events.some((event) => event.subtype === "PHONE"));
+});
+
+test("D05 JSON remains valid and response edits effective HTTPS port with visible relations", () => {
+  const sample = fixture("D05-DEV-001");
+  const result = run([{ id: "f0", hint: "json", text: JSON.stringify(sample.input.value) }], sample.taskControl.prompt);
+  assert.equal(result.disposition, "TRANSFORMED");
+  assert.ok(result.events.some((event) => event.semanticType === "HOST_OR_SERVICE"));
+  assert.ok(result.events.some((event) => event.semanticType === "FILE_OR_RESOURCE_PATH"));
+  const visible = JSON.parse(result.transformedFields[0].text);
+  assert.ok(visible.customer && visible.project);
+  assert.ok(!visible.endpointUrl.includes("service.demo.invalid"));
+  assert.equal(visible.port, 9443);
+  assert.equal(new URL(visible.endpointUrl).pathname, "/v1/ping");
+  assert.ok(visible.outputPath.startsWith("/") && visible.outputPath.endsWith(".json"));
+  assert.ok(visible.outputPath !== sample.input.value.outputPath);
+  const edited = JSON.parse(result.taskResponse);
+  const endpoint = new URL(edited.endpointUrl);
+  assert.equal(edited.port, 443);
+  assert.equal(Number(endpoint.port || (endpoint.protocol === "https:" ? 443 : 80)), 443);
+  assert.equal(endpoint.protocol, "https:");
+  assert.equal(endpoint.pathname, "/v1/ping");
+  assert.equal(endpoint.hostname, new URL(visible.endpointUrl).hostname);
+  assert.equal(edited.customer, visible.customer);
+  assert.equal(edited.project, visible.project);
+  assert.equal(edited.outputPath, visible.outputPath);
+  assert.equal(edited.os, "linux");
+  assert.equal(edited.timeoutMs, 2500);
+});
+
+test("credential assignments and URL userinfo block even for nonlive synthetic strings", () => {
+  const password = run([{ id: "f0", text: 'password=DEMO-NONLIVE-NOT-VALID' }]);
+  assert.equal(password.disposition, "BLOCK");
+  assert.ok(password.events.some((event) => event.semanticType === "CREDENTIAL_OR_SECRET"));
+  const jsonToken = run([{ id: "f0", hint: "json", text: '{"api_key":"DEMO-NONLIVE-NOT-VALID"}' }]);
+  assert.equal(jsonToken.disposition, "BLOCK");
+  const urlCredential = run([{ id: "f0", text: "https://demo.user:DEMO-NONLIVE-NOT-VALID@host.example.invalid/health" }]);
+  assert.equal(urlCredential.disposition, "BLOCK");
+  assert.equal(urlCredential.transformedFields, undefined);
+});
+
+test("malformed JSON and unsupported sink cannot emit a transformed candidate", () => {
+  const malformed = run([{ id: "f0", hint: "json", text: '{"port":443,' }]);
+  assert.equal(malformed.disposition, "BLOCK");
+  assert.equal(malformed.transformedFields, undefined);
+  const unknownSink = runReferenceCandidate({ sinkId: "EXTERNAL-NOT-CAPTURE", fields: [{ id: "f0", text: "hello" }] });
+  assert.equal(unknownSink.disposition, "BLOCK");
+  assert.equal(unknownSink.transformedFields, undefined);
+});
+
+test("raw-looking field IDs never escape through BLOCK events or transformed fields", () => {
+  const unsafeId = "DEMO-NONLIVE-TOKEN-NOT-VALID";
+  for (const text of [`token=${unsafeId}`, "health=ok"]) {
+    const result = run([{ id: unsafeId, text }]);
+    assert.equal(result.disposition, "BLOCK", "reject a field ID copied from candidate text");
+    assert.equal(result.events.length, 0, "reject before generating detector events");
+    assert.equal(result.transformedFields, undefined);
+    assert.equal(result.taskResponse, undefined);
+    assert.ok(!JSON.stringify(result).includes(unsafeId), "no protected-looking field ID in result");
+  }
+  const nonordinal = run([{ id: "f1", text: "health=ok" }]);
+  assert.equal(nonordinal.disposition, "BLOCK");
+  assert.equal(nonordinal.events.length, 0);
+});
+
+test("JSON Unicode-escaped duplicate effective outputPath blocks instead of partial rewrite", () => {
+  const text = '{"output\\u0050ath":"/opt/demo/outputs/first.json","outputPath":"/opt/demo/outputs/probe.json"}';
+  const result = run([{ id: "f0", hint: "json", text }]);
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.transformedFields, undefined);
+  assert.equal(result.taskResponse, undefined);
+});
+
+test("stateful ID getter cannot echo protected-looking text in BLOCK events", () => {
+  const unsafeId = "DEMO-NONLIVE-TOKEN-NOT-VALID";
+  let reads = 0;
+  const field = { text: `token=${unsafeId}`, get id() { return ++reads === 1 ? "f0" : unsafeId; } };
+  const result = run([field]);
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.events.length, 0, "reject accessor before generating event references");
+  assert.equal(result.transformedFields, undefined);
+  assert.ok(!JSON.stringify(result).includes(unsafeId), "no field identifier echoed by BLOCK");
+  assert.equal(reads, 0, "snapshot must not invoke a source getter");
+});
+
+test("stateful text getter cannot swap benign scan for secret-bearing transform", () => {
+  const unsafeText = "token=DEMO-NONLIVE-TOKEN-NOT-VALID";
+  let reads = 0;
+  const field = { id: "f0", get text() { return ++reads <= 3 ? "status=ok" : unsafeText; } };
+  const result = run([field]);
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.events.length, 0);
+  assert.equal(result.transformedFields, undefined);
+  assert.ok(!JSON.stringify(result).includes(unsafeText), "no late text getter output");
+  assert.equal(reads, 0, "snapshot must not invoke a source getter");
+});
+
+test("inconsistent Proxy field descriptors cannot supply unsnapshotted references", () => {
+  const field = new Proxy({ id: "f0", text: "health=ok" }, {
+    getOwnPropertyDescriptor(target, key) {
+      return key === "id" ? undefined : Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  const result = run([field]);
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.events.length, 0);
+  assert.equal(result.transformedFields, undefined);
+});
+
+test("bounded 64-field snapshots retain per-field UTF-8 offsets, but overflow blocks", () => {
+  const fields = Array.from({ length: 64 }, (_, index) => ({
+    id: `f${index}`, text: index === 63 ? "🌐 unit@example.invalid" : "status=ok",
+  }));
+  const result = run(fields);
+  assert.equal(result.disposition, "TRANSFORMED");
+  assert.equal(result.transformedFields.length, 64);
+  const email = result.events.find((event) => event.subtype === "EMAIL");
+  assert.ok(email);
+  assert.equal(email.fieldId, "f63");
+  assertByteSpan(fields[63].text, email, "unit@example.invalid");
+  const overflow = run([...fields, { id: "f64", text: "status=ok" }]);
+  assert.equal(overflow.disposition, "BLOCK");
+  assert.equal(overflow.events.length, 0);
+});
+
+test("array-slot and top-level accessors are rejected without invocation", () => {
+  let reads = 0;
+  const fields = [{ id: "f0", text: "status=ok" }];
+  Object.defineProperty(fields, 0, { configurable: true, get() { reads++; return { id: "f0", text: "status=ok" }; } });
+  const arrayResult = run(fields);
+  assert.equal(arrayResult.disposition, "BLOCK");
+  const rootResult = runReferenceCandidate({ sinkId, get fields() { reads++; return [{ id: "f0", text: "status=ok" }]; } });
+  assert.equal(rootResult.disposition, "BLOCK");
+  assert.equal(reads, 0);
+});
+
+test("fixture-authored profiles, policy claims and extra fields are not candidate inputs", () => {
+  const result = runReferenceCandidate({
+    sinkId,
+    fields: [{ id: "f0", text: "hello" }],
+    destinationProfileProposal: { exposure: "LOCAL" },
+  });
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.transformedFields, undefined);
+});
