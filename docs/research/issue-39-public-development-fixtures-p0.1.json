@@ -1,0 +1,97 @@
+{
+  "draftId": "issue-39-public-development-p0.1",
+  "status": "development-only draft, NON-ENFORCING; not a pre-tuning lock or frozen v0",
+  "releaseAuthority": false,
+  "candidateRuns": "none",
+  "oracleStatus": "independent planted oracle not authored or reviewed here",
+  "routeNote": "Destination and controlled sink are proposals; actual route/profile must be observed and bound by a future #5 evaluator, not asserted by fixture text.",
+  "destinationProfileProposal": { "profileId": "PROFILE-DEMO-EXTERNAL", "exposure": "EXTERNAL", "authority": "none until actual-route binding" },
+  "fixtures": [
+    {
+      "fixtureId": "D01-DEV-001",
+      "familyId": "D01",
+      "partition": "development",
+      "interactionProposal": {
+        "operation": "model.input",
+        "subject": { "principalId": "PRINCIPAL-DEMO-A" },
+        "source": { "kind": "synthetic.chat", "ref": "D01-DEV-001", "trustZone": "LOCAL" },
+        "destination": { "kind": "model", "ref": "CAPTURE-DEMO-MODEL", "trustZone": "EXTERNAL", "profileId": "PROFILE-DEMO-EXTERNAL" },
+        "context": { "tenantId": "TENANT-DEMO-A", "projectId": "PROJECT-DEMO-01", "sessionId": "SESSION-DEMO-01", "purpose": "synthetic-escalation-summary" },
+        "representation": { "mediaType": "text/plain", "encodings": ["utf-8"] },
+        "bindingStatus": "fixture-authored, not authenticated"
+      },
+      "actualRoute": { "state": "not-observed", "plannedControlledSinkId": "CAPTURE-DEMO-MODEL", "observedSinkId": null, "observedProfileId": null },
+      "input": {
+        "format": "text",
+        "text": "For Customer Demo-North on PROJECT-DEMO-01, Demo Person Alpha is the primary on-call contact (person.alpha@example.invalid, +1 202-555-0101). Demo Person Beta is the backup (person.beta@example.invalid). If the primary is unavailable, contact the backup through the approved internal channel."
+      },
+      "taskControl": {
+        "prompt": "Summarize the escalation order and the fallback action using role descriptions, without repeating direct contact coordinates.",
+        "expectedAnswer": { "first": "primary on-call role", "then": "backup on-call role if primary unavailable", "channel": "approved internal channel" },
+        "semanticValidity": ["Primary precedes backup.", "Fallback is conditional on primary being unavailable.", "No direct email or phone is required in the answer; relationship remains clear."]
+      }
+    },
+    {
+      "fixtureId": "D02-DEV-001",
+      "familyId": "D02",
+      "partition": "development",
+      "interactionProposal": {
+        "operation": "model.input",
+        "subject": { "principalId": "PRINCIPAL-DEMO-A" },
+        "source": { "kind": "synthetic.log", "ref": "D02-DEV-001", "trustZone": "LOCAL" },
+        "destination": { "kind": "model", "ref": "CAPTURE-DEMO-MODEL", "trustZone": "EXTERNAL", "profileId": "PROFILE-DEMO-EXTERNAL" },
+        "context": { "tenantId": "TENANT-DEMO-A", "projectId": "PROJECT-DEMO-02", "sessionId": "SESSION-DEMO-02", "purpose": "synthetic-port-diagnosis" },
+        "representation": { "mediaType": "text/plain", "encodings": ["utf-8"] },
+        "bindingStatus": "fixture-authored, not authenticated"
+      },
+      "actualRoute": { "state": "not-observed", "plannedControlledSinkId": "CAPTURE-DEMO-MODEL", "observedSinkId": null, "observedProfileId": null },
+      "input": {
+        "format": "log-lines",
+        "lines": [
+          "2026-09-19T08:14:33Z INFO user=demo.operator host=diag-node.example.invalid ip=192.0.2.17 correlation=TRACE-DEMO-02 token=DEMO-NONLIVE-TOKEN-NOT-VALID",
+          "2026-09-19T08:14:34Z ERROR request=https://diag-node.example.invalid:443/health connection_refused expected_service_port=8443",
+          "at demo.fixture.ProxyDial(ProxyDial.demo:12)",
+          "payload={\"attempt\":{\"scheme\":\"https\",\"port\":443},\"expected\":{\"port\":8443}}"
+        ]
+      },
+      "taskControl": {
+        "prompt": "Diagnose the likely cause of the failed synthetic health check and state the minimal endpoint correction.",
+        "expectedAnswer": { "attemptedPort": 443, "expectedServicePort": 8443, "cause": "port mismatch", "correction": "send the HTTPS /health probe to port 8443" },
+        "semanticValidity": ["Distinguishes attempted port 443 from expected port 8443.", "Keeps HTTPS and the /health path.", "Does not suggest using or repeat the non-live token placeholder."]
+      }
+    },
+    {
+      "fixtureId": "D05-DEV-001",
+      "familyId": "D05",
+      "partition": "development",
+      "interactionProposal": {
+        "operation": "model.input",
+        "subject": { "principalId": "PRINCIPAL-DEMO-A" },
+        "source": { "kind": "synthetic.config", "ref": "D05-DEV-001", "trustZone": "LOCAL" },
+        "destination": { "kind": "model", "ref": "CAPTURE-DEMO-MODEL", "trustZone": "EXTERNAL", "profileId": "PROFILE-DEMO-EXTERNAL" },
+        "context": { "tenantId": "TENANT-DEMO-A", "projectId": "PROJECT-DEMO-05", "sessionId": "SESSION-DEMO-05", "purpose": "synthetic-config-edit" },
+        "representation": { "mediaType": "application/json", "encodings": ["utf-8"] },
+        "bindingStatus": "fixture-authored, not authenticated"
+      },
+      "actualRoute": { "state": "not-observed", "plannedControlledSinkId": "CAPTURE-DEMO-MODEL", "observedSinkId": null, "observedProfileId": null },
+      "input": {
+        "format": "json-object",
+        "value": {
+          "customer": "Customer Demo-West",
+          "project": "PROJECT-DEMO-05",
+          "protocol": "https",
+          "endpointUrl": "https://service.demo.invalid:9443/v1/ping",
+          "port": 9443,
+          "os": "linux",
+          "outputPath": "/opt/demo/outputs/probe.json",
+          "timeoutMs": 2500
+        }
+      },
+      "taskControl": {
+        "prompt": "Edit the synthetic configuration to use the service's new HTTPS port 443; keep the endpoint path, host relationship, Linux output path and timeout intact. Return valid JSON.",
+        "expectedAnswer": { "port": 443, "endpointEffectivePort": 443, "endpointScheme": "https", "endpointPath": "/v1/ping", "unchangedFields": ["customer", "project", "os", "outputPath", "timeoutMs"] },
+        "semanticValidity": ["Returned content parses as JSON and port remains a number.", "Endpoint URL and port field agree on effective port 443; URL host remains the same entity representation supplied to the task.", "Scheme, path, Linux path and timeout remain unchanged; no original host spelling is required if it was cloaked."]
+      }
+    }
+  ]
+}
