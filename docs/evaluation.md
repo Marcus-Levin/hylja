@@ -27,7 +27,9 @@ Maintain distinct sets:
 - highly restricted real incident cases where synthetic reproduction is impossible;
 - a frozen held-out set not used to tune questions, thresholds, or rules.
 
-The eval corpus itself is sensitive infrastructure. Restricted real incidents are encrypted, access-controlled, minimized, and converted to synthetic regression cases whenever possible.
+The eval corpus itself is sensitive infrastructure. Restricted real incidents are encrypted, access-controlled, minimized, and converted to synthetic regression cases whenever possible. Held-out fixtures are frozen separately from tuning and have planted ground truth independent of whichever detector is being evaluated; changes to the held-out set require a documented new version rather than silent retuning.
+
+An executable invariant test must assert a behavior and fail on a counterexample: skipped or placeholder cross-tenant tests do not count as foundation exit evidence. Before a vault exists, exercise the tenant-scoped policy/authorization contract with synthetic fixtures; later vault and cache implementations must run the same invariant against real storage and brokers.
 
 ## Core metrics
 
@@ -68,25 +70,28 @@ Operational metrics:
 
 ## Weighted consequence
 
-A missed port is not equivalent to a missed private key. Release decisions weight class, sensitivity, sink risk, and exposure scope rather than optimizing a single global accuracy number.
+A missed port is not equivalent to a missed private key. Release decisions weight class, sensitivity, sink risk, and exposure scope rather than optimizing a single global accuracy number. Zero planted-secret escapes in held-out synthetic fixtures is a bounded release criterion, not a guarantee about arbitrary production traffic. Exact-string coverage does not establish safety against contextual re-identification; real-customer release requires separate combination-risk cases, destination-specific thresholds, and generalization acceptance.
 
 ## Property-based tests
 
 Generate thousands of planted values and structures. Required properties include:
 
-- planted protected values never appear in disallowed outbound payloads;
+- planted protected values never appear in the exact post-serialization bytes delivered to disallowed sinks, including external semantic-judge requests when enabled;
+- payload metadata, source/destination references, provenance, errors, traces, and audit evidence do not leak planted originals;
+- unsupported or opaque protected content, required-check outages, malformed input and split stream chunks cannot be released as uninspected plaintext;
 - JSON/XML/YAML remain valid after transformation;
 - authorized round-trip uncloak restores exactly where exact restoration is the contract;
 - blocked secrets cannot be restored;
 - same entity is stable within scope;
 - unrelated scopes do not correlate by default;
-- tenant A tokens/ciphertext/mappings never resolve under tenant B;
-- expired/revoked mappings do not resolve;
+- tenant A tokens/ciphertext/mappings/caches/synthetic identities never resolve under tenant B, even when an exception policy is supplied;
+- authenticated policy inputs cannot be forged by payload, headers, model output, or launcher flags;
+- expired/revoked mappings and stale replayed ciphertext do not resolve;
 - unknown synthetic-looking tokens never gain authority.
 
 ## Independent egress sentinel
 
-The final outbound check should not be identical to primary detection. It can combine deterministic secret scanners, fingerprints of known originals, canary identities, policy assertions, and separate high-risk patterns. A sentinel catch blocks release and becomes a regression case.
+The final outbound check should not be identical to primary detection. It can combine deterministic secret scanners, fingerprints of known originals, canary identities, policy assertions, and separate high-risk patterns. It checks the exact serialized release after all authorized transformations/encodings; no subsequent mutation or unchecked chunk may cross the sink. A sentinel catch blocks release and becomes a sanitized regression case. Negative tests cover encoded/fragmented values, opaque content, unavailable sentinel, and seeded leaks from metadata as well as payload.
 
 ## Champion/challenger lifecycle
 

@@ -4,7 +4,7 @@ Operational controls are part of the security boundary.
 
 ## Audit
 
-Record cloak/uncloak/use/display/export/delete/key-rotation/policy-change/failed-authorization/break-glass actions without raw protected values. Audit storage should be append-oriented and protected under a different administrative boundary from the mapping store where practical.
+Record cloak/uncloak/use/display/export/delete/key-rotation/policy-change/failed-authorization/break-glass actions without raw protected values. Use an allowlisted evidence schema with opaque scoped IDs or keyed pseudonyms: arbitrary source/destination refs, query strings, purpose text, provenance, payloads, exception messages, judge requests, and error/trace fields are not safe merely because they are called metadata. Test injected synthetic secrets in each route, including failure paths. Audit storage should be append-oriented and protected under a different administrative boundary from the mapping store where practical.
 
 ## Behavioral signals
 

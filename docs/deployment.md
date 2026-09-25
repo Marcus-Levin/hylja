@@ -4,7 +4,7 @@ Hylja should support several trust and sovereignty profiles without changing the
 
 ## Local/workstation
 
-Best for developer PoCs and CLI interception. Mapping Vault and deterministic detection remain local; external semantic judgment is optional and receives minimized context.
+Best for developer PoCs and CLI interception. When enabled in later slices, Mapping Vault and deterministic detection remain local; external semantic judgment is optional, separately policy-controlled egress, and receives only verified minimized context. The initial synthetic text proof has no production vault or bypass-resistance claim.
 
 ## Customer VPC / private cloud
 
@@ -25,6 +25,7 @@ Possible for lower-sensitivity use cases, but the service must clearly document 
 ## Deployment invariants
 
 - destination policy is independent of network topology;
-- managed deployments can prevent direct egress that bypasses Hylja;
-- tenant keys, mappings, blind indexes, caches, and synthetic identities are isolated;
+- complete managed-egress coverage is claimed only after direct bypass paths are technically prevented and re-attested for each new adapter; earlier gateway deployments state narrower capabilities;
+- tenant keys, mappings, blind indexes, caches, and synthetic identities are isolated from the first relevant stateful component, not deferred to enterprise hardening;
+- unsupported opaque/binary or hosted-tool flows are denied for protected use or explicitly outside supported coverage, never quietly forwarded;
 - deployment-specific capabilities and limitations are discoverable and auditable.

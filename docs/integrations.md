@@ -27,8 +27,8 @@ A deployment must state its coverage level rather than implying complete agent p
 
 ## Provider adapters
 
-Provider adapters translate provider-neutral model interactions into native streaming/messages/tool-call formats. They contain no privacy policy. The same classified interaction should result in the same policy decision regardless of the downstream provider profile.
+Provider adapters translate provider-neutral model interactions into native streaming/messages/tool-call formats. They contain no privacy policy. The same classified interaction and authenticated policy context must yield the same privacy outcome across adapters when the actual destination profile is the same; different destination profiles may correctly produce different decisions. Unobservable hosted tools and opaque content cannot be counted as protected merely because the model gateway sees adjacent traffic.
 
 ## CLI V1 direction
 
-A future `hylja run <harness>` can provision supported endpoint and MCP settings for one session, register a session policy context, and launch the harness. This is a convenience around the enforcement architecture, not the security boundary by itself.
+A future `hylja run <harness>` can provision supported endpoint and MCP settings for one session, register a session policy context, and launch the harness. The launcher must bind that context to an authenticated subject and actual destination: CLI arguments or agent-generated identifiers are not authorization. This is a convenience around the enforcement architecture, not the security boundary by itself.
