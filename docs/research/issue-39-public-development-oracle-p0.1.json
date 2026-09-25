@@ -1,10 +1,10 @@
 {
   "draftId": "issue-39-public-development-oracle-p0.1",
-  "status": "development-only independent planted-oracle proposal; NON-ENFORCING; not a pre-tuning lock or frozen v0",
+  "status": "development-only independently reviewed planted-oracle proposal; NON-ENFORCING; not a pre-tuning lock or frozen v0",
   "releaseAuthority": false,
   "candidateRuns": "none",
-  "independentReviewer": "pending",
-  "preTuningLock": "pending independent review, destination/policy review and integrity recording",
+  "independentReviewer": "development-only occurrence content reviewed; not destination-policy approval, scoring or pre-tuning lock",
+  "preTuningLock": "pending destination/policy and task/rubric review, blind partition access controls and integrity recording; DEV oracle review alone is not a lock",
   "v0Freeze": "pending minimal executable #1/#5 seam; no hash or score claimed",
   "fixtureReference": "issue-39-public-development-p0.1",
   "scope": {
