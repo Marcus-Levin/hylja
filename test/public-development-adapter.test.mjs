@@ -335,3 +335,33 @@ test('invalid post-candidate output and serializer bytes fail before send, not a
     assert.equal(report.utility.taskCorrect, null);
   }
 });
+
+test('D05 malformed transformed JSON object rejects before any capture or task result', async () => {
+  for (const malformed of ['{invalid-json', '[]', 'null']) {
+    const run = setup('D05-DEV-001');
+    await assert.rejects(run.run({ candidate(input) {
+      const good = runReferenceCandidate(input);
+      assert.equal(good.disposition, 'TRANSFORMED');
+      return { ...good, transformedFields: [{ id: 'f0', hint: 'json', text: malformed }] };
+    } }), (error) => error instanceof TypeError && !error.message.includes(malformed));
+    assert.deepEqual(run.capture.forCase(run.fixture.fixtureId), []);
+    const report = run.evaluation.report(run.fixture.fixtureId, run.capture, () => true);
+    assert.equal(report.utility.taskCorrect, null);
+    assert.equal(untested(report, 'task-correctness').reason, 'no-task-result');
+  }
+});
+
+test('D05 malformed task response JSON/shape rejects before any capture or task result', async () => {
+  for (const malformed of ['not-json', '[]', '{}', '{"port":"443"}']) {
+    const run = setup('D05-DEV-001');
+    await assert.rejects(run.run({ candidate(input) {
+      const good = runReferenceCandidate(input);
+      assert.equal(good.disposition, 'TRANSFORMED');
+      return { ...good, taskResponse: malformed };
+    } }), (error) => error instanceof TypeError && !error.message.includes(malformed));
+    assert.deepEqual(run.capture.forCase(run.fixture.fixtureId), []);
+    const report = run.evaluation.report(run.fixture.fixtureId, run.capture, () => true);
+    assert.equal(report.utility.taskCorrect, null);
+    assert.equal(untested(report, 'task-correctness').reason, 'no-task-result');
+  }
+});
