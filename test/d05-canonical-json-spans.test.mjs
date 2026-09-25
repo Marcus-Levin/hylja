@@ -50,6 +50,11 @@ function replace(source, before, after) {
 function rejectsRaw(raw, options) {
   assert.throws(() => projector(raw, options), generic);
 }
+function rejectsRawEvenWithMatchingParsedProjection(raw) {
+  const { projection } = inputs(raw); // Test control: a lossy JS parse cannot establish raw provenance.
+  assert.throws(() => createPublicD05SpanProjector({ rawFixtureUtf8: encoder.encode(raw),
+    projection, fixtureId, sourceValuePath: valuePath }), generic);
+}
 
 test('D05 public raw fixture binds one id/pointer; canonical field and four exact #5 UTF-8 byte slices', () => {
   const { fixture, projection, span } = projector();
@@ -57,7 +62,7 @@ test('D05 public raw fixture binds one id/pointer; canonical field and four exac
   assert.equal(span.version, 'd05-canonical-json-v1');
   const field = projection.developmentCase.fields[0].content;
   const value = fixture.input.value;
-  assert.equal(field, JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) =>
+  assert.ok(field === JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) =>
     a.localeCompare(b)))));
   const controls = [
     ['customer', value.customer, 0, value.customer.length],
@@ -70,8 +75,9 @@ test('D05 public raw fixture binds one id/pointer; canonical field and four exac
   const projected = controls.map(([key, text, start, end], index) => {
     const entry = span.projectSourceOccurrence(occurrence(key, text, start, end));
     const expected = anchoredByteSpan(value, key, start, end);
-    assert.deepEqual(entry, { fieldRef: 'field-0', ...expected, value: text.slice(start, end) });
-    assert.equal(decoder.decode(encoder.encode(field).subarray(entry.start, entry.end)), entry.value);
+    assert.ok(entry.fieldRef === 'field-0' && entry.start === expected.start &&
+      entry.end === expected.end && entry.value === text.slice(start, end));
+    assert.ok(decoder.decode(encoder.encode(field).subarray(entry.start, entry.end)) === entry.value);
     return { id: `test-authored-${index}`, ...entry,
       semanticType: { customer: 'CUSTOMER_OR_PARTNER', project: 'PROJECT_OR_CONTRACT',
         endpointUrl: 'HOST_OR_SERVICE', outputPath: 'FILE_OR_RESOURCE_PATH' }[key],
@@ -80,7 +86,10 @@ test('D05 public raw fixture binds one id/pointer; canonical field and four exac
   });
   evalOnly.registerOracle({ version: 1, caseId: fixtureId, occurrences: projected });
   evalOnly.registerCandidateEvents(fixtureId, []);
-  assert.equal(evalOnly.report(fixtureId, createInMemorySinkCapture()).candidates.planted, 4);
+  const ordinaryReport = evalOnly.report(fixtureId, createInMemorySinkCapture());
+  assert.equal(ordinaryReport.candidates.planted, 4);
+  assert.ok(controls.every(([, text, start, end]) =>
+    !JSON.stringify(ordinaryReport).includes(text.slice(start, end))));
   evalOnly.clear();
 });
 
@@ -94,24 +103,42 @@ test('path/key identity resolves repeated identical leaves; source object key or
     fixtureId, sourceValuePath: valuePath });
   const first = span.projectSourceOccurrence(occurrence('customer', fixture.input.value.customer));
   const second = span.projectSourceOccurrence(occurrence('project', fixture.input.value.project));
-  assert.equal(first.value, second.value);
-  assert.notEqual(first.start, second.start);
-  assert.deepEqual(first, { fieldRef: 'field-0', ...anchoredByteSpan(fixture.input.value,
-    'customer', 0, first.value.length), value: 'shared-demo.invalid' });
-  assert.deepEqual(second, { fieldRef: 'field-0', ...anchoredByteSpan(fixture.input.value,
-    'project', 0, second.value.length), value: 'shared-demo.invalid' });
+  assert.ok(first.value === second.value && first.start !== second.start);
+  for (const [key, result] of [['customer', first], ['project', second]]) {
+    const expected = anchoredByteSpan(fixture.input.value, key, 0, result.value.length);
+    assert.ok(result.fieldRef === 'field-0' && result.start === expected.start &&
+      result.end === expected.end && result.value === 'shared-demo.invalid');
+  }
 });
 
 test('D05 URL occurrence is HOST substring only; route, scheme, port, numeric controls and utility strings reject', () => {
   const { span, fixture } = projector();
   const url = fixture.input.value.endpointUrl;
-  assert.equal(span.projectSourceOccurrence(occurrence('endpointUrl', url, 8, 28)).value,
+  assert.ok(span.projectSourceOccurrence(occurrence('endpointUrl', url, 8, 28)).value ===
     'service.demo.invalid');
   for (const entry of [occurrence('endpointUrl', url),
     occurrence('endpointUrl', url, 29, 33), occurrence('endpointUrl', url, 33, 41),
     occurrence('endpointUrl', url, 0, 8), occurrence('protocol', 'https'),
     occurrence('os', 'linux'), occurrence('port', '9443'), occurrence('timeoutMs', '2500')]) {
     assert.throws(() => span.projectSourceOccurrence(entry), generic);
+  }
+});
+
+test('ambiguous URL authorities and unsupported D05 lexical forms reject with matching parsed projection', () => {
+  const currentUrl = '"endpointUrl": "https://service.demo.invalid:9443/v1/ping"';
+  for (const changedUrl of [
+    'https://user@service.demo.invalid:9443/v1/ping',
+    'https://service..demo.invalid:9443/v1/ping',
+    'https://service.demo.invalid:99999/v1/ping',
+    'https://%73ervice.demo.invalid:9443/v1/ping',
+    'https://[2001:db8::1]:9443/v1/ping',
+  ]) {
+    rejectsRawEvenWithMatchingParsedProjection(replace(originalRaw, currentUrl,
+      `"endpointUrl": "${changedUrl}"`));
+  }
+  for (const changed of ['"Customer \\nDemo-West"', '"Customer \\\"Demo-West"',
+    '"Customer \\\\ Demo-West"', '""']) {
+    rejectsRawEvenWithMatchingParsedProjection(replace(originalRaw, '"Customer Demo-West"', changed));
   }
 });
 
@@ -153,9 +180,9 @@ test('raw provenance required, exactly one D05 fixture at supplied index, no par
 test('decoded duplicate object keys, including escaped aliases, reject before any parsed collapse', () => {
   for (const raw of [
     replace(originalRaw, '"customer": "Customer Demo-West",',
-      '"customer": "Customer Demo-West", "customer": "Different",'),
+      '"customer": "Different", "customer": "Customer Demo-West",'),
     replace(originalRaw, '"customer": "Customer Demo-West",',
-      '"customer": "Customer Demo-West", "\\u0063ustomer": "Different",'),
+      '"\\u0063ustomer": "Different", "customer": "Customer Demo-West",'),
     replace(originalRaw, '"draftId":', '"\\u0064raftId": "alias", "draftId":'),
   ]) rejectsRaw(raw);
 });
@@ -183,7 +210,7 @@ test('unsupported D05 escaping, non-ASCII, nested/array, integer-like keys and a
     replace(originalRaw, '"customer": "Customer Demo-West",',
       '"customer": "Customer Demo-West", "1": "other",'),
     replace(originalRaw, '"timeoutMs": 2500\n        }', '"timeoutMs": 2.5e3\n        }'),
-  ]) rejectsRaw(raw);
+  ]) rejectsRawEvenWithMatchingParsedProjection(raw);
 });
 
 test('snapshot survives source and raw-byte mutation; serializer drift and candidate misinformation cannot move truth', () => {
@@ -196,9 +223,16 @@ test('snapshot survives source and raw-byte mutation; serializer drift and candi
   fixture.input.value.customer = 'candidate-claimed-value.invalid';
   const fakeEvent = { fieldId: 'f0', startByte: 0, endByte: 1, label: 'safe' };
   assert.equal(fakeEvent.label, 'safe'); // Candidate assertions are not source evidence.
-  assert.deepEqual(span.projectSourceOccurrence(occurrence('customer', 'Customer Demo-West')), occurrenceBefore);
+  const after = span.projectSourceOccurrence(occurrence('customer', 'Customer Demo-West'));
+  assert.ok(after.fieldRef === occurrenceBefore.fieldRef && after.start === occurrenceBefore.start &&
+    after.end === occurrenceBefore.end && after.value === occurrenceBefore.value);
   assert.throws(() => span.projectSourceOccurrence(occurrence('customer',
     'candidate-claimed-value.invalid')), generic);
+  const altered = inputs().fixture;
+  altered.input.value.customer = 'candidate-claimed-value.invalid';
+  const drift = projectPublicDevelopmentFixture(altered, sink);
+  assert.throws(() => createPublicD05SpanProjector({ rawFixtureUtf8: encoder.encode(originalRaw),
+    fixtureId, sourceValuePath: valuePath, projection: drift }), generic);
   const spoofed = { ...projection, developmentCase: { ...projection.developmentCase,
     fields: [{ ref: 'field-0', content: projection.developmentCase.fields[0].content + ' ' }] } };
   assert.throws(() => createPublicD05SpanProjector({ rawFixtureUtf8: encoder.encode(originalRaw),
