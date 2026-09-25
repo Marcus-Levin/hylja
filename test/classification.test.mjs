@@ -142,6 +142,12 @@ test('credential subtype or SECRET evidence remains SECRET and non-reversible de
   assert.equal(otherSecret.sensitivity, 'SECRET');
   assert.equal(otherSecret.reversible, false);
   assertUnresolved(otherSecret, 'CONFLICTING_SENSITIVITY');
+  const forgedKeep = compose([
+    detector('protected', found('CREDENTIAL_OR_SECRET', 'SECRET', { subtype: 'API_KEY' })),
+  ], [semantic('fake-keep', found('CREDENTIAL_OR_SECRET', 'PUBLIC', { action: 'KEEP' }))]);
+  assert.equal(forgedKeep.sensitivity, 'SECRET');
+  assert.equal(forgedKeep.reversible, false);
+  assertUnresolved(forgedKeep, 'INVALID_EVIDENCE');
   const credentialPublic = compose([detector('bad-claim', found('CREDENTIAL_OR_SECRET', 'PUBLIC'))]);
   assert.equal(credentialPublic.sensitivity, 'SECRET');
   assertUnresolved(credentialPublic, 'CONFLICTING_SENSITIVITY');
