@@ -275,12 +275,22 @@ test('trusted composer classification digest prevents PUBLIC substitution under 
   expectDecision(evaluate(genuinePublic), 'SELECTED', 'KEEP');
 });
 
-test('a structurally empty RESOLVED evidence record cannot be pinned as a trusted classification', () => {
+test('RESOLVED needs nonempty, detector-sourced and internally consistent evidence', () => {
   const s = scenario({ sensitivity: 'PUBLIC' });
   expectDecision(evaluate(s), 'SELECTED', 'KEEP');
-  s.request.classification = { ...s.request.classification, evidence: [] };
-  assert.throws(() => digestClassification(s.request.classification), TypeError);
-  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  const genuine = copy(s.request.classification);
+  for (const corrupt of [
+    record => { record.evidence = []; },
+    record => { record.evidence[0].source = 'parser'; },
+    record => { record.evidence[0].claim.sensitivity = 'SECRET'; },
+    record => { record.evidence[0].status = 'ABSTAIN'; delete record.evidence[0].claim; },
+  ]) {
+    const malformed = copy(genuine);
+    corrupt(malformed);
+    s.request.classification = malformed;
+    assert.throws(() => digestClassification(malformed), TypeError);
+    expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  }
 });
 
 test('two candidate units in one interaction have distinct held review fingerprints', () => {
