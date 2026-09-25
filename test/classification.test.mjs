@@ -119,6 +119,20 @@ test('initial subtype registry recognizes examples and extensions are explicit, 
   assert.equal(DEFAULT_SUBTYPES.PERSON.includes('EMPLOYEE_ALIAS'), false);
 });
 
+test('chained subtype extensions cannot grow one class without bound', () => {
+  let bounded = extendSubtypeRegistry({
+    PERSON: Array.from({ length: 124 }, (_, index) => `SYNTHETIC_${index}`),
+  });
+  assert.equal(bounded.PERSON.length, 127); // three built-in PERSON subtypes
+  bounded = extendSubtypeRegistry({ PERSON: ['SYNTHETIC_124'] }, bounded);
+  assert.equal(bounded.PERSON.length, 128);
+  assert.throws(() => extendSubtypeRegistry({ PERSON: ['SYNTHETIC_125'] }, bounded), TypeError);
+  assert.equal(bounded.PERSON.length, 128);
+  assert.equal(compose([detector('at-cap', found('PERSON', 'PUBLIC', { subtype: 'SYNTHETIC_124' }))],
+    [], [], context, bounded).status, 'RESOLVED');
+  assert.equal(DEFAULT_SUBTYPES.PERSON.length, 3);
+});
+
 test('records preserve version, independently sourced producer provenance and question/model identity', () => {
   const one = detector('detected', found('PERSON', 'CONFIDENTIAL', { subtype: 'EMAIL' }));
   const two = semantic('judged', found('PERSON', 'CONFIDENTIAL', { subtype: 'EMAIL', confidence: 0.75 }));

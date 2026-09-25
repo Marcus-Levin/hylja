@@ -79,7 +79,10 @@ export function extendSubtypeRegistry(extensions: unknown, base: SubtypeRegistry
     for (const [kind, values] of Object.entries(fields)) {
       if (!inSet(kind, SEMANTIC_CLASSES)) throw new TypeError('Invalid subtype extension');
       const subtypes = arrayItems(values);
-      if (subtypes.invalid || subtypes.values.length > 128) throw new TypeError('Invalid subtype extension');
+      // Bound the accumulated registry too: chained extensions cannot evade a per-call cap.
+      if (subtypes.invalid || result[kind].length + subtypes.values.length > 128) {
+        throw new TypeError('Invalid subtype extension');
+      }
       for (const subtype of subtypes.values) {
         if (typeof subtype !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(subtype) ||
           result[kind].includes(subtype)) throw new TypeError('Invalid subtype extension');
