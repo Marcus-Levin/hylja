@@ -96,12 +96,11 @@ function record(value: unknown, required: readonly string[], optional: readonly 
   if (prototype !== Object.prototype && prototype !== null) fail(where);
   const keys = Reflect.ownKeys(value);
   if (keys.length > required.length + optional.length) fail(where);
-  const descriptors = Object.getOwnPropertyDescriptors(value);
   const allowed = new Set([...required, ...optional]);
   const snapshot: RecordValue = Object.create(null) as RecordValue;
-  for (const key of Reflect.ownKeys(descriptors)) {
+  for (const key of keys) {
     if (typeof key !== 'string' || !allowed.has(key)) fail(where);
-    const descriptor = descriptors[key];
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) fail(where);
     // Read the validated data descriptor exactly once; never read a Proxy's field again.
     Object.defineProperty(snapshot, key, { value: descriptor.value, enumerable: true, configurable: true });

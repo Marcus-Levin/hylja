@@ -165,6 +165,37 @@ test('time-varying adapter objects cannot become bound unsupported operations or
   assert.deepEqual(parseInteractionEnvelope(serializeInteractionEnvelope(fragment), trusted), fragment);
 });
 
+test('capped adapter keys are never enumerated a second time for descriptors', () => {
+  const trusted = boundary();
+  const input = draft();
+  const realKeys = Reflect.ownKeys(input);
+  const oversizedKeys = [...realKeys, ...Array.from({ length: 80_000 }, (_, i) => `synthetic-field-${i}`)];
+  let enumerations = 0;
+  let descriptorVisits = 0;
+  const changingKeys = new Proxy(input, {
+    ownKeys() { return ++enumerations === 1 ? realKeys : oversizedKeys; },
+    getOwnPropertyDescriptor(target, key) {
+      descriptorVisits++;
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  const bound = createInteractionEnvelope(changingKeys, trusted);
+  assert.equal(enumerations, 1, 'the capped key list must be the only enumeration');
+  assert.equal(descriptorVisits, realKeys.length, 'only captured keys may be inspected');
+  assert.deepEqual(parseInteractionEnvelope(serializeInteractionEnvelope(bound), trusted), bound);
+
+  let invalidDescriptorVisits = 0;
+  const oversizedFirst = new Proxy(input, {
+    ownKeys() { return oversizedKeys; },
+    getOwnPropertyDescriptor(target, key) {
+      invalidDescriptorVisits++;
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  assert.throws(() => createInteractionEnvelope(oversizedFirst, trusted), TypeError);
+  assert.equal(invalidDescriptorVisits, 0, 'an over-cap object must be rejected before descriptors');
+});
+
 test('authenticated identity/request and observed source/actual route come only from independent trusted context', () => {
   const trusted = boundary();
   const valid = createInteractionEnvelope(draft(), trusted);
