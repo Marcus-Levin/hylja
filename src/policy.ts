@@ -15,6 +15,8 @@ export const KNOWN_POLICY_BUNDLE = Object.freeze({ id: 'hylja.foundation', versi
 export interface PolicyRequest {
   version: 1;
   interactionRef: string;
+  /** Opaque candidate-unit reference, supplied separately by trusted integration. */
+  candidateRef: string;
   subject: Subject;
   context: RequestContext;
   source: Endpoint;
@@ -27,6 +29,9 @@ export interface PolicyRequest {
 }
 export interface PolicyBoundary {
   interactionRef: string;
+  candidateRef: string;
+  /** Independently pinned digest of the trusted composer output for this candidate. */
+  classificationDigest: string;
   authenticated: { subject: Subject; context: RequestContext };
   observed: { source: Endpoint & { trust: Trust }; destination: Destination };
   /** Independently pinned control-plane SHA-256 of the exact normalized bundle snapshot. */
@@ -189,10 +194,11 @@ function classification(value: unknown): Classification {
   } as unknown as Classification;
 }
 function request(value: unknown): PolicyRequest {
-  const v = fields(value, ['version', 'interactionRef', 'subject', 'context', 'source',
+  const v = fields(value, ['version', 'interactionRef', 'candidateRef', 'subject', 'context', 'source',
     'destination', 'classification', 'operation', 'policy'], ['semanticRecommendation']);
   if (v.version !== 1) fail('INVALID_REQUEST');
-  return { version: 1, interactionRef: text(v.interactionRef), subject: subject(v.subject),
+  return { version: 1, interactionRef: text(v.interactionRef), candidateRef: text(v.candidateRef),
+    subject: subject(v.subject),
     context: context(v.context), source: endpoint(v.source), destination: destination(v.destination),
     classification: classification(v.classification), operation: member(v.operation, POLICY_OPERATIONS),
     policy: identity(v.policy),
@@ -200,10 +206,12 @@ function request(value: unknown): PolicyRequest {
       { semanticRecommendation: member(v.semanticRecommendation, POLICY_TREATMENTS) } : {}) };
 }
 function boundary(value: unknown): PolicyBoundary {
-  const v = fields(value, ['interactionRef', 'authenticated', 'observed', 'policy']);
+  const v = fields(value, ['interactionRef', 'candidateRef', 'classificationDigest',
+    'authenticated', 'observed', 'policy']);
   const a = fields(v.authenticated, ['subject', 'context']);
   const o = fields(v.observed, ['source', 'destination']);
-  return { interactionRef: text(v.interactionRef),
+  return { interactionRef: text(v.interactionRef), candidateRef: text(v.candidateRef),
+    classificationDigest: text(v.classificationDigest),
     authenticated: { subject: subject(a.subject), context: context(a.context) },
     observed: { source: sourceWithTrust(o.source), destination: destination(o.destination) },
     policy: pinnedIdentity(v.policy) };
@@ -253,6 +261,11 @@ function hash(value: object): string {
 export function digestPolicyBundle(value: unknown): string {
   try { return hash(canonicalBundle(bundle(value))); }
   catch { throw new TypeError('Invalid policy bundle'); }
+}
+/** Compiling digest seam stub; trusted composer binding is not yet checked. */
+export function digestClassification(value: unknown): string {
+  try { return hash(value as object); }
+  catch { throw new TypeError('Invalid classification'); }
 }
 function equal(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right); }
 function denied(reason: string): PolicyDecision {

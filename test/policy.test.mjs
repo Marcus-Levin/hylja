@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { composeClassification, SEMANTIC_CLASSES, TRUST_LEVELS } from '../dist/classification.js';
 import {
-  decidePolicy, decideReviewedPolicy, digestPolicyBundle,
+  decidePolicy, decideReviewedPolicy, digestPolicyBundle, digestClassification,
   POLICY_TREATMENTS, POLICY_OPERATIONS, KNOWN_POLICY_BUNDLE,
 } from '../dist/policy.js';
 
@@ -61,15 +61,19 @@ function classification(semanticType = 'PERSON', sensitivity = 'CONFIDENTIAL', t
   }] }, { interactionRef: 'interaction-a.invalid', sourceRef: source.ref, trust });
 }
 function scenario({ destination = sinks.enterprise, semanticType = 'PERSON', sensitivity = 'CONFIDENTIAL',
-  trust = 'TRUSTED', operation = 'SEND', evidence = classification(semanticType, sensitivity, trust) } = {}) {
+  trust = 'TRUSTED', operation = 'SEND', candidateRef = 'unit-a.invalid',
+  evidence = classification(semanticType, sensitivity, trust) } = {}) {
   const policy = bundle();
   const boundary = {
-    interactionRef: 'interaction-a.invalid', authenticated: { subject: copy(subject), context: copy(context) },
+    interactionRef: 'interaction-a.invalid', candidateRef,
+    classificationDigest: evidence === undefined ? '0'.repeat(64) : digestClassification(evidence),
+    authenticated: { subject: copy(subject), context: copy(context) },
     observed: { source: { ...source, trust }, destination: copy(destination) },
     policy: { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(policy) },
   };
   const request = {
-    version: 1, interactionRef: boundary.interactionRef, subject: copy(subject), context: copy(context),
+    version: 1, interactionRef: boundary.interactionRef, candidateRef,
+    subject: copy(subject), context: copy(context),
     source: copy(source), destination: copy(destination), classification: evidence, operation,
     policy: copy(KNOWN_POLICY_BUNDLE),
   };
@@ -243,6 +247,64 @@ test('UNKNOWN, conflict, parser failure and absent classifications never allow p
     s.request.classification = evidence;
     expectDecision(evaluate(s), 'DENIED', 'BLOCK');
   }
+});
+
+test('trusted composer classification digest prevents PUBLIC substitution under identical boundary and policy', () => {
+  const s = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-a.invalid' });
+  expectDecision(evaluate(s), 'HELD', 'REQUIRE_REVIEW');
+  const trustedDigest = s.boundary.classificationDigest;
+  const forged = copy(s.request.classification);
+  forged.status = 'RESOLVED';
+  forged.semanticType = 'PERSON';
+  forged.sensitivity = 'PUBLIC';
+  forged.reasons = [];
+  forged.evidence = [];
+  s.request.classification = forged; // same principal/tenant/candidate/route/policy and provenance
+  assert.equal(s.boundary.classificationDigest, trustedDigest);
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  const genuinePublic = scenario({ sensitivity: 'PUBLIC', candidateRef: 'unit-a.invalid' });
+  expectDecision(evaluate(genuinePublic), 'SELECTED', 'KEEP');
+});
+
+test('a structurally empty RESOLVED evidence record cannot be pinned as a trusted classification', () => {
+  const s = scenario({ sensitivity: 'PUBLIC' });
+  expectDecision(evaluate(s), 'SELECTED', 'KEEP');
+  s.request.classification = { ...s.request.classification, evidence: [] };
+  assert.throws(() => digestClassification(s.request.classification), TypeError);
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+});
+
+test('two candidate units in one interaction have distinct held review fingerprints', () => {
+  const a = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-a.invalid' });
+  const b = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-b.invalid' });
+  const heldA = evaluate(a);
+  const heldB = evaluate(b);
+  expectDecision(heldA, 'HELD', 'REQUIRE_REVIEW');
+  expectDecision(heldB, 'HELD', 'REQUIRE_REVIEW');
+  assert.notEqual(heldA.decisionRef, heldB.decisionRef);
+  assert.equal(JSON.stringify(heldA).includes('unit-a.invalid'), false);
+  assert.equal(JSON.stringify(heldB).includes('unit-b.invalid'), false);
+});
+
+test('approval for candidate A cannot select treatment for candidate B in the same context', () => {
+  const a = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-a.invalid' });
+  const b = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-b.invalid' });
+  const heldA = evaluate(a);
+  const heldB = evaluate(b);
+  expectDecision(heldA, 'HELD', 'REQUIRE_REVIEW');
+  expectDecision(heldB, 'HELD', 'REQUIRE_REVIEW');
+  const approvedA = outcome(a, heldA);
+  expectDecision(decideReviewedPolicy(b.request, b.boundary, b.policy, heldB, approvedA),
+    'HELD', 'REQUIRE_REVIEW');
+  expectDecision(decideReviewedPolicy(a.request, a.boundary, a.policy, heldA, approvedA),
+    'SELECTED', 'GENERALIZE');
+});
+
+test('candidate identity cannot be replaced by untrusted request-side text', () => {
+  const s = scenario({ sensitivity: 'RESTRICTED' });
+  expectDecision(evaluate(s), 'HELD', 'REQUIRE_REVIEW');
+  s.request.candidateRef = 'unit-b.invalid';
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
 });
 
 test('review is held, separate, attributable and bounded to current policy approved treatments', () => {
