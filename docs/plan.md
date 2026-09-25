@@ -4,7 +4,7 @@ This plan is the single authoritative home for implementation status. Architectu
 
 ## Current state
 
-**Foundation established; implementation not started.** Product direction, architecture, security model, threat model, contracts, evaluation policy, synthetic examples, and the dependency-ordered implementation backlog are now in the repository. The TypeScript source contains no enforcement runtime and must not be represented as a privacy boundary.
+**Foundation established; no enforcement runtime.** Product direction, architecture, security model, threat model, contracts, evaluation policy, synthetic examples, and the dependency-ordered implementation backlog are in the repository. The TypeScript source contains no enforcement runtime and must not be represented as a privacy boundary. A [standalone deterministic/no-Jev reference candidate](../evaluations/candidates/README.md) handles only public synthetic development inputs for later independent evaluation; it is evaluation-only, NON-ENFORCING and neither #5's evaluator nor a policy/egress boundary.
 
 Implementation work is tracked from [roadmap issue #36](https://github.com/Marcus-Levin/hylja/issues/36), with scoped implementation issues #1-#35 and #37 carrying their own dependencies and acceptance criteria. A separate [comparative reuse/buy/build campaign #38](https://github.com/Marcus-Levin/hylja/issues/38) may propose later scope changes; it does not itself prove implementation or alter accepted security invariants.
 

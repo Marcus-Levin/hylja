@@ -102,6 +102,17 @@ test("D05 JSON remains valid and response edits effective HTTPS port with visibl
   assert.equal(edited.timeoutMs, 2500);
 });
 
+test("credential assignments and URL userinfo block even for nonlive synthetic strings", () => {
+  const password = run([{ id: "body", text: 'password=DEMO-NONLIVE-NOT-VALID' }]);
+  assert.equal(password.disposition, "BLOCK");
+  assert.ok(password.events.some((event) => event.semanticType === "CREDENTIAL_OR_SECRET"));
+  const jsonToken = run([{ id: "config", hint: "json", text: '{"api_key":"DEMO-NONLIVE-NOT-VALID"}' }]);
+  assert.equal(jsonToken.disposition, "BLOCK");
+  const urlCredential = run([{ id: "body", text: "https://demo.user:DEMO-NONLIVE-NOT-VALID@host.example.invalid/health" }]);
+  assert.equal(urlCredential.disposition, "BLOCK");
+  assert.equal(urlCredential.transformedFields, undefined);
+});
+
 test("malformed JSON and unsupported sink cannot emit a transformed candidate", () => {
   const malformed = run([{ id: "config", hint: "json", text: '{"port":443,' }]);
   assert.equal(malformed.disposition, "BLOCK");
