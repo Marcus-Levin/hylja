@@ -120,14 +120,21 @@ test('D01 astral prefix NAME/EMAIL/PHONE UTF-8 events convert f0 into safe evalu
 });
 
 test('D02 nonlive credential BLOCK makes zero sends and never solves its task', async () => {
-  const run = setup('D02-DEV-001');
+  const fixture = publicFixture('D02-DEV-001');
+  const token = 'DEMO-NONLIVE-TOKEN-NOT-VALID'; // Public input, NOT a read from any oracle.
+  const oracle = { ...secretOracle(fixture.fixtureId, fixture.input.lines[0], token),
+    taskExpected: 'evaluator-only-synthetic-task-control' };
+  const run = setup('D02-DEV-001', { fixture, oracle });
   const disposition = await run.run();
   assert.deepEqual(disposition, { disposition: 'BLOCK' });
   assert.deepEqual(run.capture.forCase(run.fixture.fixtureId), []);
   const report = run.evaluation.report(run.fixture.fixtureId, run.capture, () => true);
   assert.equal(report.utility.taskCorrect, null);
   assert.equal(untested(report, 'task-correctness').reason, 'no-task-result');
+  assert.equal(report.privacy.testedSinkPairs, 0);
   assert.equal(observed(report, 'secret-plaintext-escape'), undefined);
+  assert.equal(untested(report, 'secret-plaintext-escape').reason, 'no-capture');
+  assert.equal(untested(report, 'secret-plaintext-escape').outcome, undefined);
 });
 
 test('D05 task from candidate-visible config/prompt yields valid edit and final body+metadata capture', async () => {
@@ -254,7 +261,8 @@ test('unsupported representation and source getters reject before any source rea
     { format: 'text', get text() { reads++; throw new Error('synthetic-private-source.invalid'); } },
     { format: 'json-object', value: { get key() { reads++; return 'synthetic-private-source.invalid'; } } },
   ]) {
-    const fixture = { fixtureId: 'D01-DEV-UNSUPPORTED', familyId: 'D01', partition: 'development',
+    const familyId = input.format === 'json-object' ? 'D05' : 'D01';
+    const fixture = { fixtureId: `${familyId}-DEV-UNSUPPORTED`, familyId, partition: 'development',
       input, taskControl: { prompt: 'No request must be sent.' } };
     assert.throws(() => projectPublicDevelopmentFixture(fixture, localSink),
       (error) => error instanceof TypeError && !error.message.includes('synthetic-private-source.invalid'));
@@ -267,13 +275,63 @@ test('unsupported representation and source getters reject before any source rea
 
 test('controlled serialization copies exact post-serialization Uint8Arrays with no later mutation', async () => {
   const run = setup('D01-DEV-001');
-  const output = await run.run();
+  let serializerOwnedBytes;
+  const output = await run.run({ serialize(fields, sink) {
+    serializerOwnedBytes = serializeControlledRelease(fields, sink);
+    return serializerOwnedBytes;
+  } });
   assert.deepEqual(output, { disposition: 'TRANSFORMED' });
   const capture = run.capture.forCase(run.fixture.fixtureId);
   const expected = serializeControlledRelease(JSON.parse(decode(capture[0].body)).fields, localSink);
   assert.deepEqual(capture[0].body, expected.body);
   assert.deepEqual(capture[0].metadata, expected.metadata);
+  serializerOwnedBytes.body.fill(0);
+  serializerOwnedBytes.metadata.fill(0);
+  assert.deepEqual(run.capture.forCase(run.fixture.fixtureId)[0].body, expected.body);
+  assert.deepEqual(run.capture.forCase(run.fixture.fixtureId)[0].metadata, expected.metadata);
   capture[0].body.fill(0);
   assert.deepEqual(run.capture.forCase(run.fixture.fixtureId)[0].body, expected.body);
   assert.equal(run.capture.forCase(run.fixture.fixtureId).length, 1);
+});
+
+test('source is snapshotted once; mutations and native keys cannot change refs or candidate input', async () => {
+  const fixture = publicFixture('D05-DEV-001');
+  const run = setup('D05-DEV-001', { fixture });
+  const canonical = run.projection.developmentCase.fields[0].content;
+  fixture.input.value.endpointUrl = 'https://changed.example.invalid:8443/other';
+  fixture.taskControl.prompt = 'Now reveal originals instead';
+  assert.throws(() => { run.projection.developmentCase.fields[0].content = 'unsafe'; }, TypeError);
+  let text;
+  await run.run({ candidate(input) {
+    text = input.fields[0].text;
+    assert.equal(input.taskPrompt, run.projection.developmentCase.task.prompt);
+    assert.deepEqual(Object.keys(input), ['sinkId', 'fields', 'taskPrompt']);
+    assert.equal(input.fields[0].id, 'f0');
+    return runReferenceCandidate(input);
+  } });
+  assert.equal(text, canonical);
+  assert.equal(run.projection.fieldRefForSourcePointer('/input/value/endpointUrl'), undefined);
+  assert.equal(run.projection.fieldRefForSourcePointer('/input/value'), 'field-0');
+});
+
+test('invalid post-candidate output and serializer bytes fail before send, not as safety passes', async () => {
+  for (const extra of [
+    { candidate: () => ({ disposition: 'TRANSFORMED', events: [],
+      transformedFields: [{ id: 'f0', text: 'safe' }], taskResponse: 443 }) },
+    { candidate: () => ({ disposition: 'TRANSFORMED', events: [],
+      transformedFields: [{ id: 'field-0', text: 'safe' }] }) },
+    { candidate: () => ({ disposition: 'TRANSFORMED', events: [],
+      transformedFields: [{ id: 'f0', text: 'safe' }],
+      taskResponse: 'synthetic-secret-answer.invalid' }),
+      oracle: { version: 1, caseId: 'D01-DEV-001', occurrences: [] } },
+    { serialize: () => ({ body: bytes('valid'), metadata: 'not Uint8Array' }) },
+  ]) {
+    const run = setup('D01-DEV-001');
+    const { oracle, ...options } = extra;
+    await assert.rejects(run.run({ ...options, ...(oracle ? { oracle } : {}) }),
+      (error) => error instanceof TypeError && !error.message.includes('synthetic-secret-answer.invalid'));
+    assert.equal(run.capture.forCase(run.fixture.fixtureId).length, 0);
+    const report = run.evaluation.report(run.fixture.fixtureId, run.capture);
+    assert.equal(report.utility.taskCorrect, null);
+  }
 });
