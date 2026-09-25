@@ -336,6 +336,22 @@ test('invalid post-candidate output and serializer bytes fail before send, not a
   }
 });
 
+test('bounded long field with 256 duplicate valid events remains an accepted observation', async () => {
+  const fixture = { fixtureId: 'D01-DEV-BOUND', familyId: 'D01', partition: 'development',
+    input: { format: 'text', text: 'x'.repeat(65_536) },
+    taskControl: { prompt: 'Synthetic local smoke only.' } };
+  const run = setup('D01-DEV-001', { fixture });
+  const result = await run.run({ candidate(input) {
+    assert.equal(bytes(input.fields[0].text).length, 65_536);
+    return { disposition: 'TRANSFORMED', events: Array.from({ length: 256 }, () => ({
+      fieldId: 'f0', startByte: 0, endByte: 1, semanticType: 'PERSON',
+    })), transformedFields: [{ id: 'f0', text: 'masked' }] };
+  } });
+  assert.deepEqual(result, { disposition: 'TRANSFORMED' });
+  assert.equal(run.capture.forCase(fixture.fixtureId).length, 1);
+  assert.equal(run.evaluation.report(fixture.fixtureId, run.capture).candidates.falsePositives, 256);
+});
+
 test('changing oracle task-control descriptor cannot cause post-send #5 rejection', async () => {
   const run = setup('D05-DEV-001');
   let keyEnumerations = 0;
