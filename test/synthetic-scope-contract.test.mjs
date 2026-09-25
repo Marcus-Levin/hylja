@@ -52,6 +52,40 @@ test('errors or non-boolean results cannot masquerade as denied authorization', 
   assert.equal(JSON.stringify(findings).includes('synthetic-private-plant.invalid'), false);
 });
 
+test('throwing boundary accessors and Proxy traps never echo planted values through contract errors', async () => {
+  const planted = 'synthetic-private-plant.invalid';
+  for (const boundary of [
+    { get canResolve() { throw Error(planted); }, authorize: () => false },
+    new Proxy({ canResolve: () => false, authorize: () => false }, {
+      get(target, key) { if (key === 'authorize') throw Error(planted); return Reflect.get(target, key); },
+    }),
+  ]) {
+    let findings;
+    try { findings = await runSyntheticScopeContract(boundary); } catch (error) {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message.includes(planted), false);
+    }
+    if (findings) {
+      assert.ok(findings.length >= 100);
+      assert.ok(findings.some((item) => item.outcome === 'fail'));
+      assert.equal(JSON.stringify(findings).includes(planted), false);
+    }
+  }
+});
+
+test('boundary methods are snapshotted once before running vectors, not re-read by malicious getters', async () => {
+  let resolutionReads = 0;
+  let authorizationReads = 0;
+  const boundary = {
+    get canResolve() { resolutionReads++; return scopedDouble.canResolve; },
+    get authorize() { authorizationReads++; return scopedDouble.authorize; },
+  };
+  const findings = await runSyntheticScopeContract(boundary);
+  assert.equal(findings.every((item) => item.outcome === 'pass'), true);
+  assert.equal(resolutionReads, 1);
+  assert.equal(authorizationReads, 1);
+});
+
 test('deterministic generator varies wrong scopes, provenance and tenant, including exception claims', () => {
   const a = generateSyntheticScopeVectors(SYNTHETIC_SCOPE_REFERENCES, 789, 128);
   const b = generateSyntheticScopeVectors(SYNTHETIC_SCOPE_REFERENCES, 789, 128);
