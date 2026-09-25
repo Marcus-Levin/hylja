@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { composeClassification, SEMANTIC_CLASSES, TRUST_LEVELS } from '../dist/classification.js';
 import {
-  decidePolicy, decideReviewedPolicy, POLICY_TREATMENTS, POLICY_OPERATIONS, KNOWN_POLICY_BUNDLE,
+  decidePolicy, decideReviewedPolicy, digestPolicyBundle,
+  POLICY_TREATMENTS, POLICY_OPERATIONS, KNOWN_POLICY_BUNDLE,
 } from '../dist/policy.js';
 
 const copy = (value) => structuredClone(value);
@@ -61,18 +62,21 @@ function classification(semanticType = 'PERSON', sensitivity = 'CONFIDENTIAL', t
 }
 function scenario({ destination = sinks.enterprise, semanticType = 'PERSON', sensitivity = 'CONFIDENTIAL',
   trust = 'TRUSTED', operation = 'SEND', evidence = classification(semanticType, sensitivity, trust) } = {}) {
+  const policy = bundle();
   const boundary = {
     interactionRef: 'interaction-a.invalid', authenticated: { subject: copy(subject), context: copy(context) },
     observed: { source: { ...source, trust }, destination: copy(destination) },
-    policy: copy(KNOWN_POLICY_BUNDLE),
+    policy: { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(policy) },
   };
   const request = {
     version: 1, interactionRef: boundary.interactionRef, subject: copy(subject), context: copy(context),
     source: copy(source), destination: copy(destination), classification: evidence, operation,
     policy: copy(KNOWN_POLICY_BUNDLE),
   };
-  return { request, boundary, policy: bundle() };
+  return { request, boundary, policy };
 }
+// Re-pin only in tests explicitly modeling a newly authorized control-plane policy snapshot.
+function pin(s) { s.boundary.policy.digest = digestPolicyBundle(s.policy); }
 function evaluate(s) { return decidePolicy(s.request, s.boundary, s.policy); }
 function expectDecision(value, state, treatment) {
   assert.equal(value.version, 1);
@@ -123,6 +127,7 @@ test('operation separation requires independent explicit USE, DISPLAY and EXPORT
   }
   const s = scenario({ destination: sinks.local, operation: 'EXPORT' });
   s.policy.rules.push(rule('explicit-export', 'local.invalid', 'PERSON', ['CONFIDENTIAL'], ['EXPORT'], 'REMOVE'));
+  pin(s);
   expectDecision(evaluate(s), 'SELECTED', 'REMOVE');
   assert.equal(evaluate(scenario({ destination: sinks.enterprise, operation: 'EXPORT' })).state, 'DENIED');
 });
@@ -190,6 +195,7 @@ test('trusted source influence is separate from sensitivity; payload CONTROL and
   const s = scenario({ trust: 'HOSTILE' });
   s.policy.rules = s.policy.rules.map(r => r.profileId === 'enterprise.invalid' ?
     { ...r, sourceTrust: ['TRUSTED'] } : r);
+  pin(s);
   expectDecision(evaluate(s), 'DENIED', 'BLOCK');
   s.request.semanticRecommendation = 'KEEP';
   expectDecision(evaluate(s), 'DENIED', 'BLOCK');
@@ -202,6 +208,7 @@ test('trusted source influence is separate from sensitivity; payload CONTROL and
   // Even an explicit rule cannot place above-ceiling original plaintext into the web profile.
   protectedCase.policy.rules.push(rule('web-confidential-keep', 'web.invalid', 'PERSON',
     ['CONFIDENTIAL'], ['SEND'], 'KEEP'));
+  pin(protectedCase);
   expectDecision(evaluate(protectedCase), 'DENIED', 'BLOCK');
 });
 
@@ -213,6 +220,7 @@ test('SECRET and credentials reject external KEEP, reversible treatments and sem
   for (const decision of ['KEEP', 'TOKENIZE', 'SYNTHETIC', 'GENERALIZE']) {
     const attempt = scenario({ semanticType: 'CREDENTIAL_OR_SECRET', sensitivity: 'SECRET' });
     attempt.policy.rules.at(-1).decision = decision;
+    pin(attempt);
     expectDecision(evaluate(attempt), 'DENIED', 'BLOCK');
   }
   const unknown = scenario({ semanticType: 'CREDENTIAL_OR_SECRET', sensitivity: 'PUBLIC' });
@@ -274,10 +282,12 @@ test('review cannot borrow another tenant, route, action, version or decision; s
   }
   const changed = scenario({ sensitivity: 'RESTRICTED' });
   changed.policy.rules = changed.policy.rules.filter(r => r.id !== 'enterprise-review-PERSON.invalid');
+  pin(changed);
   expectDecision(decideReviewedPolicy(changed.request, changed.boundary, changed.policy, held,
     outcome(s, held)), 'DENIED', 'BLOCK');
   const widened = scenario({ sensitivity: 'RESTRICTED' });
   widened.policy.rules.find(r => r.id === 'enterprise-review-PERSON.invalid').reviewTreatments.push('MASK');
+  pin(widened);
   expectDecision(decideReviewedPolicy(widened.request, widened.boundary, widened.policy, held,
     outcome(s, held)), 'DENIED', 'BLOCK');
   const otherAction = scenario({ sensitivity: 'RESTRICTED', operation: 'EXPORT' });
@@ -290,16 +300,18 @@ test('duplicate matching rules, malformed profiles, and profile treatment ceilin
   const s = scenario();
   s.policy.rules.push(rule('overlap', 'enterprise.invalid', 'PERSON',
     ['CONFIDENTIAL'], ['SEND'], 'KEEP'));
+  pin(s);
   expectDecision(evaluate(s), 'DENIED', 'BLOCK');
-  for (const mutate of [
-    policy => { policy.profiles[1].permittedTreatments = ['KEEP']; },
-    policy => { policy.profiles[1].maxCleartextSensitivity = 'PUBLIC';
-      policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').decision = 'KEEP'; },
-    policy => { policy.profiles[1].permittedTreatments = ['KEEP', 'BLOCK']; },
-    policy => { policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').sourceTrust = []; },
+  for (const [mutate, validConfiguration] of [
+    [policy => { policy.profiles[1].permittedTreatments = ['KEEP']; }, true],
+    [policy => { policy.profiles[1].maxCleartextSensitivity = 'PUBLIC';
+      policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').decision = 'KEEP'; }, true],
+    [policy => { policy.profiles[1].permittedTreatments = ['KEEP', 'BLOCK']; }, false],
+    [policy => { policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').sourceTrust = []; }, false],
   ]) {
     const attempt = scenario();
     mutate(attempt.policy);
+    if (validConfiguration) pin(attempt);
     expectDecision(evaluate(attempt), 'DENIED', 'BLOCK');
   }
 });
@@ -324,6 +336,7 @@ test('exact BLOCK rule defeats semantic KEEP and unknown context never upgrades 
   const s = scenario();
   expectDecision(evaluate(s), 'SELECTED', 'SYNTHETIC');
   s.policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').decision = 'BLOCK';
+  pin(s);
   s.request.semanticRecommendation = 'KEEP';
   expectDecision(evaluate(s), 'DENIED', 'BLOCK');
   for (const mutate of [
@@ -380,10 +393,17 @@ test('malicious getters, proxies and unsupported input never echo planted privat
 test('same ID/version rule substitution cannot turn independently trusted BLOCK into KEEP', () => {
   const s = scenario({ sensitivity: 'PUBLIC' });
   s.policy.rules.find(r => r.id === 'enterprise-public-PERSON.invalid').decision = 'BLOCK';
+  pin(s); // independently trusted commitment to the approved BLOCK snapshot
   expectDecision(evaluate(s), 'DENIED', 'BLOCK');
   // After this approved snapshot, attacker swaps only policy CONTENT; both labels stay unchanged.
   s.policy.rules.find(r => r.id === 'enterprise-public-PERSON.invalid').decision = 'KEEP';
-  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  const substituted = evaluate(s);
+  expectDecision(substituted, 'DENIED', 'BLOCK');
+  assert.equal(substituted.reason, 'BUNDLE_MISMATCH');
+  assert.equal(digestPolicyBundle(s.policy) === s.boundary.policy.digest, false);
+  const alteredPin = scenario();
+  alteredPin.boundary.policy.digest = '0'.repeat(64);
+  assert.equal(evaluate(alteredPin).reason, 'BUNDLE_MISMATCH');
 });
 
 test('object reflection uses one capped own-key snapshot before descriptor access', () => {
