@@ -48,11 +48,13 @@ function data(value: unknown, required: readonly string[], optional: readonly st
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
   const prototype: unknown = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return null;
-  if (Object.getOwnPropertySymbols(value).length) return null;
-  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > required.length + optional.length || keys.some((key) => typeof key !== 'string')) return null;
   const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-  for (const [key, descriptor] of Object.entries(descriptors)) {
-    if (!required.includes(key) && !optional.includes(key) || !descriptor.enumerable || !('value' in descriptor)) return null;
+  for (const key of keys) {
+    if (typeof key !== 'string' || !required.includes(key) && !optional.includes(key)) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return null;
     result[key] = descriptor.value;
   }
   for (const key of required) if (!Object.hasOwn(result, key)) return null;
@@ -187,11 +189,14 @@ function channels(input: unknown): { fields: Record<string, unknown>; invalid: b
   const fields: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   try {
     if (input === null || typeof input !== 'object' || Array.isArray(input) ||
-      ![Object.prototype, null].includes(Object.getPrototypeOf(input)) ||
-      Object.getOwnPropertySymbols(input).length) return { fields, invalid: true };
+      ![Object.prototype, null].includes(Object.getPrototypeOf(input))) return { fields, invalid: true };
+    const keys = Reflect.ownKeys(input);
+    if (keys.length > 16) return { fields, invalid: true };
     let invalid = false;
-    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(input))) {
-      if (!descriptor.enumerable || !('value' in descriptor)) { invalid = true; continue; }
+    for (const key of keys) {
+      if (typeof key !== 'string') { invalid = true; continue; }
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) { invalid = true; continue; }
       if (!['detectorEvidence', 'parserEvidence', 'semanticJudgments'].includes(key)) {
         invalid = true;
         continue;
@@ -203,15 +208,22 @@ function channels(input: unknown): { fields: Record<string, unknown>; invalid: b
 }
 function arrayItems(input: unknown): { values: unknown[]; invalid: boolean } {
   try {
-    if (!Array.isArray(input) || Object.getPrototypeOf(input) !== Array.prototype ||
-      Object.getOwnPropertySymbols(input).length || input.length > 256) {
+    if (!Array.isArray(input) || Object.getPrototypeOf(input) !== Array.prototype) {
       return { values: [], invalid: true };
     }
-    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const keys = Reflect.ownKeys(input);
+    if (keys.length > 257 || keys.some((key) => typeof key !== 'string')) {
+      return { values: [], invalid: true };
+    }
+    // Read descriptor data, not a Proxy's time-varying `get(length)` trap.
+    const length: unknown = Object.getOwnPropertyDescriptor(input, 'length')?.value;
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > 256) {
+      return { values: [], invalid: true };
+    }
     const values: unknown[] = [];
-    let invalid = Object.keys(descriptors).length !== input.length + 1;
-    for (let index = 0; index < input.length; index++) {
-      const descriptor = descriptors[String(index)];
+    let invalid = keys.length !== length + 1;
+    for (let index = 0; index < length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
       if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
         values.push(undefined);
         invalid = true;

@@ -297,6 +297,32 @@ test('malformed object traps and accessor arrays remain unresolved without expos
     assertUnresolved(result, 'INVALID_EVIDENCE');
     assert.equal(JSON.stringify(result).includes(planted), false);
   }
+  const lengthTrap = new Proxy([protectedEvidence], {
+    get(target, key) { if (key === 'length') throw Error(planted); return Reflect.get(target, key); },
+  });
+  const snapshotted = composeClassification({ detectorEvidence: lengthTrap }, context);
+  assert.equal(snapshotted.sensitivity, 'SECRET');
+  assert.equal(snapshotted.status, 'RESOLVED');
+  let lengthReads = 0;
+  const changingLength = new Proxy([protectedEvidence], {
+    get(target, key) {
+      if (key === 'length') return ++lengthReads === 1 ? 0 : 300; // bounded synthetic DoS probe
+      return Reflect.get(target, key);
+    },
+  });
+  const bounded = composeClassification({ detectorEvidence: changingLength }, context);
+  assert.equal(bounded.status, 'RESOLVED');
+  assert.equal(bounded.sensitivity, 'SECRET');
+  assert.equal(lengthReads, 0, 'never consume a time-varying Proxy length');
+  let descriptorReads = 0;
+  const oversized = new Proxy({}, {
+    ownKeys() { return Array.from({ length: 12 }, (_, index) => `field-${index}.invalid`); },
+    getOwnPropertyDescriptor() { descriptorReads++; throw Error(planted); },
+  });
+  const rejected = compose([protectedEvidence, oversized]);
+  assertUnresolved(rejected, 'INVALID_EVIDENCE');
+  assert.equal(rejected.sensitivity, 'SECRET');
+  assert.equal(descriptorReads, 0, 'reject oversized records before descriptor inspection');
   assert.throws(() => composeClassification({ detectorEvidence: [protectedEvidence] },
     { ...context, trust: planted }), (error) => error instanceof TypeError && !error.message.includes(planted));
 });
