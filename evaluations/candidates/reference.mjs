@@ -23,16 +23,45 @@ function hasKeys(value, keys) {
     && Object.keys(value).every((key) => keys.includes(key));
 }
 
-function validInput(input) {
-  return hasKeys(input, ["sinkId", "fields", "taskPrompt"])
-    && typeof input.sinkId === "string"
-    && Array.isArray(input.fields) && input.fields.length > 0 && input.fields.length <= 64
-    && (input.taskPrompt === undefined || (typeof input.taskPrompt === "string" && input.taskPrompt.length <= 4096))
-    && input.fields.every((field, index) => hasKeys(field, ["id", "text", "hint"])
+// Read each caller-owned property descriptor once; never call getters or reuse inputs.
+function ownData(value, required, allowed) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string" || !allowed.includes(key)
+    || !Object.hasOwn(descriptors[key], "value"))
+    || required.some((key) => !Object.hasOwn(descriptors, key))) return null;
+  const copy = Object.create(null);
+  for (const key of keys) copy[key] = descriptors[key].value;
+  return copy;
+}
+
+function snapshotInput(input) {
+  try {
+    const root = ownData(input, ["sinkId", "fields"], ["sinkId", "fields", "taskPrompt"]);
+    if (!root || typeof root.sinkId !== "string"
+      || (root.taskPrompt !== undefined && (typeof root.taskPrompt !== "string" || root.taskPrompt.length > 4096))
+      || !Array.isArray(root.fields)) return null;
+    // Bound the array before touching any index; extras cannot influence output.
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(root.fields, "length");
+    const count = lengthDescriptor?.value;
+    if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, "value")
+      || !Number.isInteger(count) || count < 1 || count > 64) return null;
+    const fields = [];
+    for (let index = 0; index < count; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(root.fields, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
+      const field = ownData(descriptor.value, ["id", "text"], ["id", "text", "hint"]);
       // Only an adapter-minted, per-case ordinal may leave the module as a reference.
-      && field.id === `f${index}`
-      && typeof field.text === "string" && field.text.length <= 65536
-      && (field.hint === undefined || HINTS.has(field.hint)));
+      if (!field || field.id !== `f${index}` || typeof field.text !== "string"
+        || field.text.length > 65536 || (field.hint !== undefined && !HINTS.has(field.hint))) return null;
+      fields.push(Object.freeze({ id: field.id, text: field.text, ...(field.hint && { hint: field.hint }) }));
+    }
+    return Object.freeze({ sinkId: root.sinkId, fields: Object.freeze(fields), taskPrompt: root.taskPrompt });
+  } catch {
+    // Inconsistent/throwing Proxy descriptors are unsupported; never echo errors.
+    return null;
+  }
 }
 
 function jsonOutputPath(text) {
@@ -136,14 +165,15 @@ function syntheticTaskResponse(fields, prompt) {
  * independent scoring, exact serialized capture and task grading.
  */
 export function runReferenceCandidate(input) {
-  if (!validInput(input)) return blocked("UNSUPPORTED_INPUT");
-  if (input.sinkId !== CAPTURE_ID) return blocked("UNSUPPORTED_SINK");
-  const scans = input.fields.map(scanField);
+  const snapshot = snapshotInput(input);
+  if (!snapshot) return blocked("UNSUPPORTED_INPUT");
+  if (snapshot.sinkId !== CAPTURE_ID) return blocked("UNSUPPORTED_SINK");
+  const scans = snapshot.fields.map(scanField);
   if (scans.some((scan) => scan.invalid)) return blocked("UNSUPPORTED_FIELD");
   const events = scans.flatMap(({ spans }, index) => spans.map((span) => {
-    const text = input.fields[index].text;
+    const text = snapshot.fields[index].text;
     return {
-      fieldId: input.fields[index].id,
+      fieldId: snapshot.fields[index].id,
       startByte: Buffer.byteLength(text.slice(0, span.start), "utf8"),
       endByte: Buffer.byteLength(text.slice(0, span.end), "utf8"),
       semanticType: span.type,
@@ -153,7 +183,7 @@ export function runReferenceCandidate(input) {
   if (scans.some(({ spans }) => spans.some((span) => span.type === "CREDENTIAL_OR_SECRET"))) {
     return blocked("SECRET_CANDIDATE", events);
   }
-  const transformedFields = input.fields.map((field, index) => {
+  const transformedFields = snapshot.fields.map((field, index) => {
     let text = field.text;
     for (const span of scans[index].spans.toReversed()) {
       text = text.slice(0, span.start) + span.replacement + text.slice(span.end);
@@ -166,6 +196,6 @@ export function runReferenceCandidate(input) {
       try { JSON.parse(field.text); } catch { return blocked("TRANSFORMATION_FAILED", events); }
     }
   }
-  const taskResponse = syntheticTaskResponse(transformedFields, input.taskPrompt);
+  const taskResponse = syntheticTaskResponse(transformedFields, snapshot.taskPrompt);
   return { disposition: "TRANSFORMED", events, transformedFields, ...(taskResponse && { taskResponse }) };
 }

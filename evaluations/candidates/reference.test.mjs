@@ -181,6 +181,33 @@ test("inconsistent Proxy field descriptors cannot supply unsnapshotted reference
   assert.equal(result.transformedFields, undefined);
 });
 
+test("bounded 64-field snapshots retain per-field UTF-8 offsets, but overflow blocks", () => {
+  const fields = Array.from({ length: 64 }, (_, index) => ({
+    id: `f${index}`, text: index === 63 ? "🌐 unit@example.invalid" : "status=ok",
+  }));
+  const result = run(fields);
+  assert.equal(result.disposition, "TRANSFORMED");
+  assert.equal(result.transformedFields.length, 64);
+  const email = result.events.find((event) => event.subtype === "EMAIL");
+  assert.ok(email);
+  assert.equal(email.fieldId, "f63");
+  assertByteSpan(fields[63].text, email, "unit@example.invalid");
+  const overflow = run([...fields, { id: "f64", text: "status=ok" }]);
+  assert.equal(overflow.disposition, "BLOCK");
+  assert.equal(overflow.events.length, 0);
+});
+
+test("array-slot and top-level accessors are rejected without invocation", () => {
+  let reads = 0;
+  const fields = [{ id: "f0", text: "status=ok" }];
+  Object.defineProperty(fields, 0, { configurable: true, get() { reads++; return { id: "f0", text: "status=ok" }; } });
+  const arrayResult = run(fields);
+  assert.equal(arrayResult.disposition, "BLOCK");
+  const rootResult = runReferenceCandidate({ sinkId, get fields() { reads++; return [{ id: "f0", text: "status=ok" }]; } });
+  assert.equal(rootResult.disposition, "BLOCK");
+  assert.equal(reads, 0);
+});
+
 test("fixture-authored profiles, policy claims and extra fields are not candidate inputs", () => {
   const result = runReferenceCandidate({
     sinkId,
