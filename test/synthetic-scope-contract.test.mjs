@@ -103,6 +103,41 @@ test('deterministic generator varies wrong scopes, provenance and tenant, includ
   assert.throws(() => generateSyntheticScopeVectors(SYNTHETIC_SCOPE_REFERENCES, 0, 8), TypeError);
 });
 
+test('scope references snapshot bounded array descriptors before any Proxy length/map/index traps', () => {
+  const values = [...SYNTHETIC_SCOPE_REFERENCES];
+  let lengthReads = 0;
+  let visited = 0;
+  const planted = 'synthetic-private-plant.invalid';
+  const changingLength = new Proxy(values, {
+    get(target, key) {
+      if (key === 'length') return ++lengthReads < 3 ? target.length : 100_000;
+      if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/u.test(key)) {
+        if (++visited > 64) throw Error(planted);
+        return target[Number(key) % target.length];
+      }
+      return Reflect.get(target, key);
+    },
+    has(target, key) { return typeof key === 'string' && /^(0|[1-9][0-9]*)$/u.test(key) || Reflect.has(target, key); },
+  });
+  let vectors;
+  try { vectors = generateSyntheticScopeVectors(changingLength, 789, 12); } catch (error) {
+    assert.ok(error instanceof TypeError);
+    assert.equal(error.message.includes(planted), false);
+  }
+  assert.ok(visited <= 32, `bounded fixture must not visit ${visited} proxy indices`);
+  assert.ok(lengthReads <= 1, `bounded fixture must not re-read changing length ${lengthReads} times`);
+  if (vectors) assert.equal(vectors.length, 12);
+  const withAccessor = [...values];
+  Object.defineProperty(withAccessor, '0', { get() { throw Error(planted); }, enumerable: true });
+  assert.throws(() => generateSyntheticScopeVectors(withAccessor, 789, 12),
+    (error) => error instanceof TypeError && !error.message.includes(planted));
+  let mapCalled = 0;
+  const withOverride = [...values];
+  withOverride.map = () => { mapCalled++; throw Error(planted); };
+  assert.throws(() => generateSyntheticScopeVectors(withOverride, 789, 12), TypeError);
+  assert.equal(mapCalled, 0);
+});
+
 test('custom synthetic fixture IDs cannot collide with generated wrong-scope attempts', async () => {
   const references = SYNTHETIC_SCOPE_REFERENCES.map((item, index) => ({
     ...item, ...(index === 0 ? { projectId: 'project-other-1024.invalid',

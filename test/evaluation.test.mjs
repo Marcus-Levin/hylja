@@ -209,6 +209,28 @@ test('independent downstream task control uses an injected rubric; correctness n
   assert.equal(JSON.stringify(throwing).includes(planted), false);
 });
 
+test('ordinary report mints opaque case/sink refs instead of echoing a protected value prefix', () => {
+  const protectedPrefix = 'synthetic-private-key-abcdef123456';
+  const value = `${protectedPrefix}.invalid`;
+  const caseId = `${protectedPrefix}-case`;
+  const sinkId = `${protectedPrefix}-sink`;
+  const source = `diagnose ${value}`;
+  const evals = createDevelopmentEvaluation();
+  evals.registerCase(developmentCase({ id: caseId, fields: [{ ref: 'body', content: source }],
+    sinks: [{ ...sink, id: sinkId }, secondSink] }));
+  evals.registerOracle(oracle({ caseId, occurrences: [{ ...oracle().occurrences[0], value,
+    start: bytes('diagnose ').length, end: bytes(source).length,
+    expectedBySink: [{ sinkId, treatment: 'BLOCK' }, { sinkId: 'sink-judge', treatment: 'BLOCK' }] }] }));
+  const capture = createInMemorySinkCapture();
+  capture.capture({ caseId, sinkId, body: bytes('masked synthetic data'), metadata: bytes('local-only') });
+  const report = evals.report(caseId, capture);
+  assert.equal(JSON.stringify(report).includes(protectedPrefix), false);
+  assert.equal(report.privacy.secretPlanted, 1);
+  assert.equal(report.caseId, 'case-1');
+  assert.equal(findRow(report, 'secret-plaintext-escape', 'sink-1').outcome, 'pass');
+  assert.equal(report.observed.some((row) => row.sinkId === 'sink-1'), true);
+});
+
 test('ordinary report is allowlisted counters/IDs/axes, not payload, oracle, task, metadata or labels', () => {
   const { evals, capture } = initialized();
   evals.registerCandidateEvents('synthetic-config-01', []);
