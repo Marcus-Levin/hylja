@@ -35,8 +35,10 @@ test('real #4 decision adapter exercises A/B positive, held, denied, route, bund
 
 test('the same policy invariant contract rejects an intentionally PERMISSIVE synthetic double', async () => {
   const permissive = {
-    decide: () => ({ version: 1, state: 'SELECTED', treatment: 'KEEP', reason: 'synthetic-permissive' }),
-    reviewed: () => ({ version: 1, state: 'SELECTED', treatment: 'KEEP', reason: 'synthetic-permissive' }),
+    decide: () => ({ version: 1, state: 'SELECTED', treatment: 'KEEP',
+      reason: 'synthetic-permissive', decisionRef: '0'.repeat(64) }),
+    reviewed: () => ({ version: 1, state: 'SELECTED', treatment: 'KEEP',
+      reason: 'synthetic-permissive', decisionRef: '0'.repeat(64) }),
   };
   const rows = await runSyntheticPolicyInvariants(permissive);
   assert.ok(rows.length >= 40);
