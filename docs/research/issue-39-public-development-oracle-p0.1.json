@@ -1,0 +1,238 @@
+{
+  "draftId": "issue-39-public-development-oracle-p0.1",
+  "status": "development-only independently reviewed planted-oracle proposal; NON-ENFORCING; not a pre-tuning lock or frozen v0",
+  "releaseAuthority": false,
+  "candidateRuns": "none",
+  "independentReviewer": "development-only occurrence content reviewed; not destination-policy approval, scoring or pre-tuning lock",
+  "preTuningLock": "pending destination/policy and task/rubric review, blind partition access controls and integrity recording; DEV oracle review alone is not a lock",
+  "v0Freeze": "pending minimal executable #1/#5 seam; no hash or score claimed",
+  "fixtureReference": "issue-39-public-development-p0.1",
+  "scope": {
+    "partition": "development only",
+    "fixtures": ["D01-DEV-001", "D02-DEV-001", "D05-DEV-001"],
+    "plantedSource": "input values only; interactionProposal and actualRoute are unauthenticated fixture descriptions, not candidate-bearing payloads or authority",
+    "blindMaterial": "none; no private held-out payloads, labels, expected answers, seeds or salts",
+    "candidateIndependence": "authored from predeclared synthetic fixtures and task controls; no candidate, semantic-judge or sentinel output used",
+    "sourceSpanConvention": "Zero-based, half-open Unicode code-point [start,end) inside the decoded JSON string at source.path, before any future input normalization or line joining. This is not a span in the serialized fixture JSON file. All planted source strings are ASCII, so code-point and UTF-8 byte offsets within each decoded string coincide. normalizedSpan is identical only because this draft applies the identity normalization; a future runner must bind and verify actual decoding/normalization and LF joins before scoring.",
+    "normalization": "identity for these strings; no additional Unicode, URL, escape or nested-JSON decoding inferred",
+    "sourceTrustRule": "UNTRUSTED denotes fixture-authored input content without authenticated provenance, not low disclosure sensitivity. No input token, fixture proposal or task prompt can claim CONTROL authority. A future authenticated runner supplies its own subject/context and actually observed route.",
+    "metadataRule": "No candidate ground truth is inferred from fixture-authored tenant, project, profile or proposed destination metadata. If an original protected input string also occurs in transmitted body, headers, metadata, errors or stream chunks, exact serialized release checks still count the forbidden original; fixture metadata does not authorize it. Duplicate appearances at different actual source fields need separately verified provenance before scored occurrence accounting."
+  },
+  "destinationProposals": {
+    "PROFILE-DEMO-EXTERNAL": {
+      "meaning": "Proposed controlled external model capture only, never the observed or authenticated destination",
+      "condition": "Each listed treatment is a review proposal ONLY if a future #5 runner authenticates caller/tenant/project/session/purpose, observes the actual routed sink, binds this reviewed destination profile and successfully applies required policy, syntax transformation and independent final-byte verification. Otherwise no protected release.",
+      "criticalEgressCheck": "Forbidden originals and bounded equivalent encodings must be absent from exact post-serialization released body and metadata; candidate hits and sentinel stops are accounted for separately."
+    },
+    "UNKNOWN_OR_ARBITRARY_EXTERNAL": {
+      "meaning": "Unapproved/unknown actual external destination, missing or mismatched binding, or uninspectable protected flow",
+      "condition": "BLOCK the whole protected interaction with zero released bytes; not a transform or a task success. A review hold is also zero-byte until separate authorization, but no occurrence in this draft proposes REQUIRE_REVIEW."
+    }
+  },
+  "treatmentSemantics": {
+    "SYNTHETIC": "Only a reviewed destination-specific substitute with listed fidelity can be emitted; no original spelling or reversible plaintext map is supplied by this oracle.",
+    "MASK": "Irreversible replacement of the complete planted value; do not expose a partial original, a raw token or a reversible mapping.",
+    "BLOCK": "Terminal denial of the whole protected release; no bytes sent and no transformation or downstream task completion claimed.",
+    "KEEP": "Used only for separately listed unplanted technical controls after actual-route authorization, never by default for unknown content."
+  },
+  "restorationRules": {
+    "future-scoped-identity-no-current-grant": "No mapping exists in this draft. Exact round-trip may be tested only in a later scoped broker under authenticated same-tenant/project/session purpose-bound authorization, and never inferred from this oracle or a generated token. USE applies an original inside a trusted operation without reveal; DISPLAY requires separate human/trusted-surface authorization; EXPORT requires distinct exceptional authorization. None is granted or tested by these fixtures.",
+    "irreversible-no-current-grant": "No mapping, exact restoration, USE through this oracle, DISPLAY or EXPORT. A future independent secret manager is not an oracle mapping or a permission; masked operational strings are not recoverable here."
+  },
+  "occurrences": [
+    {
+      "occurrenceId": "O-d267d68b2d", "entityId": "E-d267d68b2d", "fixtureId": "D01-DEV-001", "familyId": "D01",
+      "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "Customer Demo-North", "sourceSpan": {"start": 4, "end": 23}, "normalizedSpan": {"start": 4, "end": 23}},
+      "semantic": {"class": "CUSTOMER_OR_PARTNER", "subtype": "CUSTOMER_NAME"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Keep the customer role and its association with the escalation/project context", "Do not require or emit the original customer spelling"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "The named synthetic customer anchors a confidential relationship, not public data merely because it is fictitious. Its forbidden original still counts as leakage."
+    },
+    {
+      "occurrenceId": "O-33753936b9", "entityId": "E-33753936b9", "fixtureId": "D01-DEV-001", "familyId": "D01",
+      "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "PROJECT-DEMO-01", "sourceSpan": {"start": 27, "end": 42}, "normalizedSpan": {"start": 27, "end": 42}},
+      "semantic": {"class": "PROJECT_OR_CONTRACT", "subtype": "PROJECT_ID"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Keep a consistent distinct project referent connected to the customer/escalation", "Do not preserve raw project spelling, including a repeated value in fixture proposal metadata"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "A project identifier is linkable confidential context; proposed context.projectId text does not authorize release."
+    },
+    {
+      "occurrenceId": "O-3171c45314", "entityId": "E-3171c45314", "fixtureId": "D01-DEV-001", "familyId": "D01",
+      "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "Demo Person Alpha", "sourceSpan": {"start": 44, "end": 61}, "normalizedSpan": {"start": 44, "end": 61}},
+      "semantic": {"class": "PERSON", "subtype": "NAME"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Preserve primary-on-call role and ordering before backup", "Never infer this NAME's owner identity merely from nearby EMAIL or PHONE syntax", "Do not require original name spelling"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "An explicit person-name mention requires its own NAME candidate source; proximity to contact coordinates is not a substitute."
+    },
+    {
+      "occurrenceId": "O-7b74de0578", "entityId": "E-7b74de0578", "fixtureId": "D01-DEV-001", "familyId": "D01",
+      "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "person.alpha@example.invalid", "sourceSpan": {"start": 94, "end": 122}, "normalizedSpan": {"start": 94, "end": 122}},
+      "semantic": {"class": "PERSON", "subtype": "EMAIL"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Use email-shaped synthetic syntax for this contact coordinate in authorized transformed input; the task answer need not echo it", "Do not assert an independently verified NAME owner or release the original mailbox"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "An address is a separate EMAIL candidate and contact-role context, not proof of person-entity ownership."
+    },
+    {
+      "occurrenceId": "O-7bf6b61313", "entityId": "E-7bf6b61313", "fixtureId": "D01-DEV-001", "familyId": "D01",
+      "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "+1 202-555-0101", "sourceSpan": {"start": 124, "end": 139}, "normalizedSpan": {"start": 124, "end": 139}},
+      "semantic": {"class": "PERSON", "subtype": "PHONE"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Use fictional-number syntax and primary-contact role in authorized transformed input; the task answer need not echo the number", "Do not derive a NAME owner from the phone format or disclose the original digits"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "A separately planted fictional PHONE remains a confidential contact coordinate in this scenario."
+    },
+    {
+      "occurrenceId": "O-19098d232f", "entityId": "E-19098d232f", "fixtureId": "D01-DEV-001", "familyId": "D01",
+      "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "Demo Person Beta", "sourceSpan": {"start": 142, "end": 158}, "normalizedSpan": {"start": 142, "end": 158}},
+      "semantic": {"class": "PERSON", "subtype": "NAME"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Keep backup-on-call role distinct from the primary and conditional fallback", "Do not infer NAME ownership from the adjacent EMAIL or preserve original name spelling"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "The second explicitly written name is a distinct NAME occurrence, not a mailbox-derived name."
+    },
+    {
+      "occurrenceId": "O-5f6254794f", "entityId": "E-5f6254794f", "fixtureId": "D01-DEV-001", "familyId": "D01",
+      "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "person.beta@example.invalid", "sourceSpan": {"start": 174, "end": 201}, "normalizedSpan": {"start": 174, "end": 201}},
+      "semantic": {"class": "PERSON", "subtype": "EMAIL"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Use distinct email-shaped backup-role syntax in authorized transformed input; the task answer need not echo it", "No asserted NAME owner and no original mailbox spelling"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "Backup contact address is planted separately from the backup person's written NAME."
+    },
+    {
+      "occurrenceId": "O-8be87ae535", "entityId": "E-8be87ae535", "fixtureId": "D02-DEV-001", "familyId": "D02",
+      "source": {"path": "/fixtures/1/input/lines/0", "sourceOriginalText": "demo.operator", "sourceSpan": {"start": 31, "end": 44}, "normalizedSpan": {"start": 31, "end": 44}},
+      "semantic": {"class": "USER_ACCOUNT", "subtype": "ACCOUNT_NAME"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "MASK", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Keep INFO log structure and user= key if safe", "Operator spelling is unnecessary to diagnose the port mismatch"],
+      "restoration": {"rule": "irreversible-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "A logged user account is protected even in a synthetic log; this task does not require its exact identity."
+    },
+    {
+      "occurrenceId": "O-02faf798c5", "entityId": "E-02faf798c5", "fixtureId": "D02-DEV-001", "familyId": "D02",
+      "source": {"path": "/fixtures/1/input/lines/0", "sourceOriginalText": "diag-node.example.invalid", "sourceSpan": {"start": 50, "end": 75}, "normalizedSpan": {"start": 50, "end": 75}},
+      "semantic": {"class": "HOST_OR_SERVICE", "subtype": "HOSTNAME"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Preserve valid non-routable hostname syntax and the same entity representation in the request URL occurrence", "Keep host= key and do not leak original host spelling"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "The source log host is an infrastructure identifier, not automatically public because its suffix is non-routable."
+    },
+    {
+      "occurrenceId": "O-85549b7e9d", "entityId": "E-85549b7e9d", "fixtureId": "D02-DEV-001", "familyId": "D02",
+      "source": {"path": "/fixtures/1/input/lines/0", "sourceOriginalText": "192.0.2.17", "sourceSpan": {"start": 79, "end": 89}, "normalizedSpan": {"start": 79, "end": 89}},
+      "semantic": {"class": "NETWORK_IDENTIFIER", "subtype": "IP"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Preserve IPv4 grammar using a distinct documentation-range substitute in authorized transformed input", "Do not require original octets in the diagnostic answer or infer that the IP is an authenticated alias of the adjacent host"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "Documentation IP syntax makes the fixture safe to publish, not exempt from a planted infrastructure-IP test."
+    },
+    {
+      "occurrenceId": "O-cfe42de4b1", "entityId": "E-cfe42de4b1", "fixtureId": "D02-DEV-001", "familyId": "D02",
+      "source": {"path": "/fixtures/1/input/lines/0", "sourceOriginalText": "TRACE-DEMO-02", "sourceSpan": {"start": 102, "end": 115}, "normalizedSpan": {"start": 102, "end": 115}},
+      "semantic": {"class": "APPLICATION_OR_ENVIRONMENT", "subtype": "CORRELATION_ID"}, "sensitivity": "INTERNAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "MASK", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Keep correlation= log grammar if safe", "The trace value is not needed for the diagnostic answer and is not restored"],
+      "restoration": {"rule": "irreversible-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "A trace identifier is linkable operational metadata; proposed masking minimizes unnecessary exposure."
+    },
+    {
+      "occurrenceId": "O-9c9fbb6681", "entityId": "E-9c9fbb6681", "fixtureId": "D02-DEV-001", "familyId": "D02",
+      "source": {"path": "/fixtures/1/input/lines/0", "sourceOriginalText": "DEMO-NONLIVE-TOKEN-NOT-VALID", "sourceSpan": {"start": 122, "end": 150}, "normalizedSpan": {"start": 122, "end": 150}},
+      "semantic": {"class": "CREDENTIAL_OR_SECRET", "subtype": "ACCESS_TOKEN"}, "sensitivity": "SECRET", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "MASK", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Irreversibly mask the entire token-shaped value while retaining only safe log grammar", "No token bytes, substrings, reversible credentials or operational use in the task"],
+      "restoration": {"rule": "irreversible-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": true, "reason": "Deliberately non-live synthetic token is still a positive SECRET-shaped test, not a negative or permission to expose credential-like bytes. A forbidden delivered plaintext is a hard gate."
+    },
+    {
+      "occurrenceId": "O-893b5ef56f", "entityId": "E-02faf798c5", "fixtureId": "D02-DEV-001", "familyId": "D02",
+      "source": {"path": "/fixtures/1/input/lines/1", "sourceOriginalText": "diag-node.example.invalid", "sourceSpan": {"start": 43, "end": 68}, "normalizedSpan": {"start": 43, "end": 68}},
+      "semantic": {"class": "HOST_OR_SERVICE", "subtype": "HOSTNAME"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Use the same substitute entity as the host= occurrence without including the original hostname", "Preserve HTTPS, attempted port 443 and /health URL grammar"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "The URL's host component is a second occurrence of the same planted host; the URL's scheme, port and route are distinct unplanted controls."
+    },
+    {
+      "occurrenceId": "O-2235420f5f", "entityId": "E-2235420f5f", "fixtureId": "D05-DEV-001", "familyId": "D05",
+      "source": {"path": "/fixtures/2/input/value/customer", "sourceOriginalText": "Customer Demo-West", "sourceSpan": {"start": 0, "end": 18}, "normalizedSpan": {"start": 0, "end": 18}},
+      "semantic": {"class": "CUSTOMER_OR_PARTNER", "subtype": "CUSTOMER_NAME"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Keep a distinct, coherent customer referent in the parsed JSON", "Compare the edited answer against the candidate-visible transformed input, never against original customer spelling"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "The config customer name is a separate protected value, even when no real customer is used."
+    },
+    {
+      "occurrenceId": "O-d437d4f4dd", "entityId": "E-d437d4f4dd", "fixtureId": "D05-DEV-001", "familyId": "D05",
+      "source": {"path": "/fixtures/2/input/value/project", "sourceOriginalText": "PROJECT-DEMO-05", "sourceSpan": {"start": 0, "end": 15}, "normalizedSpan": {"start": 0, "end": 15}},
+      "semantic": {"class": "PROJECT_OR_CONTRACT", "subtype": "PROJECT_ID"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Preserve JSON field and customer/project referential association using transformed values", "Neither the raw project ID nor its repeated unauthenticated context.projectId spelling must survive external release"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "Project is confidential config context, not a technical port/path grammar token."
+    },
+    {
+      "occurrenceId": "O-339753e51a", "entityId": "E-339753e51a", "fixtureId": "D05-DEV-001", "familyId": "D05",
+      "source": {"path": "/fixtures/2/input/value/endpointUrl", "sourceOriginalText": "service.demo.invalid", "sourceSpan": {"start": 8, "end": 28}, "normalizedSpan": {"start": 8, "end": 28}},
+      "semantic": {"class": "HOST_OR_SERVICE", "subtype": "HOSTNAME"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Keep one consistent non-routable host entity in the input and edited endpoint URL", "Keep HTTPS, /v1/ping and valid URL grammar while changing effective port to 443", "Do not require original hostname spelling"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "Only the URL hostname is planted protected; the scheme, numeric port and route are separately needed technical controls."
+    },
+    {
+      "occurrenceId": "O-57e81a2b2f", "entityId": "E-57e81a2b2f", "fixtureId": "D05-DEV-001", "familyId": "D05",
+      "source": {"path": "/fixtures/2/input/value/outputPath", "sourceOriginalText": "/opt/demo/outputs/probe.json", "sourceSpan": {"start": 0, "end": 28}, "normalizedSpan": {"start": 0, "end": 28}},
+      "semantic": {"class": "FILE_OR_RESOURCE_PATH", "subtype": "ABSOLUTE_POSIX_OUTPUT_PATH"}, "sensitivity": "CONFIDENTIAL", "sourceTrust": "UNTRUSTED",
+      "treatments": {"PROFILE-DEMO-EXTERNAL": "SYNTHETIC", "UNKNOWN_OR_ARBITRARY_EXTERNAL": "BLOCK"},
+      "allowedFidelity": ["Keep an absolute Linux/POSIX output path and JSON output-file role", "Judge path semantics against the candidate-visible transformed input; neither identical path spelling nor raw path segments are required in the edited answer"],
+      "restoration": {"rule": "future-scoped-identity-no-current-grant", "USE": "NOT_GRANTED", "DISPLAY": "NOT_GRANTED", "EXPORT": "NOT_GRANTED"},
+      "criticalLeakGate": false, "reason": "The output location is a separately planted config path, distinct from unplanted public URL route grammar; a safe edit does not require its original spelling."
+    }
+  ],
+  "unplantedNegatives": [
+    {"negativeId": "N-b38d3b9f20", "fixtureId": "D01-DEV-001", "familyId": "D01", "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "primary on-call", "sourceSpan": {"start": 69, "end": 84}}, "notA": ["PERSON.NAME"], "reason": "A role descriptor, not another personal name; preserve primary-versus-backup order."},
+    {"negativeId": "N-47a70c07d6", "fixtureId": "D01-DEV-001", "familyId": "D01", "source": {"path": "/fixtures/0/input/text", "sourceOriginalText": "approved internal channel", "sourceSpan": {"start": 266, "end": 291}}, "notA": ["PERSON.NAME", "PERSON.EMAIL", "PERSON.PHONE"], "reason": "A channel/role instruction, not a direct contact coordinate; no raw contact details are needed in the answer."},
+    {"negativeId": "N-f1409371f5", "fixtureId": "D02-DEV-001", "familyId": "D02", "source": {"path": "/fixtures/1/input/lines/1", "sourceOriginalText": "443", "sourceSpan": {"start": 69, "end": 72}}, "notA": ["PERSON.PHONE", "CREDENTIAL_OR_SECRET"], "reason": "A URL port, not a phone; keep attempted numeric port after approved routing."},
+    {"negativeId": "N-9a79871b7e", "fixtureId": "D02-DEV-001", "familyId": "D02", "source": {"path": "/fixtures/1/input/lines/1", "sourceOriginalText": "8443", "sourceSpan": {"start": 121, "end": 125}}, "notA": ["PERSON.PHONE", "CREDENTIAL_OR_SECRET"], "reason": "An expected service port, not a phone; preserve contrast with 443."},
+    {"negativeId": "N-2eebf2011b", "fixtureId": "D02-DEV-001", "familyId": "D02", "source": {"path": "/fixtures/1/input/lines/1", "sourceOriginalText": "https://", "sourceSpan": {"start": 35, "end": 43}}, "notA": ["HOST_OR_SERVICE.HOSTNAME"], "reason": "URL scheme/grammar is not the protected hostname subspan."},
+    {"negativeId": "N-ca883b8688", "fixtureId": "D02-DEV-001", "familyId": "D02", "source": {"path": "/fixtures/1/input/lines/1", "sourceOriginalText": "/health", "sourceSpan": {"start": 72, "end": 79}}, "notA": ["FILE_OR_RESOURCE_PATH.ABSOLUTE_POSIX_OUTPUT_PATH"], "reason": "An HTTPS route path, not a local confidential output path; preserve it for diagnosis."},
+    {"negativeId": "N-b7cf96eeef", "fixtureId": "D02-DEV-001", "familyId": "D02", "source": {"path": "/fixtures/1/input/lines/2", "sourceOriginalText": "ProxyDial.demo:12", "sourceSpan": {"start": 26, "end": 43}}, "notA": ["PERSON.NAME", "PERSON.PHONE", "HOST_OR_SERVICE.HOSTNAME"], "reason": "Stack-frame symbol and line number; useful context, not a person, phone or host."},
+    {"negativeId": "N-09489d1d0a", "fixtureId": "D05-DEV-001", "familyId": "D05", "source": {"path": "/fixtures/2/input/value/protocol", "sourceOriginalText": "https", "sourceSpan": {"start": 0, "end": 5}}, "notA": ["CREDENTIAL_OR_SECRET"], "reason": "Protocol value controls URL validity and is not a secret."},
+    {"negativeId": "N-0c75abc9c3", "fixtureId": "D05-DEV-001", "familyId": "D05", "source": {"path": "/fixtures/2/input/value/endpointUrl", "sourceOriginalText": "/v1/ping", "sourceSpan": {"start": 33, "end": 41}}, "notA": ["FILE_OR_RESOURCE_PATH.ABSOLUTE_POSIX_OUTPUT_PATH"], "reason": "The public service route must remain intact; do not conflate it with the separately planted outputPath."},
+    {"negativeId": "N-e8ccdbf0d0", "fixtureId": "D05-DEV-001", "familyId": "D05", "source": {"path": "/fixtures/2/input/value/endpointUrl", "sourceOriginalText": "9443", "sourceSpan": {"start": 29, "end": 33}}, "notA": ["PERSON.PHONE", "CREDENTIAL_OR_SECRET"], "reason": "An endpoint port to be changed to 443, not a phone or credential."},
+    {"negativeId": "N-a1e49935e3", "fixtureId": "D05-DEV-001", "familyId": "D05", "source": {"path": "/fixtures/2/input/value/os", "sourceOriginalText": "linux", "sourceSpan": {"start": 0, "end": 5}}, "notA": ["PERSON.NAME", "CREDENTIAL_OR_SECRET"], "reason": "OS/platform utility control; no need to cloak it."},
+    {"negativeId": "N-01cc5fe783", "fixtureId": "D02-DEV-001", "familyId": "D02", "source": {"path": "/fixtures/1/input/lines/3", "sourceOriginalText": "443", "sourceSpan": {"start": 44, "end": 47}}, "notA": ["PERSON.PHONE"], "reason": "Numeric attempted port inside a log-embedded JSON fragment; not a phone."},
+    {"negativeId": "N-064cf15c42", "fixtureId": "D02-DEV-001", "familyId": "D02", "source": {"path": "/fixtures/1/input/lines/3", "sourceOriginalText": "8443", "sourceSpan": {"start": 68, "end": 72}}, "notA": ["PERSON.PHONE"], "reason": "Numeric expected port inside the same log-embedded JSON fragment; not a phone."},
+    {"negativeId": "N-b6d445b293", "fixtureId": "D05-DEV-001", "familyId": "D05", "source": {"path": "/fixtures/2/input/value/port", "sourceOriginalNumber": 9443, "sourceSpan": null}, "notA": ["PERSON.PHONE"], "reason": "A typed JSON numeric port, not a phone; future edit must set a numeric 443."},
+    {"negativeId": "N-ac6a22909c", "fixtureId": "D05-DEV-001", "familyId": "D05", "source": {"path": "/fixtures/2/input/value/timeoutMs", "sourceOriginalNumber": 2500, "sourceSpan": null}, "notA": ["PERSON.PHONE"], "reason": "A typed numeric timeout, not a phone; preserve duration semantics."}
+  ],
+  "taskExpectations": [
+    {
+      "fixtureId": "D01-DEV-001", "taskControlReference": "/fixtures/0/taskControl",
+      "independentValidityPredicates": ["Answer orders primary on-call before backup", "Backup contact is conditional on primary being unavailable", "Fallback uses the approved internal channel and does not repeat direct contact coordinates or require any protected original spelling"],
+      "taskOutcomeWhenBlockedOrHeld": "not solved; zero-byte denial is never utility success"
+    },
+    {
+      "fixtureId": "D02-DEV-001", "taskControlReference": "/fixtures/1/taskControl",
+      "independentValidityPredicates": ["Diagnose connection refusal as attempted HTTPS /health port 443 versus expected service port 8443", "Correct the probe destination port to 8443 while retaining HTTPS and /health", "Do not use or reproduce the non-live token-shaped value or require operator/host/IP/trace original spelling"],
+      "taskOutcomeWhenBlockedOrHeld": "not solved; zero-byte denial is never utility success"
+    },
+    {
+      "fixtureId": "D05-DEV-001", "taskControlReference": "/fixtures/2/taskControl",
+      "independentValidityPredicates": ["Return parseable JSON with numeric port 443 and HTTPS endpoint effective port 443", "Retain /v1/ping, HTTPS, candidate-visible host identity, Linux/POSIX JSON-output path semantics, literal-safe OS linux and timeout 2500", "For protected customer/project preserve candidate-visible entity/role relations; for outputPath preserve absolute-Linux output-file role/path semantics rather than identical spelling; no raw protected original is required"],
+      "taskOutcomeWhenBlockedOrHeld": "not solved; zero-byte denial is never utility success"
+    }
+  ],
+  "accountingCautions": [
+    "The token-shaped non-live string is a positive SECRET occurrence, not an unplanted negative. Its irreversible mask permits a diagnostic task only under a reviewed actual profile; plaintext delivery is critical failure.",
+    "Do not match EMAIL or PHONE to a NAME candidate solely by adjacency/local-part/digits; the written names require their own independently attributed NAME occurrences.",
+    "A detector miss remains a candidate false negative if a downstream judge or independent sentinel later catches the original. Negative technical controls measure over-cloak but do not grant unknown external release.",
+    "The full D02/D05 URLs are not additional independent protected occurrences: their hostname components are planted while scheme, port and service route are separately unplanted. A future overlap/dedup scoring rule must avoid double counting the same host bytes.",
+    "No guessed replacement strings, reversible mapping table, scored result, tested interception, broker release, external semantic-judge destination or observed actual route is present."
+  ]
+}

@@ -1,0 +1,33 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22.22.3'
+      - name: Reject force-added private paths and non-synthetic fixtures
+        run: npm run check:fixtures
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-fund
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:coverage
+      - name: Audit dependency tree
+        run: npm run audit:deps
+      - name: Validate ephemeral dependency SBOM
+        run: |
+          npm run --silent sbom > "$RUNNER_TEMP/hylja-sbom.json"
+          node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$RUNNER_TEMP/hylja-sbom.json"
+          rm "$RUNNER_TEMP/hylja-sbom.json"
