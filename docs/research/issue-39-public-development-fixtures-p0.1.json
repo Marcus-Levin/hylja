@@ -3,7 +3,7 @@
   "status": "development-only draft, NON-ENFORCING; not a pre-tuning lock or frozen v0",
   "releaseAuthority": false,
   "candidateRuns": "none",
-  "oracleStatus": "independent planted oracle not authored or reviewed here",
+  "oracleStatus": "separate independent DEV oracle proposal drafted and reviewed; this fixture contains no oracle labels or release authority; no pre-tuning or v0 lock",
   "routeNote": "Destination and controlled sink are proposals; actual route/profile must be observed and bound by a future #5 evaluator, not asserted by fixture text.",
   "destinationProfileProposal": { "profileId": "PROFILE-DEMO-EXTERNAL", "exposure": "EXTERNAL", "authority": "none until actual-route binding" },
   "fixtures": [
