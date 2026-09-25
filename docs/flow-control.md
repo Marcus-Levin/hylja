@@ -27,18 +27,11 @@ A policy decision considers:
 - explicit time-limited exceptions;
 - relevant semantic judgments such as re-identification risk.
 
-## Actions
+## Policy outcomes and treatments
 
-- `KEEP`
-- `MASK`
-- `TOKENIZE`
-- `SYNTHETIC`
-- `GENERALIZE`
-- `REMOVE`
-- `BLOCK`
-- `REQUIRE_REVIEW`
+A release decision selects a treatment (`KEEP`, `MASK`, `TOKENIZE`, `SYNTHETIC`, `GENERALIZE`, or `REMOVE`) only when the destination is authorized for the resulting representation. `BLOCK` is a terminal denial; `REQUIRE_REVIEW` holds the flow without releasing bytes until a separate, attributable approval produces a new decision. Neither is a content transformation. `REDACT` is informal language for irreversible masking/removal, not a distinct policy action. `KEEP` never means that unknown or unclassified content is implicitly approved.
 
-Policy is deterministic after its inputs are established. Semantic models may supply bounded input signals but do not execute the action.
+Policy is deterministic after verified inputs are established. An absent/mismatched authenticated subject, tenant, purpose, actual sink, or required destination profile cannot be repaired with caller-supplied strings. Unknown/conflicting classifications, unsupported encodings, unavailable required checks, and failed transformations follow the destination's explicitly conservative behavior; protected external egress cannot fall back to plaintext. Semantic models may supply bounded input signals but do not execute the action or override deterministic secret evidence.
 
 ## Destination profile
 
@@ -57,7 +50,7 @@ approved_sensitivity:
   - CONFIDENTIAL
 ```
 
-Profiles are administrative facts and should not be inferred by a model at runtime.
+Profiles are administrative facts bound to the actual destination by the enforcement point; neither a model nor a request body may assert a safer profile. A hosted semantic judge is itself an external destination with its own source-to-sink decision, even when its answer is used only in shadow mode.
 
 ## Exceptions
 

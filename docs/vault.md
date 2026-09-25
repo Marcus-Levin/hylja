@@ -19,7 +19,7 @@ Separate stores/logical boundaries are preferred for:
 
 ## Encryption
 
-Use envelope encryption with AEAD. Associated data binds ciphertext to tenant, entity, type, and mapping version. KEKs live in a managed KMS/HSM/Vault-class service; application storage holds ciphertext, wrapped DEK, key reference, and metadata, not root keys.
+Use envelope encryption with AEAD before any real or production original is persisted; earlier schema work uses synthetic fixtures only and exposes no plaintext production storage path. Associated data binds ciphertext to tenant, entity, type, and mapping version. KEKs live in a managed KMS/HSM/Vault-class service; application storage holds ciphertext, wrapped DEK, key reference, and metadata, not root keys.
 
 Equality lookup, if required, uses a separate tenant-scoped keyed blind index and separate key. Avoid deterministic ciphertext.
 
@@ -31,7 +31,7 @@ Equality lookup, if required, uses a separate tenant-scoped keyed blind index an
 
 ## Integrity
 
-Mappings use monotonic revisions. Sensitive mapping changes should prefer expire/create-new over silent mutation. AEAD context and durable audit make record swapping detectable.
+Mappings use monotonic revisions. Sensitive mapping changes should prefer expire/create-new over silent mutation. AEAD context detects ciphertext transplanted across tenant/entity/type/version, but an older valid ciphertext can still pass authentication: resolution also checks a trusted current revision, lifecycle state, and revocation/expiry before use, including after cache and backup restore.
 
 ## Lifecycle and retention
 

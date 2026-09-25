@@ -32,13 +32,18 @@ export interface InteractionEnvelope<T = unknown> {
   context: {
     tenantId: string;
     projectId?: string;
-    sessionId?: string;
-    purpose?: string;
+    sessionId: string;
+    purpose: string;
   };
   payload: T;
-  provenance: Array<{ kind: string; ref: string }>;
-  stream?: { mode: "complete" | "stream"; sequence?: number };
+  provenance: Array<{ kind: string; ref: string; authority: "authenticated" | "adapter-observed" | "untrusted" }>;
+  representation?: { mediaType?: string; encodings?: string[] };
+  stream?: { mode: "complete" | "stream"; id?: string; sequence?: number; final?: boolean; cancelled?: boolean };
 }
 ```
 
-The exact TypeScript may change when implemented, but adapters must not inject provider-specific policy semantics into this contract.
+The exact TypeScript may change when implemented; these fields describe a draft security contract, not a wire format. The principal and tenant must come from authenticated identity and tenant binding; purpose and session must be bound by the trusted caller/integration (including an assigned session for stateless calls). Source trust zone and the *effective* destination, profile, and trust zone must come from the intercepted boundary and observed routing, not from payload text or model/tool claims. An external protected release requires an identified sink and its applicable destination profile. Project, when present, must belong to the bound tenant.
+
+Hylja records the origin and authority of each provenance claim; only authenticated or adapter-observed evidence may establish security context. Payload-supplied identity, purpose, session, destination, profile, trust-zone, or `CONTROL` claims remain untrusted data, even when they resemble Hylja metadata. Missing, unauthenticated, stale, or mismatched required bindings reject authorization and protected release rather than falling back to payload claims.
+
+Representation descriptors identify observed media/encoding layers; transformations must retain a bounded relationship between decoded candidates and their original fields/spans so encodings cannot hide surviving originals. For streams, metadata must identify the stream, ordering, completion/cancellation, and inspection/holdback state before any protected segment is released; an undecided partial segment is not a release decision. Raw payloads and span maps remain ephemeral by default. Adapters must not inject provider-specific policy semantics into this contract.

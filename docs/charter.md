@@ -8,16 +8,16 @@ Hylja intercepts interactions, recognizes protected information, preserves meani
 
 ## First executable proof
 
-The first proof is deliberately small:
+The first end-to-end proof is deliberately small and spans three staged slices: synthetic text cloaking, encrypted reversible identities, then one local model gateway. The text slice alone does not claim a vault, live gateway, or production protection.
 
 1. Accept a text interaction containing synthetic people, infrastructure identifiers, customer/project identifiers, and secrets.
-2. Detect exact structured secrets and infrastructure identifiers deterministically.
-3. Submit only bounded, minimized context to a semantic classifier for ambiguous candidates.
-4. Apply a deterministic policy that distinguishes KEEP, SYNTHETIC, TOKENIZE, GENERALIZE, REDACT, and BLOCK.
-5. Preserve a reversible person/host/customer mapping in an encrypted local vault while never storing blocked credentials as reversible mappings.
+2. Generate person/email/phone and customer/project candidates; detect exact structured secrets and infrastructure identifiers deterministically.
+3. Submit only bounded, policy-authorized, minimized context to a semantic classifier for ambiguous candidates; shadow mode does not exempt that external request from egress controls.
+4. Apply deterministic policy using KEEP, MASK, TOKENIZE, SYNTHETIC, GENERALIZE, REMOVE, or BLOCK; REQUIRE_REVIEW withholds release until separately authorized.
+5. Preserve reversible person/host/customer mappings only after the encrypted scoped vault and broker exist; never store blocked credentials as reversible mappings.
 6. Send a cloaked request through one OpenAI-compatible local gateway.
 7. Receive a response, resolve known synthetic entities under authorization, and return an authorized restored response.
-8. Prove through tests that planted protected values did not leave the egress boundary and that round-trip restoration is exact where allowed.
+8. Prove on planted synthetic fixtures that protected values did not leave the boundary in the actual serialized release and that authorized round-trip restoration is exact where allowed.
 9. Record privacy-safe audit evidence and the exact intelligence bundle used.
 
 ## What success means

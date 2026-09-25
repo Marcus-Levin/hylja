@@ -2,7 +2,9 @@
 
 Cloaking protects the real representation while retaining the minimum semantics needed for the downstream task.
 
-## Transformation strategies
+## Transformation strategies and denial
+
+KEEP, MASK, TOKENIZE, SYNTHETIC, GENERALIZE, and REMOVE are policy-selected treatments; BLOCK is a no-release decision, not a transformer. REQUIRE_REVIEW also withholds release pending a new authorized decision. REDACT is informal shorthand for irreversible masking or removal.
 
 | Strategy | Use |
 |---|---|

@@ -28,8 +28,13 @@ flowchart LR
   S[Trusted source] --> G[Harness / Surface Adapter]
   G --> B[Interaction Broker]
   B --> D[Candidate Detection]
-  D --> J[Semantic Judgment\nminimized context]
-  J --> P[Deterministic Policy]
+  D --> P[Deterministic Policy]
+  D --> L[Optional local semantic judgment]
+  L --> P
+  D --> JP[Minimize and check external judge request\nwith core Policy Engine for actual sink]
+  JP --> JQ[Independent #19-equivalent final-byte sentinel\npost-serialization body and metadata]
+  JQ --> J[Optional external semantic judgment]
+  J --> P
   P --> T[Transform]
   T --> Q[Egress Sentinel]
   Q --> O[External model / tool / MCP]
@@ -97,7 +102,7 @@ Jev is one possible semantic judge. It may answer bounded questions such as:
 - Could the remaining sanitized context re-identify the protected entity?
 - Is a candidate more likely an infrastructure identifier than an ordinary technical term?
 
-Jev does not decide legal permissibility, grant access, choose decryption keys, or bypass deterministic policy. Where possible, the real candidate value is replaced by a local candidate token before semantic judgment so the external semantic service receives context rather than the secret itself.
+Jev does not decide legal permissibility, grant access, choose decryption keys, or bypass deterministic policy. A hosted judge is its own external sink: its bounded request is locally minimized, authorized against the actual destination profile, and independently checked immediately before send, even when the answer is shadow-only. Known credentials and raw protected candidates are not sent by default in text or metadata. If minimization or pre-send verification cannot be established, skip external judgment and follow the conservative deterministic/local path.
 
 ## Source-to-sink enforcement
 

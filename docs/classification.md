@@ -21,6 +21,7 @@ Initial top-level classes:
 
 Representative subtypes:
 
+- `PERSON`: NAME, EMAIL, PHONE; email/phone candidates may also be linked to a person entity without assuming every address or number names a known person.
 - `NETWORK_IDENTIFIER`: IP, PORT, DOMAIN, URL, MAC, SUBNET.
 - `CREDENTIAL_OR_SECRET`: PASSWORD, API_KEY, PRIVATE_KEY, ACCESS_TOKEN, REFRESH_TOKEN, COOKIE, CONNECTION_SECRET, CERTIFICATE_SECRET.
 - `ENGINEERING_IDENTIFIER`: ASSET_TAG, DRAWING_NUMBER, PART_NUMBER, ITEM_ID, DOCUMENT_ID, FUNCTIONAL_LOCATION, PLC_TAG, SCADA_TAG.
@@ -63,7 +64,7 @@ interface Classification {
 }
 ```
 
-This interface is illustrative until the contract issue is implemented.
+This interface is illustrative until the contract issue is implemented. Runtime records also need an explicit unresolved/unknown state rather than treating a missing label as `PUBLIC`; deterministic secret evidence is not downgraded by a semantic judge. Trust comes from authenticated provenance and never becomes `CONTROL` merely because untrusted content claims authority.
 
 ## Keys and values
 

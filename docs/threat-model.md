@@ -69,11 +69,11 @@ Backups contain durable ciphertext and metadata. Backup identities, encryption, 
 
 ### Semantic-service privacy paradox
 
-If a hosted semantic judge receives raw secrets, cloaking has only shifted the third-party exposure. Hylja minimizes/locally substitutes candidates before external semantic judgment whenever possible and supports deployments where semantic judgment is local or disabled.
+If a hosted semantic judge receives raw secrets, cloaking has only shifted the third-party exposure. Its request is itself protected external egress, even when its answer is shadow-only. Hylja applies destination policy and a separate pre-send verification to a bounded, minimized request; known credentials and raw protected candidates are not sent by default in either text or metadata. If safe minimization or verification cannot be established, external judgment is skipped in favor of a conservative deterministic path or a local/synthetic-only judge.
 
 ### Streaming leak
 
-Protected content can be released token-by-token before a late detector recognizes it. High-risk streams use a holdback/buffer policy; some classes require complete-message inspection before release.
+Protected content can be released token-by-token before a late detector recognizes it. High-risk or unknown streams use bounded holdback until an inspectable unit is complete; split secrets, out-of-order chunks, tool arguments and aborted streams must not send unverified protected bytes. Unsupported opaque attachments or resources cannot silently pass through a text-only protected egress boundary.
 
 ### Supply-chain bypass
 
