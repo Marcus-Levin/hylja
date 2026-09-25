@@ -141,6 +141,16 @@ test('unknown fields, forged frozen/approved/protocol flags and embedded restric
   }
 });
 
+test('duplicate JSON keys cannot hide a forged frozen claim behind a last-wins value', async (t) => {
+  const context = setup(t);
+  const file = join(context.root, manifestName);
+  const original = readFileSync(file, 'utf8');
+  writeFileSync(file, original.replace('"frozen": false,', '"frozen": true,\n  "frozen": false,'));
+  git(context.root, 'add', '--', manifestName);
+  commit(context.root, 'synthetic duplicate claim');
+  assert.deepEqual(await verify(context), invalid('SCHEMA_INVALID'));
+});
+
 test('a missing or substituted exact Git source observation is not eligible', async (t) => {
   const context = setup(t);
   replaceManifest(context, (manifest) => { manifest.observations.preparationSourceRevision = '0'.repeat(40); });

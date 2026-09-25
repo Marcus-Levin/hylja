@@ -17,7 +17,11 @@
   "observations": {
     "preparationSourceRevision": "b584032eef5139d396c2629740683c4a55b08609",
     "referenceEligibility": "EXPLORATORY_INELIGIBLE_PRE_LOCK",
-    "publicDevProposal": ["D01", "D02", "D05"],
+    "publicDevProposal": [
+      "D01",
+      "D02",
+      "D05"
+    ],
     "otherDevelopmentFamilies": "PLANNING_UNTESTED",
     "blindFamilies": "PLANNING_UNTESTED",
     "actualRouteAndCapture": "NOT_ESTABLISHED",
