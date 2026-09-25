@@ -336,6 +336,32 @@ test('invalid post-candidate output and serializer bytes fail before send, not a
   }
 });
 
+test('changing oracle task-control descriptor cannot cause post-send #5 rejection', async () => {
+  const run = setup('D05-DEV-001');
+  let keyEnumerations = 0;
+  let taskDescriptorChecks = 0;
+  const changingOracle = new Proxy({ version: 1, caseId: run.fixture.fixtureId,
+    occurrences: [], taskExpected: 'evaluator-only-synthetic-task-control' }, {
+    ownKeys(target) {
+      keyEnumerations++;
+      return taskDescriptorChecks ? ['version', 'caseId', 'occurrences'] : Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, key) {
+      if (key === 'taskExpected') {
+        taskDescriptorChecks++;
+        return keyEnumerations === 0 ? Reflect.getOwnPropertyDescriptor(target, key) : undefined;
+      }
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  await assert.rejects(run.run({ oracle: changingOracle }),
+    (error) => error instanceof TypeError && !error.message.includes('evaluator-only-synthetic-task-control'));
+  assert.equal(run.capture.forCase(run.fixture.fixtureId).length, 0);
+  const report = run.evaluation.report(run.fixture.fixtureId, run.capture, () => true);
+  assert.equal(report.utility.taskCorrect, null);
+  assert.equal(untested(report, 'task-correctness').reason, 'no-task-result');
+});
+
 test('D05 malformed transformed JSON object rejects before any capture or task result', async () => {
   for (const malformed of ['{invalid-json', '[]', 'null']) {
     const run = setup('D05-DEV-001');
