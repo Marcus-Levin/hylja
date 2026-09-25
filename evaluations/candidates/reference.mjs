@@ -28,14 +28,17 @@ function validInput(input) {
     && typeof input.sinkId === "string"
     && Array.isArray(input.fields) && input.fields.length > 0 && input.fields.length <= 64
     && (input.taskPrompt === undefined || (typeof input.taskPrompt === "string" && input.taskPrompt.length <= 4096))
-    && input.fields.every((field) => hasKeys(field, ["id", "text", "hint"])
-      && typeof field.id === "string" && /^[\w:.$/-]{1,80}$/.test(field.id)
+    && input.fields.every((field, index) => hasKeys(field, ["id", "text", "hint"])
+      // Only an adapter-minted, per-case ordinal may leave the module as a reference.
+      && field.id === `f${index}`
       && typeof field.text === "string" && field.text.length <= 65536
-      && (field.hint === undefined || HINTS.has(field.hint)))
-    && new Set(input.fields.map((field) => field.id)).size === input.fields.length;
+      && (field.hint === undefined || HINTS.has(field.hint)));
 }
 
 function jsonOutputPath(text) {
+  // Escaped JSON keys can alias a plain key after parsing; don't partially rewrite.
+  // This tiny candidate handles only unescaped JSON text, including its strings.
+  if (text.includes("\\")) return { valid: false };
   let parsed;
   try {
     parsed = JSON.parse(text);

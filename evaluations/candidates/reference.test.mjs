@@ -22,7 +22,7 @@ function assertByteSpan(text, event, spelling) {
 test("D01 proposed text: basic identities and roles survive irreversible masking", () => {
   const sample = fixture("D01-DEV-001");
   const { disposition, events, transformedFields, taskResponse } = run(
-    [{ id: "body", text: sample.input.text }],
+    [{ id: "f0", text: sample.input.text }],
     sample.taskControl.prompt,
   );
   assert.equal(disposition, "TRANSFORMED");
@@ -31,7 +31,7 @@ test("D01 proposed text: basic identities and roles survive irreversible masking
   assert.ok(events.some((event) => event.semanticType === "PERSON" && event.subtype === "PHONE"));
   assert.ok(events.some((event) => event.semanticType === "CUSTOMER_OR_PARTNER"));
   assert.ok(events.some((event) => event.semanticType === "PROJECT_OR_CONTRACT"));
-  assert.ok(events.every((event) => event.fieldId === "body" && event.endByte > event.startByte));
+  assert.ok(events.every((event) => event.fieldId === "f0" && event.endByte > event.startByte));
   const visible = transformedFields[0].text;
   assert.ok(!visible.includes("person.alpha@example.invalid"), "no original email in transformed field");
   assert.ok(!visible.includes("202-555-0101"), "no original phone in transformed field");
@@ -42,7 +42,7 @@ test("D01 proposed text: basic identities and roles survive irreversible masking
 
 test("UTF-8 byte spans point into their own field, not UTF-16 offsets", () => {
   const text = "🌐 customer=Customer Demo-South contact=unit@example.invalid callback=+1 202-555-0102";
-  const result = run([{ id: "message", text }]);
+  const result = run([{ id: "f0", text }]);
   assert.equal(result.disposition, "TRANSFORMED");
   const email = result.events.find((event) => event.subtype === "EMAIL");
   const phone = result.events.find((event) => event.subtype === "PHONE");
@@ -53,19 +53,19 @@ test("UTF-8 byte spans point into their own field, not UTF-16 offsets", () => {
 
 test("D02 proposed log: even obviously nonlive token means BLOCK and no field text", () => {
   const sample = fixture("D02-DEV-001");
-  const result = run(sample.input.lines.map((text, index) => ({ id: `line:${index}`, text })));
+  const result = run(sample.input.lines.map((text, index) => ({ id: `f${index}`, text })));
   assert.equal(result.disposition, "BLOCK");
   assert.equal(result.transformedFields, undefined);
   assert.equal(result.taskResponse, undefined);
   const secret = result.events.find((event) => event.semanticType === "CREDENTIAL_OR_SECRET");
   assert.ok(secret, "candidate reports secret detector event independently of blocking");
-  assert.equal(secret.fieldId, "line:0");
+  assert.equal(secret.fieldId, "f0");
   assert.ok(secret.endByte > secret.startByte);
 });
 
 test("D02 non-secret log keeps HTTPS /health, attempted 443 and expected 8443", () => {
   const sample = fixture("D02-DEV-001");
-  const result = run(sample.input.lines.slice(1).map((text, index) => ({ id: `line:${index + 1}`, text })));
+  const result = run(sample.input.lines.slice(1).map((text, index) => ({ id: `f${index}`, text })));
   assert.equal(result.disposition, "TRANSFORMED");
   const visible = result.transformedFields.map((field) => field.text).join("\n");
   assert.ok(visible.includes("https://") && visible.includes(":443/health"));
@@ -77,7 +77,7 @@ test("D02 non-secret log keeps HTTPS /health, attempted 443 and expected 8443", 
 
 test("D05 JSON remains valid and response edits effective HTTPS port with visible relations", () => {
   const sample = fixture("D05-DEV-001");
-  const result = run([{ id: "config", hint: "json", text: JSON.stringify(sample.input.value) }], sample.taskControl.prompt);
+  const result = run([{ id: "f0", hint: "json", text: JSON.stringify(sample.input.value) }], sample.taskControl.prompt);
   assert.equal(result.disposition, "TRANSFORMED");
   assert.ok(result.events.some((event) => event.semanticType === "HOST_OR_SERVICE"));
   assert.ok(result.events.some((event) => event.semanticType === "FILE_OR_RESOURCE_PATH"));
@@ -103,21 +103,21 @@ test("D05 JSON remains valid and response edits effective HTTPS port with visibl
 });
 
 test("credential assignments and URL userinfo block even for nonlive synthetic strings", () => {
-  const password = run([{ id: "body", text: 'password=DEMO-NONLIVE-NOT-VALID' }]);
+  const password = run([{ id: "f0", text: 'password=DEMO-NONLIVE-NOT-VALID' }]);
   assert.equal(password.disposition, "BLOCK");
   assert.ok(password.events.some((event) => event.semanticType === "CREDENTIAL_OR_SECRET"));
-  const jsonToken = run([{ id: "config", hint: "json", text: '{"api_key":"DEMO-NONLIVE-NOT-VALID"}' }]);
+  const jsonToken = run([{ id: "f0", hint: "json", text: '{"api_key":"DEMO-NONLIVE-NOT-VALID"}' }]);
   assert.equal(jsonToken.disposition, "BLOCK");
-  const urlCredential = run([{ id: "body", text: "https://demo.user:DEMO-NONLIVE-NOT-VALID@host.example.invalid/health" }]);
+  const urlCredential = run([{ id: "f0", text: "https://demo.user:DEMO-NONLIVE-NOT-VALID@host.example.invalid/health" }]);
   assert.equal(urlCredential.disposition, "BLOCK");
   assert.equal(urlCredential.transformedFields, undefined);
 });
 
 test("malformed JSON and unsupported sink cannot emit a transformed candidate", () => {
-  const malformed = run([{ id: "config", hint: "json", text: '{"port":443,' }]);
+  const malformed = run([{ id: "f0", hint: "json", text: '{"port":443,' }]);
   assert.equal(malformed.disposition, "BLOCK");
   assert.equal(malformed.transformedFields, undefined);
-  const unknownSink = runReferenceCandidate({ sinkId: "EXTERNAL-NOT-CAPTURE", fields: [{ id: "body", text: "hello" }] });
+  const unknownSink = runReferenceCandidate({ sinkId: "EXTERNAL-NOT-CAPTURE", fields: [{ id: "f0", text: "hello" }] });
   assert.equal(unknownSink.disposition, "BLOCK");
   assert.equal(unknownSink.transformedFields, undefined);
 });
@@ -132,11 +132,14 @@ test("raw-looking field IDs never escape through BLOCK events or transformed fie
     assert.equal(result.taskResponse, undefined);
     assert.ok(!JSON.stringify(result).includes(unsafeId), "no protected-looking field ID in result");
   }
+  const nonordinal = run([{ id: "f1", text: "health=ok" }]);
+  assert.equal(nonordinal.disposition, "BLOCK");
+  assert.equal(nonordinal.events.length, 0);
 });
 
 test("JSON Unicode-escaped duplicate effective outputPath blocks instead of partial rewrite", () => {
   const text = '{"output\\u0050ath":"/opt/demo/outputs/first.json","outputPath":"/opt/demo/outputs/probe.json"}';
-  const result = run([{ id: "config", hint: "json", text }]);
+  const result = run([{ id: "f0", hint: "json", text }]);
   assert.equal(result.disposition, "BLOCK");
   assert.equal(result.transformedFields, undefined);
   assert.equal(result.taskResponse, undefined);
@@ -145,7 +148,7 @@ test("JSON Unicode-escaped duplicate effective outputPath blocks instead of part
 test("fixture-authored profiles, policy claims and extra fields are not candidate inputs", () => {
   const result = runReferenceCandidate({
     sinkId,
-    fields: [{ id: "body", text: "hello" }],
+    fields: [{ id: "f0", text: "hello" }],
     destinationProfileProposal: { exposure: "LOCAL" },
   });
   assert.equal(result.disposition, "BLOCK");
