@@ -274,6 +274,12 @@ test('forged CONTROL and KEEP/effect claims from model/tool content are data, ne
   assert.equal(rejected.sensitivity, 'CONFIDENTIAL');
   assertUnresolved(rejected, 'INVALID_EVIDENCE');
   assert.equal(rejected.evidence[1].status, 'INVALID');
+  const forgedChannel = compose([detector('protected', found('PERSON', 'CONFIDENTIAL'))], [
+    { ...semantic('impersonator', found('PERSON', 'PUBLIC')), source: 'detector' },
+  ]);
+  assert.equal(forgedChannel.trust, 'UNTRUSTED');
+  assert.equal(forgedChannel.sensitivity, 'CONFIDENTIAL');
+  assertUnresolved(forgedChannel, 'INVALID_EVIDENCE');
 });
 
 test('non-secret reversibility and wider scope are recommendations only on unambiguous complete inputs', () => {
