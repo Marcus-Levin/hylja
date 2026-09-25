@@ -122,6 +122,26 @@ test("malformed JSON and unsupported sink cannot emit a transformed candidate", 
   assert.equal(unknownSink.transformedFields, undefined);
 });
 
+test("raw-looking field IDs never escape through BLOCK events or transformed fields", () => {
+  const unsafeId = "DEMO-NONLIVE-TOKEN-NOT-VALID";
+  for (const text of [`token=${unsafeId}`, "health=ok"]) {
+    const result = run([{ id: unsafeId, text }]);
+    assert.equal(result.disposition, "BLOCK", "reject a field ID copied from candidate text");
+    assert.equal(result.events.length, 0, "reject before generating detector events");
+    assert.equal(result.transformedFields, undefined);
+    assert.equal(result.taskResponse, undefined);
+    assert.ok(!JSON.stringify(result).includes(unsafeId), "no protected-looking field ID in result");
+  }
+});
+
+test("JSON Unicode-escaped duplicate effective outputPath blocks instead of partial rewrite", () => {
+  const text = '{"output\\u0050ath":"/opt/demo/outputs/first.json","outputPath":"/opt/demo/outputs/probe.json"}';
+  const result = run([{ id: "config", hint: "json", text }]);
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.transformedFields, undefined);
+  assert.equal(result.taskResponse, undefined);
+});
+
 test("fixture-authored profiles, policy claims and extra fields are not candidate inputs", () => {
   const result = runReferenceCandidate({
     sinkId,
