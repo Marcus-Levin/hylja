@@ -124,11 +124,26 @@ test('D05 URL occurrence is HOST substring only; route, scheme, port, numeric co
   }
 });
 
+test('whole-leaf D05 customer, project and outputPath reject even truthful partial source spans', () => {
+  const { span, fixture } = projector();
+  for (const key of ['customer', 'project', 'outputPath']) {
+    const text = fixture.input.value[key];
+    for (const [start, end] of [[0, text.length - 1], [1, text.length], [1, text.length - 1]]) {
+      // Exact decoded substring and identity normalized span do not make a partial
+      // occurrence eligible as one of the four fixed public D05 planted controls.
+      assert.throws(() => span.projectSourceOccurrence(occurrence(key, text, start, end)), generic);
+    }
+    assert.ok(span.projectSourceOccurrence(occurrence(key, text)).value === text);
+  }
+});
+
 test('ambiguous URL authorities and unsupported D05 lexical forms reject with matching parsed projection', () => {
   const currentUrl = '"endpointUrl": "https://service.demo.invalid:9443/v1/ping"';
   for (const changedUrl of [
     'https://user@service.demo.invalid:9443/v1/ping',
     'https://service..demo.invalid:9443/v1/ping',
+    'https://service.demo.invalid:9443//other.invalid',
+    'https://service.demo.invalid:9443/v1//ping',
     'https://service.demo.invalid:99999/v1/ping',
     'https://%73ervice.demo.invalid:9443/v1/ping',
     'https://[2001:db8::1]:9443/v1/ping',
