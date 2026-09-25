@@ -88,9 +88,20 @@
         }
       },
       "taskControl": {
-        "prompt": "Edit the synthetic configuration to use the service's new HTTPS port 443; keep the endpoint path, host relationship, Linux output path and timeout intact. Return valid JSON.",
-        "expectedAnswer": { "port": 443, "endpointEffectivePort": 443, "endpointScheme": "https", "endpointPath": "/v1/ping", "unchangedFields": ["customer", "project", "os", "outputPath", "timeoutMs"] },
-        "semanticValidity": ["Returned content parses as JSON and port remains a number.", "Endpoint URL and port field agree on effective port 443; URL host remains the same entity representation supplied to the task.", "Scheme, path, Linux path and timeout remain unchanged; no original host spelling is required if it was cloaked."]
+        "prompt": "Edit the synthetic configuration shown to you to use the service's new HTTPS port 443; preserve the endpoint path and host relationship, customer/project roles, absolute Linux output-file path semantics, OS and timeout. Return valid JSON without restoring hidden originals.",
+        "expectedAnswer": {
+          "port": 443,
+          "endpointEffectivePort": 443,
+          "endpointScheme": "https",
+          "endpointPath": "/v1/ping",
+          "literalSafeFields": { "os": "linux", "timeoutMs": 2500 },
+          "candidateVisibleRelations": {
+            "customer": "same customer entity/role as the candidate-visible transformed input, not necessarily the raw spelling",
+            "project": "same project entity/role as the candidate-visible transformed input, not necessarily the raw spelling",
+            "outputPath": "valid absolute Linux path with the candidate-visible output-file role/path semantics, not necessarily the raw spelling"
+          }
+        },
+        "semanticValidity": ["Returned content parses as JSON and port remains a number.", "Endpoint URL and port field agree on effective port 443; URL host retains the candidate-visible entity representation.", "OS remains linux and timeoutMs remains 2500; customer/project relations and absolute Linux output-path semantics are judged against candidate-visible transformed input, never raw original strings."]
       }
     }
   ]
