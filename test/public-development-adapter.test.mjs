@@ -370,12 +370,15 @@ test('changing oracle task-control descriptor cannot cause post-send #5 rejectio
       return Reflect.getOwnPropertyDescriptor(target, key);
     },
   });
-  await assert.rejects(run.run({ oracle: changingOracle }),
+  let candidateCallbacks = 0;
+  const evaluation = { ...run.evaluation, async runCandidate(...args) {
+    candidateCallbacks++;
+    return run.evaluation.runCandidate(...args);
+  } };
+  await assert.rejects(run.run({ oracle: changingOracle, evaluation }),
     (error) => error instanceof TypeError && !error.message.includes('evaluator-only-synthetic-task-control'));
   assert.equal(run.capture.forCase(run.fixture.fixtureId).length, 0);
-  const report = run.evaluation.report(run.fixture.fixtureId, run.capture, () => true);
-  assert.equal(report.utility.taskCorrect, null);
-  assert.equal(untested(report, 'task-correctness').reason, 'no-task-result');
+  assert.equal(candidateCallbacks, 0, 'a rejected oracle cannot invoke a task-producing candidate callback');
 });
 
 test('D05 malformed transformed JSON object rejects before any capture or task result', async () => {

@@ -156,6 +156,20 @@ export function projectPublicDevelopmentFixture(input, sinkInput) {
   });
 }
 
+function parsedJsonObject(text) {
+  // Syntax only. Task correctness and relationship semantics belong to the evaluator grader.
+  const parsed = JSON.parse(text);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) invalid();
+  return parsed;
+}
+function d05TaskShape(text) {
+  const parsed = parsedJsonObject(text);
+  const strings = ['customer', 'project', 'protocol', 'endpointUrl', 'os', 'outputPath'];
+  const numbers = ['port', 'timeoutMs'];
+  if (Object.keys(parsed).length !== strings.length + numbers.length ||
+    strings.some((key) => typeof parsed[key] !== 'string') ||
+    numbers.some((key) => !Number.isSafeInteger(parsed[key]))) invalid();
+}
 function outputFields(value, original) {
   const items = array(value, 32);
   if (items.length !== original.length) invalid();
@@ -165,25 +179,30 @@ function outputFields(value, original) {
     const expected = original[index];
     if (field.id !== expected.id || field.hint !== expected.hint) invalid();
     const text = utf8(field.text);
+    if (expected.hint === 'json') parsedJsonObject(text); // D05 cannot serialize invalid JSON as usable config.
     total += encoder.encode(text).byteLength;
     if (total > MAX_FIELD_BYTES) invalid();
     return Object.freeze({ id: expected.id, text, ...(expected.hint ? { hint: expected.hint } : {}) });
   }));
 }
 function candidateEvents(value, fields) {
-  return array(value, 256).map((raw) => {
+  const items = array(value, 256);
+  if (!items.length) return [];
+  // One bounded pass per projected field, not a new full-field UTF-8 Set per event.
+  const spans = fields.map(({ text }) => {
+    const boundaries = new Set([0]);
+    let byteLength = 0;
+    for (const symbol of text) { byteLength += encoder.encode(symbol).length; boundaries.add(byteLength); }
+    return { byteLength, boundaries };
+  });
+  return items.map((raw) => {
     const event = data(raw, ['fieldId', 'startByte', 'endByte', 'semanticType'], ['subtype']);
     const index = fields.findIndex((field) => field.id === event.fieldId);
     if (index < 0 || !SEMANTIC_CLASSES.includes(event.semanticType)) invalid();
-    const text = fields[index].text;
-    const byteLength = encoder.encode(text).byteLength;
+    const { byteLength, boundaries } = spans[index];
     const { startByte, endByte } = event;
     if (!Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte) ||
       startByte < 0 || endByte <= startByte || endByte > byteLength) invalid();
-    // Reject spans that split UTF-8 sequences instead of letting offsets drift silently.
-    const boundaries = new Set([0]);
-    let size = 0;
-    for (const symbol of text) { size += encoder.encode(symbol).length; boundaries.add(size); }
     if (!boundaries.has(startByte) || !boundaries.has(endByte)) invalid();
     if (event.subtype !== undefined &&
       (typeof event.subtype !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(event.subtype))) invalid();
@@ -208,6 +227,7 @@ function candidateResult(input, state, hasTaskExpected) {
   if (Object.hasOwn(result, 'taskResponse')) {
     if (state.taskPrompt === undefined || !hasTaskExpected) invalid();
     taskResult = utf8(result.taskResponse);
+    if (state.candidateFields.some((field) => field.hint === 'json')) d05TaskShape(taskResult);
   }
   return { disposition: 'TRANSFORMED', events, fields, taskResult };
 }
@@ -264,13 +284,14 @@ export async function runPublicReferenceCandidate(options) {
     const candidate = args.candidate === undefined ? runReferenceCandidate : args.candidate;
     const serialize = args.serialize === undefined ? serializeControlledRelease : args.serialize;
     if (typeof candidate !== 'function' || typeof serialize !== 'function') invalid();
-    // Inspect only the PRESENCE/type of evaluator task control; do not read or use its answer.
-    const taskDescriptor = Object.getOwnPropertyDescriptor(args.oracle, 'taskExpected');
-    const hasTaskExpected = Boolean(taskDescriptor && Object.hasOwn(taskDescriptor, 'value') &&
-      typeof taskDescriptor.value === 'string');
+    // Snapshot top-level oracle descriptors once. #5 must register that SAME record: a
+    // time-varying raw taskExpected could otherwise make #5 reject AFTER capture.
+    // Planted content and nested oracle validation remain exclusively #5's responsibility.
+    const oracle = data(args.oracle, ['version', 'caseId', 'occurrences'], ['taskExpected']);
+    const hasTaskExpected = Object.hasOwn(oracle, 'taskExpected') && typeof oracle.taskExpected === 'string';
     assertObserved(args.observeLocalSink, state);
     args.evaluation.registerCase(args.projection.developmentCase);
-    args.evaluation.registerOracle(args.oracle);
+    args.evaluation.registerOracle(oracle);
     let disposition;
     await args.evaluation.runCandidate(state.caseId, async (_view, send) => {
       const input = Object.freeze({ sinkId: state.localSink.id,
