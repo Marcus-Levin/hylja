@@ -157,7 +157,8 @@ export function projectPublicDevelopmentFixture(input, sinkInput) {
 }
 
 function parsedJsonObject(text) {
-  // Syntax only. Task correctness and relationship semantics belong to the evaluator grader.
+  // Exploratory DEV structural check only: no approved rubric, task semantics, or JSON
+  // duplicate-key fidelity. The independently configured evaluator grader owns correctness.
   const parsed = JSON.parse(text);
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) invalid();
   return parsed;
