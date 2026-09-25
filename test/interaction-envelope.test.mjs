@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { performance } from 'node:perf_hooks';
 import {
   INTERACTION_OPERATIONS,
   createInteractionEnvelope,
@@ -125,6 +126,45 @@ test('malformed wire, extra keys and hostile objects never echo synthetic plante
   }
 });
 
+test('a forged instance of a previously observed failure cannot echo planted data', () => {
+  const planted = 'private-planted-synthetic.invalid';
+  let sample;
+  try { serializeInteractionEnvelope({}); } catch (error) { sample = error; }
+  assert.ok(sample instanceof Error);
+  const forged = new sample.constructor(planted);
+  const input = new Proxy(draft(), { ownKeys() { throw forged; } });
+  let result;
+  try { createInteractionEnvelope(input, boundary()); } catch (error) { result = error; }
+  assert.ok(result instanceof Error);
+  assert.equal(result.message.includes(planted), false);
+});
+
+test('time-varying adapter objects cannot become bound unsupported operations or invalid streams', () => {
+  const trusted = boundary();
+  let operationReads = 0;
+  const changingOperation = new Proxy(draft(), {
+    get(target, property, receiver) {
+      if (property === 'operation') return ++operationReads === 1 ? 'model.input' : 'forged.unsupported';
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const operation = createInteractionEnvelope(changingOperation, trusted);
+  assert.equal(operation.operation, 'model.input');
+  assert.deepEqual(parseInteractionEnvelope(serializeInteractionEnvelope(operation), trusted), operation);
+
+  let finalReads = 0;
+  const changingStream = new Proxy({ mode: 'stream', id: 'stream-a.invalid', sequence: 0,
+    final: false, cancelled: false, inspection: 'unverified' }, {
+    get(target, property, receiver) {
+      if (property === 'final') return ++finalReads === 1 ? false : 'CONTROL';
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const fragment = createInteractionEnvelope({ ...draft('model.output'), stream: changingStream }, trusted);
+  assert.equal(fragment.stream.final, false);
+  assert.deepEqual(parseInteractionEnvelope(serializeInteractionEnvelope(fragment), trusted), fragment);
+});
+
 test('authenticated identity/request and observed source/actual route come only from independent trusted context', () => {
   const trusted = boundary();
   const valid = createInteractionEnvelope(draft(), trusted);
@@ -140,7 +180,7 @@ test('authenticated identity/request and observed source/actual route come only 
   assert.equal(Object.isFrozen(valid.payload.nested), true);
   assert.throws(() => { valid.destination.profileId = 'forged-profile.invalid'; }, TypeError);
   assert.throws(() => { valid.payload.nested.push('late change'); }, TypeError);
-  assert.throws(() => serializeInteractionEnvelope({ ...valid }), /bound|trusted|verified/i);
+  assert.throws(() => serializeInteractionEnvelope({ ...valid }), TypeError);
 });
 
 test('absent, unauthenticated, stale, or malformed trusted evidence cannot be promoted by wire provenance', () => {
@@ -165,6 +205,11 @@ test('absent, unauthenticated, stale, or malformed trusted evidence cannot be pr
   assert.throws(() => parseInteractionEnvelope(alter(valid, (v) => {
     v.occurredAt = '2000-01-01T00:00:00.000Z';
   }), trusted));
+  // Current by the five-minute clock, but before every proof's issue instant.
+  const beforeProofs = alter(valid, (v) => {
+    v.occurredAt = new Date(Date.now() - 230_000).toISOString();
+  });
+  assert.throws(() => parseInteractionEnvelope(beforeProofs, trusted));
   assert.throws(() => parseInteractionEnvelope(alter(valid, (v) => { v.provenance = []; }), trusted));
   assert.throws(() => parseInteractionEnvelope(alter(valid, (v) => {
     v.provenance[0].authority = 'untrusted';
@@ -215,6 +260,21 @@ test('actual routing/profile and redirect changes reject claimed safe destinatio
   const missingProfile = structuredClone(trusted);
   delete missingProfile.observed.destination.profileId;
   assert.throws(() => parseInteractionEnvelope(serializeInteractionEnvelope(valid), missingProfile));
+});
+
+test('local destinations also need an observed valid profile; neither path silently defaults', () => {
+  const trusted = boundary({ destinationRef: 'local-sink.example.invalid',
+    destinationZone: 'trusted-local', profileId: 'profile-local.invalid' });
+  const created = createInteractionEnvelope(draft('tool.call'), trusted);
+  assert.equal(created.destination.profileId, 'profile-local.invalid');
+  assert.deepEqual(parseInteractionEnvelope(serializeInteractionEnvelope(created), trusted), created);
+  const missingProfile = structuredClone(trusted);
+  delete missingProfile.observed.destination.profileId;
+  assert.throws(() => createInteractionEnvelope(draft('tool.call'), missingProfile));
+  assert.throws(() => parseInteractionEnvelope(serializeInteractionEnvelope(created), missingProfile));
+  assert.throws(() => parseInteractionEnvelope(alter(created, (v) => {
+    delete v.destination.profileId;
+  }), trusted));
 });
 
 test('correlation/provider/model and payload CONTROL text never establish identity or release authority', () => {
@@ -274,7 +334,7 @@ test('representation descriptors and JSON payloads must be valid and immutable, 
   assert.throws(() => createInteractionEnvelope({ ...draft(), payload: cyclic }, trusted));
   const getter = {};
   Object.defineProperty(getter, 'secret', { enumerable: true, get() { throw Error('getter executed'); } });
-  assert.throws(() => createInteractionEnvelope({ ...draft(), payload: getter }, trusted), /JSON|data|descriptor/i);
+  assert.throws(() => createInteractionEnvelope({ ...draft(), payload: getter }, trusted), TypeError);
 });
 
 test('wire limits count UTF-8 bytes and reject repeated acyclic branching input', () => {
@@ -287,6 +347,21 @@ test('wire limits count UTF-8 bytes and reject repeated acyclic branching input'
   let shared = { value: 'synthetic' };
   for (let i = 0; i < 18; i++) shared = { left: shared, right: shared };
   assert.throws(() => createInteractionEnvelope({ ...draft(), payload: shared }, trusted));
+});
+
+test('near-limit JSON fields round-trip while oversized key maps reject promptly', () => {
+  const trusted = boundary();
+  const fields = (count) => Object.fromEntries(Array.from({ length: count }, (_, i) => [`k${i.toString(36)}`, i % 2]));
+  const nearLimit = createInteractionEnvelope({ ...draft(), payload: fields(9_800) }, trusted);
+  assert.deepEqual(parseInteractionEnvelope(serializeInteractionEnvelope(nearLimit), trusted), nearLimit);
+
+  // Compact synthetic JSON stays under the byte limit but exceeds the object-key cap.
+  const valid = createInteractionEnvelope(draft(), trusted);
+  const oversizedWire = alter(valid, (v) => { v.payload = fields(80_000); });
+  assert.ok(Buffer.byteLength(oversizedWire, 'utf8') < 1_048_576);
+  const started = performance.now();
+  assert.throws(() => parseInteractionEnvelope(oversizedWire, trusted));
+  assert.ok(performance.now() - started < 4_000, 'oversized key maps must not require quadratic validation');
 });
 
 test('stream fragments require contiguous order, stable trust context, and only unverified inspection state', () => {

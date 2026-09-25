@@ -75,16 +75,15 @@ export interface InteractionDraft {
 const MAX_AGE_MS = 5 * 60 * 1000;
 const MAX_WIRE_BYTES = 1_048_576;
 const MAX_JSON_NODES = 100_000;
+const MAX_JSON_KEYS = 10_000;
 const boundEnvelopes = new WeakSet<object>();
 
 type RecordValue = Record<string, unknown>;
-class EnvelopeError extends TypeError {}
-function fail(where: string): never { throw new EnvelopeError(`Invalid interaction envelope: ${where}`); }
+function fail(_where: string): never { throw new TypeError('Invalid interaction envelope'); }
 function safe<T>(action: () => T): T {
-  try { return action(); } catch (error) {
-    // JSON.parse, proxies and unexpected JS object traps can include attacker-controlled text.
-    if (error instanceof EnvelopeError) throw error;
-    throw new EnvelopeError('Invalid interaction envelope');
+  try { return action(); } catch {
+    // Never trust even the error class: a caller can forge/rethrow one with raw data.
+    throw new TypeError('Invalid interaction envelope');
   }
 }
 function bytes(value: string): number {
@@ -95,14 +94,20 @@ function record(value: unknown, required: readonly string[], optional: readonly 
   if (value === null || typeof value !== 'object' || Array.isArray(value)) fail(where);
   const prototype: unknown = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) fail(where);
-  if (Object.getOwnPropertySymbols(value).length !== 0) fail(where);
-  const entries = Object.entries(Object.getOwnPropertyDescriptors(value));
-  for (const [key, descriptor] of entries) {
-    if (!descriptor.enumerable || !('value' in descriptor) ||
-      (!required.includes(key) && !optional.includes(key))) fail(`${where}: unexpected field`);
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > required.length + optional.length) fail(where);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const allowed = new Set([...required, ...optional]);
+  const snapshot: RecordValue = Object.create(null) as RecordValue;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== 'string' || !allowed.has(key)) fail(where);
+    const descriptor = descriptors[key];
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) fail(where);
+    // Read the validated data descriptor exactly once; never read a Proxy's field again.
+    Object.defineProperty(snapshot, key, { value: descriptor.value, enumerable: true, configurable: true });
   }
-  for (const key of required) if (!Object.hasOwn(value, key)) fail(`${where}.${key}`);
-  return value as RecordValue;
+  for (const key of required) if (!Object.hasOwn(snapshot, key)) fail(where);
+  return snapshot;
 }
 function text(value: unknown, where: string, limit = 256): string {
   if (typeof value !== 'string' || !value.length || value.length > limit ||
@@ -182,21 +187,31 @@ function jsonValue(value: unknown, depth = 0, ancestors = new Set<object>(),
   ancestors.add(value);
   let result: JsonValue;
   if (Array.isArray(value)) {
-    if (value.length > 10_000 || Object.keys(value).length !== value.length ||
-      Object.getOwnPropertySymbols(value).length) fail('JSON payload array');
+    const keys = Reflect.ownKeys(value);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    const length: unknown = lengthDescriptor?.value;
+    if (!Number.isSafeInteger(length) || (length as number) > MAX_JSON_KEYS ||
+      keys.length !== (length as number) + 1 || !keys.includes('length')) fail('JSON payload array');
+    const indexKeys = new Set(keys);
     const items: JsonValue[] = [];
-    for (let index = 0; index < value.length; index++) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-      if (!descriptor || !('value' in descriptor)) fail('JSON payload array descriptor');
+    for (let index = 0; index < (length as number); index++) {
+      const key = String(index);
+      if (!indexKeys.has(key)) fail('JSON payload array');
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) fail('JSON payload array descriptor');
       items.push(jsonValue(descriptor.value, depth + 1, ancestors, budget));
     }
     result = items;
   } else {
-    const object = record(value, [], Object.keys(value), 'JSON payload descriptor');
-    if (Object.keys(object).length > 10_000) fail('JSON payload size');
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) fail('JSON payload descriptor');
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > MAX_JSON_KEYS) fail('JSON payload size');
     const entries: [string, JsonValue][] = [];
-    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(object))) {
-      if (!('value' in descriptor)) fail('JSON payload descriptor');
+    for (const key of keys) {
+      if (typeof key !== 'string') fail('JSON payload descriptor');
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) fail('JSON payload descriptor');
       budget.bytes += bytes(key);
       if (budget.bytes > MAX_WIRE_BYTES) fail('JSON payload bounds');
       entries.push([key, jsonValue(descriptor.value, depth + 1, ancestors, budget)]);
@@ -277,6 +292,12 @@ function bind(value: InteractionEnvelope, trusted: ReturnType<typeof boundary>, 
   if (!same(value.subject, trusted.subject) || !same(value.context, trusted.context) ||
     !same(value.source, trusted.source) || !same(value.destination, trusted.destination) ||
     !same(value.provenance, trusted.provenance)) fail('authenticated/observed boundary mismatch');
+  const occurredAt = Date.parse(value.occurredAt);
+  for (const claim of trusted.provenance) {
+    if (occurredAt < Date.parse(claim.issuedAt) || occurredAt >= Date.parse(claim.expiresAt)) {
+      fail('interaction outside proof interval');
+    }
+  }
   const fragment = value.stream?.mode === 'stream' ? value.stream : undefined;
   if (previous !== undefined) {
     if (!boundEnvelopes.has(previous) || !fragment || previous.stream?.mode !== 'stream' ||
