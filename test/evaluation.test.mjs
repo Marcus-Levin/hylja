@@ -13,6 +13,9 @@ function developmentCase(overrides = {}) {
   return {
     version: 1, id: 'synthetic-config-01', familyId: 'D05', partition: 'development',
     fields: [{ ref: 'body', content }], sinks: [sink, secondSink],
+    context: { tenantId: 'tenant-a.invalid', projectId: 'project-a.invalid',
+      sessionId: 'session-a.invalid', principalId: 'principal-a.invalid',
+      purpose: 'synthetic-diagnostic', provenanceRef: 'issuer-a.invalid' },
     task: { id: 'diagnose-config', prompt: 'Which port must the client use?' }, ...overrides,
   };
 }
@@ -65,6 +68,17 @@ test('independent oracle validates source byte offsets and exact planted UTF-8 b
   }]), TypeError);
 });
 
+test('plant cannot coincide with allowlisted IDs emitted by an ordinary report', () => {
+  const value = 'synthetic-ambiguous-plant';
+  const caseId = value;
+  const evals = createDevelopmentEvaluation();
+  evals.registerCase(developmentCase({ id: caseId, fields: [{ ref: 'body', content: value }] }));
+  const item = oracle().occurrences[0];
+  const againstId = oracle({ caseId, occurrences: [{ ...item, value, start: 0, end: bytes(value).length }] });
+  assert.throws(() => evals.registerOracle(againstId),
+    (error) => error instanceof TypeError && !error.message.includes(value));
+});
+
 test('case, oracle, candidate and capture sizes and field schemas are bounded without value echo', () => {
   const evals = createDevelopmentEvaluation();
   const attempts = [
@@ -89,6 +103,8 @@ test('post-serialization sink retains copies of exact body AND metadata bytes, w
   const body = bytes('serialized body');
   const metadata = bytes(`header:${planted}`);
   capture.capture({ caseId: 'synthetic-config-01', sinkId: 'sink-remote', body, metadata });
+  assert.equal(Object.isFrozen(capture), true);
+  assert.throws(() => { capture.forCase = () => []; }, TypeError);
   body.fill(0); metadata.fill(0);
   const first = capture.forCase('synthetic-config-01');
   assert.equal(new TextDecoder().decode(first[0].body), 'serialized body');
@@ -184,6 +200,66 @@ test('ordinary report is allowlisted counters/IDs/axes, not payload, oracle, tas
   assert.ok(report.observed.length >= 3, 'reports must carry independently measured findings');
   assert.equal(report.observed.every((item) => item.provenance === 'independently-executed' && 'outcome' in item), true);
   assert.equal(report.untested.every((item) => item.provenance === 'untested' && !('outcome' in item)), true);
+});
+
+test('evaluator-origin latency/compute/model cost have units, bounds and untested state', () => {
+  const { evals, capture } = initialized();
+  const absent = evals.report('synthetic-config-01', capture);
+  assert.deepEqual(absent.operations, { latencyMs: null, computeMs: null, modelApiCostMicrounits: null });
+  assert.equal(findUntested(absent, 'operational-measurement').reason, 'no-operational-observation');
+  for (const invalid of [{ latencyMs: -1, computeMs: 1, modelApiCostMicrounits: 0 },
+    { latencyMs: Number.NaN, computeMs: 1, modelApiCostMicrounits: 0 },
+    { latencyMs: 1, computeMs: 1, modelApiCostMicrounits: 0, rawTrace: planted }]) {
+    assert.throws(() => evals.recordOperationalMeasurement('synthetic-config-01', invalid), TypeError);
+  }
+  evals.recordOperationalMeasurement('synthetic-config-01', {
+    latencyMs: 12.5, computeMs: 2.25, modelApiCostMicrounits: 0,
+  });
+  const result = evals.report('synthetic-config-01', capture);
+  assert.deepEqual(result.operations, { latencyMs: 12.5, computeMs: 2.25, modelApiCostMicrounits: 0 });
+  assert.equal(findRow(result, 'operational-measurement').outcome, 'observed-only');
+  assert.throws(() => evals.recordOperationalMeasurement('synthetic-config-01', {
+    latencyMs: 10, computeMs: 3, modelApiCostMicrounits: 0,
+  }), TypeError);
+  assert.equal(JSON.stringify(result).includes(planted), false);
+});
+
+test('candidate callback receives only frozen development data; evaluator exclusively captures and grades', async () => {
+  const { evals, capture } = initialized();
+  await evals.runCandidate('synthetic-config-01', async (view, send) => {
+    assert.equal(view.version, 1);
+    assert.equal(view.familyId, 'D05');
+    assert.equal(view.fields[0].content, content);
+    assert.equal(view.context.tenantId, 'tenant-a.invalid');
+    assert.equal(view.context.provenanceRef, 'issuer-a.invalid');
+    assert.equal(Object.isFrozen(view.context), true);
+    assert.equal(view.task.prompt, 'Which port must the client use?');
+    assert.equal(Object.hasOwn(view, 'oracle'), false);
+    assert.equal(Object.hasOwn(view.task, 'expected'), false);
+    assert.equal(Object.isFrozen(view), true);
+    assert.equal(Object.isFrozen(view.fields[0]), true);
+    assert.throws(() => { view.fields[0].content = 'tampered'; }, TypeError);
+    assert.throws(() => send('unknown-sink', { body: bytes('x'), metadata: bytes('') }), TypeError);
+    send('sink-remote', { body: bytes('masked output'), metadata: bytes(planted) });
+    return { events: [{ fieldRef: 'body', start, end: start + bytes(planted).length,
+      semanticType: 'CREDENTIAL_OR_SECRET', subtype: 'API_KEY' }], taskResult: 'port 443' };
+  }, capture);
+  const report = evals.report('synthetic-config-01', capture, (expected, actual) => expected === actual);
+  assert.equal(report.candidates.matched, 1);
+  assert.equal(report.utility.taskCorrect, true);
+  assert.equal(report.privacy.criticalPlaintextEscapes, 1);
+  assert.equal(JSON.stringify(report).includes(planted), false);
+  assert.equal(findUntested(report, 'secret-plaintext-escape', 'sink-judge').reason, 'no-capture');
+});
+
+test('candidate callback cannot smuggle oracle labels or self-grade via extra fields', async () => {
+  const { evals, capture } = initialized();
+  await assert.rejects(evals.runCandidate('synthetic-config-01', async () => ({
+    events: [], result: 'pass', oracle: planted,
+  }), capture), (error) => error instanceof TypeError && !error.message.includes(planted));
+  const result = evals.report('synthetic-config-01', capture);
+  assert.equal(findUntested(result, 'candidate-detection').reason, 'no-candidate-events');
+  assert.equal(findUntested(result, 'task-correctness').reason, 'no-task-result');
 });
 
 test('capture for an undeclared sink is rejected instead of silently making a known sink pass', () => {

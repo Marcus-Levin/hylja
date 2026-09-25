@@ -69,6 +69,21 @@ test('deterministic generator varies wrong scopes, provenance and tenant, includ
   assert.throws(() => generateSyntheticScopeVectors(SYNTHETIC_SCOPE_REFERENCES, 0, 8), TypeError);
 });
 
+test('custom synthetic fixture IDs cannot collide with generated wrong-scope attempts', async () => {
+  const references = SYNTHETIC_SCOPE_REFERENCES.map((item, index) => ({
+    ...item, ...(index === 0 ? { projectId: 'project-other-1024.invalid',
+      ref: 'unknown-1024.invalid' } : {}),
+  }));
+  const issued = new Map(references.map((item) => [item.ref, item]));
+  const double = {
+    canResolve: (attempt) => sameScope(issued.get(attempt.ref), attempt),
+    authorize: (attempt) => attempt.action === 'USE' && sameScope(issued.get(attempt.ref), attempt),
+  };
+  const findings = await runSyntheticScopeContract(double, references);
+  assert.ok(findings.length >= 100);
+  assert.equal(findings.every((item) => item.outcome === 'pass'), true);
+});
+
 test('a single all-true or all-false result is not sufficient: positives and negatives are both checked', async () => {
   const denied = await runSyntheticScopeContract({ canResolve: () => false, authorize: () => false });
   assert.ok(denied.some((item) => item.expected === 'allow' && item.outcome === 'fail'));
