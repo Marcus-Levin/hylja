@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { SEMANTIC_CLASSES, SENSITIVITIES, TRUST_LEVELS } from './classification.js';
-import type { Classification, SemanticClass, Sensitivity, Trust } from './classification.js';
+import type { Classification, ClassificationClaim, EvidenceRecord, SemanticClass, Sensitivity, Trust } from './classification.js';
 import type { Destination, Endpoint, RequestContext, Subject } from './interaction-envelope.js';
 
 /** Policy is a pure decision seam. Only a trusted integration may supply boundary, bundle and review. */
@@ -74,6 +74,8 @@ export interface TrustedReviewOutcome {
   policy: { id: string; version: string; digest: string };
   binding: {
     interactionRef: string;
+    candidateRef: string;
+    classificationDigest: string;
     subject: Subject;
     context: RequestContext;
     source: Endpoint & { trust: Trust };
@@ -166,32 +168,78 @@ function identity(value: unknown): { id: string; version: string } {
   const v = fields(value, ['id', 'version']);
   return { id: text(v.id), version: text(v.version) };
 }
+function pinnedDigest(value: unknown): string {
+  const digest = text(value);
+  if (!/^[a-f0-9]{64}$/u.test(digest)) fail('INVALID_CONTEXT');
+  return digest;
+}
 function pinnedIdentity(value: unknown): PolicyBoundary['policy'] {
   const v = fields(value, ['id', 'version', 'digest']);
-  const digest = text(v.digest);
-  if (!/^[a-f0-9]{64}$/u.test(digest)) fail('INVALID_CONTEXT');
-  return { id: text(v.id), version: text(v.version), digest };
+  return { id: text(v.id), version: text(v.version), digest: pinnedDigest(v.digest) };
+}
+function evidenceRecord(value: unknown): EvidenceRecord {
+  const v = fields(value, ['version', 'source', 'status'], ['id', 'provenance', 'claim']);
+  if (v.version !== 1) fail('INVALID_CLASSIFICATION');
+  const source = member(v.source, ['detector', 'parser', 'semantic']);
+  if (v.status === 'INVALID') {
+    if (Object.hasOwn(v, 'id') || Object.hasOwn(v, 'provenance') || Object.hasOwn(v, 'claim')) {
+      fail('INVALID_CLASSIFICATION');
+    }
+    return { version: 1, source, status: 'INVALID' };
+  }
+  const status = member(v.status, ['FOUND', 'ABSTAIN', 'FAILURE']);
+  const p = fields(v.provenance, ['inputRef', 'producerId', 'producerVersion'],
+    source === 'semantic' ? ['questionSetVersion', 'modelId'] : []);
+  const provenance = { inputRef: text(p.inputRef, 1024), producerId: text(p.producerId),
+    producerVersion: text(p.producerVersion),
+    ...(source === 'semantic' ? { questionSetVersion: text(p.questionSetVersion),
+      modelId: text(p.modelId) } : {}) };
+  const id = text(v.id);
+  if (status !== 'FOUND') {
+    if (Object.hasOwn(v, 'claim')) fail('INVALID_CLASSIFICATION');
+    return { version: 1, id, source, provenance, status };
+  }
+  const c = fields(v.claim, ['semanticType'], ['subtype', 'sensitivity', 'reversible', 'scope', 'confidence']);
+  if (Object.hasOwn(c, 'reversible') && typeof c.reversible !== 'boolean') fail('INVALID_CLASSIFICATION');
+  if (Object.hasOwn(c, 'confidence') && (source !== 'semantic' ||
+    typeof c.confidence !== 'number' || !Number.isFinite(c.confidence) ||
+    c.confidence < 0 || c.confidence > 1)) fail('INVALID_CLASSIFICATION');
+  const claim: ClassificationClaim = { semanticType: text(c.semanticType, 64),
+    ...(Object.hasOwn(c, 'subtype') ? { subtype: text(c.subtype, 64) } : {}),
+    ...(Object.hasOwn(c, 'sensitivity') ? { sensitivity: member(c.sensitivity, SENSITIVITIES) } : {}),
+    ...(Object.hasOwn(c, 'reversible') ? { reversible: c.reversible as boolean } : {}),
+    ...(Object.hasOwn(c, 'scope') ? { scope: member(c.scope, ['request', 'session', 'project', 'tenant']) } : {}),
+    ...(Object.hasOwn(c, 'confidence') ? { confidence: c.confidence as number } : {}) };
+  return { version: 1, id, source, provenance, status, claim };
 }
 function classification(value: unknown): Classification {
   const v = fields(value, ['version', 'status', 'semanticType', 'sensitivity', 'trust',
     'reversible', 'scope', 'reasons', 'evidence', 'provenance'], ['subtype']);
-  if (v.version !== 1 || typeof v.reversible !== 'boolean' ||
-    !['request', 'session', 'project', 'tenant'].includes(v.scope as string)) fail('INVALID_CLASSIFICATION');
+  if (v.version !== 1 || typeof v.reversible !== 'boolean') fail('INVALID_CLASSIFICATION');
   const status = member(v.status, ['RESOLVED', 'UNRESOLVED']);
   const semanticType = member(v.semanticType, [...SEMANTIC_CLASSES, 'UNKNOWN']);
   const sensitivity = member(v.sensitivity, [...SENSITIVITIES, 'UNKNOWN']);
   const trust = member(v.trust, TRUST_LEVELS);
+  const scope = member(v.scope, ['request', 'session', 'project', 'tenant']);
   const provenance = fields(v.provenance, ['interactionRef', 'sourceRef']);
   const reasons = items(v.reasons, text, 64);
-  items(v.evidence, () => null, 256); // Evidence is classified upstream, never interpreted as policy authority.
-  if (Object.hasOwn(v, 'subtype')) text(v.subtype);
-  if (status === 'RESOLVED' && (semanticType === 'UNKNOWN' || sensitivity === 'UNKNOWN' ||
-    reasons.length !== 0 || semanticType === 'CREDENTIAL_OR_SECRET' && sensitivity !== 'SECRET')) {
-    fail('INVALID_CLASSIFICATION');
+  const evidence = items(v.evidence, evidenceRecord, 768);
+  const subtype = Object.hasOwn(v, 'subtype') ? text(v.subtype, 64) : undefined;
+  if (status === 'RESOLVED') {
+    if (semanticType === 'UNKNOWN' || sensitivity === 'UNKNOWN' || reasons.length !== 0 ||
+      evidence.length === 0 || !evidence.some((record) => record.source === 'detector' &&
+        record.status === 'FOUND') || evidence.some((record) => record.status !== 'FOUND' ||
+          !record.claim || record.claim.semanticType !== semanticType ||
+          record.claim.sensitivity !== undefined && record.claim.sensitivity !== sensitivity ||
+          record.claim.sensitivity === undefined && semanticType !== 'CREDENTIAL_OR_SECRET' ||
+          record.claim.subtype !== undefined && record.claim.subtype !== subtype) ||
+      new Set(evidence.map((record) => record.status === 'FOUND' ? record.id : '')).size !== evidence.length ||
+      semanticType === 'CREDENTIAL_OR_SECRET' && sensitivity !== 'SECRET' ||
+      sensitivity === 'SECRET' && v.reversible === true) fail('INVALID_CLASSIFICATION');
   }
-  return { ...v, status, semanticType, sensitivity, trust, reasons,
-    provenance: { interactionRef: text(provenance.interactionRef), sourceRef: text(provenance.sourceRef, 2048) },
-  } as unknown as Classification;
+  return { version: 1, status, semanticType, ...(subtype ? { subtype } : {}), sensitivity,
+    trust, reversible: v.reversible, scope, reasons, evidence,
+    provenance: { interactionRef: text(provenance.interactionRef), sourceRef: text(provenance.sourceRef, 2048) } };
 }
 function request(value: unknown): PolicyRequest {
   const v = fields(value, ['version', 'interactionRef', 'candidateRef', 'subject', 'context', 'source',
@@ -211,7 +259,7 @@ function boundary(value: unknown): PolicyBoundary {
   const a = fields(v.authenticated, ['subject', 'context']);
   const o = fields(v.observed, ['source', 'destination']);
   return { interactionRef: text(v.interactionRef), candidateRef: text(v.candidateRef),
-    classificationDigest: text(v.classificationDigest),
+    classificationDigest: pinnedDigest(v.classificationDigest),
     authenticated: { subject: subject(a.subject), context: context(a.context) },
     observed: { source: sourceWithTrust(o.source), destination: destination(o.destination) },
     policy: pinnedIdentity(v.policy) };
@@ -262,9 +310,9 @@ export function digestPolicyBundle(value: unknown): string {
   try { return hash(canonicalBundle(bundle(value))); }
   catch { throw new TypeError('Invalid policy bundle'); }
 }
-/** Compiling digest seam stub; trusted composer binding is not yet checked. */
+/** Content commitment for a validated composer record; only an independent trusted pin is authoritative. */
 export function digestClassification(value: unknown): string {
-  try { return hash(value as object); }
+  try { return hash(classification(value)); }
   catch { throw new TypeError('Invalid classification'); }
 }
 function equal(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right); }
@@ -283,7 +331,8 @@ function fingerprint(r: PolicyRequest, b: PolicyBoundary, config: PolicyBundle, 
   // Deliberately excludes raw candidate evidence, payload and advice. Canonical order survives
   // JSON replay and profile/rule array reorder; the bundle CONTENT is pinned, not just its label.
   const canonical = { policy: canonicalBundle(config),
-    binding: { interactionRef: b.interactionRef, subject: b.authenticated.subject,
+    binding: { interactionRef: b.interactionRef, candidateRef: b.candidateRef,
+      classificationDigest: b.classificationDigest, subject: b.authenticated.subject,
       context: b.authenticated.context, source: b.observed.source, destination: b.observed.destination },
     classification: { status: r.classification.status, semanticType: r.classification.semanticType,
       subtype: r.classification.subtype ?? null, sensitivity: r.classification.sensitivity,
@@ -301,11 +350,14 @@ function checked(requestValue: unknown, boundaryValue: unknown, bundleValue: unk
   try { r = request(requestValue); } catch { return { decision: denied('INVALID_REQUEST') }; }
   try { b = boundary(boundaryValue); } catch { return { decision: denied('INVALID_CONTEXT') }; }
   if (!equal(r.subject, b.authenticated.subject) || !equal(r.context, b.authenticated.context) ||
-    r.interactionRef !== b.interactionRef || !equal(r.source, {
+    r.interactionRef !== b.interactionRef || r.candidateRef !== b.candidateRef || !equal(r.source, {
       kind: b.observed.source.kind, ref: b.observed.source.ref, trustZone: b.observed.source.trustZone,
     }) || !equal(r.destination, b.observed.destination) ||
     !equal(r.classification.provenance, { interactionRef: b.interactionRef, sourceRef: b.observed.source.ref }) ||
     r.classification.trust !== b.observed.source.trust) return { decision: denied('CONTEXT_MISMATCH') };
+  if (hash(r.classification) !== b.classificationDigest) {
+    return { decision: denied('CLASSIFICATION_MISMATCH') };
+  }
   if (!equal(r.policy, { id: b.policy.id, version: b.policy.version }) ||
     !equal(r.policy, KNOWN_POLICY_BUNDLE)) return { decision: denied('UNKNOWN_POLICY') };
   try { config = bundle(bundleValue); } catch { return { decision: denied('UNAVAILABLE_BUNDLE') }; }
@@ -365,10 +417,12 @@ export function decideReviewedPolicy(requestValue: unknown, trustedBoundary: unk
     try {
       const v = fields(trustedOutcome, ['version', 'decisionRef', 'policy', 'binding',
         'reviewerRef', 'treatment']);
-      const binding = fields(v.binding, ['interactionRef', 'subject', 'context', 'source', 'destination']);
+      const binding = fields(v.binding, ['interactionRef', 'candidateRef', 'classificationDigest',
+        'subject', 'context', 'source', 'destination']);
       if (v.version !== 1) fail('INVALID_REVIEW');
       review = { version: 1, decisionRef: text(v.decisionRef), policy: pinnedIdentity(v.policy),
-        binding: { interactionRef: text(binding.interactionRef), subject: subject(binding.subject),
+        binding: { interactionRef: text(binding.interactionRef), candidateRef: text(binding.candidateRef),
+          classificationDigest: pinnedDigest(binding.classificationDigest), subject: subject(binding.subject),
           context: context(binding.context), source: sourceWithTrust(binding.source),
           destination: destination(binding.destination) },
         reviewerRef: text(v.reviewerRef), treatment: member(v.treatment, RELEASE_TREATMENTS) };
@@ -376,6 +430,8 @@ export function decideReviewedPolicy(requestValue: unknown, trustedBoundary: unk
     if (!equal(review.policy, current.boundary.policy) ||
       review.decisionRef !== current.decision.decisionRef ||
       !equal(review.binding, { interactionRef: current.boundary.interactionRef,
+        candidateRef: current.boundary.candidateRef,
+        classificationDigest: current.boundary.classificationDigest,
         subject: current.boundary.authenticated.subject, context: current.boundary.authenticated.context,
         source: current.boundary.observed.source, destination: current.boundary.observed.destination }) ||
       !current.rule.reviewTreatments?.includes(review.treatment)) return current.decision;

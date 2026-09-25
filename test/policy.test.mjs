@@ -92,7 +92,9 @@ function expectDecision(value, state, treatment) {
 }
 function outcome(s, held, treatment = 'GENERALIZE') {
   return { version: 1, decisionRef: held.decisionRef, policy: copy(s.boundary.policy),
-    binding: { interactionRef: s.boundary.interactionRef, subject: copy(s.boundary.authenticated.subject),
+    binding: { interactionRef: s.boundary.interactionRef, candidateRef: s.boundary.candidateRef,
+      classificationDigest: s.boundary.classificationDigest,
+      subject: copy(s.boundary.authenticated.subject),
       context: copy(s.boundary.authenticated.context), source: copy(s.boundary.observed.source),
       destination: copy(s.boundary.observed.destination) },
     reviewerRef: 'reviewer-a.invalid', treatment };
@@ -183,6 +185,9 @@ test('binding mismatches for authenticated principal/workload/tenant/project/ses
     s => { s.request.context.sessionId = 'session-b.invalid'; },
     s => { s.request.context.purpose = 'other-purpose.invalid'; },
     s => { s.request.interactionRef = 'interaction-b.invalid'; },
+    s => { delete s.request.candidateRef; },
+    s => { delete s.boundary.candidateRef; },
+    s => { delete s.boundary.classificationDigest; },
     s => { s.boundary.authenticated.context.tenantId = 'tenant-b.invalid'; },
     s => { s.request.source.ref = 'other-source.invalid'; },
     s => { s.boundary.observed.source.trust = 'UNTRUSTED'; },
@@ -262,6 +267,10 @@ test('trusted composer classification digest prevents PUBLIC substitution under 
   s.request.classification = forged; // same principal/tenant/candidate/route/policy and provenance
   assert.equal(s.boundary.classificationDigest, trustedDigest);
   expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  s.request.classification = classification('PERSON', 'PUBLIC'); // valid shape, wrong trusted content
+  const substituted = evaluate(s);
+  expectDecision(substituted, 'DENIED', 'BLOCK');
+  assert.equal(substituted.reason, 'CLASSIFICATION_MISMATCH');
   const genuinePublic = scenario({ sensitivity: 'PUBLIC', candidateRef: 'unit-a.invalid' });
   expectDecision(evaluate(genuinePublic), 'SELECTED', 'KEEP');
 });
@@ -300,6 +309,25 @@ test('approval for candidate A cannot select treatment for candidate B in the sa
     'SELECTED', 'GENERALIZE');
 });
 
+test('64 synthetic candidate units cannot borrow one review inside a shared interaction', () => {
+  const first = scenario({ sensitivity: 'RESTRICTED', candidateRef: 'unit-0.invalid' });
+  const heldFirst = evaluate(first);
+  expectDecision(heldFirst, 'HELD', 'REQUIRE_REVIEW');
+  const seen = new Set([heldFirst.decisionRef]);
+  for (let index = 1; index <= 64; index++) {
+    const current = scenario({ sensitivity: 'RESTRICTED', candidateRef: `unit-${index}.invalid` });
+    const held = evaluate(current);
+    expectDecision(held, 'HELD', 'REQUIRE_REVIEW');
+    assert.equal(seen.has(held.decisionRef), false);
+    seen.add(held.decisionRef);
+    expectDecision(decideReviewedPolicy(current.request, current.boundary, current.policy,
+      held, outcome(first, heldFirst)), 'HELD', 'REQUIRE_REVIEW');
+    expectDecision(decideReviewedPolicy(current.request, current.boundary, current.policy,
+      held, outcome(current, held)), 'SELECTED', 'GENERALIZE');
+  }
+  assert.equal(seen.size, 65);
+});
+
 test('candidate identity cannot be replaced by untrusted request-side text', () => {
   const s = scenario({ sensitivity: 'RESTRICTED' });
   expectDecision(evaluate(s), 'HELD', 'REQUIRE_REVIEW');
@@ -332,6 +360,8 @@ test('review cannot borrow another tenant, route, action, version or decision; s
     r => { r.binding.context.projectId = 'project-b.invalid'; },
     r => { r.binding.context.sessionId = 'session-b.invalid'; },
     r => { r.binding.context.purpose = 'other-purpose.invalid'; },
+    r => { r.binding.candidateRef = 'unit-b.invalid'; },
+    r => { r.binding.classificationDigest = '0'.repeat(64); },
     r => { r.binding.source.ref = 'other-source.invalid'; },
     r => { r.binding.destination = copy(sinks.web); },
     r => { r.policy.version = '2'; },
