@@ -36,8 +36,9 @@ function initialized() {
   evals.registerOracle(oracle());
   return { evals, capture: createInMemorySinkCapture() };
 }
-const findRow = (report, claim, sinkId) => report.observed.find((row) => row.claim === claim && row.sinkId === sinkId);
-const findUntested = (report, claim, sinkId) => report.untested.find((row) => row.claim === claim && row.sinkId === sinkId);
+const publicSinkRef = (sinkId) => sinkId === 'sink-remote' ? 'sink-1' : sinkId === 'sink-judge' ? 'sink-2' : sinkId;
+const findRow = (report, claim, sinkId) => report.observed.find((row) => row.claim === claim && row.sinkId === publicSinkRef(sinkId));
+const findUntested = (report, claim, sinkId) => report.untested.find((row) => row.claim === claim && row.sinkId === publicSinkRef(sinkId));
 
 test('public family IDs are disjoint, and development registration never accepts blind families', () => {
   assert.deepEqual(DEVELOPMENT_FAMILY_IDS, Array.from({ length: 12 }, (_, index) => `D${String(index + 1).padStart(2, '0')}`));
@@ -162,7 +163,7 @@ test('actual plaintext in serialized metadata fails containment despite zero can
   assert.equal(report.privacy.criticalPlaintextEscapes, 1);
   assert.equal(report.privacy.testedSinkPairs, 1);
   assert.deepEqual(findRow(report, 'secret-plaintext-escape', 'sink-remote'), {
-    claim: 'secret-plaintext-escape', sinkId: 'sink-remote', provenance: 'independently-executed', outcome: 'fail',
+    claim: 'secret-plaintext-escape', sinkId: 'sink-1', provenance: 'independently-executed', outcome: 'fail',
   });
   assert.equal(findUntested(report, 'secret-plaintext-escape', 'sink-judge').reason, 'no-capture');
 });

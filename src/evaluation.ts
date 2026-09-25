@@ -264,15 +264,18 @@ function oracleRecord(input: unknown, record: DevelopmentCase): IndependentOracl
     if (expectedBySink.length !== record.sinks.length ||
       new Set(expectedBySink.map((target) => target.sinkId)).size !== record.sinks.length ||
       expectedBySink.some((target) => !record.sinks.some((sink) => sink.id === target.sinkId))) invalid();
-    // Secret fixtures in this preparatory seam use disallowed captured sinks; no policy exception is asserted.
+    // A credential/secret semantic type has an unconditional SECRET sensitivity floor.
+    // A contradictory planted oracle must never remove it from the escape denominator.
+    if (semanticType === 'CREDENTIAL_OR_SECRET' && sensitivity !== 'SECRET') invalid();
+    // Secret fixtures here use disallowed captured sinks; no policy exception is asserted.
     if (sensitivity === 'SECRET' && expectedBySink.some((target) => target.treatment === 'KEEP')) invalid();
     return { id: id(plant.id), fieldRef, start, end, value, semanticType, sensitivity, trust,
       critical: plant.critical, expectedBySink,
       ...(Object.hasOwn(plant, 'subtype') ? { subtype: subtype(plant.subtype) } : {}) };
   });
   if (new Set(occurrences.map((plant) => plant.id)).size !== occurrences.length) invalid();
-  // An opaque report ID must not itself be the planted value or contain it as a substring.
-  // Enum strings are fixed vocabulary rather than echoed input; reject accidental collisions too.
+  // Defense in depth: never reuse the full planted value as a fixture or reporting label.
+  // Ordinary report case/sink references below are minted independently, not copied from IDs.
   const visible = [record.id, record.familyId, ...record.sinks.map((sink) => sink.id),
     'development', 'secret-plaintext-escape', 'candidate-detection', 'task-correctness',
     'operational-measurement', 'independently-executed', 'untested', 'pass', 'fail', 'observed-only'];
@@ -352,6 +355,8 @@ function untested(claim: EvaluationClaim, reason: UntestedEvidence['reason'], si
 /** Registry makes independent oracle registration precede candidate events; ordinary reports never expose it. */
 export function createDevelopmentEvaluation(): DevelopmentEvaluation {
   const cases = new Map<string, DevelopmentCase>();
+  // Local ordinal references are evaluator-minted: fixture IDs can contain planted prefixes.
+  const reportCaseIds = new Map<string, string>();
   const oracles = new Map<string, IndependentOracle>();
   const candidates = new Map<string, CandidateEvent[]>();
   const taskResults = new Map<string, string>();
@@ -361,6 +366,7 @@ export function createDevelopmentEvaluation(): DevelopmentEvaluation {
       safe(() => {
         const record = caseRecord(input);
         if (cases.has(record.id) || cases.size >= 256) invalid();
+        reportCaseIds.set(record.id, `case-${cases.size + 1}`);
         cases.set(record.id, record);
       });
     },
@@ -443,18 +449,22 @@ export function createDevelopmentEvaluation(): DevelopmentEvaluation {
         const key = id(caseId);
         const record = cases.get(key);
         const oracle = oracles.get(key);
-        if (!record || !oracle || !issuedCaptures.has(sink)) invalid();
+        const reportCaseId = reportCaseIds.get(key);
+        if (!record || !oracle || !reportCaseId || !issuedCaptures.has(sink)) invalid();
         const captures = sink.forCase(key);
         if (captures.some((capture) => !record.sinks.some((target) => target.id === capture.sinkId))) invalid();
         const observed: ObservedEvidence[] = [];
         const missing: UntestedEvidence[] = [];
-        const secrets = oracle.occurrences.filter((plant) => plant.sensitivity === 'SECRET');
+        // Keep metric selection robust if a future oracle ingestion path weakens validation.
+        const secrets = oracle.occurrences.filter((plant) => plant.sensitivity === 'SECRET' ||
+          plant.semanticType === 'CREDENTIAL_OR_SECRET');
         let testedSinkPairs = 0;
         let criticalPlaintextEscapes = 0;
-        for (const target of record.sinks) {
+        for (const [index, target] of record.sinks.entries()) {
+          const reportSinkId = `sink-${index + 1}`;
           const releases = captures.filter((capture) => capture.sinkId === target.id);
-          if (!secrets.length) { missing.push(untested('secret-plaintext-escape', 'no-secret-control', target.id)); continue; }
-          if (!releases.length) { missing.push(untested('secret-plaintext-escape', 'no-capture', target.id)); continue; }
+          if (!secrets.length) { missing.push(untested('secret-plaintext-escape', 'no-secret-control', reportSinkId)); continue; }
+          if (!releases.length) { missing.push(untested('secret-plaintext-escape', 'no-capture', reportSinkId)); continue; }
           testedSinkPairs += secrets.length;
           let leaked = false;
           for (const plant of secrets) {
@@ -465,7 +475,7 @@ export function createDevelopmentEvaluation(): DevelopmentEvaluation {
               if (plant.critical) criticalPlaintextEscapes++;
             }
           }
-          observed.push(measured('secret-plaintext-escape', leaked ? 'fail' : 'pass', target.id));
+          observed.push(measured('secret-plaintext-escape', leaked ? 'fail' : 'pass', reportSinkId));
         }
         const emitted = candidates.get(key);
         let matched = 0;
@@ -501,13 +511,13 @@ export function createDevelopmentEvaluation(): DevelopmentEvaluation {
         const candidatesReport = { planted, matched, misses: emitted ? planted - matched : 0, falsePositives,
           recall: emitted && planted ? matched / planted : null,
           precision: emitted && emitted.length ? matched / emitted.length : null };
-        return { version: 1, caseId: record.id, familyId: record.familyId, partition: 'development',
+        return { version: 1, caseId: reportCaseId, familyId: record.familyId, partition: 'development',
           observed, untested: missing, privacy: { secretPlanted: secrets.length, testedSinkPairs, criticalPlaintextEscapes },
           candidates: candidatesReport, utility: { taskCorrect },
           operations: { latencyMs: measurement?.latencyMs ?? null, computeMs: measurement?.computeMs ?? null,
             modelApiCostMicrounits: measurement?.modelApiCostMicrounits ?? null } };
       });
     },
-    clear() { cases.clear(); oracles.clear(); candidates.clear(); taskResults.clear(); measurements.clear(); },
+    clear() { cases.clear(); reportCaseIds.clear(); oracles.clear(); candidates.clear(); taskResults.clear(); measurements.clear(); },
   };
 }

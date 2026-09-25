@@ -51,8 +51,22 @@ export const SYNTHETIC_SCOPE_REFERENCES: readonly ScopedReference[] = Object.fre
 function invalid(): never { throw new TypeError('Invalid synthetic scope contract input'); }
 function referenceList(references: readonly ScopedReference[]): ScopedReference[] {
   try {
-    if (!Array.isArray(references) || references.length < 2 || references.length > 32) invalid();
-    const result = references.map((input) => {
+    if (!Array.isArray(references) || Object.getPrototypeOf(references) !== Array.prototype) invalid();
+    const keys = Reflect.ownKeys(references);
+    if (keys.length < 3 || keys.length > 33 || keys.some((key) => typeof key !== 'string')) invalid();
+    const length: unknown = Object.getOwnPropertyDescriptor(references, 'length')?.value;
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 2 || length > 32 ||
+      keys.length !== length + 1 || !keys.includes('length')) invalid();
+    const snapshot: unknown[] = [];
+    for (let index = 0; index < length; index++) {
+      const key = String(index);
+      if (!keys.includes(key)) invalid();
+      const item = Object.getOwnPropertyDescriptor(references, key);
+      if (!item || !item.enumerable || !('value' in item)) invalid();
+      snapshot.push(item.value);
+    }
+    // Never call a caller-owned map/get(length)/index accessor after the bounded snapshot.
+    const result = snapshot.map((input) => {
       if (!input || typeof input !== 'object' || Array.isArray(input) ||
         ![null, Object.prototype].includes(Object.getPrototypeOf(input))) invalid();
       const keys = Reflect.ownKeys(input);
@@ -156,12 +170,21 @@ function staticVectors(fixtures: readonly ScopedReference[]): ScopeVector[] {
 export async function runSyntheticScopeContract(boundary: SyntheticScopeBoundary,
   references: readonly ScopedReference[] = SYNTHETIC_SCOPE_REFERENCES): Promise<readonly ScopeFinding[]> {
   const fixtures = referenceList(references);
-  if (typeof boundary?.canResolve !== 'function' || typeof boundary.authorize !== 'function') invalid();
+  let resolve: SyntheticScopeBoundary['canResolve'];
+  let authorize: SyntheticScopeBoundary['authorize'];
+  try {
+    // Snapshot each possibly hostile getter/Proxy trap exactly once, inside the non-echoing boundary.
+    const resolutionMethod = boundary?.canResolve;
+    const authorizationMethod = boundary?.authorize;
+    if (typeof resolutionMethod !== 'function' || typeof authorizationMethod !== 'function') invalid();
+    resolve = (attempt) => Reflect.apply(resolutionMethod, boundary, [attempt]) as boolean | Promise<boolean>;
+    authorize = (attempt) => Reflect.apply(authorizationMethod, boundary, [attempt]) as boolean | Promise<boolean>;
+  } catch { return invalid(); }
   const findings: ScopeFinding[] = [];
   for (const vector of [...staticVectors(fixtures), ...generateSyntheticScopeVectors(fixtures)]) {
     for (const [name, expected, evaluate] of [
-      ['resolution', vector.expectedResolution, boundary.canResolve.bind(boundary)],
-      ['authorization', vector.expectedAuthorization, boundary.authorize.bind(boundary)],
+      ['resolution', vector.expectedResolution, resolve],
+      ['authorization', vector.expectedAuthorization, authorize],
     ] as const) {
       let outcome: ScopeFinding['outcome'] = 'fail';
       try {
