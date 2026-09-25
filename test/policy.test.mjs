@@ -304,6 +304,126 @@ test('duplicate matching rules, malformed profiles, and profile treatment ceilin
   }
 });
 
+test('one sensitivity matrix exercises KEEP ceiling, TOKENIZE, SYNTHETIC, review, BLOCK and secret removal', () => {
+  for (const [sensitivity, expectedState, expectedTreatment] of [
+    ['PUBLIC', 'SELECTED', 'KEEP'], ['INTERNAL', 'SELECTED', 'TOKENIZE'],
+    ['CONFIDENTIAL', 'SELECTED', 'SYNTHETIC'], ['RESTRICTED', 'HELD', 'REQUIRE_REVIEW'],
+    ['SECRET', 'DENIED', 'BLOCK'],
+  ]) {
+    const s = scenario({ sensitivity });
+    assert.equal(s.request.classification.status, 'RESOLVED');
+    expectDecision(evaluate(s), expectedState, expectedTreatment);
+  }
+  const protectedPublic = scenario({ destination: sinks.web, sensitivity: 'PUBLIC' });
+  expectDecision(evaluate(protectedPublic), 'SELECTED', 'KEEP');
+  const restrictive = scenario({ destination: sinks.web, sensitivity: 'INTERNAL' });
+  expectDecision(evaluate(restrictive), 'DENIED', 'BLOCK');
+});
+
+test('exact BLOCK rule defeats semantic KEEP and unknown context never upgrades an external sink', () => {
+  const s = scenario();
+  expectDecision(evaluate(s), 'SELECTED', 'SYNTHETIC');
+  s.policy.rules.find(r => r.id === 'enterprise-confidential-PERSON.invalid').decision = 'BLOCK';
+  s.request.semanticRecommendation = 'KEEP';
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  for (const mutate of [
+    t => { t.boundary = undefined; },
+    t => { t.policy = undefined; },
+    t => { t.request.destination.profileId = 'not-registered.invalid'; },
+    t => { t.boundary.observed.destination.trustZone = 'UNKNOWN'; },
+  ]) {
+    const attempt = scenario();
+    mutate(attempt);
+    expectDecision(evaluate(attempt), 'DENIED', 'BLOCK');
+  }
+});
+
+test('synthetic tenant variations are isolated for both policy and pending review', () => {
+  const original = scenario({ sensitivity: 'RESTRICTED' });
+  const held = evaluate(original);
+  expectDecision(held, 'HELD', 'REQUIRE_REVIEW');
+  let checked = 0;
+  for (let i = 0; i < 64; i++) {
+    const tenant = `tenant-${i}.invalid`;
+    const other = scenario({ sensitivity: 'RESTRICTED' });
+    other.request.context.tenantId = tenant;
+    other.boundary.authenticated.context.tenantId = tenant;
+    const current = evaluate(other);
+    expectDecision(current, 'HELD', 'REQUIRE_REVIEW');
+    assert.notEqual(current.decisionRef, held.decisionRef);
+    expectDecision(decideReviewedPolicy(other.request, other.boundary, other.policy, current,
+      outcome(original, held)), 'HELD', 'REQUIRE_REVIEW');
+    expectDecision(decideReviewedPolicy(other.request, other.boundary, other.policy, current,
+      outcome(other, current)), 'SELECTED', 'GENERALIZE');
+    checked++;
+  }
+  assert.equal(checked, 64);
+});
+
+test('malicious getters, proxies and unsupported input never echo planted private text', () => {
+  const planted = 'private-synthetic-value.invalid';
+  const baseline = scenario();
+  expectDecision(evaluate(baseline), 'SELECTED', 'SYNTHETIC');
+  const poisoned = scenario();
+  Object.defineProperty(poisoned.request.context, 'purpose', {
+    enumerable: true, get() { throw new Error(planted); },
+  });
+  const trapped = scenario();
+  trapped.policy = new Proxy({}, { ownKeys() { throw new Error(planted); } });
+  for (const testCase of [poisoned, trapped]) {
+    const decision = evaluate(testCase);
+    expectDecision(decision, 'DENIED', 'BLOCK');
+    assert.equal(JSON.stringify(decision).includes(planted), false);
+  }
+});
+
+test('same ID/version rule substitution cannot turn independently trusted BLOCK into KEEP', () => {
+  const s = scenario({ sensitivity: 'PUBLIC' });
+  s.policy.rules.find(r => r.id === 'enterprise-public-PERSON.invalid').decision = 'BLOCK';
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+  // After this approved snapshot, attacker swaps only policy CONTENT; both labels stay unchanged.
+  s.policy.rules.find(r => r.id === 'enterprise-public-PERSON.invalid').decision = 'KEEP';
+  expectDecision(evaluate(s), 'DENIED', 'BLOCK');
+});
+
+test('object reflection uses one capped own-key snapshot before descriptor access', () => {
+  const oneShot = scenario();
+  let ownKeysCalls = 0;
+  oneShot.request = new Proxy(oneShot.request, {
+    ownKeys(target) {
+      if (++ownKeysCalls !== 1) throw new Error('second-reflection.invalid');
+      return Reflect.ownKeys(target);
+    },
+  });
+  expectDecision(evaluate(oneShot), 'SELECTED', 'SYNTHETIC');
+  assert.equal(ownKeysCalls, 1);
+  const overflowing = scenario();
+  let descriptorCalls = 0;
+  overflowing.request = new Proxy(overflowing.request, {
+    ownKeys(target) { return [...Reflect.ownKeys(target), ...Array.from({ length: 65 }, (_, i) => `extra-${i}`)]; },
+    getOwnPropertyDescriptor(target, key) {
+      descriptorCalls++;
+      return Reflect.getOwnPropertyDescriptor(target, key) ?? { configurable: true, enumerable: true,
+        writable: true, value: 'synthetic.invalid' };
+    },
+  });
+  expectDecision(evaluate(overflowing), 'DENIED', 'BLOCK');
+  assert.equal(descriptorCalls, 0, 'oversized object rejects before reflecting descriptors');
+});
+
+test('array validation snapshots descriptor length rather than trusting a changing Proxy length', () => {
+  const s = scenario();
+  let lengthGets = 0;
+  s.policy.rules = new Proxy(s.policy.rules, {
+    get(target, key, receiver) {
+      if (key === 'length') return ++lengthGets === 1 ? target.length : 1_000_000;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  expectDecision(evaluate(s), 'SELECTED', 'SYNTHETIC');
+  assert.equal(lengthGets, 0, 'array length property reads cannot extend validation loop');
+});
+
 test('decisions replay exactly from durable non-secret policy/context/classification, regardless rule order', () => {
   const s = scenario({ destination: sinks.enterprise, sensitivity: 'RESTRICTED' });
   const held = evaluate(s);
