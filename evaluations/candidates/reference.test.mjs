@@ -145,6 +145,42 @@ test("JSON Unicode-escaped duplicate effective outputPath blocks instead of part
   assert.equal(result.taskResponse, undefined);
 });
 
+test("stateful ID getter cannot echo protected-looking text in BLOCK events", () => {
+  const unsafeId = "DEMO-NONLIVE-TOKEN-NOT-VALID";
+  let reads = 0;
+  const field = { text: `token=${unsafeId}`, get id() { return ++reads === 1 ? "f0" : unsafeId; } };
+  const result = run([field]);
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.events.length, 0, "reject accessor before generating event references");
+  assert.equal(result.transformedFields, undefined);
+  assert.ok(!JSON.stringify(result).includes(unsafeId), "no field identifier echoed by BLOCK");
+  assert.equal(reads, 0, "snapshot must not invoke a source getter");
+});
+
+test("stateful text getter cannot swap benign scan for secret-bearing transform", () => {
+  const unsafeText = "token=DEMO-NONLIVE-TOKEN-NOT-VALID";
+  let reads = 0;
+  const field = { id: "f0", get text() { return ++reads <= 3 ? "status=ok" : unsafeText; } };
+  const result = run([field]);
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.events.length, 0);
+  assert.equal(result.transformedFields, undefined);
+  assert.ok(!JSON.stringify(result).includes(unsafeText), "no late text getter output");
+  assert.equal(reads, 0, "snapshot must not invoke a source getter");
+});
+
+test("inconsistent Proxy field descriptors cannot supply unsnapshotted references", () => {
+  const field = new Proxy({ id: "f0", text: "health=ok" }, {
+    getOwnPropertyDescriptor(target, key) {
+      return key === "id" ? undefined : Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  const result = run([field]);
+  assert.equal(result.disposition, "BLOCK");
+  assert.equal(result.events.length, 0);
+  assert.equal(result.transformedFields, undefined);
+});
+
 test("fixture-authored profiles, policy claims and extra fields are not candidate inputs", () => {
   const result = runReferenceCandidate({
     sinkId,
