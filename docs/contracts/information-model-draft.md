@@ -24,7 +24,7 @@ Checked properties: `effective` never falls below any valid deterministic claim;
 
 ## Task fidelity
 
-A fidelity contract belongs to a **task** and is keyed by occurrence or entity refs, so it answers "per candidate, per task, or both" with both. Its author is an independent task owner, never the payload or the model. `validateTaskFidelityContractDraft` requires opaque prefixed refs (`task-…`, `occ-…`, `entity-…`, lower-case, no dots, colons or underscores), unique targets, known predicates, and `NOT_REQUIRED` only on its own. The ref grammar rejects hostnames, IPs, URLs and typical key formats, but it cannot prove that a well-formed ref holds no protected value.
+A fidelity contract belongs to a **task** and is keyed by occurrence or entity refs, so it answers "per candidate, per task, or both" with both. Its author is an independent task owner, never the payload or the model. `validateTaskFidelityContractDraft` requires opaque prefixed refs (`task-…`, `occ-…`, `entity-…`, lower-case, no dots, colons or underscores), unique targets, known predicates, and `NOT_REQUIRED` only on its own. The ref grammar rejects dotted hostnames and IPs, URLs and `_`/`:`-separated key formats, but it cannot prove that a well-formed ref holds no protected value.
 
 | Predicate | Meaning | Forms that can satisfy it |
 | --- | --- | --- |
@@ -40,7 +40,7 @@ A fidelity contract belongs to a **task** and is keyed by occurrence or entity r
 
 `WITHHELD` (BLOCK/REQUIRE_REVIEW) satisfies only `NOT_REQUIRED`. Representations hint at existing treatments: EXACT→KEEP, IDENTITY_SYNTHETIC→SYNTHETIC, OPAQUE_TOKEN→TOKENIZE, SEMANTIC_PLACEHOLDER→MASK, GENERALIZED→GENERALIZE, REMOVED→REMOVE.
 
-`assessFidelityDraft(predicates, sensitivity)` takes a resolved `effective` sensitivity and returns the forms that satisfy every predicate, any unmet predicates, whether the secret ceiling applied, and advice. The ceiling SEMANTIC_PLACEHOLDER/REMOVED/WITHHELD applies to `SECRET` **and** to `UNKNOWN`, so an unresolved record never gets wider forms. An `EXACT_VALUE` requirement under that ceiling returns `USE_WITHOUT_REVEAL`: a trusted local effect uses the credential and the model sees only the outcome, such as `401`. `UNMET_WITHIN_CEILING` means review or a local effect is the remedy; it never means widening release. Checked properties: results under the ceiling stay within it, and an added predicate never enlarges the satisfying set (true by construction). The result carries no treatment or decision field.
+`assessFidelityDraft(predicates, effectiveSensitivity)` takes a resolution's `effective` sensitivity (never `highestConcern`) and returns the forms that satisfy every predicate, any unmet predicates, whether the secret ceiling applied, and advice. The ceiling SEMANTIC_PLACEHOLDER/REMOVED/WITHHELD applies to `SECRET` **and** to `UNKNOWN`, so an unresolved record never gets wider forms. An `EXACT_VALUE` requirement under that ceiling returns `USE_WITHOUT_REVEAL`: a trusted local effect uses the credential and the model sees only the outcome, such as `401`. `UNMET_WITHIN_CEILING` means review or a local effect is the remedy; it never means widening release. Checked properties: results under the ceiling stay within it, and an added predicate never enlarges the satisfying set (true by construction). The result carries no treatment or decision field.
 
 ## Semantic placeholders
 

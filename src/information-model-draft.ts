@@ -254,7 +254,9 @@ export interface FidelityAssessmentDraft {
  * Pure fidelity cost information for policy and evaluation. Fidelity can raise the cost of a
  * restrictive treatment; it never widens what policy permits and it never yields a treatment.
  */
-export function assessFidelityDraft(predicates: unknown, sensitivity: unknown): FidelityAssessmentDraft {
+export function assessFidelityDraft(predicates: unknown, effectiveSensitivity: unknown): FidelityAssessmentDraft {
+  // Pass a resolution's `effective`, never `highestConcern`: only `effective` is UNKNOWN when unresolved.
+  const sensitivity = effectiveSensitivity;
   const wanted = predicateList(predicates);
   if (!wanted || !inSet(sensitivity, [...SENSITIVITIES, 'UNKNOWN'] as const)) throw new TypeError('Invalid fidelity request');
   // Unknown or unresolved sensitivity gets the secret ceiling: uncertainty never widens forms.
@@ -271,7 +273,7 @@ export function assessFidelityDraft(predicates: unknown, sensitivity: unknown): 
   });
 }
 
-/* ---------- Semantic placeholders: typed, unambiguously synthetic, not reversible ---------- */
+/* ---------- Semantic placeholders: typed and not reversible; not self-authenticating ---------- */
 
 const PLACEHOLDER = /^\[hylja:protected:([A-Z][A-Z0-9_]{0,63})\]$/u;
 /**
