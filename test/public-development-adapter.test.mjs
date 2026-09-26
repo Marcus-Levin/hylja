@@ -137,6 +137,114 @@ test('D02 nonlive credential BLOCK makes zero sends and never solves its task', 
   assert.equal(untested(report, 'secret-plaintext-escape').outcome, undefined);
 });
 
+// Characterize the exposed DEV reference, not an approved destination treatment or a scored D02 run.
+// Test-local labels/treatments are development hypotheses, not independently approved truth.
+// The test locates values in public source text; it loads no separate oracle and never uses
+// candidate output to set expected answers. A human must review any treatment before scoring.
+test('D02 without only the token reaches local capture but exposes known account/trace misses and no task answer', async () => {
+  const fixture = publicFixture('D02-DEV-001');
+  const tokenAssignment = ' token=DEMO-NONLIVE-TOKEN-NOT-VALID';
+  assert.equal(fixture.input.lines[0].endsWith(tokenAssignment), true);
+  fixture.input.lines[0] = fixture.input.lines[0].slice(0, -tokenAssignment.length);
+  fixture.fixtureId = 'D02-DEV-NONSECRET';
+  assert.equal(fixture.input.lines.length, 4);
+  const specs = [
+    [0, 'demo.operator', 'USER_ACCOUNT', 'ACCOUNT_NAME', 'CONFIDENTIAL', 'MASK'],
+    [0, 'diag-node.example.invalid', 'HOST_OR_SERVICE', 'HOSTNAME', 'CONFIDENTIAL', 'SYNTHETIC'],
+    [0, '192.0.2.17', 'NETWORK_IDENTIFIER', 'IP', 'CONFIDENTIAL', 'SYNTHETIC'],
+    [0, 'TRACE-DEMO-02', 'APPLICATION_OR_ENVIRONMENT', 'CORRELATION_ID', 'INTERNAL', 'MASK'],
+    [1, 'diag-node.example.invalid', 'HOST_OR_SERVICE', 'HOSTNAME', 'CONFIDENTIAL', 'SYNTHETIC'],
+  ];
+  const occurrences = specs.map(([index, value, semanticType, subtype, sensitivity, treatment], ordinal) => {
+    const source = fixture.input.lines[index];
+    const position = source.indexOf(value);
+    assert.ok(position >= 0 && source.lastIndexOf(value) === position);
+    const start = bytes(source.slice(0, position)).length;
+    return { id: `test-plant-${ordinal}`, fieldRef: `field-${index}`, start,
+      end: start + bytes(value).length, value, semanticType, subtype, sensitivity,
+      trust: 'UNTRUSTED', critical: false,
+      expectedBySink: [{ sinkId: localSink.id, treatment }] };
+  });
+  const run = setup('D02-DEV-001', { fixture,
+    oracle: { version: 1, caseId: fixture.fixtureId, occurrences,
+      taskExpected: 'test-only-diagnostic-control' } });
+  let candidateEvents;
+  const result = await run.run({ candidate(input) {
+    assert.equal(input.taskPrompt, fixture.taskControl.prompt);
+    assert.equal(input.fields.length, 4);
+    const output = runReferenceCandidate(input);
+    candidateEvents = output.events;
+    return output;
+  } });
+  assert.deepEqual(result, { disposition: 'TRANSFORMED' });
+  const captures = run.capture.forCase(fixture.fixtureId);
+  assert.equal(captures.length, 1);
+  const serializedBody = decode(captures[0].body);
+  const serializedMetadata = decode(captures[0].metadata);
+  // Malformed candidate/capture text must not become an echoed AssertionError or JSON parser error.
+  const parseWithoutEcho = (text) => {
+    try { return JSON.parse(text); } catch { assert.fail('invalid captured D02 JSON'); }
+  };
+  const body = parseWithoutEcho(serializedBody);
+  assert.equal(Array.isArray(body?.fields) && body.fields.length === 4 &&
+    body.fields.every((field) => typeof field?.text === 'string'), true);
+  assert.equal(parseWithoutEcho(serializedMetadata)?.profileId === localSink.profileId, true);
+  const first = body.fields[0].text;
+  const second = body.fields[1].text;
+  // These are KNOWN synthetic misses in this ineligible reference, not permitted egress.
+  assert.equal(first.includes('demo.operator'), true);
+  assert.equal(first.includes('TRACE-DEMO-02'), true);
+  for (const original of ['diag-node.example.invalid', '192.0.2.17']) {
+    assert.equal(serializedBody.includes(original), false);
+    assert.equal(serializedMetadata.includes(original), false);
+  }
+  for (const original of ['demo.operator', 'TRACE-DEMO-02']) {
+    assert.equal(serializedMetadata.includes(original), false);
+  }
+  const host = /\bhost=([^\s]+)/u.exec(first)?.[1];
+  const ip = /\bip=([^\s]+)/u.exec(first)?.[1];
+  const request = /\brequest=(https:\/\/[^\s]+)/u.exec(second)?.[1];
+  assert.equal(typeof host === 'string' && typeof ip === 'string' && typeof request === 'string', true);
+  // A consistent non-routable host and a distinct documentation-range IPv4 are DEV structure,
+  // not a claim that this output has passed destination policy or every leakage representation.
+  assert.equal(/^(?:[a-z0-9-]+\.)+invalid$/u.test(host) && host !== 'diag-node.example.invalid', true);
+  assert.equal(/^(?:192\.0\.2|198\.51\.100|203\.0\.113)\.\d{1,3}$/u.test(ip) &&
+    Number(ip.split('.').at(-1)) <= 255 && ip !== '192.0.2.17', true);
+  let url;
+  try { url = new URL(request); } catch { assert.fail('invalid captured D02 URL'); }
+  assert.equal(url.protocol === 'https:' && Number(url.port || 443) === 443 &&
+    url.pathname === '/health' && url.hostname === host, true);
+  assert.equal(second.includes('expected_service_port=8443'), true);
+  assert.equal(body.fields[3].text.startsWith('payload='), true);
+  const payload = parseWithoutEcho(body.fields[3].text.slice('payload='.length));
+  assert.equal(payload?.attempt?.scheme === 'https' && payload.attempt.port === 443 &&
+    payload?.expected?.port === 8443, true);
+  for (const [index, value] of [
+    [1, 'https://'], [1, ':443/health'], [1, 'expected_service_port=8443'],
+    [2, 'ProxyDial.demo:12'], [3, '"port":443'], [3, '"port":8443'],
+  ]) {
+    const source = fixture.input.lines[index];
+    const position = source.indexOf(value);
+    assert.ok(position >= 0 && source.lastIndexOf(value) === position);
+    const start = bytes(source.slice(0, position)).length;
+    const end = start + bytes(value).length;
+    assert.equal(candidateEvents.some((event) => event.fieldId === `f${index}` &&
+      event.startByte < end && event.endByte > start), false, 'technical control must not be cloaked');
+  }
+  let gradeCalls = 0;
+  const report = run.evaluation.report(fixture.fixtureId, run.capture, () => { gradeCalls++; return true; });
+  assert.deepEqual(report.candidates, { planted: 5, matched: 1, misses: 4,
+    falsePositives: 2, recall: 1 / 5, precision: 1 / 3 });
+  assert.equal(report.utility.taskCorrect, null);
+  assert.equal(gradeCalls, 0, 'no D02 task response exists for the grader to approve');
+  assert.equal(untested(report, 'task-correctness').reason, 'no-task-result');
+  assert.equal(report.privacy.secretPlanted, 0);
+  assert.equal(observed(report, 'secret-plaintext-escape'), undefined);
+  assert.equal(untested(report, 'secret-plaintext-escape').reason, 'no-secret-control');
+  assert.equal(JSON.stringify(report).includes('demo.operator'), false);
+  assert.equal(JSON.stringify(report).includes('TRACE-DEMO-02'), false);
+});
+
 test('D05 task from candidate-visible config/prompt yields valid edit and final body+metadata capture', async () => {
   const run = setup('D05-DEV-001');
   let candidateInput;
