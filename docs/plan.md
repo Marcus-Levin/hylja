@@ -83,6 +83,8 @@ Goal: local synthetic text request -> deterministic and configured candidate gen
 
 Initial categories: PERSON (including EMAIL/PHONE), CREDENTIAL_OR_SECRET, HOST, IP/URL, CUSTOMER/PROJECT. PERSON/EMAIL/PHONE must have an explicit candidate source and synthetic acceptance cases; shadow judgment is not that source.
 
+Bounded, **NON-ENFORCING** #7 parsers exist in [`src/structured-parsers.ts`](../src/structured-parsers.ts). They cover JSON (with spans), dotenv/shell assignments, INI, URLs, connection strings (key=value and URI forms) and log header/key=value lines. Each emits fields with key paths, source spans, decoded values and a credential-key flag. Malformed or over-budget input is a whole-input `FAILURE`; unrecognized dotenv/INI lines are opaque (`PARTIAL`); log parsing is fields-only; YAML, TOML and XML are `UNSUPPORTED` (opaque). `rewriteFieldValues` re-encodes replacements for each value's syntax and re-parses to verify keys and values, failing rather than passing the original through. The parsers are not yet wired to #6 normalization, #8 detectors or #13 transformation.
+
 No production vault yet beyond minimal development fixture state. No unverified hosted semantic request, opaque protected content, or unchecked stream is silently released; this slice is not a production traffic claim.
 
 Primary issues: #6-#13, #19, and #37 (PERSON/EMAIL/PHONE candidate source).
