@@ -174,3 +174,65 @@ test('detection fold removes invisible characters and maps compatibility forms w
   assert.throws(() => mapFoldedSpan(fold, 3, 3), RangeError);
   assert.throws(() => foldForDetection(7), TypeError);
 });
+
+test('review regressions: binary-wrapped text is reached as TEXT or STRINGS, never hidden under COMPLETE', () => {
+  const bytes = (...parts) => Buffer.concat(parts.map((p) => typeof p === 'string' ? Buffer.from(p, 'utf8') : Buffer.from(p)));
+  const cases = [
+    bytes([0], MARKER), bytes(MARKER, [0]), bytes('\x1b[1m', MARKER), bytes([0xff], MARKER), Buffer.from(MARKER, 'utf16le'),
+  ].map((raw) => `v=${raw.toString('base64')}`);
+  cases.push(`id=ff${hex(MARKER)}`, `id=cafe${hex(MARKER)}`, `q=%ff%00${[...Buffer.from(MARKER)].map((b) => `%${b.toString(16)}`).join('')}`,
+    `name=%E9${pct(MARKER)}`);
+  for (const input of cases) {
+    const result = normalizeInput(input);
+    assert.ok(reachable(result) || result.status === 'PARTIAL', input);
+    assert.ok(reachable(result), input);
+  }
+});
+
+test('review regressions: misaligned, odd, concatenated, wrapped and short encodings are decoded', () => {
+  const wrapped = b64(`line one ${MARKER} ${'é'.repeat(40)} end`).match(/.{1,76}/gu).join('\r\n');
+  for (const input of [
+    `GET /files/${b64(MARKER)} HTTP/1.1`, `https://api.example.com/v1/token/${b64(MARKER)}`, `a+${b64(MARKER)}`,
+    `${b64(`${MARKER}ab`)}A`, `id=a${hex(MARKER)}`, `${b64(`${MARKER}a`)}${b64('z')}`, `-----\n${wrapped}\n-----`,
+  ]) assert.ok(reachable(normalizeInput(input)), input);
+  // Short Basic credentials (12+ characters) are decoded for detectors.
+  const basic = normalizeInput(`Authorization: Basic ${b64('user:pass')}`);
+  assert.ok(basic.views.some((v) => v.text === 'user:pass'));
+});
+
+test('review regressions: uninspected spans are capped and budgets collapse to one span', () => {
+  const many = Array.from({ length: 100_000 }, (_, i) => `%41${i}`).join(' ');
+  const result = normalizeInput(many, { maxViews: 2 });
+  assert.equal(result.status, 'PARTIAL');
+  assert.ok(result.uninspected.length <= 1024);
+  assert.ok(result.reasons.includes('VIEW_LIMIT'));
+  const work = normalizeInput(`${b64(MARKER)} ${b64(MARKER + 'x')}`, { maxDecodeWork: 10 });
+  assert.equal(work.status, 'PARTIAL');
+  assert.deepEqual(work.reasons, ['WORK_LIMIT']);
+  assert.equal(work.uninspected[0].end, work.views[0].text.length);
+});
+
+test('review regressions: budget keys, BOM, fold ordering and size, sniff hints', () => {
+  for (const budget of [{ constructor: 5 }, { toString: 3 }, { hasOwnProperty: 1 }]) {
+    assert.deepEqual(normalizeInput('x', budget).reasons, ['INVALID_BUDGET']);
+  }
+  assert.equal(normalizeInput(Uint8Array.from([0xef, 0xbb, 0xbf, 0x61])).views[0].text, '﻿a');
+  const fold = foldForDetection('o­́k');
+  assert.equal(fold.text, 'ók');
+  assert.deepEqual(mapFoldedSpan(fold, 0, 1), { start: 0, end: 3 });
+  assert.throws(() => foldForDetection('x'.repeat(DEFAULT_BUDGET.maxInputUnits + 1)), RangeError);
+  assert.equal(sniffContentType('<b>hi'), 'TEXT');
+  assert.equal(sniffContentType('\x1b[32mINFO\x1b[0m started\n\x1b[31mERROR\x1b[0m failed'), 'TEXT');
+});
+
+test('property: a random single-byte binary prefix never hides a planted marker under COMPLETE', () => {
+  const random = prng(0x6060);
+  for (let run = 0; run < 300; run++) {
+    const marker = `${MARKER}-${run}`;
+    const raw = Buffer.concat([Buffer.from([Math.floor(random() * 256)]), Buffer.from(marker)]);
+    const encoded = [raw.toString('base64'), raw.toString('base64url'), raw.toString('hex'),
+      [...raw].map((b) => `%${b.toString(16).padStart(2, '0')}`).join('')][Math.floor(random() * 4)];
+    const result = normalizeInput(`x=${encoded} y`);
+    assert.ok(reachable(result, marker) || result.status === 'PARTIAL', encoded);
+  }
+});

@@ -3,6 +3,10 @@
  * original text as the root view, bounded decoded views of Base64/percent/hex runs with provenance, a
  * content-type *hint*, and an explicit record of everything it did not inspect. Anything uninspected makes
  * the result PARTIAL, which policy must treat as opaque, never as clean.
+ *
+ * Scope limits (not decoded here, owned by #7 parsers or #8 detectors): JSON/JS `\uXXXX`/`\xNN` escapes,
+ * colon-separated hex, HTML entities, `+`-as-space form encoding, quoted-printable, compression and archives.
+ * Minimum candidate lengths: Base64 12 characters, hex 16 digits (8 bytes).
  */
 
 export const ENCODINGS = ['ROOT', 'BASE64', 'BASE64URL', 'PERCENT', 'HEX'] as const;
@@ -19,21 +23,31 @@ export interface NormalizationBudget {
   maxDecodedUnits: number;
   /** Maximum number of decoded views. */
   maxViews: number;
+  /** Maximum total encoded code units fed to decoders, including runs that decode to nothing useful. */
+  maxDecodeWork: number;
 }
 export const DEFAULT_BUDGET: Readonly<NormalizationBudget> = Object.freeze({
-  maxInputUnits: 1 << 20, maxDepth: 3, maxDecodedUnits: 1 << 20, maxViews: 256,
+  maxInputUnits: 1 << 20, maxDepth: 3, maxDecodedUnits: 1 << 20, maxViews: 256, maxDecodeWork: 4 << 20,
 });
 const HARD_LIMITS: Readonly<NormalizationBudget> = Object.freeze({
-  maxInputUnits: 16 << 20, maxDepth: 8, maxDecodedUnits: 16 << 20, maxViews: 4096,
+  maxInputUnits: 16 << 20, maxDepth: 8, maxDecodedUnits: 16 << 20, maxViews: 4096, maxDecodeWork: 64 << 20,
 });
 /** Longest single encoded run considered for decoding; longer runs are recorded as uninspected. */
 const MAX_RUN = 1 << 16;
+/** Extra decode starts tried inside one Base64 run (after `/` or `+`), for runs glued to a path or prefix. */
+const MAX_INNER_STARTS = 16;
+/** Uninspected spans kept before collapsing into one truncation reason. */
+const MAX_UNINSPECTED = 1024;
+/** Printable runs shorter than this inside binary decodes are noise, not text. */
+const MIN_STRING = 8;
 
 export interface NormalizedView {
   id: number;
   /** Parent view id; null for the root. */
   parent: number | null;
   encoding: Encoding;
+  /** TEXT: the decode is text. STRINGS: printable runs extracted from a binary decode, joined by newlines. */
+  form: 'TEXT' | 'STRINGS';
   depth: number;
   /** UTF-16 span of the encoded run inside the parent view's text; the whole run maps to the decoded view. */
   parentStart: number;
@@ -44,16 +58,20 @@ export interface UninspectedSpan {
   viewId: number;
   start: number;
   end: number;
-  reason: 'DEPTH_LIMIT' | 'EXPANSION_LIMIT' | 'VIEW_LIMIT' | 'RUN_TOO_LONG';
+  reason: 'DEPTH_LIMIT' | 'EXPANSION_LIMIT' | 'VIEW_LIMIT' | 'RUN_TOO_LONG' | 'WORK_LIMIT';
 }
 export interface NormalizationResult {
-  /** COMPLETE: every candidate run was decoded or proved non-text. PARTIAL: see `uninspected`. */
+  /**
+   * COMPLETE: no budget was exceeded, and every candidate run (at the minimum lengths above) was decoded to
+   * a TEXT or STRINGS view or held no printable run. COMPLETE is not "clean": out-of-scope encodings remain
+   * only in their parent view, where detectors still scan them. PARTIAL: see `uninspected`/`reasons`.
+   */
   status: 'COMPLETE' | 'PARTIAL' | 'FAILURE';
   reasons: readonly string[];
   contentType: ContentType | 'UNKNOWN';
   views: readonly NormalizedView[];
   uninspected: readonly UninspectedSpan[];
-  /** Encoded-looking runs that decoded to non-text bytes; the original run stays in its parent view. */
+  /** Encoded-looking runs that decoded to bytes without any printable run; the run stays in its parent. */
   binaryDecodes: number;
 }
 
@@ -67,7 +85,7 @@ function budgetFrom(raw: unknown): NormalizationBudget | null {
   const result = { ...DEFAULT_BUDGET };
   try {
     for (const key of Object.keys(raw)) {
-      if (!(key in DEFAULT_BUDGET)) return null;
+      if (!Object.hasOwn(DEFAULT_BUDGET, key)) return null;
       const value: unknown = (raw as Record<string, unknown>)[key];
       const name = key as keyof NormalizationBudget;
       if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > HARD_LIMITS[name]) return null;
@@ -77,99 +95,147 @@ function budgetFrom(raw: unknown): NormalizationBudget | null {
   return result;
 }
 
-/* ---------- Decoders (fatal: invalid bytes are never replaced) ---------- */
+/* ---------- Decoders (strict: invalid bytes are never silently replaced in TEXT views) ---------- */
 
-const utf8 = new TextDecoder('utf-8', { fatal: true });
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+const lenient = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
+const utf16 = new TextDecoder('utf-16le', { fatal: false, ignoreBOM: true });
 const encoder = new TextEncoder();
-const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-/** Text a detector can read: valid UTF-8 with no controls other than tab/newline/carriage return. */
-function asText(bytes: Uint8Array): string | null {
-  let text: string;
-  try { text = utf8.decode(bytes); } catch { return null; }
-  return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(text) || !text.length ? null : text;
+const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
+const NOT_PRINTABLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f�]+/u;
+const BASE64_VALUES = new Int16Array(128).fill(-1);
+'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.split('').forEach((char, index) => {
+  BASE64_VALUES[char.charCodeAt(0)] = index;
+});
+
+/**
+ * Classify decoded bytes: strict UTF-8 text; else UTF-16LE text when every other byte is mostly zero;
+ * else the printable runs (>= MIN_STRING) as STRINGS; else null (no printable content).
+ */
+function readable(bytes: Uint8Array): { text: string; form: NormalizedView['form'] } | null {
+  if (!bytes.length) return null;
+  try {
+    const text = utf8.decode(bytes);
+    if (!CONTROL.test(text)) return { text, form: 'TEXT' };
+  } catch { /* not strict UTF-8 */ }
+  if (bytes.length >= 2 * MIN_STRING && bytes.length % 2 === 0) {
+    let zeros = 0;
+    for (let index = 1; index < bytes.length; index += 2) if (bytes[index] === 0) zeros++;
+    if (zeros >= bytes.length / 2 * 0.8) {
+      const text = utf16.decode(bytes);
+      if (!CONTROL.test(text) && !text.includes('�')) return { text, form: 'TEXT' };
+    }
+  }
+  const strings = lenient.decode(bytes).split(NOT_PRINTABLE).filter((piece) => piece.length >= MIN_STRING);
+  return strings.length ? { text: strings.join('\n'), form: 'STRINGS' } : null;
 }
 function decodeBase64(run: string, url: boolean): Uint8Array | null {
-  const standard = url ? run.replace(/-/gu, '+').replace(/_/gu, '/') : run;
-  const padded = standard.padEnd(Math.ceil(standard.length / 4) * 4, '=');
-  if (padded.length % 4 !== 0 || /=[^=]/u.test(padded) || /={3,}$/u.test(padded)) return null;
-  const bytes: number[] = [];
-  let buffer = 0, bits = 0;
-  for (const char of padded) {
-    if (char === '=') break;
-    const value = BASE64_ALPHABET.indexOf(char);
+  const body = run.replace(/[\r\n \t]/gu, '').replace(/=+$/u, '');
+  const usable = body.length - (body.length % 4 === 1 ? 1 : 0);
+  const bytes = new Uint8Array(Math.floor(usable * 3 / 4));
+  let buffer = 0, bits = 0, out = 0;
+  for (let index = 0; index < usable; index++) {
+    let code = body.charCodeAt(index);
+    if (url) code = code === 45 ? 43 : code === 95 ? 47 : code;
+    const value = code < 128 ? BASE64_VALUES[code]! : -1;
     if (value < 0) return null;
-    buffer = (buffer << 6) | value;
+    buffer = ((buffer << 6) | value) & 0xffffff;
     bits += 6;
-    if (bits >= 8) { bits -= 8; bytes.push((buffer >> bits) & 0xff); }
+    if (bits >= 8) { bits -= 8; bytes[out++] = (buffer >> bits) & 0xff; }
   }
-  return Uint8Array.from(bytes);
+  return bytes.subarray(0, out);
 }
 function decodeHex(run: string): Uint8Array {
-  const bytes = new Uint8Array(run.length / 2);
-  for (let index = 0; index < bytes.length; index++) bytes[index] = parseInt(run.slice(index * 2, index * 2 + 2), 16);
+  const bytes = new Uint8Array(run.length >> 1);
+  for (let index = 0; index < bytes.length; index++) bytes[index] = parseInt(run.substr(index * 2, 2), 16);
   return bytes;
+}
+function hexValue(code: number): number {
+  return code >= 48 && code <= 57 ? code - 48 : code >= 65 && code <= 70 ? code - 55 : code >= 97 && code <= 102 ? code - 87 : -1;
 }
 function decodePercent(run: string): Uint8Array {
   const bytes: number[] = [];
   for (let index = 0; index < run.length;) {
-    if (run[index] === '%' && /^[0-9A-Fa-f]{2}$/u.test(run.slice(index + 1, index + 3))) {
-      bytes.push(parseInt(run.slice(index + 1, index + 3), 16));
-      index += 3;
-    } else {
-      // Non-escaped characters pass through as their UTF-8 bytes.
-      const point = run.codePointAt(index)!;
-      const char = String.fromCodePoint(point);
-      for (const byte of encoder.encode(char)) bytes.push(byte);
-      index += char.length;
+    const code = run.charCodeAt(index);
+    if (code === 37 && index + 2 < run.length) {
+      const high = hexValue(run.charCodeAt(index + 1)), low = hexValue(run.charCodeAt(index + 2));
+      if (high >= 0 && low >= 0) { bytes.push(high * 16 + low); index += 3; continue; }
     }
+    if (code < 128) { bytes.push(code); index++; continue; }
+    const char = String.fromCodePoint(run.codePointAt(index)!);
+    for (const byte of encoder.encode(char)) bytes.push(byte);
+    index += char.length;
   }
   return Uint8Array.from(bytes);
 }
 
-// Bounded run patterns; lookarounds make each run maximal so one run is considered once.
-const BASE64_RUN = /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{16,}={0,2}(?![A-Za-z0-9+/=])/gu;
-const BASE64URL_RUN = /(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[_-])[A-Za-z0-9_-]{16,}={0,2}(?![A-Za-z0-9_=-])/gu;
-const HEX_RUN = /(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){8,}(?![0-9A-Fa-f])/gu;
+/* ---------- Candidate runs ---------- */
+
+// A Base64 run may end at its padding even when another run follows (concatenated segments).
+const BASE64_RUN = /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{12,}(?:={1,2}|(?![A-Za-z0-9+/=]))/gu;
+// Line-wrapped (MIME/PEM-style) Base64: two or more full lines joined into one logical run.
+const BASE64_WRAPPED = /(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{16,}\r?\n[ \t]*){1,4096}[A-Za-z0-9+/]{4,}={0,2}(?![A-Za-z0-9+/=])/gu;
+const BASE64URL_RUN = /(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[_-])[A-Za-z0-9_-]{12,}={0,2}(?![A-Za-z0-9_=-])/gu;
+const HEX_RUN = /(?<![0-9A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Fa-f])/gu;
 // Percent runs: whole whitespace/quote-delimited tokens that contain an escape (linear: no backtracking).
 const TOKEN_RUN = /[^\s"'<>`]+/gu;
 const PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/u;
 
-interface Run { start: number; end: number; encoding: Exclude<Encoding, 'ROOT'> }
+interface Run { start: number; end: number; encoding: Exclude<Encoding, 'ROOT'>; decode: () => Uint8Array | null }
 function runs(text: string): Run[] {
   const found: Run[] = [];
+  const add = (start: number, end: number, encoding: Run['encoding'], decode: () => Uint8Array | null): void => {
+    found.push({ start, end, encoding, decode });
+  };
   for (const match of text.matchAll(TOKEN_RUN)) {
-    if (PERCENT_ESCAPE.test(match[0])) found.push({ start: match.index, end: match.index + match[0].length, encoding: 'PERCENT' });
+    if (PERCENT_ESCAPE.test(match[0])) add(match.index, match.index + match[0].length, 'PERCENT', () => decodePercent(match[0]));
   }
-  for (const [pattern, encoding] of [[HEX_RUN, 'HEX'], [BASE64_RUN, 'BASE64'], [BASE64URL_RUN, 'BASE64URL']] as const) {
-    for (const match of text.matchAll(pattern)) {
-      found.push({ start: match.index, end: match.index + match[0].length, encoding });
+  for (const match of text.matchAll(HEX_RUN)) {
+    const value = match[0], start = match.index, end = start + value.length;
+    if (value.length % 2 === 0) add(start, end, 'HEX', () => decodeHex(value));
+    else {
+      // Odd length: a stray nibble at either end; try both parities.
+      add(start + 1, end, 'HEX', () => decodeHex(value.slice(1)));
+      add(start, end - 1, 'HEX', () => decodeHex(value.slice(0, -1)));
     }
+  }
+  for (const match of text.matchAll(BASE64_RUN)) {
+    const value = match[0], start = match.index;
+    add(start, start + value.length, 'BASE64', () => decodeBase64(value, false));
+    // A path or `+` prefix glued to the run misaligns it; also decode from after each `/` or `+`.
+    let inner = 0;
+    for (let index = 0; index < value.length - 12 && inner < MAX_INNER_STARTS; index++) {
+      if (value[index] !== '/' && value[index] !== '+') continue;
+      const rest = value.slice(index + 1);
+      add(start + index + 1, start + value.length, 'BASE64', () => decodeBase64(rest, false));
+      inner++;
+    }
+  }
+  for (const match of text.matchAll(BASE64_WRAPPED)) {
+    const value = match[0];
+    add(match.index, match.index + value.length, 'BASE64', () => decodeBase64(value, false));
+  }
+  for (const match of text.matchAll(BASE64URL_RUN)) {
+    const value = match[0];
+    add(match.index, match.index + value.length, 'BASE64URL', () => decodeBase64(value, true));
   }
   return found.sort((a, b) => a.start - b.start || a.end - b.end);
 }
-function decodeRun(text: string, encoding: Run['encoding']): Uint8Array | null {
-  switch (encoding) {
-    case 'HEX': return decodeHex(text);
-    case 'PERCENT': return decodePercent(text);
-    case 'BASE64': return decodeBase64(text, false);
-    case 'BASE64URL': return decodeBase64(text, true);
-  }
-}
 
-/* ---------- Content-type hint (parsers verify; this never authorizes anything) ---------- */
+/* ---------- Content-type hint (parsers verify; this never authorizes or skips anything) ---------- */
 
+/** A hint only. Only JSON is verified by parsing. `BINARY_LIKE` never means "skip text detection". */
 export function sniffContentType(text: string): ContentType {
   const sample = text.slice(0, 1 << 16);
   const trimmed = sample.trim();
   if (!trimmed) return 'TEXT';
-  const controls = (sample.match(/[\u0000-\u0008\u000e-\u001f]/gu) ?? []).length;
+  // ESC is common in ANSI-coloured logs and is not counted as binary.
+  const controls = (sample.match(/[\u0000-\u0008\u000e-\u001a\u001c-\u001f]/gu) ?? []).length;
   if (controls > sample.length / 100) return 'BINARY_LIKE';
-  if (/^[{[]/u.test(trimmed) && /[}\]]$/u.test(text.trim())) {
-    if (text.length <= 1 << 20) {
-      try { JSON.parse(text); return 'JSON'; } catch { /* fall through */ }
-    }
+  if (/^[{[]/u.test(trimmed) && /[}\]]$/u.test(text.trim()) && text.length <= 1 << 20) {
+    try { JSON.parse(text); return 'JSON'; } catch { /* fall through */ }
   }
-  if (/^<(?:\?xml|[A-Za-z_][\w.-]*[\s>/])/u.test(trimmed)) return 'XML';
+  if (/^<(?:\?xml|[A-Za-z_][\w.-]*[\s>/])/u.test(trimmed) && /<\/[A-Za-z_]|\/>/u.test(sample)) return 'XML';
   const lines = sample.split(/\r?\n/u).filter((line) => line.trim() && !/^\s*[#;]/u.test(line));
   if (/^[a-z][a-z0-9+.-]*:\/\/\S+$/iu.test(trimmed)) return 'URL';
   const assignments = lines.filter((line) => /^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=/u.test(line)).length;
@@ -186,8 +252,8 @@ export function sniffContentType(text: string): ContentType {
 
 /**
  * Build bounded decoded views. String input is used as-is (lone surrogates are a FAILURE); byte input
- * must be valid UTF-8 or the result is FAILURE with no text. A FAILURE or PARTIAL result is never clean:
- * the caller keeps the original and policy treats it conservatively.
+ * must be valid UTF-8 (a BOM is kept) or the result is FAILURE with no text. FAILURE or PARTIAL is never
+ * clean: the caller keeps the original and policy treats it conservatively.
  */
 export function normalizeInput(input: unknown, budget?: unknown): NormalizationResult {
   const limits = budgetFrom(budget);
@@ -202,39 +268,55 @@ export function normalizeInput(input: unknown, budget?: unknown): NormalizationR
     try { root = utf8.decode(input); } catch { return failure('INVALID_UTF8'); }
   } else return failure('INVALID_INPUT');
 
-  const views: NormalizedView[] = [Object.freeze({ id: 0, parent: null, encoding: 'ROOT', depth: 0,
+  const views: NormalizedView[] = [Object.freeze({ id: 0, parent: null, encoding: 'ROOT', form: 'TEXT', depth: 0,
     parentStart: 0, parentEnd: root.length, text: root })];
   const uninspected: UninspectedSpan[] = [];
   const reasons = new Set<string>();
-  let decodedUnits = 0;
-  let binaryDecodes = 0;
+  let decodedUnits = 0, work = 0, binaryDecodes = 0;
+  let exhausted: UninspectedSpan['reason'] | null = null;
+  const record = (span: UninspectedSpan): void => {
+    reasons.add(span.reason);
+    if (uninspected.length < MAX_UNINSPECTED) uninspected.push(Object.freeze(span));
+    else reasons.add('UNINSPECTED_TRUNCATED');
+  };
   for (let cursor = 0; cursor < views.length; cursor++) {
     const view = views[cursor]!;
-    const seen = new Set<string>();
+    if (exhausted) {
+      // A global budget ran out: every not-yet-scanned view is wholly uninspected.
+      record({ viewId: view.id, start: 0, end: view.text.length, reason: exhausted });
+      continue;
+    }
+    const texts = new Set<string>();
     for (const run of runs(view.text)) {
-      const key = `${run.start}:${run.end}`;
-      const record = (reason: UninspectedSpan['reason']): void => {
-        uninspected.push(Object.freeze({ viewId: view.id, start: run.start, end: run.end, reason }));
-        reasons.add(reason);
-      };
-      if (run.end - run.start > MAX_RUN) { if (!seen.has(key)) record('RUN_TOO_LONG'); seen.add(key); continue; }
-      const bytes = decodeRun(view.text.slice(run.start, run.end), run.encoding);
-      const text = bytes && asText(bytes);
-      if (!text || text === view.text.slice(run.start, run.end)) {
-        if (bytes && !text) binaryDecodes++;
-        continue;
+      if (run.end - run.start > MAX_RUN) { record({ viewId: view.id, start: run.start, end: run.end, reason: 'RUN_TOO_LONG' }); continue; }
+      if (work + (run.end - run.start) > limits.maxDecodeWork) exhausted = 'WORK_LIMIT';
+      else {
+        work += run.end - run.start;
+        const decoded = run.decode();
+        const found = decoded && readable(decoded);
+        if (!found) { if (decoded) binaryDecodes++; continue; }
+        if (found.text === view.text.slice(run.start, run.end) || texts.has(found.text)) continue;
+        if (view.depth + 1 > limits.maxDepth) {
+          record({ viewId: view.id, start: run.start, end: run.end, reason: 'DEPTH_LIMIT' });
+          continue;
+        }
+        if (views.length >= limits.maxViews + 1) exhausted = 'VIEW_LIMIT';
+        else if (decodedUnits + found.text.length > limits.maxDecodedUnits) exhausted = 'EXPANSION_LIMIT';
+        else {
+          texts.add(found.text);
+          decodedUnits += found.text.length;
+          views.push(Object.freeze({ id: views.length, parent: view.id, encoding: run.encoding, form: found.form,
+            depth: view.depth + 1, parentStart: run.start, parentEnd: run.end, text: found.text }));
+          continue;
+        }
       }
-      // The same span may be valid under several encodings (e.g. hex digits are also Base64); keep each text view.
-      if (view.depth + 1 > limits.maxDepth) { record('DEPTH_LIMIT'); continue; }
-      if (views.length >= limits.maxViews + 1) { record('VIEW_LIMIT'); continue; }
-      if (decodedUnits + text.length > limits.maxDecodedUnits) { record('EXPANSION_LIMIT'); continue; }
-      decodedUnits += text.length;
-      views.push(Object.freeze({ id: views.length, parent: view.id, encoding: run.encoding, depth: view.depth + 1,
-        parentStart: run.start, parentEnd: run.end, text }));
+      // One span covers the rest of this view; later views are recorded whole above.
+      record({ viewId: view.id, start: run.start, end: view.text.length, reason: exhausted });
+      break;
     }
   }
   return Object.freeze({
-    status: uninspected.length ? 'PARTIAL' : 'COMPLETE', reasons: Object.freeze([...reasons].sort()),
+    status: uninspected.length || reasons.size ? 'PARTIAL' : 'COMPLETE', reasons: Object.freeze([...reasons].sort()),
     contentType: sniffContentType(root), views: Object.freeze(views), uninspected: Object.freeze(uninspected),
     binaryDecodes,
   });
@@ -245,29 +327,39 @@ export function normalizeInput(input: unknown, budget?: unknown): NormalizationR
 export interface DetectionFold {
   text: string;
   /** For each folded code unit, the start and end of its source cluster in the input. */
-  origin: readonly number[];
-  originEnd: readonly number[];
+  origin: Uint32Array;
+  originEnd: Uint32Array;
 }
 const DASHES = /[‐-―−﹘﹣－]/gu;
+const IGNORABLE = /\p{Default_Ignorable_Code_Point}/u;
 /**
- * NFKC per grapheme-ish cluster (a base plus its marks), with default-ignorable characters (zero-width,
- * bidi controls, variation selectors, soft hyphen) removed and Unicode dashes mapped to `-`. Detectors
- * match on `text` and map spans back with `origin`/`originEnd`, so the input is never rewritten.
+ * NFKC per cluster (a base plus its marks) after removing default-ignorable characters (zero-width, bidi
+ * controls, variation selectors, soft hyphen), with Unicode dashes mapped to `-`. Removing ignorables first
+ * lets a mark rejoin its base (`o<SHY>́` -> `ó`). Detectors match on `text` and map spans back with
+ * `origin`/`originEnd`; the input is never rewritten. Input is limited to the default input budget.
  */
 export function foldForDetection(input: string): DetectionFold {
   if (typeof input !== 'string') throw new TypeError('Invalid fold input');
+  if (input.length > DEFAULT_BUDGET.maxInputUnits) throw new RangeError('Fold input too large');
+  let kept = '';
+  const keptOrigin: number[] = [];
+  for (let index = 0; index < input.length;) {
+    const char = String.fromCodePoint(input.codePointAt(index)!);
+    if (!IGNORABLE.test(char)) { kept += char; for (let unit = 0; unit < char.length; unit++) keptOrigin.push(index); }
+    index += char.length;
+  }
   let text = '';
   const origin: number[] = [];
   const originEnd: number[] = [];
-  for (const match of input.matchAll(/\P{M}\p{M}*|\p{M}+/gsu)) {
-    const piece = match[0].normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').replace(DASHES, '-');
-    for (let unit = 0; unit < piece.length; unit++) {
-      origin.push(match.index);
-      originEnd.push(match.index + match[0].length);
-    }
+  for (const match of kept.matchAll(/\P{M}\p{M}*|\p{M}+/gsu)) {
+    const from = keptOrigin[match.index]!;
+    const last = keptOrigin[match.index + match[0].length - 1]!;
+    const to = last + (input.codePointAt(last)! > 0xffff ? 2 : 1);
+    const piece = match[0].normalize('NFKC').replace(DASHES, '-');
+    for (let unit = 0; unit < piece.length; unit++) { origin.push(from); originEnd.push(to); }
     text += piece;
   }
-  return Object.freeze({ text, origin: Object.freeze(origin), originEnd: Object.freeze(originEnd) });
+  return Object.freeze({ text, origin: Uint32Array.from(origin), originEnd: Uint32Array.from(originEnd) });
 }
 /** Map a folded span back to the smallest covering input span. */
 export function mapFoldedSpan(fold: DetectionFold, start: number, end: number): { start: number; end: number } {
