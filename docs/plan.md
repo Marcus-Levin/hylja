@@ -81,6 +81,8 @@ Primary issues: #1-#5.
 
 Goal: local synthetic text request -> deterministic and configured candidate generation -> optional local or independently guarded semantic shadow judgment -> policy -> transformation -> independent check of the exact serialized egress.
 
+A bounded, **NON-ENFORCING** #6 normalization stage exists in [`src/normalization.ts`](../src/normalization.ts). It never rewrites the input. It returns the original text as the root view plus decoded Base64/base64url/percent/hex views with provenance, and it enforces explicit depth, total-expansion, view-count and run-length budgets. Anything beyond a budget is recorded as an uninspected span, and the result is `PARTIAL`, never clean; invalid UTF-8 bytes are a `FAILURE` with no replacement text. It also gives a content-type *hint* and a detection fold (NFKC, invisible characters removed, dashes unified) with an offset map. Detectors (#8, #9, #37) and parsers (#7) are not yet wired to it, JSON/XML string escapes belong to #7, and binary-decoding payloads (for example UTF-16) are not inspected.
+
 Initial categories: PERSON (including EMAIL/PHONE), CREDENTIAL_OR_SECRET, HOST, IP/URL, CUSTOMER/PROJECT. PERSON/EMAIL/PHONE must have an explicit candidate source and synthetic acceptance cases; shadow judgment is not that source.
 
 No production vault yet beyond minimal development fixture state. No unverified hosted semantic request, opaque protected content, or unchecked stream is silently released; this slice is not a production traffic claim.
