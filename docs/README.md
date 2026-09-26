@@ -25,7 +25,7 @@ Hylja follows the same documentation discipline used in Verdande: product direct
 
 ## Decisions - `decisions/`
 
-Accepted architectural decisions are numbered sequentially. New evidence that changes an accepted direction gets a new decision or an explicit superseding note.
+Accepted architectural decisions are numbered sequentially. New evidence that changes an accepted direction gets a new decision or an explicit superseding note. A decision marked **proposed** has no authority until a human reviewer accepts it.
 
 ## Contracts - `contracts/`
 
