@@ -119,7 +119,8 @@ function git(args, raw = false) {
   // ls-tree/index read metadata only, and local fsmonitor is explicitly disabled.
   const env = {
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
-    GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', HOME: devNull, XDG_CONFIG_HOME: devNull,
+    GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', GIT_NO_REPLACE_OBJECTS: '1',
+    HOME: devNull, XDG_CONFIG_HOME: devNull,
   };
   const result = spawnSync('git', ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${devNull}`,
     '-C', root, ...args], {
@@ -132,6 +133,17 @@ function git(args, raw = false) {
 function requireRepositoryAndIndex() {
   const location = git(['rev-parse', '--show-toplevel']);
   if (location.status !== 0 || resolve(location.stdout.trimEnd()) !== root) fail('CHECK_UNAVAILABLE');
+  // A repository-local graft can fabricate revision ancestry even with Git replacement
+  // objects disabled. Git resolves the worktree's own metadata path; never read or echo it.
+  const graft = git(['rev-parse', '--git-path', 'info/grafts']);
+  if (graft.status !== 0 || !graft.stdout.trimEnd() || /[\r\n\0]/u.test(graft.stdout.trimEnd())) {
+    fail('CHECK_UNAVAILABLE');
+  }
+  try { lstatSync(resolve(root, graft.stdout.trimEnd())); fail('GIT_REVISION_INVALID'); }
+  catch (error) {
+    if (error instanceof PreparationFailure) throw error;
+    if (error?.code !== 'ENOENT') fail('CHECK_UNAVAILABLE');
+  }
   const index = git(['ls-files', '--stage', '-z', '--', ...NAMES]);
   if (index.status !== 0) fail('CHECK_UNAVAILABLE');
   const found = new Map();
