@@ -65,6 +65,7 @@ test('configured names are tenant/project scoped: another scope never matches or
   const mismatch = run(text, { names: namesB });
   assert.deepEqual(spans(text, mismatch), []);
   assert.deepEqual(mismatch.reasons, ['NAME_DICTIONARY_SCOPE_MISMATCH']);
+  assert.equal(mismatch.status, 'PARTIAL');
   // Same tenant, different project is also a mismatch.
   const otherProject = run(text, { scope: { tenantRef: scopeA.tenantRef, projectRef: 'project-z.invalid' } });
   assert.ok(otherProject.reasons.includes('NAME_DICTIONARY_SCOPE_MISMATCH'));
@@ -72,6 +73,7 @@ test('configured names are tenant/project scoped: another scope never matches or
   // A forged dictionary object is not a dictionary.
   const forged = run(text, { names: { tenantRef: scopeA.tenantRef, names: ['Quillon Fakeworth'] } });
   assert.ok(forged.reasons.includes('INVALID_NAME_DICTIONARY'));
+  assert.equal(forged.status, 'PARTIAL');
   assert.deepEqual(spans(text, forged), []);
 });
 
@@ -134,7 +136,10 @@ test('failures are explicit and never read as "no contact data"', () => {
   const getter = { inputRef: 'x', scope: scopeA };
   Object.defineProperty(getter, 'text', { get() { throw new Error('synthetic-planted.invalid'); } });
   assert.deepEqual(generateContactCandidates(getter).reasons, ['INVALID_REQUEST']);
-  assert.ok(run('Café Orla').reasons.includes('NAME_MATCHING_SKIPPED_NON_NFC'));
+  // A decomposed character elsewhere no longer disables name matching; offsets map back to the input.
+  const decomposed = 'Cafe\u0301 Orla Synthetica';
+  assert.deepEqual(spans(decomposed, run(decomposed)), [['NAME', 'Orla Synthetica']]);
+  assert.equal(run(decomposed).status, 'COMPLETE');
 });
 
 test('name dictionaries reject malformed configuration', () => {
@@ -145,7 +150,7 @@ test('name dictionaries reject malformed configuration', () => {
   // Regex metacharacters in a configured name are literal.
   const dict = createNameDictionary(scopeA, ['A.B (Synthetic)']);
   assert.deepEqual(spans('AxB (Synthetic) and A.B (Synthetic)', run('AxB (Synthetic) and A.B (Synthetic)', { names: dict })),
-    [['NAME', 'A.B (Synthetic)']]);
+    [['NAME', 'A.B (Synthetic']]);
 });
 
 test('property: planted synthetic emails and phones are found at their exact spans', () => {
@@ -212,4 +217,67 @@ test('synthetic golden set: per-subtype recall, precision and false negatives ar
     assert.equal(fn, 0, `${subtype} false negatives`);
     assert.equal(fp, 0, `${subtype} false positives`);
   }
+});
+
+test('review regressions: parenthesized and keyword-prefixed phones are found with exact spans', () => {
+  for (const [text, expected] of [
+    ['(call 202-555-0143)', '202-555-0143'], ['(+1 202 555 0143)', '+1 202 555 0143'],
+    ['phone: 202-555-0143).', '202-555-0143'], ['Orla (202-555-0143)', '202-555-0143'],
+    ['tel:+12025550143', '+12025550143'], ['phone:2025550143', '2025550143'], ['phone=2025550143', '2025550143'],
+    ['Phone #2025550143', '2025550143'], ['tel=+1 202 555 0143', '+1 202 555 0143'],
+    ['phone number: 2025550143', '2025550143'], ['mob 202 555 0143', '202 555 0143'],
+    ['see (202) 555-0199)', '(202) 555-0199'],
+  ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'PHONE'), [['PHONE', expected]], text);
+});
+
+test('review regressions: non-ASCII and RFC local parts are never truncated', () => {
+  for (const [text, expected] of [
+    ['åsa.test@example.se', 'åsa.test@example.se'], ['müller@example.com', 'müller@example.com'],
+    ["o'brien@example.com", "o'brien@example.com"], ['user=x@example.com', 'user=x@example.com'],
+    ['josé@example.com', 'josé@example.com'], ['user@exämple.com', 'user@exämple.com'],
+    ['user@example.com-', 'user@example.com'], ['user@example.xn--p1ai', 'user@example.xn--p1ai'],
+    [`${'l'.repeat(100)}@example.com`, `${'l'.repeat(100)}@example.com`],
+    [`u@${'a.'.repeat(12)}example.com`, `u@${'a.'.repeat(12)}example.com`],
+    ['mailto:user@example.com', 'user@example.com'],
+  ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'EMAIL').map(([, v]) => v), [expected], text);
+});
+
+test('known over-cloaks are pinned so a precision change is a visible decision', () => {
+  // Recall bias: these non-phone digit groups are emitted as PHONE candidates today (see plan).
+  for (const text of ['range 1000-2000', 'ISBN 978-3-16-148410-0', 'price 1 234 567 kr', 'order 12345-67890']) {
+    assert.equal(spans(text, run(text)).filter(([s]) => s === 'PHONE').length, 1, text);
+  }
+});
+
+test('evidence ids are unique across fields and composition never collides', () => {
+  const a = run('a@example.com', { inputRef: 'field-a.invalid' });
+  const b = run('a@example.com', { inputRef: 'field-b.invalid' });
+  assert.notEqual(a.candidates[0].evidence.id, b.candidates[0].evidence.id);
+  const composed = composeClassification({ detectorEvidence: [...a.candidates, ...b.candidates].map((c) => c.evidence) },
+    { interactionRef: 'interaction-a.invalid', sourceRef: 'source-a.invalid', trust: 'UNTRUSTED' });
+  assert.ok(!composed.reasons.includes('DUPLICATE_EVIDENCE_ID'));
+  // A COMPLETE result never exceeds the composer's per-channel limit.
+  assert.equal(run(Array.from({ length: 257 }, (_, i) => `u${i}@example.com`).join(' ')).status, 'FAILURE');
+  assert.equal(run(Array.from({ length: 256 }, (_, i) => `u${i}@example.com`).join(' ')).candidates.length, 256);
+});
+
+test('throwing scope getters fail closed as INVALID_REQUEST', () => {
+  const scope = {};
+  Object.defineProperty(scope, 'tenantRef', { enumerable: true, get() { throw new Error('synthetic.invalid'); } });
+  assert.deepEqual(generateContactCandidates({ text: 'x', inputRef: 'x', scope }).reasons, ['INVALID_REQUEST']);
+});
+
+test('a 10k-name dictionary scans 1 MiB of adversarial text within a bounded-work budget', () => {
+  const names = Array.from({ length: 10_000 }, (_, i) => `Orla Synthname${i.toString(36)} Testvold`);
+  const dict = createNameDictionary(scopeA, names);
+  for (const text of ['Orla Synthname '.repeat(69_000).slice(0, MAX_TEXT_UNITS), 'lorem ipsum dolor '.repeat(58_000)]) {
+    const started = process.hrtime.bigint();
+    const result = run(text, { names: dict });
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.equal(result.status, 'COMPLETE');
+    // Catches super-linear matching; not a performance SLA.
+    assert.ok(elapsedMs < 5000, `${elapsedMs}ms`);
+  }
+  const text = 'ping orla synthnameA testvold today';
+  assert.deepEqual(spans(text, run(text, { names: dict })), [['NAME', 'orla synthnameA testvold']]);
 });

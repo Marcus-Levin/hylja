@@ -3,6 +3,7 @@
  * it emits classification v1 detector evidence and spans only. It never returns matched text, selects a
  * treatment or authorizes release. Input is text the caller has already normalized (#6/#7 are pending).
  */
+import { createHash } from 'node:crypto';
 import type { ClassificationClaim, EvidenceProvenance } from './classification.js';
 
 /** Input record for the v1 `detectorEvidence` channel; the composer assigns `source` itself. */
@@ -14,17 +15,19 @@ export interface DetectorEvidenceInput {
   claim: ClassificationClaim;
 }
 
-export const CONTACT_PRODUCER = Object.freeze({ id: 'hylja.contact-candidates', version: '1' });
+export const CONTACT_PRODUCER = Object.freeze({ id: 'hylja.contact-candidates', version: '2' });
 export const CONTACT_SUBTYPES = ['NAME', 'EMAIL', 'PHONE'] as const;
 export type ContactSubtype = (typeof CONTACT_SUBTYPES)[number];
 export const MAX_TEXT_UNITS = 1 << 20;
+/** Matches the v1 composer's per-channel limit, so every COMPLETE result can be composed. */
+export const MAX_CANDIDATES = 256;
 const MAX_NAMES = 10_000;
-const MAX_CANDIDATES = 4096;
+const MAX_NAME_TOKENS = 16;
 
 export interface CandidateScope { tenantRef: string; projectRef: string }
 export interface ContactCandidate {
   subtype: ContactSubtype;
-  /** UTF-16 code-unit span into the normalized input, end-exclusive. */
+  /** UTF-16 code-unit span into the input, end-exclusive. */
   start: number;
   end: number;
   /** Unicode code-point span of the same range, end-exclusive. */
@@ -34,9 +37,13 @@ export interface ContactCandidate {
   basis: 'PATTERN' | 'KEYWORD_CONTEXT' | 'DICTIONARY' | 'FIELD_HINT';
   evidence: DetectorEvidenceInput;
 }
+/**
+ * COMPLETE: every requested source ran over the whole input. PARTIAL: some requested source did not run
+ * (see reasons); the candidates are real but absence proves nothing. FAILURE: nothing ran. Only COMPLETE
+ * may be read as "these sources found nothing else", and even that is not proof of no personal data.
+ */
 export interface CandidateResult {
-  status: 'COMPLETE' | 'FAILURE';
-  /** Opaque codes; a FAILURE is never evidence that the input holds no contact data. */
+  status: 'COMPLETE' | 'PARTIAL' | 'FAILURE';
   reasons: readonly string[];
   candidates: readonly ContactCandidate[];
 }
@@ -55,72 +62,140 @@ function label(value: unknown, limit = 256): value is string {
     value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
-/* ---------- Tenant/project-scoped configured names ---------- */
+/* ---------- Text folding shared by names and input: NFC per cluster, with an offset map ---------- */
+
+const TOKEN = /[\p{L}\p{N}_]+/gu;
+interface Folded { text: string; origin: number[] }
+/**
+ * NFC-normalize and lower-case each base character with its combining marks, recording for every folded
+ * code unit the original offset of its cluster. Offsets therefore survive decomposed input. Compositions
+ * that span clusters (e.g. conjoining Hangul jamo) are not joined; #6 owns full normalization.
+ */
+function fold(text: string): Folded {
+  let folded = '';
+  const origin: number[] = [];
+  for (const match of text.matchAll(/\P{M}\p{M}*|\p{M}+/gsu)) {
+    const piece = match[0].normalize('NFC').toLowerCase();
+    for (let unit = 0; unit < piece.length; unit++) origin.push(match.index);
+    folded += piece;
+  }
+  origin.push(text.length);
+  return { text: folded, origin };
+}
+/** Separator between two tokens: whitespace runs compare equal, anything else must match exactly. */
+function separator(text: string): string {
+  return text.replace(/\s+/gu, ' ');
+}
+
+/* ---------- Tenant/project-scoped configured names: a token trie, linear in input tokens ---------- */
 
 declare const nameDictionaryBrand: unique symbol;
 /** Opaque handle; names are only reachable through the module-private registry below. */
 export interface NameDictionary { readonly [nameDictionaryBrand]: true }
-interface DictionaryState { scope: CandidateScope; pattern: RegExp | null }
+interface TrieNode { terminal: boolean; next: Map<string, TrieNode> }
+interface DictionaryState { scope: CandidateScope; root: TrieNode }
 const dictionaries = new WeakMap<object, DictionaryState>();
+const edge = (sep: string, token: string): string => `${sep}\u0000${token}`;
 
-function escape(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-}
-/** Trusted configuration: bind configured names to exactly one tenant and project. */
+/**
+ * Trusted configuration: bind configured names to exactly one tenant and project. Names match as token
+ * sequences, case-insensitively, with the same separators between tokens (whitespace runs are equal);
+ * punctuation before the first or after the last token is ignored.
+ */
 export function createNameDictionary(scope: CandidateScope, names: readonly string[]): NameDictionary {
   if (!scope || !label(scope.tenantRef) || !label(scope.projectRef) || !Array.isArray(names) ||
     names.length > MAX_NAMES) throw new TypeError('Invalid name dictionary');
-  const normalized = new Set<string>();
+  const root: TrieNode = { terminal: false, next: new Map() };
   for (const name of names) {
     if (!label(name, 128) || !/\p{L}/u.test(name)) throw new TypeError('Invalid name dictionary');
-    normalized.add(name.normalize('NFC').replace(/\s+/gu, ' '));
+    const folded = fold(name).text;
+    const tokens = [...folded.matchAll(TOKEN)];
+    if (!tokens.length || tokens.length > MAX_NAME_TOKENS) throw new TypeError('Invalid name dictionary');
+    let node = root;
+    tokens.forEach((token, index) => {
+      const previous = tokens[index - 1];
+      const key = edge(previous ? separator(folded.slice(previous.index + previous[0].length, token.index)) : '',
+        token[0]);
+      let child = node.next.get(key);
+      if (!child) node.next.set(key, child = { terminal: false, next: new Map() });
+      node = child;
+    });
+    node.terminal = true;
   }
-  // Longest first so "Ada Lovelace" wins over "Ada" at the same position.
-  const alternatives = [...normalized].sort((a, b) => b.length - a.length || (a < b ? -1 : 1))
-    .map((name) => escape(name).replace(/ /gu, '\\s+'));
   const handle = Object.freeze(Object.create(null)) as NameDictionary;
-  dictionaries.set(handle, {
-    scope: Object.freeze({ tenantRef: scope.tenantRef, projectRef: scope.projectRef }),
-    pattern: alternatives.length ?
-      new RegExp(`(?<![\\p{L}\\p{N}_])(?:${alternatives.join('|')})(?![\\p{L}\\p{N}_])`, 'giu') : null,
-  });
+  dictionaries.set(handle, { scope: Object.freeze({ tenantRef: scope.tenantRef, projectRef: scope.projectRef }), root });
   return handle;
+}
+/** Longest configured name at each token start; non-overlapping, O(tokens x MAX_NAME_TOKENS). */
+function matchNames(text: string, root: TrieNode): { start: number; end: number }[] {
+  const folded = fold(text);
+  const tokens = [...folded.text.matchAll(TOKEN)];
+  const spans: { start: number; end: number }[] = [];
+  for (let index = 0; index < tokens.length;) {
+    let node = root.next.get(edge('', tokens[index]![0]));
+    let longest = node?.terminal ? index : -1;
+    for (let next = index + 1; node && next < tokens.length && next - index < MAX_NAME_TOKENS; next++) {
+      const before = tokens[next - 1]!;
+      node = node.next.get(edge(separator(folded.text.slice(before.index + before[0].length, tokens[next]!.index)),
+        tokens[next]![0]));
+      if (node?.terminal) longest = next;
+    }
+    if (longest < 0) { index++; continue; }
+    const first = tokens[index]!, last = tokens[longest]!;
+    spans.push({ start: folded.origin[first.index]!, end: folded.origin[last.index + last[0].length]! });
+    index = longest + 1;
+  }
+  return spans;
 }
 
 /* ---------- Patterns (bounded quantifiers; no nested unbounded repetition) ---------- */
 
-// Local part: dot-atom without leading/trailing/double dots. Domain: labels plus an alphabetic TLD.
-const EMAIL = /(?<![A-Za-z0-9%+_-])[A-Za-z0-9%+_-](?:[A-Za-z0-9%+_-]|\.(?=[A-Za-z0-9%+_-])){0,63}@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){1,8}[A-Za-z]{2,24}(?![A-Za-z0-9-]|\.[A-Za-z0-9])/gu;
-// A run of digits with phone separators. Boundaries exclude tokens such as hosts, versions and UUIDs.
-const PHONE = /(?<![\p{L}\p{N}_.:/@#=-])(?:\+|00)?\(?\d{1,4}\)?(?:[ \-.]?\(?\d{1,4}\)?){1,7}(?![\p{L}\p{N}_@]|[.:\-/]\d)/gu;
-const PHONE_KEYWORD = /(?:\b(?:tel|telephone|phone|mobile|mobil|cell|fax|telefon|tfn|ring)\b|☎)[\s.:#=-]{0,4}$/iu;
+// RFC 5322 atext plus Unicode letters/digits (RFC 6531). The lookbehind excludes the same class, so a
+// match always starts at the token start instead of leaving an uncloaked prefix.
+const LOCAL = "[\\p{L}\\p{N}!#$%&'*+/=?^_`{|}~-]";
+const EMAIL = new RegExp(`(?<!${LOCAL})${LOCAL}(?:${LOCAL}|\\.(?=${LOCAL})){0,255}@` +
+  '(?:[\\p{L}\\p{N}](?:[\\p{L}\\p{N}-]{0,61}[\\p{L}\\p{N}])?\\.){1,16}(?:xn--[a-z0-9-]{1,59}|\\p{L}{2,24})' +
+  '(?![\\p{L}\\p{N}]|\\.[\\p{L}\\p{N}])', 'gu');
+// Digit groups with phone separators. `:`, `=` and `#` may precede (keyword forms such as `tel:`).
+const PHONE = /(?<![\p{L}\p{N}_./@-])(?:\+|00)?\(?\d{1,4}\)?(?:[ \-.]?\(?\d{1,4}\)?){1,7}(?![\p{L}\p{N}_@]|[.:\-/]\d)/gu;
+const PHONE_KEYWORD = /(?:\b(?:tel|telephone|phone|mobile|mob|mobil|cell|fax|telefon|tfn|tlf|ring)(?:\s*(?:number|no\.?|nr\.?|#))?|☎)[\s.:#=-]{0,4}$/iu;
+const BARE_PREFIX = /[:=#]$/u;
 
-function digitsOf(text: string): string {
-  return text.replace(/\D/gu, '');
+/** Drop an unbalanced leading `(` or trailing `)` that belongs to surrounding prose. */
+function balance(start: number, value: string): { start: number; value: string } {
+  let open = (value.match(/\(/gu) ?? []).length;
+  let close = (value.match(/\)/gu) ?? []).length;
+  while (close > open && value.endsWith(')')) { value = value.slice(0, -1); close--; }
+  while (open > close && value.startsWith('(')) { value = value.slice(1); start++; open--; }
+  // Parentheses wrapping the whole number are prose, not part of the number.
+  if (/^\([^()]*\)$/u.test(value)) { value = value.slice(1, -1); start++; }
+  return { start, value: value.replace(/[ \-.]+$/u, '') };
 }
 /** Reject shapes that are technical values, not phone numbers. Recall bias: keep when unsure. */
-function plausiblePhone(match: string, before: string): 'PATTERN' | 'KEYWORD_CONTEXT' | null {
-  const digits = digitsOf(match);
+function plausiblePhone(value: string, before: string): 'PATTERN' | 'KEYWORD_CONTEXT' | null {
+  const digits = value.replace(/\D/gu, '');
   const keyword = PHONE_KEYWORD.test(before);
   if (digits.length < 7 || digits.length > 15) return null;
-  const international = match.startsWith('+') || match.startsWith('00');
-  const separators = match.replace(/[\d+]/gu, '');
+  // A bare `k=`, `#` or `x:` prefix without a phone keyword marks a key/value or reference, not a phone.
+  if (!keyword && BARE_PREFIX.test(before)) return null;
+  const international = value.startsWith('+') || value.startsWith('00');
+  const separators = value.replace(/[\d+]/gu, '');
   // Dotted quads, versions and dotted dates: only dots as separators and no international prefix.
   if (!international && separators.length && /^\.+$/u.test(separators) && !keyword) return null;
-  // ISO dates and date-times: YYYY-MM-DD.
-  if (/^\d{4}-\d{2}-\d{2}$/u.test(match)) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/u.test(value)) return null;
   // Bare digit runs (IDs, timestamps, counters) need an international prefix or a phone keyword.
   if (!separators.replace(/[()]/gu, '').length && !international && !keyword) return null;
-  // Unbalanced parentheses are not a phone layout.
-  if ((match.match(/\(/gu)?.length ?? 0) !== (match.match(/\)/gu)?.length ?? 0)) return null;
+  if ((value.match(/\(/gu) ?? []).length !== (value.match(/\)/gu) ?? []).length) return null;
   return keyword ? 'KEYWORD_CONTEXT' : 'PATTERN';
 }
 
 /* ---------- Generation ---------- */
 
-function evidenceFor(subtype: ContactSubtype, index: number, inputRef: string): DetectorEvidenceInput {
+function evidenceFor(subtype: ContactSubtype, start: number, end: number, inputRef: string): DetectorEvidenceInput {
+  // Unique across fields and positions so composing several fields never collides.
+  const field = createHash('sha256').update(inputRef).digest('hex').slice(0, 16);
   return Object.freeze({
-    version: 1, id: `${CONTACT_PRODUCER.id}.${subtype.toLowerCase()}.${index}`, status: 'FOUND',
+    version: 1, id: `${CONTACT_PRODUCER.id}.${subtype.toLowerCase()}.${field}.${start}-${end}`, status: 'FOUND',
     provenance: Object.freeze({ inputRef, producerId: CONTACT_PRODUCER.id, producerVersion: CONTACT_PRODUCER.version }),
     // No sensitivity: that is policy metadata. v1 composition therefore stays UNRESOLVED until a
     // trusted configuration supplies it, which is the conservative default.
@@ -138,15 +213,16 @@ function failure(reason: string): CandidateResult {
  * must not discard the stronger protected evidence.
  */
 export function generateContactCandidates(request: CandidateRequest): CandidateResult {
-  let text: unknown, inputRef: unknown, scope: unknown, names: unknown, fieldHint: unknown;
+  let text: unknown, inputRef: unknown, names: unknown, fieldHint: unknown, tenantRef: unknown, projectRef: unknown;
   try {
+    let scope: unknown;
     ({ text, inputRef, scope, names, fieldHint } = request);
+    if (scope === null || typeof scope !== 'object') return failure('INVALID_REQUEST');
+    ({ tenantRef, projectRef } = scope as Record<string, unknown>);
   } catch { return failure('INVALID_REQUEST'); }
-  if (typeof text !== 'string' || !label(inputRef, 1024) || scope === null || typeof scope !== 'object') {
+  if (typeof text !== 'string' || !label(inputRef, 1024) || !label(tenantRef) || !label(projectRef)) {
     return failure('INVALID_REQUEST');
   }
-  const { tenantRef, projectRef } = scope as Partial<CandidateScope>;
-  if (!label(tenantRef) || !label(projectRef)) return failure('INVALID_REQUEST');
   if (fieldHint !== undefined && !(CONTACT_SUBTYPES as readonly unknown[]).includes(fieldHint)) {
     return failure('INVALID_REQUEST');
   }
@@ -156,56 +232,66 @@ export function generateContactCandidates(request: CandidateRequest): CandidateR
   }
 
   const reasons = new Set<string>();
-  const found: { subtype: ContactSubtype; start: number; end: number; basis: ContactCandidate['basis'] }[] = [];
+  let partial = false;
   let dictionary: DictionaryState | undefined;
   if (names !== undefined) {
     dictionary = typeof names === 'object' && names !== null ? dictionaries.get(names) : undefined;
-    if (!dictionary) reasons.add('INVALID_NAME_DICTIONARY');
+    if (!dictionary) { reasons.add('INVALID_NAME_DICTIONARY'); partial = true; }
     else if (dictionary.scope.tenantRef !== tenantRef || dictionary.scope.projectRef !== projectRef) {
-      // Another tenant's or project's names must never match here.
+      // Another tenant's or project's names must never match here, and the caller must see that it failed.
       reasons.add('NAME_DICTIONARY_SCOPE_MISMATCH');
+      partial = true;
       dictionary = undefined;
     }
   } else reasons.add('NO_NAME_DICTIONARY');
 
+  const found: { subtype: ContactSubtype; start: number; end: number; basis: ContactCandidate['basis'] }[] = [];
+  const add = (item: (typeof found)[number]): boolean => found.push(item) <= MAX_CANDIDATES;
   if (fieldHint !== undefined) {
     const start = text.length - text.trimStart().length;
     const end = text.trimEnd().length;
-    if (end > start) found.push({ subtype: fieldHint as ContactSubtype, start, end, basis: 'FIELD_HINT' });
+    if (end > start) add({ subtype: fieldHint as ContactSubtype, start, end, basis: 'FIELD_HINT' });
   }
   for (const match of text.matchAll(EMAIL)) {
-    found.push({ subtype: 'EMAIL', start: match.index, end: match.index + match[0].length, basis: 'PATTERN' });
-  }
-  for (const match of text.matchAll(PHONE)) {
-    // Trim a trailing separator the pattern may have consumed before a boundary.
-    const value = match[0].replace(/[ \-.]+$/u, '');
-    const basis = plausiblePhone(value, text.slice(Math.max(0, match.index - 24), match.index));
-    if (basis) found.push({ subtype: 'PHONE', start: match.index, end: match.index + value.length, basis });
-  }
-  if (dictionary?.pattern) {
-    dictionary.pattern.lastIndex = 0;
-    const source = text.normalize('NFC');
-    // Offsets are only valid when NFC normalization did not change the text; otherwise report it.
-    if (source !== text) reasons.add('NAME_MATCHING_SKIPPED_NON_NFC');
-    else for (const match of source.matchAll(dictionary.pattern)) {
-      found.push({ subtype: 'NAME', start: match.index, end: match.index + match[0].length, basis: 'DICTIONARY' });
+    if (!add({ subtype: 'EMAIL', start: match.index, end: match.index + match[0].length, basis: 'PATTERN' })) {
+      return failure('TOO_MANY_CANDIDATES');
     }
   }
-  if (found.length > MAX_CANDIDATES) return failure('TOO_MANY_CANDIDATES');
+  for (const match of text.matchAll(PHONE)) {
+    const { start, value } = balance(match.index, match[0]);
+    const basis = plausiblePhone(value, text.slice(Math.max(0, start - 32), start));
+    if (basis && !add({ subtype: 'PHONE', start, end: start + value.length, basis })) return failure('TOO_MANY_CANDIDATES');
+  }
+  if (dictionary) {
+    for (const span of matchNames(text, dictionary.root)) {
+      if (!add({ subtype: 'NAME', ...span, basis: 'DICTIONARY' })) return failure('TOO_MANY_CANDIDATES');
+    }
+  }
 
   found.sort((a, b) => a.start - b.start || a.end - b.end ||
     CONTACT_SUBTYPES.indexOf(a.subtype) - CONTACT_SUBTYPES.indexOf(b.subtype));
   const unique = found.filter((item, index) => index === 0 || item.start !== found[index - 1]!.start ||
     item.end !== found[index - 1]!.end || item.subtype !== found[index - 1]!.subtype);
-  const counters: Record<ContactSubtype, number> = { NAME: 0, EMAIL: 0, PHONE: 0 };
+  // Candidates are sorted by start, so code-point offsets are counted incrementally (linear overall).
+  let counted = 0, countedPoints = 0;
+  const points = (from: number, to: number): number => {
+    let total = 0;
+    for (let unit = from; unit < to; unit++) {
+      const code = text.charCodeAt(unit);
+      if (code < 0xdc00 || code > 0xdfff) total++;
+    }
+    return total;
+  };
   const candidates = unique.map((item) => {
-    const codePointStart = [...text.slice(0, item.start)].length;
+    countedPoints += points(counted, item.start);
+    counted = item.start;
+    const codePointStart = countedPoints;
     return Object.freeze({
       subtype: item.subtype, start: item.start, end: item.end, codePointStart,
-      codePointEnd: codePointStart + [...text.slice(item.start, item.end)].length, basis: item.basis,
-      evidence: evidenceFor(item.subtype, counters[item.subtype]++, inputRef),
+      codePointEnd: codePointStart + points(item.start, item.end), basis: item.basis,
+      evidence: evidenceFor(item.subtype, item.start, item.end, inputRef),
     });
   });
-  return Object.freeze({ status: 'COMPLETE', reasons: Object.freeze([...reasons].sort()),
+  return Object.freeze({ status: partial ? 'PARTIAL' : 'COMPLETE', reasons: Object.freeze([...reasons].sort()),
     candidates: Object.freeze(candidates) });
 }
