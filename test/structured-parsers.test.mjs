@@ -129,7 +129,8 @@ test('YAML, TOML and XML are UNSUPPORTED and wholly opaque; bad input fails clos
 
 test('credential key recognition normalizes case and separators without catching near-misses', () => {
   for (const key of ['password', 'DB_PASSWORD', 'apiKey', 'x-api-key', 'Client Secret', 'access_token', 'AUTH',
-    'Authorization', 'set-cookie', 'privateKey', 'SAS', 'pwd', 'passphrase', 'basicAuth']) assert.ok(isCredentialKey(key), key);
+    'Authorization', 'set-cookie', 'privateKey', 'SAS', 'pwd', 'passphrase', 'basicAuth', 'key', 'sig', 'DB_PASS',
+    'SMTP_PASS', 'db_pw', 'PHPSESSID', 'dsn', 'ssh_key', 'encryption_key', 'otp', 'p\u0430ssword']) assert.ok(isCredentialKey(key), key);
   for (const key of ['author', 'authority', 'host', 'port', 'passenger', 'user']) {
     assert.ok(!isCredentialKey(key), key);
   }
@@ -156,7 +157,9 @@ test('round-trip: rewriting values preserves keys and syntax for every supported
       assert.equal(reparsed.status, 'COMPLETE');
       assert.deepEqual(reparsed.fields.map((f) => f.path.join('.')), parseStructured(text, format).fields.map((f) => f.path.join('.')));
       assert.equal(reparsed.fields.find((f) => f.path.join('.') === path).value, replacement);
-      assert.ok(!out.text.includes('old') || path !== 'userinfo.password' || out.text.includes('token=old'));
+      // The original value is gone from the edited field's source span.
+      const after = parseStructured(out.text, format).fields.find((f) => f.path.join('.') === path);
+      assert.ok(!out.text.slice(after.valueStart, after.valueEnd).includes('old'));
     }
   }
 });
@@ -192,5 +195,110 @@ test('adversarial inputs stay within a bounded-work budget', () => {
     assert.ok(result.fields.length <= DEFAULT_PARSE_BUDGET.maxFields);
     // Catches super-linear work; not a performance SLA.
     assert.ok(elapsedMs < 5000, `${format} ${elapsedMs}ms`);
+  }
+});
+
+
+function prng(seed) {
+  let state = seed >>> 0;
+  return () => { state = (state + 0x6d2b79f5) >>> 0; let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+test('review regressions: comments are listed, and rewriting refuses or removes them', () => {
+  const text = '# PASSWORD=synthetic-old\nA=1 # token=synthetic-old\nPASSWORD=synthetic-old # was synthetic-old';
+  const result = parseStructured(text, 'DOTENV');
+  assert.equal(result.status, 'COMPLETE');
+  assert.ok(result.reasons.includes('COMMENTS'));
+  assert.deepEqual(result.comments.map((c) => text.slice(c.start, c.end)),
+    ['# PASSWORD=synthetic-old', '# token=synthetic-old', '# was synthetic-old']);
+  const field = result.fields.find((f) => f.path[0] === 'PASSWORD');
+  assert.deepEqual(rewriteFieldValues(text, 'DOTENV', [{ field, replacement: 'X' }]),
+    { status: 'FAILURE', reason: 'SOURCE_HAS_COMMENTS' });
+  const removed = rewriteFieldValues(text, 'DOTENV', [{ field, replacement: 'X' }], { comments: 'REMOVE' });
+  assert.equal(removed.status, 'OK');
+  assert.ok(!removed.text.includes('synthetic-old'));
+  const ini = parseStructured('[s]\n; old password\npassword = synthetic-old #1', 'INI');
+  assert.equal(ini.comments.length, 2);
+  assert.equal(ini.fields[0].value, 'synthetic-old');
+});
+
+test('review regressions: credential ancestors, name/value siblings and URL forms are high risk', () => {
+  const risky = (text, format) => parseStructured(text, format).fields.filter((f) => f.highRisk).map((f) => f.path.join('.'));
+  assert.deepEqual(risky('{"password":["synthetic"],"token":{"value":"synthetic"}}', 'JSON'), ['password.0', 'token.value']);
+  assert.deepEqual(risky('[secrets]\ndb = synthetic', 'INI'), ['secrets.db']);
+  assert.deepEqual(risky('{"env":[{"name":"DB_PASSWORD","value":"synthetic"},{"name":"MODE","value":"x"}]}', 'JSON'),
+    ['env.0.value']);
+  assert.deepEqual(risky('https://h.example.invalid/?syntheticbare&a=1;token=synthetic', 'URL'), ['query.', 'query.token']);
+  assert.deepEqual(risky('https://h.example.invalid/cb#access_token=synthetic&x=1', 'URL'), ['fragment.access_token']);
+  assert.deepEqual(risky('https://synthetic-token@h.example.invalid/', 'URL'), ['userinfo.username']);
+  const jdbc = parseStructured('jdbc:postgresql://h.example.invalid/db?user=u&password=synthetic', 'CONNECTION_STRING');
+  assert.equal(jdbc.status, 'COMPLETE');
+  assert.deepEqual(jdbc.fields.filter((f) => f.highRisk).map((f) => f.path.join('.')), ['query.password']);
+});
+
+test('review regressions: over-long or unterminated log values mark the line opaque', () => {
+  for (const text of [`token=${'x'.repeat(5000)}`, `password="${'y'.repeat(5000)}"`, 'password="unterminated', "k='open"]) {
+    const result = parseStructured(text, 'LOG');
+    assert.equal(result.status, 'PARTIAL', text.slice(0, 20));
+    assert.ok(result.reasons.includes('OPAQUE_RANGES'));
+  }
+  const header = parseStructured('Authorization: Bearer synthetic   ', 'LOG').fields[0];
+  assert.equal(header.value, 'Bearer synthetic');
+});
+
+test('review regressions: budget caps bound memory; rewrites never throw', () => {
+  assert.deepEqual(parseStructured('1', 'JSON', { maxDepth: 129 }).reasons, ['INVALID_BUDGET']);
+  assert.deepEqual(parseStructured('1', 'JSON', { maxFields: 65537 }).reasons, ['INVALID_BUDGET']);
+  const deepWide = `${'['.repeat(120)}${'1,'.repeat(20_000)}1${']'.repeat(120)}`;
+  assert.equal(parseStructured(deepWide, 'JSON', { maxDepth: 128, maxFields: 65536 }).status, 'FAILURE');
+  const url = 'https://u:old@h.example.invalid/';
+  const field = parseStructured(url, 'URL').fields.find((f) => f.path.join('.') === 'userinfo.password');
+  assert.deepEqual(rewriteFieldValues(url, 'URL', [{ field, replacement: '\uD800' }]),
+    { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' });
+  // Caller-supplied syntax is ignored: the parser's own syntax for that span is used.
+  const json = '{"a":"old"}';
+  const jf = parseStructured(json, 'JSON').fields[0];
+  const out = rewriteFieldValues(json, 'JSON', [{ field: { ...jf, syntax: 'BARE' }, replacement: 'q"x' }]);
+  assert.deepEqual(parseStructured(out.text, 'JSON').fields[0].value, 'q"x');
+});
+
+test('review regressions: long whitespace runs parse in linear time', () => {
+  for (const [text, format] of [[`A: x${' '.repeat(1 << 19)}y`, 'LOG'], [`a${' '.repeat(1 << 19)}`, 'INI'],
+    [`[s${' '.repeat(1 << 19)}`, 'INI'], [`A=${' '.repeat(1 << 19)}#c`, 'DOTENV'], [`a:${' '.repeat(1 << 19)}b`, 'INI']]) {
+    const started = process.hrtime.bigint();
+    parseStructured(text, format);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(elapsedMs < 2000, `${format} ${elapsedMs}ms`);
+  }
+});
+
+test('property: rewriting random fields preserves every key and unedited value and removes the edited originals', () => {
+  const random = prng(0x0707);
+  const alphabet = ['a', 'Z', '0', ' ', '"', "'", '\\', ';', '#', '}', '{', '=', '&', '%', '\n', 'é', ':', '/'];
+  const pick = (list) => list[Math.floor(random() * list.length)];
+  const word = (n) => Array.from({ length: n }, () => pick(alphabet)).join('');
+  for (let run = 0; run < 300; run++) {
+    const obj = { host: 'h.example.invalid', password: `old-${run}`, nested: { token: `old2-${run}`, list: ['x', `old3-${run}`] } };
+    const cases = [
+      [JSON.stringify(obj), 'JSON'],
+      [`HOST=h.example.invalid\nPASSWORD="old-${run}"\nTOKEN='old2-${run}'`, 'DOTENV'],
+      [`Server=h.example.invalid;Password="old-${run}";Pwd={old2-${run}}`, 'CONNECTION_STRING'],
+      [`https://u:old-${run}@h.example.invalid/p?token=old2-${run}#f`, 'URL'],
+    ];
+    const [text, format] = pick(cases);
+    const parsed = parseStructured(text, format);
+    const targets = parsed.fields.filter((f) => f.value.startsWith('old'));
+    const edits = targets.map((field) => ({ field, replacement: word(1 + Math.floor(random() * 12)) }));
+    const out = rewriteFieldValues(text, format, edits);
+    if (out.status === 'FAILURE') { assert.ok(['UNENCODABLE_REPLACEMENT', 'ROUND_TRIP_MISMATCH'].includes(out.reason)); continue; }
+    const after = parseStructured(out.text, format);
+    assert.deepEqual(after.fields.map((f) => f.path.join('.')), parsed.fields.map((f) => f.path.join('.')));
+    parsed.fields.forEach((field, index) => {
+      const edit = edits.find((e) => e.field === field);
+      assert.equal(after.fields[index].value, edit ? edit.replacement : field.value);
+    });
+    for (const field of targets) assert.ok(!out.text.includes(field.value), `${format} ${out.text}`);
   }
 });

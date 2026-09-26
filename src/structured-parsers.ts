@@ -33,7 +33,7 @@ export interface ParsedField {
 export interface OpaqueRange { start: number; end: number; reason: string }
 export interface ParseResult {
   /**
-   * COMPLETE: every byte is structure or a field. PARTIAL: some ranges are opaque (malformed lines, budget).
+   * COMPLETE: every byte is structure, a field or a listed comment. PARTIAL: some ranges are opaque.
    * UNSUPPORTED: no parser for the format. FAILURE: the input as a whole is malformed or over budget.
    * LOG results are field extraction only (`coverage: FIELDS_ONLY`); free text still needs detectors.
    */
@@ -43,17 +43,29 @@ export interface ParseResult {
   reasons: readonly string[];
   fields: readonly ParsedField[];
   opaque: readonly OpaqueRange[];
+  /**
+   * Comment text (full-line and inline) in dotenv/INI sources. Comments are not fields, but they are never
+   * dropped: detectors must scan them, and rewriting refuses sources with comments unless told to remove them.
+   */
+  comments: readonly OpaqueRange[];
 }
 
 /* ---------- Credential-like keys ---------- */
 
 const RISKY = ['password', 'passwd', 'passphrase', 'pwd', 'secret', 'token', 'apikey', 'accesskey', 'privatekey',
   'credential', 'authorization', 'cookie', 'sessionid', 'signature', 'bearer', 'connectionstring', 'sas', 'jwt'];
-/** Normalizes `API_KEY`, `apiKey`, `x-api-key`, `Client Secret` and similar before matching. */
+const RISKY_EXACT = ['auth', 'pass', 'sid', 'sig', 'key', 'pw', 'otp', 'dsn'];
+const RISKY_SUFFIX = ['pass', 'pw', 'key', 'sessid', 'auth', 'dsn'];
+/**
+ * Normalizes `API_KEY`, `apiKey`, `x-api-key`, `Client Secret` and similar before matching. Keys with
+ * non-ASCII letters are treated as credential-like: homoglyphs (`pаssword`) must not hide a password.
+ * Over-matching (`max_tokens`, `monkey`) only over-protects.
+ */
 export function isCredentialKey(key: string): boolean {
+  if (/[^\u0000-\u007f]/u.test(key)) return true;
   const compact = key.toLowerCase().replace(/[^a-z0-9]/gu, '');
   if (!compact) return false;
-  if (compact === 'auth' || compact === 'pass' || compact === 'sid' || compact.endsWith('auth') && compact.length <= 12) return true;
+  if (RISKY_EXACT.includes(compact) || RISKY_SUFFIX.some((suffix) => compact.endsWith(suffix))) return true;
   return RISKY.some((word) => compact.includes(word));
 }
 
@@ -69,8 +81,8 @@ function budgetFrom(raw: unknown): ParseBudget | null {
     for (const key of Object.keys(raw)) {
       if (!(key in DEFAULT_PARSE_BUDGET)) return null;
       const value: unknown = (raw as Record<string, unknown>)[key];
-      // Depth is capped well below the JS stack limit so recursion cannot fail unpredictably.
-      const cap = key === 'maxDepth' ? 512 : 16 << 20;
+      // Depth stays well below the JS stack limit; fields are capped so per-field path copies stay bounded.
+      const cap = key === 'maxDepth' ? 128 : key === 'maxFields' ? 65536 : 16 << 20;
       if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > cap) return null;
       result[key as keyof ParseBudget] = value;
     }
@@ -78,17 +90,21 @@ function budgetFrom(raw: unknown): ParseBudget | null {
   return result;
 }
 function result(format: Format, status: ParseResult['status'], fields: ParsedField[], opaque: OpaqueRange[],
-  reasons: Iterable<string>, coverage: ParseResult['coverage'] = 'FULL'): ParseResult {
+  reasons: Iterable<string>, coverage: ParseResult['coverage'] = 'FULL', comments: OpaqueRange[] = []): ParseResult {
   return Object.freeze({ status, format, coverage, reasons: Object.freeze([...new Set(reasons)].sort()),
     fields: Object.freeze(fields.map((field) => Object.freeze({ ...field, path: Object.freeze([...field.path]) }))),
-    opaque: Object.freeze(opaque.map((range) => Object.freeze(range))) });
+    opaque: Object.freeze(opaque.map((range) => Object.freeze(range))),
+    comments: Object.freeze(comments.map((range) => Object.freeze(range))) });
 }
 function whole(format: Format, text: string, status: 'FAILURE' | 'UNSUPPORTED', reason: string): ParseResult {
   return result(format, status, [], text.length ? [{ start: 0, end: text.length, reason }] : [], [reason]);
 }
-interface Collector { fields: ParsedField[]; max: number }
+/** Total path segments across all fields, bounding memory for deep-and-wide inputs. */
+const MAX_PATH_ELEMENTS = 1 << 20;
+interface Collector { fields: ParsedField[]; max: number; pathElements: number; comments: OpaqueRange[] }
 function push(into: Collector, field: ParsedField): void {
-  if (into.fields.length >= into.max) throw new Budget('FIELD_LIMIT');
+  into.pathElements += field.path.length;
+  if (into.fields.length >= into.max || into.pathElements > MAX_PATH_ELEMENTS) throw new Budget('FIELD_LIMIT');
   into.fields.push(field);
 }
 function lines(text: string): { start: number; end: number; line: string }[] {
@@ -132,11 +148,25 @@ function parseJson(text: string, budget: ParseBudget, into: Collector, reasons: 
     ws();
     const char = text[at];
     const keyed = key ? { keyStart: key.start, keyEnd: key.end } : {};
-    const risky = path.length > 0 && isCredentialKey(path[path.length - 1]!);
+    // A credential-like ancestor makes every nested value high risk (`{"password":["x"]}`).
+    const risky = path.some((segment) => isCredentialKey(segment));
     if (char === '{') {
       at++; ws();
       const seen = new Set<string>();
       if (text[at] === '}') { at++; return; }
+      const first = into.fields.length;
+      const close = (): void => {
+        // `{"name":"DB_PASSWORD","value":"x"}` (Kubernetes env, docker inspect): the sibling names the value.
+        const children = into.fields.slice(first).filter((field) => field.path.length === path.length + 1);
+        const named = children.some((field) => /^(?:name|key)$/iu.test(field.path[path.length]!) &&
+          field.syntax === 'JSON_STRING' && isCredentialKey(field.value));
+        if (named) {
+          for (const field of into.fields.slice(first)) {
+            if (/^value$/iu.test(field.path[path.length] ?? '')) field.highRisk = true;
+          }
+        }
+        at++;
+      };
       for (;;) {
         ws();
         const name = string();
@@ -148,7 +178,7 @@ function parseJson(text: string, budget: ParseBudget, into: Collector, reasons: 
         value([...path, name.value], depth + 1, { start: name.start, end: name.end });
         ws();
         if (text[at] === ',') { at++; continue; }
-        if (text[at] === '}') { at++; return; }
+        if (text[at] === '}') { close(); return; }
         throw new Malformed('EXPECTED_OBJECT_END', at);
       }
     }
@@ -182,7 +212,7 @@ function parseJson(text: string, budget: ParseBudget, into: Collector, reasons: 
 
 /* ---------- Line formats: dotenv / shell assignments and INI ---------- */
 
-interface Quoted { value: string; start: number; end: number; syntax: ValueSyntax }
+interface Quoted { value: string; start: number; end: number; syntax: ValueSyntax; commentStart?: number }
 /** Parse a value starting at `at` in `line` (offset `base`); returns null if a quote is unterminated. */
 function lineValue(line: string, at: number, base: number, comments: string): Quoted | null {
   const quote = line[at];
@@ -196,38 +226,57 @@ function lineValue(line: string, at: number, base: number, comments: string): Qu
     }
     if (index >= line.length) return null;
     const rest = line.slice(index + 1);
-    if (rest.trim() && !new RegExp(`^\\s+[${comments}]`, 'u').test(rest)) return null;
-    return { value, start: base + at + 1, end: base + index, syntax: quote === '"' ? 'DOUBLE_QUOTED' : 'SINGLE_QUOTED' };
+    const marker = new RegExp(`^\\s+[${comments}]`, 'u').exec(rest);
+    if (rest.trim() && !marker) return null;
+    return { value, start: base + at + 1, end: base + index, syntax: quote === '"' ? 'DOUBLE_QUOTED' : 'SINGLE_QUOTED',
+      ...(marker ? { commentStart: base + index + 1 + marker[0].length - 1 } : {}) };
   }
   let end = line.length;
   const comment = new RegExp(`\\s[${comments}]`, 'u').exec(line.slice(at));
   if (comment) end = at + comment.index;
+  const commentStart = comment ? base + at + comment.index + 1 : undefined;
   while (end > at && /\s/u.test(line[end - 1]!)) end--;
-  return { value: line.slice(at, end), start: base + at, end: base + end, syntax: 'BARE' };
+  return { value: line.slice(at, end), start: base + at, end: base + end, syntax: 'BARE',
+    ...(commentStart !== undefined ? { commentStart } : {}) };
 }
 function parseDotenv(text: string, into: Collector, opaque: OpaqueRange[]): void {
   for (const { start, line } of lines(text)) {
-    if (!line.trim() || /^\s*#/u.test(line)) continue;
+    if (!line.trim()) continue;
+    const full = /^\s*#/u.exec(line);
+    if (full) { into.comments.push({ start: start + full[0].length - 1, end: start + line.length, reason: 'COMMENT' }); continue; }
     const match = /^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)/u.exec(line);
     const parsed = match && lineValue(line, match[0].length, start, '#');
     if (!match || !parsed) { opaque.push({ start, end: start + line.length, reason: 'UNRECOGNIZED_LINE' }); continue; }
     const keyStart = start + match[1]!.length;
     push(into, { path: [match[2]!], keyStart, keyEnd: keyStart + match[2]!.length, valueStart: parsed.start,
       valueEnd: parsed.end, value: parsed.value, syntax: parsed.syntax, highRisk: isCredentialKey(match[2]!) });
+    if (parsed.commentStart !== undefined) into.comments.push({ start: parsed.commentStart, end: start + line.length, reason: 'COMMENT' });
   }
 }
 function parseIni(text: string, into: Collector, opaque: OpaqueRange[]): void {
   let section: string[] = [];
   for (const { start, line } of lines(text)) {
-    if (!line.trim() || /^\s*[#;]/u.test(line)) continue;
-    const header = /^\s*\[([^\]\r\n]+)\]\s*$/u.exec(line);
-    if (header) { section = header[1]!.trim().split('.'); continue; }
-    const match = /^(\s*)([^=:\s][^=:]*?)(\s*[=:]\s*)/u.exec(line);
-    const parsed = match && lineValue(line, match[0].length, start, '#;');
-    if (!match || !parsed) { opaque.push({ start, end: start + line.length, reason: 'UNRECOGNIZED_LINE' }); continue; }
-    const keyStart = start + match[1]!.length;
-    push(into, { path: [...section, match[2]!], keyStart, keyEnd: keyStart + match[2]!.length, valueStart: parsed.start,
-      valueEnd: parsed.end, value: parsed.value, syntax: parsed.syntax, highRisk: isCredentialKey(match[2]!) });
+    if (!line.trim()) continue;
+    const full = /^\s*[#;]/u.exec(line);
+    if (full) { into.comments.push({ start: start + full[0].length - 1, end: start + line.length, reason: 'COMMENT' }); continue; }
+    const trimmed = line.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']') && trimmed.length > 2 && !/[\]\r\n]/u.test(trimmed.slice(1, -1))) {
+      section = trimmed.slice(1, -1).trim().split('.');
+      continue;
+    }
+    // Linear key scan: the first `=` or `:` separates key and value (no backtracking regex).
+    const indent = line.length - line.trimStart().length;
+    let separator = -1;
+    for (let index = indent; index < line.length; index++) if (line[index] === '=' || line[index] === ':') { separator = index; break; }
+    const key = separator > indent ? line.slice(indent, separator).trimEnd() : '';
+    let valueAt = separator + 1;
+    while (valueAt < line.length && (line[valueAt] === ' ' || line[valueAt] === '\t')) valueAt++;
+    const parsed = key ? lineValue(line, valueAt, start, '#;') : null;
+    if (!key || !parsed) { opaque.push({ start, end: start + line.length, reason: 'UNRECOGNIZED_LINE' }); continue; }
+    const path = [...section, key];
+    push(into, { path, keyStart: start + indent, keyEnd: start + indent + key.length, valueStart: parsed.start,
+      valueEnd: parsed.end, value: parsed.value, syntax: parsed.syntax, highRisk: path.some((segment) => isCredentialKey(segment)) });
+    if (parsed.commentStart !== undefined) into.comments.push({ start: parsed.commentStart, end: start + line.length, reason: 'COMMENT' });
   }
 }
 
@@ -251,7 +300,8 @@ function percentDecode(text: string, plusIsSpace: boolean): string {
   }
   try { return utf8.decode(Uint8Array.from(bytes)); } catch { throw new Malformed('BAD_PERCENT_UTF8', 0); }
 }
-const URL_SHAPE = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/(?:([^/?#@\s]*)@)?(\[[0-9A-Fa-f:.]+\]|[^/?#:@\s]*)(?::(\d{1,5}))?(\/[^?#\s]*)?(?:\?([^#\s]*))?(?:#(\S*))?$/u;
+// A compound scheme such as `jdbc:postgresql://` is accepted as one scheme.
+const URL_SHAPE = /^([A-Za-z][A-Za-z0-9+.-]*(?::[A-Za-z][A-Za-z0-9+.-]*)?):\/\/(?:([^/?#@\s]*)@)?(\[[0-9A-Fa-f:.]+\]|[^/?#:@\s]*)(?::(\d{1,5}))?(\/[^?#\s]*)?(?:\?([^#\s]*))?(?:#(\S*))?$/u;
 function parseUrl(text: string, into: Collector, base = 0): void {
   const match = URL_SHAPE.exec(text);
   if (!match || match[4] !== undefined && Number(match[4]) > 65535) throw new Malformed('NOT_A_URL', base);
@@ -266,7 +316,8 @@ function parseUrl(text: string, into: Collector, base = 0): void {
   if (match[2] !== undefined) {
     const colon = match[2].indexOf(':');
     const user = colon < 0 ? match[2] : match[2].slice(0, colon);
-    field(['userinfo', 'username'], user, offset);
+    // Without a password, the username often *is* the token (`https://<token>@host`).
+    field(['userinfo', 'username'], user, offset, false, colon < 0);
     if (colon >= 0) field(['userinfo', 'password'], match[2].slice(colon + 1), offset + colon + 1, false, true);
     offset += match[2].length + 1;
   }
@@ -276,24 +327,30 @@ function parseUrl(text: string, into: Collector, base = 0): void {
   field(['path'], match[5], offset);
   offset += match[5]?.length ?? 0;
   if (match[6] !== undefined) {
-    let cursor = offset + 1;
-    for (const pair of match[6].split('&')) {
-      const eq = pair.indexOf('=');
-      const key = percentDecode(eq < 0 ? pair : pair.slice(0, eq), true);
-      if (eq >= 0) {
-        const raw = pair.slice(eq + 1);
-        push(into, { path: ['query', key], keyStart: base + cursor, keyEnd: base + cursor + eq, valueStart: base + cursor + eq + 1,
-          valueEnd: base + cursor + pair.length, value: percentDecode(raw, true),
-          syntax: 'PERCENT_ENCODED', highRisk: isCredentialKey(key) });
-      }
-      cursor += pair.length + 1;
-    }
+    pairs(['query'], match[6], base + offset + 1, into);
     offset += match[6].length + 1;
   }
-  field(['fragment'], match[7], offset + 1);
+  // OAuth implicit-flow fragments carry `access_token=...`: parse key=value fragments like a query.
+  if (match[7] !== undefined && match[7].includes('=')) pairs(['fragment'], match[7], base + offset + 1, into);
+  else field(['fragment'], match[7], offset + 1);
+}
+/** `&`- or `;`-separated pairs; a parameter without `=` is still a field (key ''), never dropped. */
+function pairs(prefix: string[], raw: string, start: number, into: Collector): void {
+  let cursor = start;
+  for (const pair of raw.split(/[&;]/u)) {
+    const eq = pair.indexOf('=');
+    const key = eq < 0 ? '' : percentDecode(pair.slice(0, eq), true);
+    const valueStart = eq < 0 ? cursor : cursor + eq + 1;
+    if (pair.length) {
+      push(into, { path: [...prefix, key], ...(eq >= 0 ? { keyStart: cursor, keyEnd: cursor + eq } : {}), valueStart,
+        valueEnd: cursor + pair.length, value: percentDecode(pair.slice(eq + 1), true), syntax: 'PERCENT_ENCODED',
+        highRisk: eq < 0 || isCredentialKey(key) });
+    }
+    cursor += pair.length + 1;
+  }
 }
 function parseConnectionString(text: string, into: Collector): void {
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(text.trim())) {
+  if (/^[A-Za-z][A-Za-z0-9+.-]*(?::[A-Za-z][A-Za-z0-9+.-]*)?:\/\//u.test(text.trim())) {
     const lead = text.length - text.trimStart().length;
     parseUrl(text.trim(), into, lead);
     return;
@@ -342,18 +399,33 @@ function parseConnectionString(text: string, into: Collector): void {
 
 /* ---------- Logs: header lines and key=value tokens (field extraction only) ---------- */
 
-const HEADER_LINE = /^(\s*)([A-Za-z][A-Za-z0-9-]{0,63})(:[ \t]*)(\S.*?)\s*$/u;
+// Linear: the value runs to end of line and trailing whitespace is trimmed in code, not by backtracking.
+const HEADER_LINE = /^(\s*)([A-Za-z][A-Za-z0-9-]{0,63})(:[ \t]*)(\S[^\r\n]*)$/u;
+const QUOTE_OPEN = /(?<![\w.-])[A-Za-z_][\w.-]{0,63}=(["'])/gu;
 const KV_TOKEN = /(?<![\w.-])([A-Za-z_][\w.-]{0,63})=("(?:[^"\\\r\n]|\\.){0,4096}"|'[^'\r\n]{0,4096}'|[^\s"',;]{1,4096})/gu;
-function parseLog(text: string, into: Collector): void {
+function parseLog(text: string, into: Collector, opaque: OpaqueRange[]): void {
   lines(text).forEach(({ start, line }, lineNo) => {
     const header = HEADER_LINE.exec(line);
     // A timestamp-like `12:34` is not a header; header names start with a letter.
     if (header && !/^\d/u.test(header[4]!)) {
       const keyStart = start + header[1]!.length;
       const valueStart = keyStart + header[2]!.length + header[3]!.length;
+      const value = header[4]!.trimEnd();
       push(into, { path: [String(lineNo), header[2]!], keyStart, keyEnd: keyStart + header[2]!.length, valueStart,
-        valueEnd: valueStart + header[4]!.length, value: header[4]!, syntax: 'BARE', highRisk: isCredentialKey(header[2]!) });
+        valueEnd: valueStart + value.length, value, syntax: 'BARE', highRisk: isCredentialKey(header[2]!) });
     }
+    // A value cut by a length cap or an unterminated quote would give a partial span: mark the line opaque.
+    const quotedStarts = new Set<number>();
+    let overflow = false;
+    for (const match of line.matchAll(KV_TOKEN)) {
+      const raw = match[2]!;
+      if (raw[0] === '"' || raw[0] === "'") quotedStarts.add(match.index + match[1]!.length + 1);
+      else if (raw.length === 4096 && /[^\s"',;]/u.test(line[match.index + match[0].length] ?? ' ')) overflow = true;
+    }
+    for (const open of line.matchAll(QUOTE_OPEN)) {
+      if (!quotedStarts.has(open.index + open[0].length - 1)) overflow = true;
+    }
+    if (overflow) opaque.push({ start, end: start + line.length, reason: 'VALUE_OVERFLOW' });
     for (const match of line.matchAll(KV_TOKEN)) {
       const raw = match[2]!;
       const quoted = raw[0] === '"' || raw[0] === "'";
@@ -385,7 +457,7 @@ export function parseStructured(text: unknown, format: unknown, budget?: unknown
     return whole(kind, text, 'FAILURE', 'INVALID_TEXT');
   }
   if (!SUPPORTED.includes(kind)) return whole(kind, text, 'UNSUPPORTED', 'UNSUPPORTED_FORMAT');
-  const into: Collector = { fields: [], max: limits.maxFields };
+  const into: Collector = { fields: [], max: limits.maxFields, pathElements: 0, comments: [] };
   const opaque: OpaqueRange[] = [];
   const reasons = new Set<string>();
   try {
@@ -395,7 +467,7 @@ export function parseStructured(text: unknown, format: unknown, budget?: unknown
       case 'INI': parseIni(text, into, opaque); break;
       case 'URL': parseUrl(text.trim(), into, text.length - text.trimStart().length); break;
       case 'CONNECTION_STRING': parseConnectionString(text, into); break;
-      case 'LOG': parseLog(text, into); break;
+      case 'LOG': parseLog(text, into, opaque); break;
     }
   } catch (error) {
     // No success-shaped partial parse: the whole input becomes opaque.
@@ -403,8 +475,9 @@ export function parseStructured(text: unknown, format: unknown, budget?: unknown
     return whole(kind, text, 'FAILURE', 'PARSER_ERROR');
   }
   if (opaque.length) reasons.add('OPAQUE_RANGES');
+  if (into.comments.length) reasons.add('COMMENTS');
   return result(kind, opaque.length ? 'PARTIAL' : 'COMPLETE', into.fields, opaque, reasons,
-    kind === 'LOG' ? 'FIELDS_ONLY' : 'FULL');
+    kind === 'LOG' ? 'FIELDS_ONLY' : 'FULL', into.comments);
 }
 
 /* ---------- Round-trip rewriting (keys and syntax preserved, or FAILURE) ---------- */
@@ -418,42 +491,52 @@ function encodeFor(syntax: ValueSyntax, replacement: string): string | null {
     case 'DOUBLED_SINGLE_QUOTED': return replacement.replace(/'/gu, "''");
     case 'SINGLE_QUOTED': return replacement.includes("'") || /[\r\n]/u.test(replacement) ? null : replacement;
     case 'BRACED': return replacement.replace(/\}/gu, '}}');
-    case 'PERCENT_ENCODED': return encodeURIComponent(replacement);
+    case 'PERCENT_ENCODED': try { return encodeURIComponent(replacement); } catch { return null; }
     case 'BARE': return /^[A-Za-z0-9._~:@\-[\]<>]*$/u.test(replacement) ? replacement : null;
   }
 }
 export interface RewriteEdit { field: ParsedField; replacement: string }
+export interface RewriteOptions {
+  /** REFUSE (default): sources with comments fail. REMOVE: comment text is deleted (markers kept). */
+  comments?: 'REFUSE' | 'REMOVE';
+}
 /**
- * Replace field values, re-encoding each replacement for its source syntax, then re-parse and require the
- * same key paths and decoded replacement values. Any mismatch is a FAILURE: callers must not fall back
- * to emitting the original text.
+ * Replace field values, re-encoding each replacement for the syntax the parser found at that span, then
+ * re-parse and require identical key paths, the replacements at edited fields and unchanged values
+ * everywhere else. Any mismatch is a FAILURE: callers must not fall back to emitting the original text.
  */
-export function rewriteFieldValues(text: string, format: Format, edits: readonly RewriteEdit[]):
+export function rewriteFieldValues(text: string, format: Format, edits: readonly RewriteEdit[], options: RewriteOptions = {}):
   { status: 'OK'; text: string } | { status: 'FAILURE'; reason: string } {
   const before = parseStructured(text, format);
   if (before.status !== 'COMPLETE' || before.coverage !== 'FULL') return { status: 'FAILURE', reason: 'SOURCE_NOT_COMPLETE' };
-  const known = new Set(before.fields.map((field) => `${field.valueStart}:${field.valueEnd}`));
-  const ordered = [...edits].sort((a, b) => b.field.valueStart - a.field.valueStart);
-  let output = text, previousStart = Infinity;
-  for (const { field, replacement } of ordered) {
-    if (typeof replacement !== 'string' || !known.has(`${field.valueStart}:${field.valueEnd}`) || field.valueEnd > previousStart) {
+  if (before.comments.length && options.comments !== 'REMOVE') return { status: 'FAILURE', reason: 'SOURCE_HAS_COMMENTS' };
+  const byStart = new Map(before.fields.map((field, index) => [`${field.valueStart}:${field.valueEnd}`, index]));
+  const replacements = new Map<number, string>();
+  for (const edit of edits) {
+    const index = byStart.get(`${edit.field?.valueStart}:${edit.field?.valueEnd}`);
+    if (index === undefined || typeof edit.replacement !== 'string' || replacements.has(index)) {
       return { status: 'FAILURE', reason: 'INVALID_EDIT' };
     }
+    replacements.set(index, edit.replacement);
+  }
+  // Splice right to left: field values, then removed comment text, never overlapping.
+  const splices: { start: number; end: number; text: string }[] = [];
+  for (const [index, replacement] of replacements) {
+    const field = before.fields[index]!;
     const encoded = encodeFor(field.syntax, replacement);
     if (encoded === null) return { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' };
-    output = output.slice(0, field.valueStart) + encoded + output.slice(field.valueEnd);
-    previousStart = field.valueStart;
+    splices.push({ start: field.valueStart, end: field.valueEnd, text: encoded });
   }
+  for (const comment of before.comments) splices.push({ start: comment.start + 1, end: comment.end, text: '' });
+  splices.sort((a, b) => b.start - a.start);
+  let output = text;
+  for (const splice of splices) output = output.slice(0, splice.start) + splice.text + output.slice(splice.end);
   const after = parseStructured(output, format);
-  const paths = (parsed: ParseResult): string[] => parsed.fields.map((field) => JSON.stringify(field.path));
-  if (after.status !== 'COMPLETE' || JSON.stringify(paths(after)) !== JSON.stringify(paths(before))) {
-    return { status: 'FAILURE', reason: 'ROUND_TRIP_MISMATCH' };
-  }
-  const index = new Map(before.fields.map((field, i) => [`${field.valueStart}:${field.valueEnd}`, i]));
-  for (const { field, replacement } of edits) {
-    if (after.fields[index.get(`${field.valueStart}:${field.valueEnd}`)!]!.value !== replacement) {
-      return { status: 'FAILURE', reason: 'ROUND_TRIP_MISMATCH' };
-    }
+  if (after.status !== 'COMPLETE' || after.fields.length !== before.fields.length) return { status: 'FAILURE', reason: 'ROUND_TRIP_MISMATCH' };
+  for (let index = 0; index < before.fields.length; index++) {
+    const expected = replacements.get(index) ?? before.fields[index]!.value;
+    if (JSON.stringify(after.fields[index]!.path) !== JSON.stringify(before.fields[index]!.path) ||
+      after.fields[index]!.value !== expected) return { status: 'FAILURE', reason: 'ROUND_TRIP_MISMATCH' };
   }
   return { status: 'OK', text: output };
 }
