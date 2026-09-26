@@ -64,8 +64,10 @@ function label(value: unknown, limit = 256): value is string {
 
 /* ---------- Text folding shared by names and input: NFC per cluster, with an offset map ---------- */
 
-const TOKEN = /[\p{L}\p{N}_]+/gu;
-interface Folded { text: string; origin: number[] }
+// Marks belong to their token: Indic/Thai/Arabic vowel signs and case-fold marks (İ -> i + U+0307).
+const TOKEN = /[\p{L}\p{M}\p{N}_]+/gu;
+/** Per folded code unit: original start and end of the cluster it came from. */
+interface Folded { text: string; origin: number[]; originEnd: number[] }
 /**
  * NFC-normalize and lower-case each base character with its combining marks, recording for every folded
  * code unit the original offset of its cluster. Offsets therefore survive decomposed input. Compositions
@@ -74,13 +76,16 @@ interface Folded { text: string; origin: number[] }
 function fold(text: string): Folded {
   let folded = '';
   const origin: number[] = [];
+  const originEnd: number[] = [];
   for (const match of text.matchAll(/\P{M}\p{M}*|\p{M}+/gsu)) {
     const piece = match[0].normalize('NFC').toLowerCase();
-    for (let unit = 0; unit < piece.length; unit++) origin.push(match.index);
+    for (let unit = 0; unit < piece.length; unit++) {
+      origin.push(match.index);
+      originEnd.push(match.index + match[0].length);
+    }
     folded += piece;
   }
-  origin.push(text.length);
-  return { text: folded, origin };
+  return { text: folded, origin, originEnd };
 }
 /** Separator between two tokens: whitespace runs compare equal, anything else must match exactly. */
 function separator(text: string): string {
@@ -142,7 +147,8 @@ function matchNames(text: string, root: TrieNode): { start: number; end: number 
     }
     if (longest < 0) { index++; continue; }
     const first = tokens[index]!, last = tokens[longest]!;
-    spans.push({ start: folded.origin[first.index]!, end: folded.origin[last.index + last[0].length]! });
+    // End at the end of the cluster holding the last folded unit, so no trailing mark or letter is lost.
+    spans.push({ start: folded.origin[first.index]!, end: folded.originEnd[last.index + last[0].length - 1]! });
     index = longest + 1;
   }
   return spans;
@@ -150,11 +156,14 @@ function matchNames(text: string, root: TrieNode): { start: number; end: number 
 
 /* ---------- Patterns (bounded quantifiers; no nested unbounded repetition) ---------- */
 
-// RFC 5322 atext plus Unicode letters/digits (RFC 6531). The lookbehind excludes the same class, so a
-// match always starts at the token start instead of leaving an uncloaked prefix.
-const LOCAL = "[\\p{L}\\p{N}!#$%&'*+/=?^_`{|}~-]";
-const EMAIL = new RegExp(`(?<!${LOCAL})${LOCAL}(?:${LOCAL}|\\.(?=${LOCAL})){0,255}@` +
-  '(?:[\\p{L}\\p{N}](?:[\\p{L}\\p{N}-]{0,61}[\\p{L}\\p{N}])?\\.){1,16}(?:xn--[a-z0-9-]{1,59}|\\p{L}{2,24})' +
+// Local part: Unicode letters/digits (RFC 6531) and the atext that appears in practice. It may not start
+// with an apostrophe, and rarer atext (`/ = ? & ~ { } \``) is excluded so quotes, paths and URL queries are
+// not swallowed. The lookbehind excludes every start character and `.`, so a match starts at the token
+// start and a dotted run has a single start (bounded work). 64 is the RFC 5321 local-part limit.
+const LOCAL_START = '[\\p{L}\\p{M}\\p{N}_%+-]';
+const LOCAL = "[\\p{L}\\p{M}\\p{N}_%+'-]";
+const EMAIL = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}_%+.-])${LOCAL_START}(?:${LOCAL}|\\.(?=${LOCAL})){0,63}@` +
+  '(?:[\\p{L}\\p{N}](?:[\\p{L}\\p{M}\\p{N}-]{0,61}[\\p{L}\\p{M}\\p{N}])?\\.){1,16}(?:xn--[a-z0-9-]{1,59}|\\p{L}{2,24})' +
   '(?![\\p{L}\\p{N}]|\\.[\\p{L}\\p{N}])', 'gu');
 // Digit groups with phone separators. `:`, `=` and `#` may precede (keyword forms such as `tel:`).
 const PHONE = /(?<![\p{L}\p{N}_./@-])(?:\+|00)?\(?\d{1,4}\)?(?:[ \-.]?\(?\d{1,4}\)?){1,7}(?![\p{L}\p{N}_@]|[.:\-/]\d)/gu;

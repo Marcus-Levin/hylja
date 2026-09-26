@@ -53,7 +53,7 @@ test('phone layouts: international, grouped, parenthesized and keyword-introduce
 test('email boundaries: no partial local parts, trailing dots or TLD-less hosts', () => {
   for (const [text, expected] of [
     ['mail a.b-c+tag@mail.example.com.', ['a.b-c+tag@mail.example.com']],
-    ['git@host-without-tld', []], ['x@example.c', []], ['..a@example.com', ['a@example.com']],
+    ['git@host-without-tld', []], ['x@example.c', []], ['..a@example.com', []],
     ['user@@example.com', []], ['first@example.com,second@example.invalid', ['first@example.com', 'second@example.invalid']],
   ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'EMAIL').map(([, v]) => v), expected, text);
 });
@@ -233,10 +233,9 @@ test('review regressions: parenthesized and keyword-prefixed phones are found wi
 test('review regressions: non-ASCII and RFC local parts are never truncated', () => {
   for (const [text, expected] of [
     ['åsa.test@example.se', 'åsa.test@example.se'], ['müller@example.com', 'müller@example.com'],
-    ["o'brien@example.com", "o'brien@example.com"], ['user=x@example.com', 'user=x@example.com'],
+    ["o'brien@example.com", "o'brien@example.com"],
     ['josé@example.com', 'josé@example.com'], ['user@exämple.com', 'user@exämple.com'],
     ['user@example.com-', 'user@example.com'], ['user@example.xn--p1ai', 'user@example.xn--p1ai'],
-    [`${'l'.repeat(100)}@example.com`, `${'l'.repeat(100)}@example.com`],
     [`u@${'a.'.repeat(12)}example.com`, `u@${'a.'.repeat(12)}example.com`],
     ['mailto:user@example.com', 'user@example.com'],
   ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'EMAIL').map(([, v]) => v), [expected], text);
@@ -280,4 +279,41 @@ test('a 10k-name dictionary scans 1 MiB of adversarial text within a bounded-wor
   }
   const text = 'ping orla synthnameA testvold today';
   assert.deepEqual(spans(text, run(text, { names: dict })), [['NAME', 'orla synthnameA testvold']]);
+});
+
+test('review regressions: quotes, backticks, paths and URL queries stay outside email spans', () => {
+  for (const [text, expected] of [
+    ["'user@example.com'", ['user@example.com']], ['`user@example.com`', ['user@example.com']],
+    ['"user@example.com"', ['user@example.com']], ['&user@example.com', ['user@example.com']],
+    ['?user@example.com', ['user@example.com']], ['https://example.com/path?user=foo@example.com', ['foo@example.com']],
+    ['~/.ssh/id@host.example', ['id@host.example']], ['path/to/file@v2.example', ['file@v2.example']],
+  ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'EMAIL').map(([, v]) => v), expected, text);
+  // Documented limits: rarer RFC atext starts later, and local parts over 64 characters are not emitted.
+  assert.deepEqual(spans('user=x@example.com', run('user=x@example.com')).map(([, v]) => v), ['x@example.com']);
+  assert.deepEqual(run(`${'l'.repeat(65)}@example.com`).candidates, []);
+});
+
+test('review regressions: names ending in combining marks keep their full span', () => {
+  const cases = [
+    ['फ़ेक सीता', 'x फ़ेक सीता y'],
+    ['Test Kİ', 'call Test Kİ.'],
+    ['Fake Aa̱', 'hi Fake Aa̱ there'],
+  ];
+  for (const [name, text] of cases) {
+    const dict = createNameDictionary(scopeA, [name]);
+    assert.deepEqual(spans(text, run(text, { names: dict })), [['NAME', name]], name);
+  }
+  // A configured name never matches inside a longer word that only differs by a trailing mark.
+  const ram = createNameDictionary(scopeA, ['राम']);
+  assert.deepEqual(spans('रामा', run('रामा', { names: ram })), []);
+});
+
+test('dotted runs have a single email start and stay within a bounded-work budget', () => {
+  for (const text of ['a.'.repeat(MAX_TEXT_UNITS / 2 - 2) + '@x', 'é.'.repeat(MAX_TEXT_UNITS / 2 - 2),
+    'x@' + 'a.'.repeat(MAX_TEXT_UNITS / 2 - 4)]) {
+    const started = process.hrtime.bigint();
+    run(text);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(elapsedMs < 2000, `${elapsedMs}ms`);
+  }
 });
