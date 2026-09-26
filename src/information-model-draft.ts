@@ -27,7 +27,7 @@ function plain(value: unknown, required: readonly string[], optional: readonly s
     return result;
   } catch { return null; }
 }
-/** Snapshot a dense plain array through descriptors; a Proxy or accessor makes it invalid. */
+/** Snapshot a dense plain array once through descriptors; an accessor or hole makes it invalid. */
 function items(value: unknown, max = MAX_ITEMS): unknown[] | null {
   try {
     if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return null;
@@ -47,8 +47,14 @@ function items(value: unknown, max = MAX_ITEMS): unknown[] | null {
 function inSet<T extends string>(value: unknown, set: readonly T[]): value is T {
   return typeof value === 'string' && set.includes(value as T);
 }
-function ref(value: unknown): value is string {
-  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value);
+/**
+ * Opaque, prefixed, lower-case refs. The grammar rejects dotted hostnames, IPs, URLs and typical
+ * `_`/`:`-separated key formats; it cannot prove that a well-formed ref embeds no protected value.
+ */
+function ref(value: unknown, prefixes: readonly string[]): value is string {
+  if (typeof value !== 'string' || value.length > 64) return false;
+  const match = /^([a-z]+)-[a-z0-9]+(?:-[a-z0-9]+)*$/u.exec(value);
+  return match !== null && prefixes.includes(match[1]!);
 }
 function name(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/u.test(value);
@@ -78,19 +84,22 @@ export const RESOLUTION_STATES = ['RESOLVED', 'RESOLVED_CONSERVATIVELY', 'UNRESO
 export type ResolutionState = (typeof RESOLUTION_STATES)[number];
 export interface SensitivityResolutionDraft {
   state: ResolutionState;
-  /** Highest agreed deterministic sensitivity; UNKNOWN when no deterministic floor exists. */
+  /** The single agreed deterministic sensitivity (SECRET for a credential); UNKNOWN whenever UNRESOLVED. */
   floor: Sensitivity | 'UNKNOWN';
-  /** Never below `floor`; retains the highest concern seen even when unresolved. */
+  /** The sensitivity a v2 consumer may act on; never below `floor`, and UNKNOWN whenever UNRESOLVED. */
   effective: Sensitivity | 'UNKNOWN';
+  /** Highest validated claim seen, for review and metering only; never a decision input. */
+  highestConcern: Sensitivity | 'UNKNOWN';
   /** Ordered steps a semantic judgment raised above the floor; a metering signal, not a decision. */
   escalationSteps: number;
   reasons: readonly string[];
 }
 const BLOCKING_SENSITIVITY_REASONS = new Set([
   'INVALID_EVIDENCE', 'MISSING_DETERMINISTIC_EVIDENCE', 'DETERMINISTIC_CONFLICT', 'DETERMINISTIC_FAILURE',
+  // Any deterministic abstention blocks, as in v1: a detector that could not decide may hide a secret.
   // A semantic abstention equals an absent judge: it claims no escalation and leaves the floor intact.
   // A semantic FAILURE is not: the judge may have escalated, so it stays fail-closed (v1 parity).
-  'SEMANTIC_FAILURE', 'MISSING_SENSITIVITY',
+  'DETERMINISTIC_ABSTAINED', 'SEMANTIC_FAILURE', 'MISSING_SENSITIVITY',
 ]);
 
 /**
@@ -141,10 +150,11 @@ export function resolveSensitivityDraft(claims: unknown): SensitivityResolutionD
   const state: ResolutionState = blocked ? 'UNRESOLVED' :
     reasons.has('SEMANTIC_ESCALATION') || reasons.has('SEMANTIC_BELOW_FLOOR_IGNORED') ||
       reasons.has('CREDENTIAL_FLOOR_APPLIED') ? 'RESOLVED_CONSERVATIVELY' : 'RESOLVED';
-  const effective = concern ?? 'UNKNOWN';
+  const resolved = state !== 'UNRESOLVED' && floor !== undefined && concern !== undefined;
   return Object.freeze({
-    state, floor: floor ?? 'UNKNOWN', effective,
-    escalationSteps: floor !== undefined && concern !== undefined ? rank(concern) - rank(floor) : 0,
+    state, floor: resolved ? floor : 'UNKNOWN', effective: resolved ? concern : 'UNKNOWN',
+    highestConcern: concern ?? 'UNKNOWN',
+    escalationSteps: resolved ? rank(concern) - rank(floor) : 0,
     reasons: Object.freeze([...reasons].sort()),
   });
 }
@@ -159,7 +169,8 @@ export interface AttributeResolutionDraft { value: AttributeState; reasons: read
 /**
  * Used for contextual attributes such as `personalData` and `specialCategory`. YES dominates; NO needs
  * deterministic or trusted-context evidence with no failure or contrary claim. A model's NO alone is
- * UNKNOWN, and the result is never a legal determination.
+ * UNKNOWN, and the result is never a legal determination. Each attribute resolves independently; the
+ * oracle schema, not this resolver, enforces cross-attribute rules such as special category => personal data.
  */
 export function resolveAttributeDraft(claims: unknown): AttributeResolutionDraft {
   const reasons = new Set<string>();
@@ -182,7 +193,7 @@ export function resolveAttributeDraft(claims: unknown): AttributeResolutionDraft
   if (yes && !seen.DETERMINISTIC.has('YES')) reasons.add('SEMANTIC_ONLY_ASSERTION');
   if (!yes && seen.SEMANTIC.has('NO') && !seen.DETERMINISTIC.has('NO')) reasons.add('SEMANTIC_NEGATIVE_IGNORED');
   const deterministicNo = seen.DETERMINISTIC.has('NO') && !yes && !reasons.has('INVALID_EVIDENCE') &&
-    !reasons.has('DETERMINISTIC_FAILURE') && !reasons.has('SEMANTIC_FAILURE');
+    !reasons.has('DETERMINISTIC_FAILURE') && !reasons.has('DETERMINISTIC_ABSTAINED') && !reasons.has('SEMANTIC_FAILURE');
   if (!yes && !deterministicNo) reasons.add('ATTRIBUTE_UNKNOWN');
   return Object.freeze({
     value: yes ? 'YES' : deterministicNo ? 'NO' : 'UNKNOWN',
@@ -229,34 +240,45 @@ export interface FidelityAssessmentDraft {
   satisfying: readonly Representation[];
   /** Predicates no form within the ceiling can satisfy. */
   unmet: readonly FidelityPredicate[];
-  /** e.g. USE_WITHOUT_REVEAL: a trusted local effect may use the value; the model receives only the result. */
-  advice: readonly ('USE_WITHOUT_REVEAL' | 'TASK_UNSOLVABLE_WITHOUT_RELEASE')[];
+  /** Whether the non-reversible secret ceiling applied (always, unless a known sensitivity below SECRET). */
+  secretCeiling: boolean;
+  /**
+   * USE_WITHOUT_REVEAL: a trusted local effect may use the value and the model receives only the result.
+   * UNMET_WITHIN_CEILING: no released form within the ceiling meets every predicate; the remedy is review
+   * or a local effect, never widening release.
+   */
+  advice: readonly ('USE_WITHOUT_REVEAL' | 'UNMET_WITHIN_CEILING')[];
 }
 
 /**
  * Pure fidelity cost information for policy and evaluation. Fidelity can raise the cost of a
  * restrictive treatment; it never widens what policy permits and it never yields a treatment.
  */
-export function assessFidelityDraft(predicates: unknown, secret: boolean): FidelityAssessmentDraft {
-  const list = items(predicates, FIDELITY_PREDICATES.length);
-  if (typeof secret !== 'boolean' || !list || !list.length || list.some((value) => !inSet(value, FIDELITY_PREDICATES)) ||
-    new Set(list).size !== list.length) throw new TypeError('Invalid fidelity request');
-  const wanted = list as FidelityPredicate[];
+export function assessFidelityDraft(predicates: unknown, sensitivity: unknown): FidelityAssessmentDraft {
+  const wanted = predicateList(predicates);
+  if (!wanted || !inSet(sensitivity, [...SENSITIVITIES, 'UNKNOWN'] as const)) throw new TypeError('Invalid fidelity request');
+  // Unknown or unresolved sensitivity gets the secret ceiling: uncertainty never widens forms.
+  const secret = sensitivity === 'UNKNOWN' || sensitivity === 'SECRET';
   const ceiling = secret ? SECRET_REPRESENTATIONS : REPRESENTATIONS;
   const satisfying = ceiling.filter((form) => wanted.every((predicate) => SATISFIES[predicate].includes(form)));
   const unmet = wanted.filter((predicate) => !ceiling.some((form) => SATISFIES[predicate].includes(form)));
   const advice: FidelityAssessmentDraft['advice'][number][] = [];
   if (secret && wanted.includes('EXACT_VALUE')) advice.push('USE_WITHOUT_REVEAL');
-  if (!satisfying.some((form) => form !== 'WITHHELD')) advice.push('TASK_UNSOLVABLE_WITHOUT_RELEASE');
+  if (!satisfying.some((form) => form !== 'WITHHELD')) advice.push('UNMET_WITHIN_CEILING');
   return Object.freeze({
-    satisfying: Object.freeze(satisfying), unmet: Object.freeze(unmet.sort()), advice: Object.freeze(advice),
+    satisfying: Object.freeze(satisfying), unmet: Object.freeze(unmet.sort()), secretCeiling: secret,
+    advice: Object.freeze(advice),
   });
 }
 
 /* ---------- Semantic placeholders: typed, unambiguously synthetic, not reversible ---------- */
 
 const PLACEHOLDER = /^\[hylja:protected:([A-Z][A-Z0-9_]{0,63})\]$/u;
-/** Exposes only kind and presence. Derived facts such as emptiness or format validity need policy approval. */
+/**
+ * Exposes only kind and presence. Derived facts such as emptiness or format validity need policy approval.
+ * The grammar is not self-authenticating: the same text arriving in *input* is untrusted content, and a
+ * transformer or sentinel must flag or escape it rather than read it as a Hylja-issued placeholder.
+ */
 export function semanticPlaceholder(kind: string): string {
   if (!name(kind)) throw new TypeError('Invalid placeholder kind');
   return `[hylja:protected:${kind}]`;
@@ -285,7 +307,7 @@ function predicateList(value: unknown): FidelityPredicate[] | null {
 }
 export function validateTaskFidelityContractDraft(raw: unknown): TaskFidelityContractDraft | null {
   const contract = plain(raw, ['version', 'taskRef', 'requirements']);
-  if (!contract || contract.version !== INFORMATION_MODEL_DRAFT_VERSION || !ref(contract.taskRef)) return null;
+  if (!contract || contract.version !== INFORMATION_MODEL_DRAFT_VERSION || !ref(contract.taskRef, ['task'])) return null;
   const list = items(contract.requirements);
   if (!list || !list.length) return null;
   const targets = new Set<string>();
@@ -293,7 +315,8 @@ export function validateTaskFidelityContractDraft(raw: unknown): TaskFidelityCon
   for (const entry of list) {
     const requirement = plain(entry, ['targetRef', 'predicates']);
     const predicates = requirement && predicateList(requirement.predicates);
-    if (!requirement || !predicates || !ref(requirement.targetRef) || targets.has(requirement.targetRef)) return null;
+    if (!requirement || !predicates || !ref(requirement.targetRef, ['occ', 'entity']) ||
+      targets.has(requirement.targetRef)) return null;
     targets.add(requirement.targetRef);
     requirements.push(Object.freeze({ targetRef: requirement.targetRef, predicates: Object.freeze(predicates) }));
   }
@@ -315,8 +338,8 @@ export interface OracleAnnotationDraft {
 }
 export function validateOracleAnnotationDraft(raw: unknown): OracleAnnotationDraft | null {
   const record = plain(raw, ['version', 'occurrenceRef', 'semantic', 'privacy', 'sensitivity'], ['entityRef']);
-  if (!record || record.version !== INFORMATION_MODEL_DRAFT_VERSION || !ref(record.occurrenceRef) ||
-    (Object.hasOwn(record, 'entityRef') && !ref(record.entityRef)) || !inSet(record.sensitivity, SENSITIVITIES)) return null;
+  if (!record || record.version !== INFORMATION_MODEL_DRAFT_VERSION || !ref(record.occurrenceRef, ['occ']) ||
+    (Object.hasOwn(record, 'entityRef') && !ref(record.entityRef, ['entity'])) || !inSet(record.sensitivity, SENSITIVITIES)) return null;
   const semantic = plain(record.semantic, ['semanticType'], ['domain', 'subtype']);
   if (!semantic || !name(semantic.semanticType) || (Object.hasOwn(semantic, 'domain') && !name(semantic.domain)) ||
     (Object.hasOwn(semantic, 'subtype') && !name(semantic.subtype))) return null;

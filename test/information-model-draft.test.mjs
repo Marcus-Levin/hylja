@@ -27,7 +27,8 @@ function randomClaim(random) {
 
 test('agreed deterministic evidence resolves without a semantic judge', () => {
   assert.deepEqual({ ...resolveSensitivityDraft([det('INTERNAL'), det('INTERNAL')]) },
-    { state: 'RESOLVED', floor: 'INTERNAL', effective: 'INTERNAL', escalationSteps: 0, reasons: [] });
+    { state: 'RESOLVED', floor: 'INTERNAL', effective: 'INTERNAL', highestConcern: 'INTERNAL', escalationSteps: 0,
+      reasons: [] });
 });
 
 test('#66 escalation: deterministic INTERNAL vs semantic CONFIDENTIAL resolves conservatively upward', () => {
@@ -69,13 +70,20 @@ test('uncertain floors stay UNRESOLVED and retain the highest concern', () => {
     [[det('INTERNAL'), { origin: 'SEMANTIC', status: 'FAILURE' }], 'SEMANTIC_FAILURE'],
     [[det('INTERNAL'), { origin: 'DETERMINISTIC', status: 'FAILURE' }], 'DETERMINISTIC_FAILURE'],
     [[{ origin: 'DETERMINISTIC', status: 'FOUND' }], 'MISSING_SENSITIVITY'],
+    // v1 parity: a detector that could not decide (e.g. an undecodable blob) may be hiding a secret.
+    [[det('INTERNAL'), { origin: 'DETERMINISTIC', status: 'ABSTAIN' }], 'DETERMINISTIC_ABSTAINED'],
     [[], 'MISSING_DETERMINISTIC_EVIDENCE'],
   ]) {
     const result = resolveSensitivityDraft(claims);
     assert.equal(result.state, 'UNRESOLVED', reason);
     assert.ok(result.reasons.includes(reason), reason);
+    // An unresolved record exposes no actionable sensitivity, even a high one.
+    assert.equal(result.effective, 'UNKNOWN', reason);
+    assert.equal(result.floor, 'UNKNOWN', reason);
+    assert.equal(result.escalationSteps, 0, reason);
   }
-  assert.equal(resolveSensitivityDraft([det('INTERNAL'), det('RESTRICTED')]).effective, 'RESTRICTED');
+  assert.equal(resolveSensitivityDraft([det('INTERNAL'), det('RESTRICTED')]).highestConcern, 'RESTRICTED');
+  assert.equal(resolveSensitivityDraft([sem('PUBLIC')]).effective, 'UNKNOWN');
 });
 
 test('a semantic abstention is an absent judge and cannot lower anything', () => {
@@ -96,9 +104,12 @@ test('malformed, forged or accessor-backed evidence fails closed without echoing
   ]) {
     const result = resolveSensitivityDraft(claims);
     assert.equal(result.state, 'UNRESOLVED');
+    assert.equal(result.effective, 'UNKNOWN');
     assert.ok(result.reasons.includes('INVALID_EVIDENCE'));
     assert.ok(!JSON.stringify(result).includes(planted));
   }
+  // A rejected SECRET claim beside a valid PUBLIC one must not leave PUBLIC actionable.
+  assert.equal(resolveSensitivityDraft([det('PUBLIC'), { ...det('SECRET'), note: planted }]).effective, 'UNKNOWN');
 });
 
 test('property: effective is never below any deterministic claim and adding a claim never lowers it', () => {
@@ -112,9 +123,13 @@ test('property: effective is never below any deterministic claim and adding a cl
       }
     }
     const after = resolveSensitivityDraft([...claims, randomClaim(random)]);
-    if (before.effective !== 'UNKNOWN') assert.ok(rank(after.effective) >= rank(before.effective), JSON.stringify(claims));
-    if (before.floor !== 'UNKNOWN' && after.floor !== 'UNKNOWN') assert.ok(rank(after.floor) >= rank(before.floor) ||
-      after.state === 'UNRESOLVED');
+    // Adding a claim either makes the record unactionable or keeps/raises its sensitivity.
+    if (before.effective !== 'UNKNOWN' && after.effective !== 'UNKNOWN') {
+      assert.ok(rank(after.effective) >= rank(before.effective), JSON.stringify(claims));
+    }
+    if (before.highestConcern !== 'UNKNOWN') assert.ok(rank(after.highestConcern) >= rank(before.highestConcern));
+    assert.equal(before.state === 'UNRESOLVED', before.effective === 'UNKNOWN');
+    if (claims.some((c) => c.origin === 'DETERMINISTIC' && c.status !== 'FOUND')) assert.equal(before.state, 'UNRESOLVED');
     // Composition is order-independent.
     const shuffled = [...claims].sort(() => random() - 0.5);
     assert.deepEqual({ ...resolveSensitivityDraft(shuffled) }, { ...before });
@@ -135,6 +150,7 @@ test('personal-data attribute: YES dominates, model NO alone is UNKNOWN, failure
   assert.ok(resolveAttributeDraft([d('NO'), s('YES')]).reasons.includes('ATTRIBUTE_CONFLICT'));
   assert.ok(resolveAttributeDraft([s('YES')]).reasons.includes('SEMANTIC_ONLY_ASSERTION'));
   assert.equal(resolveAttributeDraft([d('NO'), { origin: 'SEMANTIC', status: 'FAILURE' }]).value, 'UNKNOWN');
+  assert.equal(resolveAttributeDraft([d('NO'), { origin: 'DETERMINISTIC', status: 'ABSTAIN' }]).value, 'UNKNOWN');
   assert.equal(resolveAttributeDraft([]).value, 'UNKNOWN');
   assert.equal(resolveAttributeDraft([d('MAYBE')]).value, 'UNKNOWN');
   const random = prng(0x6666);
@@ -152,24 +168,32 @@ test('personal-data attribute: YES dominates, model NO alone is UNKNOWN, failure
 });
 
 test('#68 fidelity: a dropped credential fails EXISTENCE; a placeholder keeps it without the value', () => {
-  const apiKey = assessFidelityDraft(['EXISTENCE', 'KIND'], true);
+  const apiKey = assessFidelityDraft(['EXISTENCE', 'KIND'], 'SECRET');
   assert.deepEqual(apiKey.satisfying, ['SEMANTIC_PLACEHOLDER']);
   assert.ok(!apiKey.satisfying.includes('REMOVED'));
   assert.deepEqual(apiKey.unmet, []);
 });
 
 test('#68 fidelity: port 443 needs EXACT; hostnames keep relationships via synthetic identity', () => {
-  assert.deepEqual(assessFidelityDraft(['EXACT_VALUE'], false).satisfying, ['EXACT']);
-  assert.deepEqual(assessFidelityDraft(['RELATIONSHIP', 'CONSISTENCY', 'KIND'], false).satisfying,
+  assert.deepEqual(assessFidelityDraft(['EXACT_VALUE'], 'INTERNAL').satisfying, ['EXACT']);
+  assert.deepEqual(assessFidelityDraft(['RELATIONSHIP', 'CONSISTENCY', 'KIND'], 'CONFIDENTIAL').satisfying,
     ['EXACT', 'IDENTITY_SYNTHETIC', 'OPAQUE_TOKEN']);
-  assert.deepEqual(assessFidelityDraft(['GENERALIZED'], false).satisfying, ['EXACT', 'GENERALIZED']);
+  assert.deepEqual(assessFidelityDraft(['GENERALIZED'], 'CONFIDENTIAL').satisfying, ['EXACT', 'GENERALIZED']);
 });
 
 test('#68 fidelity: an exact secret requirement is unmet and points to USE without reveal', () => {
-  const result = assessFidelityDraft(['EXACT_VALUE'], true);
+  const result = assessFidelityDraft(['EXACT_VALUE'], 'SECRET');
   assert.deepEqual(result.satisfying, []);
   assert.deepEqual(result.unmet, ['EXACT_VALUE']);
-  assert.deepEqual(result.advice, ['USE_WITHOUT_REVEAL', 'TASK_UNSOLVABLE_WITHOUT_RELEASE']);
+  assert.deepEqual(result.advice, ['USE_WITHOUT_REVEAL', 'UNMET_WITHIN_CEILING']);
+});
+
+test('#68 fidelity: unknown or unresolved sensitivity gets the secret ceiling', () => {
+  const unresolved = resolveSensitivityDraft([det('INTERNAL'), det('RESTRICTED')]);
+  const result = assessFidelityDraft(['EXACT_VALUE'], unresolved.effective);
+  assert.equal(result.secretCeiling, true);
+  assert.deepEqual(result.satisfying, []);
+  assert.equal(assessFidelityDraft(['EXACT_VALUE'], 'RESTRICTED').secretCeiling, false);
 });
 
 test('property: secrets stay within the non-reversible ceiling and predicates only narrow forms', () => {
@@ -179,13 +203,15 @@ test('property: secrets stay within the non-reversible ceiling and predicates on
     if (!subset.includes('NOT_REQUIRED') || subset.length === 1) subsets.push(subset);
   }
   for (const subset of subsets) {
-    for (const secret of [true, false]) {
-      const result = assessFidelityDraft(subset, secret);
+    for (const sensitivity of [...SENSITIVITIES, 'UNKNOWN']) {
+      const secret = sensitivity === 'SECRET' || sensitivity === 'UNKNOWN';
+      const result = assessFidelityDraft(subset, sensitivity);
+      assert.equal(result.secretCeiling, secret);
       assert.ok(result.satisfying.every((form) => REPRESENTATIONS.includes(form)));
       if (secret) assert.ok(result.satisfying.every((form) => SECRET_REPRESENTATIONS.includes(form)));
       assert.ok(!('treatment' in result) && !('decision' in result));
       for (const predicate of FIDELITY_PREDICATES.filter((p) => !subset.includes(p) && p !== 'NOT_REQUIRED')) {
-        const wider = assessFidelityDraft([...subset.filter((p) => p !== 'NOT_REQUIRED'), predicate], secret);
+        const wider = assessFidelityDraft([...subset.filter((p) => p !== 'NOT_REQUIRED'), predicate], sensitivity);
         assert.ok(wider.satisfying.every((form) => result.satisfying.includes(form)));
       }
     }
@@ -193,9 +219,10 @@ test('property: secrets stay within the non-reversible ceiling and predicates on
 });
 
 test('fidelity requests reject malformed input', () => {
-  for (const [predicates, secret] of [[[], false], [['EXACT_VALUE', 'EXACT_VALUE'], false], [['KEEP'], false],
-    [['EXACT_VALUE'], 'no'], ['EXACT_VALUE', false]]) {
-    assert.throws(() => assessFidelityDraft(predicates, secret), TypeError);
+  for (const [predicates, sensitivity] of [[[], 'INTERNAL'], [['EXACT_VALUE', 'EXACT_VALUE'], 'INTERNAL'],
+    [['KEEP'], 'INTERNAL'], [['EXACT_VALUE'], false], [['EXACT_VALUE'], 'TOP_SECRET'], ['EXACT_VALUE', 'INTERNAL'],
+    [['NOT_REQUIRED', 'KIND'], 'INTERNAL']]) {
+    assert.throws(() => assessFidelityDraft(predicates, sensitivity), TypeError);
   }
 });
 
@@ -210,7 +237,7 @@ test('semantic placeholders are typed, bounded and never look like a usable cred
 });
 
 const contract = {
-  version: 'draft-1', taskRef: 'task-d02.invalid',
+  version: 'draft-1', taskRef: 'task-d02',
   requirements: [
     { targetRef: 'occ-port-attempted', predicates: ['EXACT_VALUE'] },
     { targetRef: 'occ-api-key', predicates: ['EXISTENCE', 'KIND'] },
@@ -229,6 +256,10 @@ test('task fidelity contracts validate strictly and bind requirements to refs, n
     (c) => { c.requirements[3].predicates = ['NOT_REQUIRED', 'KIND']; },
     (c) => { c.requirements[0].predicates = ['KEEP']; },
     (c) => { c.requirements[0].targetRef = 'has space'; },
+    // Refs are opaque and prefixed: hostnames, IPs and key-shaped strings do not fit the grammar.
+    (c) => { c.taskRef = 'plc-gateway-07.internal'; }, (c) => { c.requirements[0].targetRef = '192.0.2.10'; },
+    (c) => { c.requirements[0].targetRef = 'occ-sk_example_0000'; }, (c) => { c.requirements[0].targetRef = 'task-a'; },
+    (c) => { c.requirements[0].targetRef = `occ-${'a'.repeat(64)}`; },
   ]) {
     const copy = structuredClone(contract);
     mutate(copy);
@@ -258,6 +289,7 @@ test('oracle annotations reject trust, treatment, contradictions and malformed f
     (a) => { a.privacy.jurisdictions = ['SE', 'SE']; }, (a) => { a.privacy.jurisdictions = ['sweden']; },
     (a) => { a.semantic.semanticType = 'person'; }, (a) => { a.semantic.raw = 'synthetic-value.invalid'; },
     (a) => { delete a.privacy.personalData; }, (a) => { a.occurrenceRef = ''; },
+    (a) => { a.occurrenceRef = 'entity-client-a'; }, (a) => { a.entityRef = 'host.example.invalid'; },
   ]) {
     const copy = structuredClone(annotation);
     mutate(copy);
