@@ -83,6 +83,8 @@ No production vault yet beyond minimal development fixture state. No unverified 
 
 Primary issues: #6-#13, #19, and #37 (PERSON/EMAIL/PHONE candidate source).
 
+A bounded, **NON-ENFORCING** #37 candidate source exists in [`src/contact-candidates.ts`](../src/contact-candidates.ts). It emits v1 detector evidence and spans, without values, for synthetic EMAIL/PHONE patterns and tenant/project-scoped configured NAME dictionaries, and it rejects common technical look-alikes (IPs, versions, dates, UUIDs, MACs, bare IDs). It operates on text the caller has already normalized, because #6/#7 normalization and parsers are pending. It emits no sensitivity, so v1 composition stays unresolved until trusted configuration supplies one. Its synthetic golden check is a development measurement, **not** held-out recall or leak evidence; #37 stays open for #6/#7 integration, held-out evaluation and #19 egress checks.
+
 ### 2. Reversible identity and vault
 
 Goal: encrypted scoped mappings, entity consistency, brokered USE/DISPLAY operations, lifecycle/retention, and exact authorized round-trip restoration. No production original is persisted before encryption; privacy-safe audit and unconditional tenant isolation are prerequisites for brokered reveal.
