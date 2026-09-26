@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "draftId": "issue-39-v0-preparation-draft-p0.1",
+  "normative": false,
+  "enforcing": false,
+  "protocolVersion": null,
+  "frozen": false,
+  "scored": false,
+  "releaseAuthority": false,
+  "gates": {
+    "scope": "PENDING",
+    "destinationPolicyTreatments": "PENDING",
+    "independentTaskRubric": "PENDING",
+    "blindCustody": "PENDING",
+    "candidateEligibilityChronology": "PENDING"
+  },
+  "observations": {
+    "preparationSourceRevision": "b584032eef5139d396c2629740683c4a55b08609",
+    "referenceEligibility": "EXPLORATORY_INELIGIBLE_PRE_LOCK",
+    "publicDevProposal": [
+      "D01",
+      "D02",
+      "D05"
+    ],
+    "otherDevelopmentFamilies": "PLANNING_UNTESTED",
+    "blindFamilies": "PLANNING_UNTESTED",
+    "actualRouteAndCapture": "NOT_ESTABLISHED",
+    "preTuningLock": "NOT_ESTABLISHED",
+    "finalV0Freeze": "NOT_ESTABLISHED"
+  },
+  "publicSha256": {
+    "CORPUS_PREP": "e3a6cdf33785d6ad291c790594df623077c553e24a658637c5159b580f03eb3c",
+    "DEV_FIXTURE": "4ef52e84a9cb7327977dbfa230a203a21c51d4120f288cf2059972d0f05ae8ad",
+    "DEV_ORACLE_PROPOSAL": "3d5133765927b3fd36e7a0bae3d45fb924183775177944ae077eb89a9d026b4f",
+    "DEV_RUBRIC_PROPOSAL": "17471ac60f5a1bc69a84b34aaa97da3f2416301ef045320dabdf8d55d05ec4ac",
+    "OPEN_GATES": "05ba3e882666d7cab492cad78a4f11374af98036bbf356374cffb7583e0c0daf"
+  }
+}
