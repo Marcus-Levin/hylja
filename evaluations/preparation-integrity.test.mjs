@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync, appendFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync, appendFileSync, linkSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -77,6 +78,48 @@ test('an unstaged or staged public change cannot be pinned by an unchanged manif
   assert.deepEqual(await verify(context), invalid('PUBLIC_FILE_CHANGED'));
 });
 
+test('assume-unchanged and skip-worktree cannot conceal matching modified public bytes and draft', async (t) => {
+  for (const flag of ['--assume-unchanged', '--skip-worktree']) {
+    await t.test(flag, async (subtest) => {
+      const context = setup(subtest);
+      const fixture = join(context.root, fixtureName);
+      appendFileSync(fixture, `\n${planted}\n`);
+      context.manifest.publicSha256.DEV_FIXTURE = createHash('sha256')
+        .update(readFileSync(fixture)).digest('hex');
+      writeFileSync(join(context.root, manifestName), `${JSON.stringify(context.manifest, null, 2)}\n`);
+      git(context.root, 'update-index', flag, '--', fixtureName, manifestName);
+      const hidden = spawnSync('git', ['-C', context.root, 'diff', '--quiet', 'HEAD', '--', fixtureName, manifestName]);
+      assert.equal(hidden.status, 0);
+      assert.deepEqual(await verify(context), invalid('PUBLIC_FILE_CHANGED'));
+      const cli = spawnSync(process.execPath, [context.script], { cwd: context.root, encoding: 'utf8' });
+      assert.equal(cli.status, 1);
+      assert.deepEqual(JSON.parse(cli.stdout), invalid('PUBLIC_FILE_CHANGED'));
+      assert.equal(cli.stderr, '');
+      assert.equal(cli.stdout.includes(planted), false);
+      assert.equal(cli.stdout.includes(context.manifest.publicSha256.DEV_FIXTURE), false);
+    });
+  }
+});
+
+test('global Git fsmonitor cannot run a helper during valid public preparation', (t) => {
+  const context = setup(t);
+  const home = join(context.disposable, 'synthetic-home');
+  mkdirSync(home);
+  const marker = join(home, 'hook-invoked');
+  const helper = join(home, 'synthetic-fsmonitor.sh');
+  writeFileSync(helper, `#!/bin/sh\nprintf 'invoked' > '${marker}'\nexit 0\n`);
+  chmodSync(helper, 0o755);
+  writeFileSync(join(home, '.gitconfig'), `[core]\n  fsmonitor = ${helper}\n`);
+  const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: home };
+  delete env.GIT_CONFIG_GLOBAL;
+  delete env.GIT_CONFIG_NOSYSTEM;
+  const cli = spawnSync(process.execPath, [context.script], { cwd: context.root, encoding: 'utf8', env });
+  assert.equal(cli.status, 0);
+  assert.deepEqual(JSON.parse(cli.stdout), valid);
+  assert.equal(cli.stderr, '');
+  assert.equal(existsSync(marker), false);
+});
+
 test('a committed hash mismatch is rejected without exposing the source hash', async (t) => {
   const context = setup(t);
   replaceManifest(context, (manifest) => { manifest.publicSha256.DEV_FIXTURE = '0'.repeat(64); });
@@ -104,6 +147,12 @@ test('symlinked public file and symlinked parent cannot redirect the verifier', 
   renameSync(join(parent.root, 'docs/research'), detached);
   symlinkSync(detached, join(parent.root, 'docs/research'));
   assert.deepEqual(await verify(parent), invalid('PUBLIC_FILE_UNSAFE'));
+});
+
+test('a hardlinked public path cannot silently read another path to the same inode', async (t) => {
+  const context = setup(t);
+  linkSync(join(context.root, fixtureName), join(context.disposable, 'outside.synthetic'));
+  assert.deepEqual(await verify(context), invalid('PUBLIC_FILE_UNSAFE'));
 });
 
 test('manifest path escape and arbitrary API-supplied file/root paths are not accepted', async (t) => {
