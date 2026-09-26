@@ -78,6 +78,16 @@ test('an unstaged or staged public change cannot be pinned by an unchanged manif
   assert.deepEqual(await verify(context), invalid('PUBLIC_FILE_CHANGED'));
 });
 
+test('staged index divergence is rejected even when public worktree bytes match HEAD', async (t) => {
+  const context = setup(t);
+  const file = join(context.root, fixtureName);
+  const original = readFileSync(file);
+  appendFileSync(file, `\n${planted}\n`);
+  git(context.root, 'add', '--', fixtureName);
+  writeFileSync(file, original);
+  assert.deepEqual(await verify(context), invalid('PUBLIC_FILE_CHANGED'));
+});
+
 test('assume-unchanged and skip-worktree cannot conceal matching modified public bytes and draft', async (t) => {
   for (const flag of ['--assume-unchanged', '--skip-worktree']) {
     await t.test(flag, async (subtest) => {

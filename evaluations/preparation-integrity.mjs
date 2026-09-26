@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
+import { devNull } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -84,7 +85,9 @@ function assertRegularPublicPath(name) {
       fail('CHECK_UNAVAILABLE');
     }
     if (entry.isSymbolicLink() ||
-        (index === parts.length - 1 ? !entry.isFile() : !entry.isDirectory())) fail('PUBLIC_FILE_UNSAFE');
+        (index === parts.length - 1 ? !entry.isFile() || entry.nlink !== 1 : !entry.isDirectory())) {
+      fail('PUBLIC_FILE_UNSAFE');
+    }
   }
   return current;
 }
@@ -96,7 +99,7 @@ function readRegularPublic(name) {
     if (realpathSync(current) !== current || realpathSync(root) !== root) fail('PUBLIC_FILE_UNSAFE');
     descriptor = openSync(current, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const stat = fstatSync(descriptor);
-    if (!stat.isFile() || stat.size > MAX_FILE_BYTES) fail('PUBLIC_FILE_UNSAFE');
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_FILE_BYTES) fail('PUBLIC_FILE_UNSAFE');
     const content = readFileSync(descriptor);
     if (content.length > MAX_FILE_BYTES) fail('PUBLIC_FILE_UNSAFE');
     return content;
@@ -110,11 +113,18 @@ function readRegularPublic(name) {
   }
 }
 
-function git(args) {
-  // Ignore hostile Git env overrides; never include Git stderr, revisions or paths in a report.
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
-  const result = spawnSync('git', ['-C', root, ...args], {
-    encoding: 'utf8', maxBuffer: 64 * 1024, timeout: 15_000, windowsHide: true, env,
+function git(args, raw = false) {
+  // Ignore caller Git overrides and global/system config, including fsmonitor helpers.
+  // No hooks, filters or diff drivers are needed: cat-file reads raw object bytes,
+  // ls-tree/index read metadata only, and local fsmonitor is explicitly disabled.
+  const env = {
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
+    GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', HOME: devNull, XDG_CONFIG_HOME: devNull,
+  };
+  const result = spawnSync('git', ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${devNull}`,
+    '-C', root, ...args], {
+    encoding: raw ? 'buffer' : 'utf8', maxBuffer: raw ? MAX_FILE_BYTES + 8192 : 64 * 1024,
+    timeout: 15_000, windowsHide: true, env,
   });
   if (result.error || result.signal || result.status === null) fail('CHECK_UNAVAILABLE');
   return { status: result.status, stdout: result.stdout };
@@ -124,19 +134,34 @@ function requireRepositoryAndIndex() {
   if (location.status !== 0 || resolve(location.stdout.trimEnd()) !== root) fail('CHECK_UNAVAILABLE');
   const index = git(['ls-files', '--stage', '-z', '--', ...NAMES]);
   if (index.status !== 0) fail('CHECK_UNAVAILABLE');
-  const found = new Set();
+  const found = new Map();
   for (const line of index.stdout.split('\0').filter(Boolean)) {
     const entry = /^(100644) ([0-9a-f]{40,64}) 0\t(.+)$/u.exec(line);
     if (!entry || !NAMES.includes(entry[3]) || found.has(entry[3])) fail('PUBLIC_FILE_UNSAFE');
-    found.add(entry[3]);
+    found.set(entry[3], entry[2]);
   }
   if (found.size !== NAMES.length) fail('PUBLIC_FILE_UNTRACKED');
-  assertCleanPublicFiles();
+  // Compare index objects explicitly to HEAD: skip-worktree / assume-unchanged may
+  // otherwise hide staged divergence from a worktree-oriented diff.
+  const tree = git(['ls-tree', '-r', '-z', 'HEAD', '--', ...NAMES]);
+  if (tree.status !== 0) fail('CHECK_UNAVAILABLE');
+  const head = new Map();
+  for (const line of tree.stdout.split('\0').filter(Boolean)) {
+    const entry = /^(100644) blob ([0-9a-f]{40,64})\t(.+)$/u.exec(line);
+    if (!entry || !NAMES.includes(entry[3]) || head.has(entry[3])) fail('PUBLIC_FILE_CHANGED');
+    head.set(entry[3], entry[2]);
+  }
+  if (head.size !== NAMES.length || NAMES.some((name) => found.get(name) !== head.get(name))) {
+    fail('PUBLIC_FILE_CHANGED');
+  }
 }
-function assertCleanPublicFiles() {
-  const diff = git(['diff', '--quiet', '--no-ext-diff', '--no-textconv', 'HEAD', '--', ...NAMES]);
-  if (diff.status === 1) fail('PUBLIC_FILE_CHANGED');
-  if (diff.status !== 0) fail('CHECK_UNAVAILABLE');
+function assertHeadBytes(name, bytes) {
+  // These are fixed literal paths. cat-file returns a RAW HEAD blob, not a filtered
+  // checkout, and we neither print nor hash its contents. HEAD and manifest are
+  // unkeyed reproducibility anchors only, never external attestations or authority.
+  const blob = git(['cat-file', 'blob', `HEAD:${name}`], true);
+  if (blob.status !== 0) fail('PUBLIC_FILE_CHANGED');
+  if (!blob.stdout.equals(bytes)) fail('PUBLIC_FILE_CHANGED');
 }
 function assertSourceRevision(revision) {
   const commit = git(['rev-parse', '--verify', '--quiet', `${revision}^{commit}`]);
@@ -155,6 +180,7 @@ export function verifyPreparation(...args) {
     let manifest;
     try {
       const bytes = readRegularPublic(MANIFEST);
+      assertHeadBytes(MANIFEST, bytes);
       manifest = JSON.parse(bytes.toString('utf8'));
       // Canonical form rejects ignored duplicate JSON keys, unknown escaped keys and
       // non-UTF-8 replacement decoding; last-wins parsing is not an integrity rule.
@@ -166,10 +192,11 @@ export function verifyPreparation(...args) {
     const { revision, hashes } = validateDraft(manifest);
     assertSourceRevision(revision);
     for (const [id, name] of Object.entries(PUBLIC)) {
-      const actual = createHash('sha256').update(readRegularPublic(name)).digest('hex');
+      const bytes = readRegularPublic(name);
+      assertHeadBytes(name, bytes);
+      const actual = createHash('sha256').update(bytes).digest('hex');
       if (actual !== hashes[id]) fail('PUBLIC_HASH_MISMATCH');
     }
-    assertCleanPublicFiles();
     return VALID;
   } catch (error) {
     return invalid(error instanceof PreparationFailure ? error.reason : 'CHECK_UNAVAILABLE');
