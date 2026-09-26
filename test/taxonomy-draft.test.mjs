@@ -74,9 +74,11 @@ test('Swedish national identifiers are distinct, SE-scoped and not modelled as s
     assert.deepEqual(entry.jurisdictions, ['SE']);
     assert.equal(entry.personalDataPrior, 'ALWAYS');
     assert.ok(entry.evidence.includes('FORMAT'));
-    assert.equal(entry.v1, null);
+    assert.deepEqual({ ...entry.v1 }, { semanticType: 'PERSON' });
   }
-  assert.ok(TAXONOMY_DRAFT.filter((e) => e.jurisdictions).every((e) => e.domain === 'NATIONAL_ID'));
+  assert.ok(TAXONOMY_DRAFT.filter((e) => e.jurisdictions).every((e) => e.jurisdictions.every((c) => c === 'SE')));
+  // A sole trader's organisationsnummer is a personnummer: never NOT_BY_ITSELF.
+  assert.equal(taxonomyEntryDraft('SE_ORGANISATIONSNUMMER').personalDataPrior, 'CONTEXTUAL');
 });
 
 test('every v1 default subtype maps to exactly one draft entry and every v1 class has a home', () => {
@@ -87,6 +89,13 @@ test('every v1 default subtype maps to exactly one draft entry and every v1 clas
     }
   }
   assert.deepEqual(draftEntriesForV1('PERSON', 'EMAIL').map((e) => e.subtype), ['EMAIL_ADDRESS']);
+  // Replay of tenant-extended v1 subtypes and class-only homes.
+  assert.deepEqual(draftEntriesForV1('ENGINEERING_IDENTIFIER', 'EQUIPMENT_TAG').map((e) => e.subtype), ['EQUIPMENT_TAG']);
+  assert.deepEqual(draftEntriesForV1('USER_ACCOUNT', 'USERNAME').map((e) => e.subtype), ['USERNAME']);
+  assert.ok(draftEntriesForV1('ENGINEERING_IDENTIFIER').every((e) => e.semanticType === 'ENGINEERING_IDENTIFIER'));
+  assert.equal(draftEntriesForV1('ENGINEERING_IDENTIFIER').length, byType('ENGINEERING_IDENTIFIER').length);
+  // Only content without any v1 class stays unmapped.
+  for (const entry of TAXONOMY_DRAFT.filter((e) => e.v1 === null)) assert.equal(entry.semanticType, 'ENGINEERING_INFORMATION');
   for (const entry of TAXONOMY_DRAFT) {
     if (!entry.v1) continue;
     assert.ok(SEMANTIC_CLASSES.includes(entry.v1.semanticType));
@@ -103,10 +112,18 @@ test('lookups reject unknown or non-string input', () => {
   assert.deepEqual(draftEntriesForV1('PERSON', 'NOT_A_SUBTYPE'), []);
 });
 
+test('FORMAT is not claimed for subtypes whose syntax is shared with unrelated values', () => {
+  for (const subtype of ['TENANT_ID', 'SUBSCRIPTION_ID', 'ACCOUNT_ID', 'BUCKET', 'HOSTNAME', 'PORT', 'PART_NUMBER']) {
+    assert.ok(!taxonomyEntryDraft(subtype).evidence.includes('FORMAT'), subtype);
+  }
+  for (const entry of byType('ENGINEERING_IDENTIFIER')) assert.ok(entry.evidence.includes('TENANT_DICTIONARY'), entry.subtype);
+});
+
 test('research record documents every draft subtype and contains no national-ID-shaped digits', () => {
   const doc = readFileSync(new URL('../docs/research/issue-65-taxonomy-draft-p0.1.md', import.meta.url), 'utf8');
   for (const entry of TAXONOMY_DRAFT) assert.ok(doc.includes(`\`${entry.subtype}\``), entry.subtype);
   for (const type of DRAFT_SEMANTIC_TYPES) assert.ok(doc.includes(`\`${type}\``), type);
-  const source = readFileSync(new URL('../src/taxonomy-draft.ts', import.meta.url), 'utf8');
-  for (const text of [doc, source]) assert.doesNotMatch(text, /\b\d{6,8}[-+]?\d{4}\b/);
+  const texts = ['../src/taxonomy-draft.ts', './taxonomy-draft.test.mjs']
+    .map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'));
+  for (const text of [doc, ...texts]) assert.doesNotMatch(text, /\b\d{6,8}[-+ ]?\d{4}\b/);
 });
