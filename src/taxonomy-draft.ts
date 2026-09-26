@@ -1,0 +1,184 @@
+/**
+ * PROPOSED #65 taxonomy draft. NOT wired into classification v1 (`SEMANTIC_CLASSES`,
+ * `DEFAULT_SUBTYPES`), policy or any detector. Entries describe what information *is*; they carry no
+ * sensitivity, treatment or legal conclusion. Priors are review hints, never labels for a value.
+ */
+import { SEMANTIC_CLASSES } from './classification.js';
+import type { SemanticClass } from './classification.js';
+
+export const TAXONOMY_DRAFT_VERSION = 'draft-1' as const;
+export const DRAFT_SEMANTIC_TYPES = [
+  'PERSON', 'PERSONAL_IDENTIFIER', 'PERSONAL_ATTRIBUTE', 'CREDENTIAL_OR_SECRET', 'USER_ACCOUNT',
+  'NETWORK_IDENTIFIER', 'HOST_OR_SERVICE', 'CLOUD_RESOURCE', 'FILE_OR_RESOURCE_PATH',
+  'APPLICATION_OR_ENVIRONMENT', 'CUSTOMER_OR_PARTNER', 'PROJECT_OR_CONTRACT', 'ENGINEERING_IDENTIFIER',
+  'ENGINEERING_INFORMATION', 'BUSINESS_CONFIDENTIAL',
+] as const;
+export type DraftSemanticType = (typeof DRAFT_SEMANTIC_TYPES)[number];
+export const DRAFT_DOMAINS = [
+  'IDENTITY', 'CONTACT', 'NATIONAL_ID', 'ONLINE', 'EMPLOYMENT', 'PERSONAL_PROFILE', 'FINANCIAL', 'AUTHENTICATION', 'IT',
+  'CLOUD', 'ORGANIZATION', 'PLM', 'CAD', 'CAE', 'CAM', 'PROCESS_PLANT', 'ASSET', 'OT', 'QUALITY', 'IM',
+  'BUSINESS',
+] as const;
+export type DraftDomain = (typeof DRAFT_DOMAINS)[number];
+/** An identifier names or references a thing; content describes it; a credential grants access. */
+export const FORMS = ['IDENTIFIER', 'CONTENT', 'CREDENTIAL'] as const;
+export type Form = (typeof FORMS)[number];
+/**
+ * Evidence that can plausibly establish the subtype. FORMAT: syntax/checksum alone. STRUCTURE: parser
+ * or schema context. TENANT_DICTIONARY: tenant/project-scoped configured values or ontology.
+ * CONTEXT: surrounding meaning, i.e. semantic judgment that stays advisory. FORMAT is listed only where
+ * syntax distinguishes the subtype; syntax that is necessary but shared (a GUID, a bare word) is not FORMAT.
+ */
+export const EVIDENCE_KINDS = ['FORMAT', 'STRUCTURE', 'TENANT_DICTIONARY', 'CONTEXT'] as const;
+export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+/**
+ * Review prior only; actual personal-data status is a contextual attribute (#66), never a type. ALWAYS is
+ * reserved for concepts that by definition identify a natural person; everything that merely can is CONTEXTUAL.
+ */
+export const PERSONAL_DATA_PRIORS = ['ALWAYS', 'CONTEXTUAL', 'NOT_BY_ITSELF'] as const;
+export type PersonalDataPrior = (typeof PERSONAL_DATA_PRIORS)[number];
+
+export interface TaxonomyEntryDraft {
+  semanticType: DraftSemanticType;
+  domain: DraftDomain;
+  subtype: string;
+  form: Form;
+  evidence: readonly EvidenceKind[];
+  personalDataPrior: PersonalDataPrior;
+  jurisdictions?: readonly string[];
+  /**
+   * Nearest classification v1 class/subtype. A class-only mapping means v1 can hold the concept only as a
+   * tenant `extendSubtypeRegistry` subtype of that class; `null` means v1 has no fitting class at all.
+   */
+  v1: Readonly<{ semanticType: SemanticClass; subtype?: string }> | null;
+}
+
+type Row = [DraftSemanticType, DraftDomain, string, Form, EvidenceKind[], PersonalDataPrior,
+  (readonly [SemanticClass, string?]) | null, string[]?];
+const F: EvidenceKind = 'FORMAT', S: EvidenceKind = 'STRUCTURE', T: EvidenceKind = 'TENANT_DICTIONARY',
+  C: EvidenceKind = 'CONTEXT';
+const ROWS: readonly Row[] = [
+  ['PERSON', 'IDENTITY', 'PERSON_NAME', 'IDENTIFIER', [S, T, C], 'ALWAYS', ['PERSON', 'NAME']],
+  ['PERSON', 'IDENTITY', 'PERSON_ALIAS', 'IDENTIFIER', [T, C], 'ALWAYS', ['PERSON']],
+  ['PERSONAL_IDENTIFIER', 'CONTACT', 'EMAIL_ADDRESS', 'IDENTIFIER', [F, S], 'CONTEXTUAL', ['PERSON', 'EMAIL']],
+  ['PERSONAL_IDENTIFIER', 'CONTACT', 'PHONE_NUMBER', 'IDENTIFIER', [F, S, C], 'CONTEXTUAL', ['PERSON', 'PHONE']],
+  ['PERSONAL_IDENTIFIER', 'CONTACT', 'POSTAL_ADDRESS', 'IDENTIFIER', [S, C], 'CONTEXTUAL', ['PERSON']],
+  ['PERSONAL_IDENTIFIER', 'NATIONAL_ID', 'SE_PERSONNUMMER', 'IDENTIFIER', [F, S], 'ALWAYS', ['PERSON'], ['SE']],
+  ['PERSONAL_IDENTIFIER', 'NATIONAL_ID', 'SE_SAMORDNINGSNUMMER', 'IDENTIFIER', [F, S], 'ALWAYS', ['PERSON'], ['SE']],
+  ['PERSONAL_IDENTIFIER', 'NATIONAL_ID', 'NATIONAL_ID_OTHER', 'IDENTIFIER', [S, C], 'ALWAYS', ['PERSON']],
+  ['PERSONAL_IDENTIFIER', 'NATIONAL_ID', 'TRAVEL_OR_LICENCE_DOCUMENT', 'IDENTIFIER', [S, C], 'ALWAYS', ['PERSON']],
+  ['PERSONAL_IDENTIFIER', 'ONLINE', 'ONLINE_IDENTIFIER', 'IDENTIFIER', [S, C], 'CONTEXTUAL', ['PERSON']],
+  ['PERSONAL_IDENTIFIER', 'ONLINE', 'DEVICE_IDENTIFIER', 'IDENTIFIER', [S, C], 'CONTEXTUAL', ['PERSON']],
+  ['PERSONAL_IDENTIFIER', 'EMPLOYMENT', 'EMPLOYEE_NUMBER', 'IDENTIFIER', [S, T], 'ALWAYS', ['PERSON']],
+  ['PERSONAL_IDENTIFIER', 'FINANCIAL', 'PAYMENT_CARD_NUMBER', 'IDENTIFIER', [F, S], 'CONTEXTUAL', ['PERSON']],
+  ['PERSONAL_IDENTIFIER', 'FINANCIAL', 'BANK_ACCOUNT_NUMBER', 'IDENTIFIER', [F, S], 'CONTEXTUAL', ['PERSON']],
+  ['PERSONAL_ATTRIBUTE', 'PERSONAL_PROFILE', 'DATE_OF_BIRTH', 'CONTENT', [S, C], 'CONTEXTUAL', ['PERSON']],
+  ['PERSONAL_ATTRIBUTE', 'PERSONAL_PROFILE', 'PRECISE_LOCATION', 'CONTENT', [S, C], 'CONTEXTUAL', ['PERSON']],
+  ['PERSONAL_ATTRIBUTE', 'PERSONAL_PROFILE', 'HEALTH_INFORMATION', 'CONTENT', [C], 'CONTEXTUAL', ['PERSON']],
+  ['CREDENTIAL_OR_SECRET', 'AUTHENTICATION', 'PASSWORD', 'CREDENTIAL', [S, C], 'NOT_BY_ITSELF', ['CREDENTIAL_OR_SECRET', 'PASSWORD']],
+  ['CREDENTIAL_OR_SECRET', 'AUTHENTICATION', 'API_KEY', 'CREDENTIAL', [F, S], 'NOT_BY_ITSELF', ['CREDENTIAL_OR_SECRET', 'API_KEY']],
+  ['CREDENTIAL_OR_SECRET', 'AUTHENTICATION', 'PRIVATE_KEY', 'CREDENTIAL', [F], 'NOT_BY_ITSELF', ['CREDENTIAL_OR_SECRET', 'PRIVATE_KEY']],
+  ['CREDENTIAL_OR_SECRET', 'AUTHENTICATION', 'ACCESS_TOKEN', 'CREDENTIAL', [F, S], 'CONTEXTUAL', ['CREDENTIAL_OR_SECRET', 'ACCESS_TOKEN']],
+  ['CREDENTIAL_OR_SECRET', 'AUTHENTICATION', 'REFRESH_TOKEN', 'CREDENTIAL', [F, S], 'CONTEXTUAL', ['CREDENTIAL_OR_SECRET', 'REFRESH_TOKEN']],
+  ['CREDENTIAL_OR_SECRET', 'AUTHENTICATION', 'COOKIE', 'CREDENTIAL', [S], 'CONTEXTUAL', ['CREDENTIAL_OR_SECRET', 'COOKIE']],
+  ['CREDENTIAL_OR_SECRET', 'AUTHENTICATION', 'CONNECTION_SECRET', 'CREDENTIAL', [S], 'NOT_BY_ITSELF', ['CREDENTIAL_OR_SECRET', 'CONNECTION_SECRET']],
+  ['CREDENTIAL_OR_SECRET', 'AUTHENTICATION', 'CERTIFICATE_SECRET', 'CREDENTIAL', [F, S], 'NOT_BY_ITSELF', ['CREDENTIAL_OR_SECRET', 'CERTIFICATE_SECRET']],
+  ['USER_ACCOUNT', 'IT', 'USERNAME', 'IDENTIFIER', [S, T, C], 'CONTEXTUAL', ['USER_ACCOUNT']],
+  ['NETWORK_IDENTIFIER', 'IT', 'IP', 'IDENTIFIER', [F, S], 'CONTEXTUAL', ['NETWORK_IDENTIFIER', 'IP']],
+  ['NETWORK_IDENTIFIER', 'IT', 'PORT', 'IDENTIFIER', [S, C], 'NOT_BY_ITSELF', ['NETWORK_IDENTIFIER', 'PORT']],
+  ['NETWORK_IDENTIFIER', 'IT', 'DOMAIN', 'IDENTIFIER', [F, S], 'CONTEXTUAL', ['NETWORK_IDENTIFIER', 'DOMAIN']],
+  ['NETWORK_IDENTIFIER', 'IT', 'URL', 'IDENTIFIER', [F], 'CONTEXTUAL', ['NETWORK_IDENTIFIER', 'URL']],
+  ['NETWORK_IDENTIFIER', 'IT', 'MAC', 'IDENTIFIER', [F], 'CONTEXTUAL', ['NETWORK_IDENTIFIER', 'MAC']],
+  ['NETWORK_IDENTIFIER', 'IT', 'SUBNET', 'IDENTIFIER', [F], 'NOT_BY_ITSELF', ['NETWORK_IDENTIFIER', 'SUBNET']],
+  ['HOST_OR_SERVICE', 'IT', 'HOSTNAME', 'IDENTIFIER', [S, T], 'CONTEXTUAL', ['HOST_OR_SERVICE']],
+  ['HOST_OR_SERVICE', 'IT', 'SERVICE_ENDPOINT', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['HOST_OR_SERVICE']],
+  ['HOST_OR_SERVICE', 'IT', 'DATABASE_NAME', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['HOST_OR_SERVICE']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'TENANT_ID', 'IDENTIFIER', [S], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'TENANT_ID']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'SUBSCRIPTION_ID', 'IDENTIFIER', [S], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'SUBSCRIPTION_ID']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'ACCOUNT_ID', 'IDENTIFIER', [S], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'ACCOUNT_ID']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'ARN', 'IDENTIFIER', [F], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'ARN']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'PROJECT_ID', 'IDENTIFIER', [S], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'PROJECT_ID']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'RESOURCE_GROUP', 'IDENTIFIER', [S], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'RESOURCE_GROUP']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'BUCKET', 'IDENTIFIER', [S], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'BUCKET']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'VAULT', 'IDENTIFIER', [S], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'VAULT']],
+  ['CLOUD_RESOURCE', 'CLOUD', 'SERVICE_ACCOUNT', 'IDENTIFIER', [F, S], 'NOT_BY_ITSELF', ['CLOUD_RESOURCE', 'SERVICE_ACCOUNT']],
+  ['FILE_OR_RESOURCE_PATH', 'IT', 'FILE_PATH', 'IDENTIFIER', [F, S], 'CONTEXTUAL', ['FILE_OR_RESOURCE_PATH']],
+  ['APPLICATION_OR_ENVIRONMENT', 'IT', 'APPLICATION_NAME', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['APPLICATION_OR_ENVIRONMENT']],
+  ['APPLICATION_OR_ENVIRONMENT', 'IT', 'ENVIRONMENT_NAME', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['APPLICATION_OR_ENVIRONMENT']],
+  ['CUSTOMER_OR_PARTNER', 'ORGANIZATION', 'ORGANIZATION_NAME', 'IDENTIFIER', [T, C], 'NOT_BY_ITSELF', ['CUSTOMER_OR_PARTNER']],
+  // A sole trader's organisationsnummer is their personnummer, hence CONTEXTUAL.
+  ['CUSTOMER_OR_PARTNER', 'ORGANIZATION', 'SE_ORGANISATIONSNUMMER', 'IDENTIFIER', [F, S], 'CONTEXTUAL', ['CUSTOMER_OR_PARTNER'], ['SE']],
+  ['PROJECT_OR_CONTRACT', 'ORGANIZATION', 'PROJECT_NAME', 'IDENTIFIER', [T, C], 'NOT_BY_ITSELF', ['PROJECT_OR_CONTRACT']],
+  ['PROJECT_OR_CONTRACT', 'ORGANIZATION', 'CONTRACT_NUMBER', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['PROJECT_OR_CONTRACT']],
+  ['ENGINEERING_IDENTIFIER', 'PLM', 'PART_NUMBER', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER', 'PART_NUMBER']],
+  ['ENGINEERING_IDENTIFIER', 'PLM', 'ITEM_ID', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER', 'ITEM_ID']],
+  ['ENGINEERING_IDENTIFIER', 'PLM', 'DRAWING_NUMBER', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER', 'DRAWING_NUMBER']],
+  ['ENGINEERING_IDENTIFIER', 'PLM', 'REVISION_ID', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER']],
+  ['ENGINEERING_IDENTIFIER', 'PLM', 'CHANGE_ORDER_NUMBER', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER']],
+  ['ENGINEERING_IDENTIFIER', 'IM', 'DOCUMENT_ID', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER', 'DOCUMENT_ID']],
+  ['ENGINEERING_IDENTIFIER', 'IM', 'TRANSMITTAL_NUMBER', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER']],
+  ['ENGINEERING_IDENTIFIER', 'ASSET', 'ASSET_TAG', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER', 'ASSET_TAG']],
+  ['ENGINEERING_IDENTIFIER', 'ASSET', 'FUNCTIONAL_LOCATION', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER', 'FUNCTIONAL_LOCATION']],
+  ['ENGINEERING_IDENTIFIER', 'ASSET', 'SERIAL_NUMBER', 'IDENTIFIER', [S, T], 'CONTEXTUAL', ['ENGINEERING_IDENTIFIER']],
+  ['ENGINEERING_IDENTIFIER', 'PROCESS_PLANT', 'EQUIPMENT_TAG', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER']],
+  ['ENGINEERING_IDENTIFIER', 'PROCESS_PLANT', 'LINE_NUMBER', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER']],
+  ['ENGINEERING_IDENTIFIER', 'PROCESS_PLANT', 'INSTRUMENT_TAG', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER']],
+  ['ENGINEERING_IDENTIFIER', 'OT', 'PLC_TAG', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER', 'PLC_TAG']],
+  ['ENGINEERING_IDENTIFIER', 'OT', 'SCADA_TAG', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER', 'SCADA_TAG']],
+  ['ENGINEERING_IDENTIFIER', 'QUALITY', 'NCR_NUMBER', 'IDENTIFIER', [S, T], 'NOT_BY_ITSELF', ['ENGINEERING_IDENTIFIER']],
+  ['ENGINEERING_INFORMATION', 'PLM', 'BOM_STRUCTURE', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'PLM', 'VARIANT_EFFECTIVITY', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'PLM', 'CHANGE_DESCRIPTION', 'CONTENT', [C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAD', 'GEOMETRY', 'CONTENT', [S], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAD', 'PMI_TOLERANCE', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAD', 'MATERIAL_SPECIFICATION', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAE', 'SIMULATION_MODEL', 'CONTENT', [S], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAE', 'LOAD_CASE', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAE', 'SIMULATION_RESULT', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAM', 'NC_PROGRAM', 'CONTENT', [F, S], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAM', 'TOOLPATH', 'CONTENT', [S], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAM', 'PROCESS_PARAMETERS', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'CAM', 'PROCESS_PLAN', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'PROCESS_PLANT', 'PROCESS_TOPOLOGY', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'PROCESS_PLANT', 'PROCESS_CONDITIONS', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'OT', 'CONTROL_LOGIC', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'OT', 'CONTROL_SETPOINT', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'OT', 'CONTROL_SYSTEM_CONFIGURATION', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'ASSET', 'MAINTENANCE_RECORD', 'CONTENT', [S, C], 'CONTEXTUAL', null],
+  ['ENGINEERING_INFORMATION', 'ASSET', 'INSPECTION_RESULT', 'CONTENT', [S, C], 'CONTEXTUAL', null],
+  ['ENGINEERING_INFORMATION', 'QUALITY', 'MEASUREMENT_RESULT', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'QUALITY', 'DEVIATION_REPORT', 'CONTENT', [C], 'CONTEXTUAL', null],
+  ['ENGINEERING_INFORMATION', 'IM', 'DOCUMENT_CONTROL_METADATA', 'CONTENT', [S], 'CONTEXTUAL', null],
+  ['ENGINEERING_INFORMATION', 'IT', 'SYSTEM_TOPOLOGY', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'IT', 'INTEGRATION_CONFIGURATION', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['ENGINEERING_INFORMATION', 'IT', 'DEPLOYMENT_CONFIGURATION', 'CONTENT', [S, C], 'NOT_BY_ITSELF', null],
+  ['BUSINESS_CONFIDENTIAL', 'BUSINESS', 'PRICING', 'CONTENT', [C], 'NOT_BY_ITSELF', ['BUSINESS_CONFIDENTIAL']],
+  ['BUSINESS_CONFIDENTIAL', 'BUSINESS', 'CONTRACT_TERMS', 'CONTENT', [C], 'NOT_BY_ITSELF', ['BUSINESS_CONFIDENTIAL']],
+  ['BUSINESS_CONFIDENTIAL', 'BUSINESS', 'STRATEGY_OR_PLAN', 'CONTENT', [C], 'NOT_BY_ITSELF', ['BUSINESS_CONFIDENTIAL']],
+];
+
+export const TAXONOMY_DRAFT: readonly TaxonomyEntryDraft[] = Object.freeze(ROWS.map(
+  ([semanticType, domain, subtype, form, evidence, personalDataPrior, v1, jurisdictions]) => Object.freeze({
+    semanticType, domain, subtype, form, evidence: Object.freeze([...evidence]), personalDataPrior,
+    ...(jurisdictions ? { jurisdictions: Object.freeze([...jurisdictions]) } : {}),
+    v1: v1 ? Object.freeze({ semanticType: v1[0], ...(v1[1] !== undefined ? { subtype: v1[1] } : {}) }) : null,
+  }),
+));
+
+/** Subtypes are globally unique in the draft, so a subtype alone identifies its entry. */
+export function taxonomyEntryDraft(subtype: unknown): TaxonomyEntryDraft | undefined {
+  return typeof subtype === 'string' ? TAXONOMY_DRAFT.find((entry) => entry.subtype === subtype) : undefined;
+}
+
+/**
+ * Migration aid: draft entries a v1 class/subtype may become. A v1 default subtype maps to exactly one
+ * entry. A tenant-extended v1 subtype maps to the class-only entry whose draft subtype has the same name.
+ * A v1 class without a subtype maps to every entry under it (a reviewer or detector must narrow it).
+ */
+export function draftEntriesForV1(semanticType: unknown, subtype?: unknown): readonly TaxonomyEntryDraft[] {
+  if (typeof semanticType !== 'string' || !(SEMANTIC_CLASSES as readonly string[]).includes(semanticType)) return [];
+  if (subtype !== undefined && typeof subtype !== 'string') return [];
+  return Object.freeze(TAXONOMY_DRAFT.filter((entry) => entry.v1?.semanticType === semanticType &&
+    (subtype === undefined || entry.v1.subtype === subtype ||
+      (entry.v1.subtype === undefined && entry.subtype === subtype))));
+}
