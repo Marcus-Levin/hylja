@@ -320,7 +320,7 @@ test('dotted runs have a single email start and stay within a bounded-work budge
 
 test('second rereview regressions: leading dots and invisible marks do not hide contacts', () => {
   for (const [text, expected] of [
-    ['.john@example.com', ['john@example.com']], ['Contact me...john@example.com', ['john@example.com']],
+    ['.john@example.com', ['john@example.com']], ["'.john@example.com", ['john@example.com']], ['Contact me...john@example.com', ['john@example.com']],
     ['first..last@example.com', ['last@example.com']], ['user@example.cóm', ['user@example.cóm']],
   ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'EMAIL').map(([, v]) => v), expected, text);
   for (const text of ['Orla Synthetica️', 'Orla͏ Synthetica', '͏Orla Synthetica', 'Orla︎ Synthetica',

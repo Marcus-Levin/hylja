@@ -164,7 +164,7 @@ function matchNames(text: string, root: TrieNode): { start: number; end: number 
 // `...` in prose does not hide the address. 64 is the RFC 5321 local-part limit.
 const LOCAL_START = '[\\p{L}\\p{M}\\p{N}_%+-]';
 const LOCAL = "[\\p{L}\\p{M}\\p{N}_%+'-]";
-const EMAIL = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}_%+-])(?<![\\p{L}\\p{M}\\p{N}_%+'-]\\.)${LOCAL_START}(?:${LOCAL}|\\.(?=${LOCAL})){0,63}@` +
+const EMAIL = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}_%+-])(?<![\\p{L}\\p{M}\\p{N}_%+-]\\.)${LOCAL_START}(?:${LOCAL}|\\.(?=${LOCAL})){0,63}@` +
   '(?:[\\p{L}\\p{N}](?:[\\p{L}\\p{M}\\p{N}-]{0,61}[\\p{L}\\p{M}\\p{N}])?\\.){1,16}(?:xn--[a-z0-9-]{1,59}|\\p{L}[\\p{L}\\p{M}]{1,47})' +
   '(?![\\p{L}\\p{M}\\p{N}]|\\.[\\p{L}\\p{N}])', 'gu');
 // Digit groups with phone separators. `:`, `=` and `#` may precede (keyword forms such as `tel:`).
