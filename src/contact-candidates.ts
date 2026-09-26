@@ -65,7 +65,7 @@ function label(value: unknown, limit = 256): value is string {
 /* ---------- Text folding shared by names and input: NFC per cluster, with an offset map ---------- */
 
 // Marks belong to their token: Indic/Thai/Arabic vowel signs and case-fold marks (İ -> i + U+0307).
-const TOKEN = /[\p{L}\p{M}\p{N}_]+/gu;
+const TOKEN = /[\p{L}\p{N}_][\p{L}\p{M}\p{N}_]*/gu;
 /** Per folded code unit: original start and end of the cluster it came from. */
 interface Folded { text: string; origin: number[]; originEnd: number[] }
 /**
@@ -78,7 +78,8 @@ function fold(text: string): Folded {
   const origin: number[] = [];
   const originEnd: number[] = [];
   for (const match of text.matchAll(/\P{M}\p{M}*|\p{M}+/gsu)) {
-    const piece = match[0].normalize('NFC').toLowerCase();
+    // Invisible default-ignorable marks (U+034F, variation selectors) must not split or extend a token.
+    const piece = match[0].normalize('NFC').toLowerCase().replace(/(?=\p{M})\p{Default_Ignorable_Code_Point}/gu, '');
     for (let unit = 0; unit < piece.length; unit++) {
       origin.push(match.index);
       originEnd.push(match.index + match[0].length);
@@ -158,13 +159,14 @@ function matchNames(text: string, root: TrieNode): { start: number; end: number 
 
 // Local part: Unicode letters/digits (RFC 6531) and the atext that appears in practice. It may not start
 // with an apostrophe, and rarer atext (`/ = ? & ~ { } \``) is excluded so quotes, paths and URL queries are
-// not swallowed. The lookbehind excludes every start character and `.`, so a match starts at the token
-// start and a dotted run has a single start (bounded work). 64 is the RFC 5321 local-part limit.
+// not swallowed. The lookbehinds exclude every start character and a `.` that follows a local character, so a
+// match starts at the token start, a dotted run has a single start (bounded work), and a leading `.` or
+// `...` in prose does not hide the address. 64 is the RFC 5321 local-part limit.
 const LOCAL_START = '[\\p{L}\\p{M}\\p{N}_%+-]';
 const LOCAL = "[\\p{L}\\p{M}\\p{N}_%+'-]";
-const EMAIL = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}_%+.-])${LOCAL_START}(?:${LOCAL}|\\.(?=${LOCAL})){0,63}@` +
-  '(?:[\\p{L}\\p{N}](?:[\\p{L}\\p{M}\\p{N}-]{0,61}[\\p{L}\\p{M}\\p{N}])?\\.){1,16}(?:xn--[a-z0-9-]{1,59}|\\p{L}{2,24})' +
-  '(?![\\p{L}\\p{N}]|\\.[\\p{L}\\p{N}])', 'gu');
+const EMAIL = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}_%+-])(?<![\\p{L}\\p{M}\\p{N}_%+'-]\\.)${LOCAL_START}(?:${LOCAL}|\\.(?=${LOCAL})){0,63}@` +
+  '(?:[\\p{L}\\p{N}](?:[\\p{L}\\p{M}\\p{N}-]{0,61}[\\p{L}\\p{M}\\p{N}])?\\.){1,16}(?:xn--[a-z0-9-]{1,59}|\\p{L}[\\p{L}\\p{M}]{1,47})' +
+  '(?![\\p{L}\\p{M}\\p{N}]|\\.[\\p{L}\\p{N}])', 'gu');
 // Digit groups with phone separators. `:`, `=` and `#` may precede (keyword forms such as `tel:`).
 const PHONE = /(?<![\p{L}\p{N}_./@-])(?:\+|00)?\(?\d{1,4}\)?(?:[ \-.]?\(?\d{1,4}\)?){1,7}(?![\p{L}\p{N}_@]|[.:\-/]\d)/gu;
 const PHONE_KEYWORD = /(?:\b(?:tel|telephone|phone|mobile|mob|mobil|cell|fax|telefon|tfn|tlf|ring)(?:\s*(?:number|no\.?|nr\.?|#))?|☎)[\s.:#=-]{0,4}$/iu;

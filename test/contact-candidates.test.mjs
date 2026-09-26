@@ -53,7 +53,7 @@ test('phone layouts: international, grouped, parenthesized and keyword-introduce
 test('email boundaries: no partial local parts, trailing dots or TLD-less hosts', () => {
   for (const [text, expected] of [
     ['mail a.b-c+tag@mail.example.com.', ['a.b-c+tag@mail.example.com']],
-    ['git@host-without-tld', []], ['x@example.c', []], ['..a@example.com', []],
+    ['git@host-without-tld', []], ['x@example.c', []], ['..a@example.com', ['a@example.com']],
     ['user@@example.com', []], ['first@example.com,second@example.invalid', ['first@example.com', 'second@example.invalid']],
   ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'EMAIL').map(([, v]) => v), expected, text);
 });
@@ -315,5 +315,17 @@ test('dotted runs have a single email start and stay within a bounded-work budge
     run(text);
     const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
     assert.ok(elapsedMs < 2000, `${elapsedMs}ms`);
+  }
+});
+
+test('second rereview regressions: leading dots and invisible marks do not hide contacts', () => {
+  for (const [text, expected] of [
+    ['.john@example.com', ['john@example.com']], ['Contact me...john@example.com', ['john@example.com']],
+    ['first..last@example.com', ['last@example.com']], ['user@example.cóm', ['user@example.cóm']],
+  ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'EMAIL').map(([, v]) => v), expected, text);
+  for (const text of ['Orla Synthetica️', 'Orla͏ Synthetica', '͏Orla Synthetica', 'Orla︎ Synthetica',
+    ' ́Orla Synthetica']) {
+    const names = spans(text, run(text)).filter(([s]) => s === 'NAME').map(([, v]) => v.replace(/[͏︎️]/gu, ''));
+    assert.ok(names.includes('Orla Synthetica'), JSON.stringify(text));
   }
 });
