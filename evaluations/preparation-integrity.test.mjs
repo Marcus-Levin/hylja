@@ -111,6 +111,48 @@ test('assume-unchanged and skip-worktree cannot conceal matching modified public
   }
 });
 
+test('Git replace refs cannot swap HEAD fixture and manifest blobs for self-matching bytes', async (t) => {
+  const context = setup(t);
+  const fixture = join(context.root, fixtureName);
+  appendFileSync(fixture, `\n${planted}\n`);
+  context.manifest.publicSha256.DEV_FIXTURE = createHash('sha256')
+    .update(readFileSync(fixture)).digest('hex');
+  writeFileSync(join(context.root, manifestName), `${JSON.stringify(context.manifest, null, 2)}\n`);
+  for (const name of [fixtureName, manifestName]) {
+    const original = git(context.root, 'rev-parse', `HEAD:${name}`);
+    const substituted = git(context.root, 'hash-object', '-w', '--', name);
+    assert.notEqual(original, substituted);
+    git(context.root, 'replace', original, substituted);
+  }
+  assert.equal(git(context.root, 'cat-file', 'blob', `HEAD:${fixtureName}`).includes(planted), true);
+  assert.deepEqual(await verify(context), invalid('PUBLIC_FILE_CHANGED'));
+  const cli = spawnSync(process.execPath, [context.script], { cwd: context.root, encoding: 'utf8' });
+  assert.equal(cli.status, 1);
+  assert.deepEqual(JSON.parse(cli.stdout), invalid('PUBLIC_FILE_CHANGED'));
+  assert.equal(cli.stderr, '');
+  assert.equal(cli.stdout.includes(planted), false);
+  assert.equal(cli.stdout.includes(context.manifest.publicSha256.DEV_FIXTURE), false);
+});
+
+test('a local Git graft cannot forge preparation source ancestry', async (t) => {
+  const context = setup(t);
+  const tree = git(context.root, 'write-tree');
+  const unrelated = git(context.root, '-c', 'user.name=Synthetic Test',
+    '-c', 'user.email=test@example.invalid', 'commit-tree', tree, '-m', 'unrelated synthetic root');
+  replaceManifest(context, (manifest) => { manifest.observations.preparationSourceRevision = unrelated; });
+  assert.deepEqual(await verify(context), invalid('GIT_REVISION_INVALID'));
+  const graft = resolve(context.root, git(context.root, 'rev-parse', '--git-path', 'info/grafts'));
+  mkdirSync(dirname(graft), { recursive: true });
+  writeFileSync(graft, `${git(context.root, 'rev-parse', 'HEAD')} ${unrelated}\n`);
+  const spoofed = spawnSync('git', ['-C', context.root, 'merge-base', '--is-ancestor', unrelated, 'HEAD']);
+  assert.equal(spoofed.status, 0);
+  assert.deepEqual(await verify(context), invalid('GIT_REVISION_INVALID'));
+  const cli = spawnSync(process.execPath, [context.script], { cwd: context.root, encoding: 'utf8' });
+  assert.equal(cli.status, 1);
+  assert.deepEqual(JSON.parse(cli.stdout), invalid('GIT_REVISION_INVALID'));
+  assert.equal(cli.stderr, '');
+});
+
 test('global Git fsmonitor cannot run a helper during valid public preparation', (t) => {
   const context = setup(t);
   const home = join(context.disposable, 'synthetic-home');
