@@ -50,10 +50,13 @@ test('nested Base64 -> percent -> Base64 is decoded to depth 3 with a provenance
   const input = `payload ${b64(`x=${pct(`t=${inner}`)}`)} end`;
   const result = normalizeInput(input);
   assert.equal(result.status, 'COMPLETE');
-  const leaf = result.views.find((v) => v.text.includes(MARKER));
-  const chain = [];
-  for (let view = leaf; view; view = view.parent === null ? undefined : result.views[view.parent]) chain.push(view.encoding);
-  assert.deepEqual(chain, ['BASE64', 'PERCENT', 'BASE64', 'ROOT']);
+  // Several decode paths may reach the marker; the full provenance chain must be one of them.
+  const chains = result.views.filter((v) => v.text.includes(MARKER)).map((leaf) => {
+    const chain = [];
+    for (let view = leaf; view; view = view.parent === null ? undefined : result.views[view.parent]) chain.push(view.encoding);
+    return chain.join('>');
+  });
+  assert.ok(chains.includes('BASE64>PERCENT>BASE64>ROOT'), chains.join(' | '));
 });
 
 test('#6 negative: a marker beyond the depth budget is uninspected, PARTIAL and never clean', () => {
@@ -235,4 +238,40 @@ test('property: a random single-byte binary prefix never hides a planted marker 
     const result = normalizeInput(`x=${encoded} y`);
     assert.ok(reachable(result, marker) || result.status === 'PARTIAL', encoded);
   }
+});
+
+
+test('rereview: disjoint identical copies are all recorded as occurrences', () => {
+  const encoded = b64('synthetic-user:synthetic-pass.invalid');
+  const input = `Authorization: Basic ${encoded}\nX-Forwarded-Auth: Basic ${encoded}\nx=${hex('synthetic-user:synthetic-pass.invalid')}`;
+  const result = normalizeInput(input);
+  const views = result.views.filter((v) => v.text === 'synthetic-user:synthetic-pass.invalid');
+  const spans = views.flatMap((v) => v.occurrences.map((o) => input.slice(o.start, o.end)));
+  assert.equal(spans.filter((s) => s === encoded).length, 2);
+  assert.ok(spans.some((s) => s.startsWith(hex('synthetic'))));
+});
+
+test('rereview: UTF-16 variants and Base64 glued to letters are reached', () => {
+  const le = Buffer.from(MARKER, 'utf16le');
+  const be = Buffer.from(MARKER, 'utf16le').swap16();
+  for (const raw of [Buffer.concat([le, Buffer.from([0x41])]), Buffer.concat([Buffer.from([1, 0]), le]),
+    Buffer.concat([Buffer.from([0x00, 0xd8]), le]), be]) {
+    assert.ok(reachable(normalizeInput(`v=${raw.toString('base64')}`)), raw.toString('hex').slice(0, 12));
+  }
+  for (const prefix of ['token', 'abc', 'x', 'ab']) assert.ok(reachable(normalizeInput(`${prefix}${b64(MARKER)}`)), prefix);
+});
+
+test('rereview: ordinary binary attachments stay COMPLETE and produce at most one view per run', () => {
+  const random = prng(0x6161);
+  const blob = () => Buffer.from(Array.from({ length: 48_000 }, () => Math.floor(random() * 256))).toString('base64');
+  const payload = JSON.stringify({ files: Array.from({ length: 7 }, (_, i) => ({ name: `f${i}.bin`, data: blob() })) });
+  const result = normalizeInput(payload);
+  assert.equal(result.status, 'COMPLETE');
+  assert.ok(result.views.length <= 8);
+  assert.deepEqual(result.uninspected, []);
+});
+
+test('rereview: fold accepts an explicit limit up to the hard input limit', () => {
+  assert.equal(foldForDetection('x'.repeat(DEFAULT_BUDGET.maxInputUnits + 1), 2 << 20).text.length, DEFAULT_BUDGET.maxInputUnits + 1);
+  assert.throws(() => foldForDetection('x', 1 << 30), RangeError);
 });

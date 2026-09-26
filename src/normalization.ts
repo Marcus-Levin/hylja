@@ -6,7 +6,8 @@
  *
  * Scope limits (not decoded here, owned by #7 parsers or #8 detectors): JSON/JS `\uXXXX`/`\xNN` escapes,
  * colon-separated hex, HTML entities, `+`-as-space form encoding, quoted-printable, compression and archives.
- * Minimum candidate lengths: Base64 12 characters, hex 16 digits (8 bytes).
+ * Minimum candidate lengths: Base64 12 characters, hex 16 digits (8 bytes). Residual limits: printable runs
+ * shorter than 8 characters inside binary, line-wrapped Base64 with lines under 16 characters, UTF-32.
  */
 
 export const ENCODINGS = ['ROOT', 'BASE64', 'BASE64URL', 'PERCENT', 'HEX'] as const;
@@ -27,15 +28,15 @@ export interface NormalizationBudget {
   maxDecodeWork: number;
 }
 export const DEFAULT_BUDGET: Readonly<NormalizationBudget> = Object.freeze({
-  maxInputUnits: 1 << 20, maxDepth: 3, maxDecodedUnits: 1 << 20, maxViews: 256, maxDecodeWork: 4 << 20,
+  maxInputUnits: 1 << 20, maxDepth: 3, maxDecodedUnits: 1 << 20, maxViews: 256, maxDecodeWork: 8 << 20,
 });
 const HARD_LIMITS: Readonly<NormalizationBudget> = Object.freeze({
-  maxInputUnits: 16 << 20, maxDepth: 8, maxDecodedUnits: 16 << 20, maxViews: 4096, maxDecodeWork: 64 << 20,
+  maxInputUnits: 16 << 20, maxDepth: 8, maxDecodedUnits: 16 << 20, maxViews: 4096, maxDecodeWork: 128 << 20,
 });
 /** Longest single encoded run considered for decoding; longer runs are recorded as uninspected. */
 const MAX_RUN = 1 << 16;
-/** Extra decode starts tried inside one Base64 run (after `/` or `+`), for runs glued to a path or prefix. */
-const MAX_INNER_STARTS = 16;
+/** Disjoint parent spans recorded on one view for identical decoded text before a new view is created. */
+const MAX_OCCURRENCES = 1024;
 /** Uninspected spans kept before collapsing into one truncation reason. */
 const MAX_UNINSPECTED = 1024;
 /** Printable runs shorter than this inside binary decodes are noise, not text. */
@@ -49,9 +50,11 @@ export interface NormalizedView {
   /** TEXT: the decode is text. STRINGS: printable runs extracted from a binary decode, joined by newlines. */
   form: 'TEXT' | 'STRINGS';
   depth: number;
-  /** UTF-16 span of the encoded run inside the parent view's text; the whole run maps to the decoded view. */
+  /** UTF-16 span of the (first) encoded run inside the parent view's text; the whole run maps to the view. */
   parentStart: number;
   parentEnd: number;
+  /** Every disjoint parent span whose run decoded to this same text, including the first. */
+  occurrences: readonly { start: number; end: number }[];
   text: string;
 }
 export interface UninspectedSpan {
@@ -75,6 +78,7 @@ export interface NormalizationResult {
   binaryDecodes: number;
 }
 
+type MutableView = Omit<NormalizedView, 'occurrences'> & { occurrences: { start: number; end: number }[] };
 function failure(reason: string): NormalizationResult {
   return Object.freeze({ status: 'FAILURE', reasons: Object.freeze([reason]), contentType: 'UNKNOWN',
     views: Object.freeze([]), uninspected: Object.freeze([]), binaryDecodes: 0 });
@@ -100,6 +104,8 @@ function budgetFrom(raw: unknown): NormalizationBudget | null {
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const lenient = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
 const utf16 = new TextDecoder('utf-16le', { fatal: false, ignoreBOM: true });
+const utf16be = new TextDecoder('utf-16be', { fatal: false, ignoreBOM: true });
+const ASCII_RUN = /[\u0020-\u007e\t]{8,}/gu;
 const encoder = new TextEncoder();
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const NOT_PRINTABLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f�]+/u;
@@ -127,10 +133,20 @@ function readable(bytes: Uint8Array): { text: string; form: NormalizedView['form
     }
   }
   const strings = lenient.decode(bytes).split(NOT_PRINTABLE).filter((piece) => piece.length >= MIN_STRING);
-  return strings.length ? { text: strings.join('\n'), form: 'STRINGS' } : null;
+  // Like `strings -el`/`-eb`: ASCII runs from UTF-16 at both byte parities (odd lengths, controls, BE).
+  if (bytes.length >= 2 * MIN_STRING) {
+    for (const decoder of [utf16, utf16be]) {
+      for (const offset of [0, 1]) {
+        const view = bytes.subarray(offset, offset + ((bytes.length - offset) & ~1));
+        for (const match of decoder.decode(view).matchAll(ASCII_RUN)) strings.push(match[0]);
+      }
+    }
+  }
+  const unique = [...new Set(strings)];
+  return unique.length ? { text: unique.join('\n'), form: 'STRINGS' } : null;
 }
-function decodeBase64(run: string, url: boolean): Uint8Array | null {
-  const body = run.replace(/[\r\n \t]/gu, '').replace(/=+$/u, '');
+function decodeBase64(run: string, url: boolean, skip = 0): Uint8Array | null {
+  const body = run.replace(/[\r\n \t]/gu, '').replace(/=+$/u, '').slice(skip);
   const usable = body.length - (body.length % 4 === 1 ? 1 : 0);
   const bytes = new Uint8Array(Math.floor(usable * 3 / 4));
   let buffer = 0, bits = 0, out = 0;
@@ -181,45 +197,45 @@ const HEX_RUN = /(?<![0-9A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Fa-f])/gu;
 const TOKEN_RUN = /[^\s"'<>`]+/gu;
 const PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/u;
 
-interface Run { start: number; end: number; encoding: Exclude<Encoding, 'ROOT'>; decode: () => Uint8Array | null }
-function runs(text: string): Run[] {
-  const found: Run[] = [];
-  const add = (start: number, end: number, encoding: Run['encoding'], decode: () => Uint8Array | null): void => {
-    found.push({ start, end, encoding, decode });
-  };
+interface Run { start: number; end: number; encoding: Exclude<Encoding, 'ROOT'>; decodes: (() => Uint8Array | null)[] }
+/** Pick the most useful decode: TEXT from any candidate, else the STRINGS with the most printable content. */
+function best(candidates: (Uint8Array | null)[]): { bytes: Uint8Array | null; found: ReturnType<typeof readable> } {
+  let chosen: ReturnType<typeof readable> = null, bytes: Uint8Array | null = null;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    bytes ??= candidate;
+    const found = readable(candidate);
+    if (found?.form === 'TEXT') return { bytes: candidate, found };
+    if (found && (!chosen || found.text.length > chosen.text.length)) chosen = found;
+  }
+  return { bytes, found: chosen };
+}
+/** Candidate runs, produced lazily so a budget stop does not first materialize every run of a view. */
+function* runs(text: string): Generator<Run> {
   for (const match of text.matchAll(TOKEN_RUN)) {
-    if (PERCENT_ESCAPE.test(match[0])) add(match.index, match.index + match[0].length, 'PERCENT', () => decodePercent(match[0]));
+    if (PERCENT_ESCAPE.test(match[0])) {
+      const value = match[0];
+      yield { start: match.index, end: match.index + value.length, encoding: 'PERCENT', decodes: [() => decodePercent(value)] };
+    }
   }
   for (const match of text.matchAll(HEX_RUN)) {
     const value = match[0], start = match.index, end = start + value.length;
-    if (value.length % 2 === 0) add(start, end, 'HEX', () => decodeHex(value));
+    if (value.length % 2 === 0) yield { start, end, encoding: 'HEX', decodes: [() => decodeHex(value)] };
     else {
       // Odd length: a stray nibble at either end; try both parities.
-      add(start + 1, end, 'HEX', () => decodeHex(value.slice(1)));
-      add(start, end - 1, 'HEX', () => decodeHex(value.slice(0, -1)));
+      yield { start: start + 1, end, encoding: 'HEX', decodes: [() => decodeHex(value.slice(1))] };
+      yield { start, end: end - 1, encoding: 'HEX', decodes: [() => decodeHex(value.slice(0, -1))] };
     }
   }
-  for (const match of text.matchAll(BASE64_RUN)) {
-    const value = match[0], start = match.index;
-    add(start, start + value.length, 'BASE64', () => decodeBase64(value, false));
-    // A path or `+` prefix glued to the run misaligns it; also decode from after each `/` or `+`.
-    let inner = 0;
-    for (let index = 0; index < value.length - 12 && inner < MAX_INNER_STARTS; index++) {
-      if (value[index] !== '/' && value[index] !== '+') continue;
-      const rest = value.slice(index + 1);
-      add(start + index + 1, start + value.length, 'BASE64', () => decodeBase64(rest, false));
-      inner++;
+  // A prefix glued to Base64 (`token<b64>`, a URL path) misaligns it; decoding at offsets 0-3 realigns
+  // any prefix length, and the prefix garbage falls out of STRINGS extraction.
+  for (const [pattern, url] of [[BASE64_RUN, false], [BASE64_WRAPPED, false], [BASE64URL_RUN, true]] as const) {
+    for (const match of text.matchAll(pattern)) {
+      const value = match[0];
+      yield { start: match.index, end: match.index + value.length, encoding: url ? 'BASE64URL' : 'BASE64',
+        decodes: [0, 1, 2, 3].map((skip) => () => decodeBase64(value, url, skip)) };
     }
   }
-  for (const match of text.matchAll(BASE64_WRAPPED)) {
-    const value = match[0];
-    add(match.index, match.index + value.length, 'BASE64', () => decodeBase64(value, false));
-  }
-  for (const match of text.matchAll(BASE64URL_RUN)) {
-    const value = match[0];
-    add(match.index, match.index + value.length, 'BASE64URL', () => decodeBase64(value, true));
-  }
-  return found.sort((a, b) => a.start - b.start || a.end - b.end);
 }
 
 /* ---------- Content-type hint (parsers verify; this never authorizes or skips anything) ---------- */
@@ -268,8 +284,8 @@ export function normalizeInput(input: unknown, budget?: unknown): NormalizationR
     try { root = utf8.decode(input); } catch { return failure('INVALID_UTF8'); }
   } else return failure('INVALID_INPUT');
 
-  const views: NormalizedView[] = [Object.freeze({ id: 0, parent: null, encoding: 'ROOT', form: 'TEXT', depth: 0,
-    parentStart: 0, parentEnd: root.length, text: root })];
+  const views: MutableView[] = [{ id: 0, parent: null, encoding: 'ROOT', form: 'TEXT', depth: 0,
+    parentStart: 0, parentEnd: root.length, occurrences: [{ start: 0, end: root.length }], text: root }];
   const uninspected: UninspectedSpan[] = [];
   const reasons = new Set<string>();
   let decodedUnits = 0, work = 0, binaryDecodes = 0;
@@ -286,16 +302,24 @@ export function normalizeInput(input: unknown, budget?: unknown): NormalizationR
       record({ viewId: view.id, start: 0, end: view.text.length, reason: exhausted });
       continue;
     }
-    const texts = new Set<string>();
+    // Decoded text already produced from this view, with its disjoint parent spans.
+    const produced = new Map<string, MutableView>();
     for (const run of runs(view.text)) {
       if (run.end - run.start > MAX_RUN) { record({ viewId: view.id, start: run.start, end: run.end, reason: 'RUN_TOO_LONG' }); continue; }
-      if (work + (run.end - run.start) > limits.maxDecodeWork) exhausted = 'WORK_LIMIT';
+      const cost = (run.end - run.start) * run.decodes.length;
+      if (work + cost > limits.maxDecodeWork) exhausted = 'WORK_LIMIT';
       else {
-        work += run.end - run.start;
-        const decoded = run.decode();
-        const found = decoded && readable(decoded);
-        if (!found) { if (decoded) binaryDecodes++; continue; }
-        if (found.text === view.text.slice(run.start, run.end) || texts.has(found.text)) continue;
+        work += cost;
+        const { bytes, found } = best(run.decodes.map((decode) => decode()));
+        if (!found) { if (bytes) binaryDecodes++; continue; }
+        if (found.text === view.text.slice(run.start, run.end)) continue;
+        const existing = produced.get(found.text);
+        if (existing) {
+          // Overlapping duplicates (odd-hex parities, alternative encodings of one span) add nothing; a
+          // disjoint copy is another occurrence that transformation must also cover.
+          if (existing.occurrences.some((o) => o.start < run.end && run.start < o.end)) continue;
+          if (existing.occurrences.length < MAX_OCCURRENCES) { existing.occurrences.push({ start: run.start, end: run.end }); continue; }
+        }
         if (view.depth + 1 > limits.maxDepth) {
           record({ viewId: view.id, start: run.start, end: run.end, reason: 'DEPTH_LIMIT' });
           continue;
@@ -303,21 +327,26 @@ export function normalizeInput(input: unknown, budget?: unknown): NormalizationR
         if (views.length >= limits.maxViews + 1) exhausted = 'VIEW_LIMIT';
         else if (decodedUnits + found.text.length > limits.maxDecodedUnits) exhausted = 'EXPANSION_LIMIT';
         else {
-          texts.add(found.text);
           decodedUnits += found.text.length;
-          views.push(Object.freeze({ id: views.length, parent: view.id, encoding: run.encoding, form: found.form,
-            depth: view.depth + 1, parentStart: run.start, parentEnd: run.end, text: found.text }));
+          const created: MutableView = { id: views.length, parent: view.id, encoding: run.encoding, form: found.form,
+            depth: view.depth + 1, parentStart: run.start, parentEnd: run.end,
+            occurrences: [{ start: run.start, end: run.end }], text: found.text };
+          views.push(created);
+          produced.set(found.text, created);
           continue;
         }
       }
-      // One span covers the rest of this view; later views are recorded whole above.
-      record({ viewId: view.id, start: run.start, end: view.text.length, reason: exhausted });
+      // Runs are produced lazily and out of position order, so the whole view is marked uninspected.
+      record({ viewId: view.id, start: 0, end: view.text.length, reason: exhausted });
       break;
     }
   }
   return Object.freeze({
     status: uninspected.length || reasons.size ? 'PARTIAL' : 'COMPLETE', reasons: Object.freeze([...reasons].sort()),
-    contentType: sniffContentType(root), views: Object.freeze(views), uninspected: Object.freeze(uninspected),
+    contentType: sniffContentType(root),
+    views: Object.freeze(views.map((view) => Object.freeze({ ...view,
+      occurrences: Object.freeze(view.occurrences.map((o) => Object.freeze(o))) }))),
+    uninspected: Object.freeze(uninspected),
     binaryDecodes,
   });
 }
@@ -336,11 +365,13 @@ const IGNORABLE = /\p{Default_Ignorable_Code_Point}/u;
  * NFKC per cluster (a base plus its marks) after removing default-ignorable characters (zero-width, bidi
  * controls, variation selectors, soft hyphen), with Unicode dashes mapped to `-`. Removing ignorables first
  * lets a mark rejoin its base (`o<SHY>́` -> `ó`). Detectors match on `text` and map spans back with
- * `origin`/`originEnd`; the input is never rewritten. Input is limited to the default input budget.
+ * `origin`/`originEnd`; the input is never rewritten. `maxUnits` (default 1 MiB, at most 16 MiB) bounds memory;
+ * callers fold larger allowed inputs in chunks.
  */
-export function foldForDetection(input: string): DetectionFold {
+export function foldForDetection(input: string, maxUnits: number = DEFAULT_BUDGET.maxInputUnits): DetectionFold {
   if (typeof input !== 'string') throw new TypeError('Invalid fold input');
-  if (input.length > DEFAULT_BUDGET.maxInputUnits) throw new RangeError('Fold input too large');
+  if (!Number.isSafeInteger(maxUnits) || maxUnits < 0 || maxUnits > HARD_LIMITS.maxInputUnits) throw new RangeError('Invalid fold limit');
+  if (input.length > maxUnits) throw new RangeError('Fold input too large');
   let kept = '';
   const keptOrigin: number[] = [];
   for (let index = 0; index < input.length;) {
