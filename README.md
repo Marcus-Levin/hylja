@@ -12,6 +12,8 @@ Foundation only. This repository currently defines product direction, security i
 
 Implementation status has one authoritative home: [docs/plan.md](docs/plan.md).
 
+![Hylja concept illustration showing information cloaked between a source and an AI provider](docs/assets/hylja-concept.png)
+
 ## Start here
 
 - [VISION.md](VISION.md) - product direction and experience.
