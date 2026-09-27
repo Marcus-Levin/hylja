@@ -89,11 +89,11 @@ Bounded, **NON-ENFORCING** #8 credential detectors exist in [`src/secret-detecto
 - authorization, cookie and API-key headers;
 - URL userinfo up to the last `@`;
 - credential-like key assignments, including ones nested inside other values and `$`-sigil keys;
-- CLI flags, Dockerfile `ENV`, `.netrc` after `login`, `curl -u`, XML elements (including CDATA), key/value attribute and Kubernetes name/value pairs, token-only URL userinfo, YAML block scalars and trusted #7 field keys.
+- CLI flags, Dockerfile `ENV`, `.netrc` after `machine`/`default`/`login` (same or earlier lines), `curl -u`, XML elements (including CDATA), key/value attribute and Kubernetes name/value pairs, token-only URL userinfo, YAML block scalars and trusted #7 field keys.
 
-Context values over-cover to the end of the line or quote rather than stop inside a secret. Quoted values may span lines within a 64 KiB window, and an unterminated quote covers the whole window. The detectors emit `CREDENTIAL_OR_SECRET` / `SECRET`, non-reversible v1 evidence with spans and optional domain-separated, tenant-keyed HMAC fingerprints, never values. Anyone holding the key can still test guesses of low-entropy values. Whole-value env/template references and explicit masks are skipped. Known gaps:
+Context values over-cover to the end of the line or quote rather than stop inside a secret. Quoted values may span lines within a 64 KiB window, and an unterminated quote covers the whole window. Scanning resumes at the end of the opening line, so a key swallowed by a stray quote still gets its own candidate. A single quoted value longer than 64 KiB is covered only up to the window end. The detectors emit `CREDENTIAL_OR_SECRET` / `SECRET`, non-reversible v1 evidence with spans and optional domain-separated, tenant-keyed HMAC fingerprints, never values. Anyone holding the key can still test guesses of low-entropy values. Whole-value env/template references and explicit masks are skipped. Known gaps:
 - no generic high-entropy detection, so unknown token formats without a credential-like key are missed;
-- attached short flags (`-psecret`), prose (`the password is x`) and a standalone `.netrc` `password x` line without `login` are missed;
+- attached short flags (`-psecret`), prose (`the password is x`) and a `.netrc` `password x` without a preceding `machine`/`default`/`login` token are missed; keys that describe a credential (`password_hint`, `token_type`) are ignored;
 - over-covering can span structural characters in inline contexts.
 
 The synthetic golden check is a development measurement of detector recall, **not** held-out or zero-egress evidence; that needs #13 transformation and the #19 sentinel on actual outbound bytes. The detectors are not yet wired to #6 decoded views or #7 fields.

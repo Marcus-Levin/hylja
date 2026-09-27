@@ -266,3 +266,17 @@ test('second review: prose, ports and bare quotes are not candidates', () => {
     assert.deepEqual(run(text).candidates.map((c) => text.slice(c.start, c.end)), [], text);
   }
 });
+
+test('third review: CDATA is linear, later keys survive a stray quote, short numeric URL passwords, multi-line .netrc', () => {
+  const started = process.hrtime.bigint();
+  run('<a><![CDATA['.repeat(90_000));
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 3000);
+  for (const [text, value] of [['password: "abc\napi_key: "synthsecretvalue"', 'synthsecretvalue'],
+    ['password="a\nsecret="synthsec3"', 'synthsec3'], ['redis://:12345@cache.example.invalid', '12345'],
+    ['https://svc:1234@h.example.invalid/x', '1234'], ['machine h.example.invalid\n  login svc\n  password synthnetrc', 'synthnetrc'],
+    ['machine h.example.invalid password synthnetrc2', 'synthnetrc2']]) assert.ok(covers(text, value), text);
+  for (const text of ['name="password_hint" value="Your pet"', 'key="password_min_length" value="8"',
+    'https://first.last.example.name@example.invalid/', 'The machine password is expired']) {
+    assert.deepEqual(run(text).candidates.map((c) => text.slice(c.start, c.end)), [], text);
+  }
+});

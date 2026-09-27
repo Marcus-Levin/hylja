@@ -71,6 +71,8 @@ const KEY_SUBTYPES: readonly [RegExp, SecretSubtype][] = [
 export function subtypeForKey(key: string): SecretSubtype | null {
   const compact = key.toLowerCase().replace(/[^a-z0-9]/gu, '');
   if (!compact || compact.length > 64) return null;
+  // Keys that describe a credential rather than hold one (`password_hint`, `token_type`, `password_min_length`).
+  if (/(?:hint|policy|length|rules?|reset|expiry|expires|expiresin|changed|required|enabled|strength|prompt|label|type)$/u.test(compact)) return null;
   for (const [pattern, subtype] of KEY_SUBTYPES) if (pattern.test(compact)) return subtype;
   return null;
 }
@@ -233,8 +235,10 @@ function assignmentCandidates(text: string, out: Found[]): void {
     // `PWD=/home/...` in an env dump is the working directory, not a password.
     if (/^pwd$/iu.test(match[3]!) && /^[/~]/u.test(raw)) continue;
     add(out, { subtype, rule: 'context.key-assignment', basis: 'CONTEXT', ...value });
-    // Anything inside a credential value is already covered: resume after it (keeps scanning linear).
-    KEY_SEP.lastIndex = Math.max(KEY_SEP.lastIndex, value.end);
+    // Anything inside a credential value on its own line is already covered: resume after it. A quoted value
+    // that closes on a later line may have swallowed another key, so scanning resumes at the end of the
+    // opening line and later keys still get their own candidates.
+    KEY_SEP.lastIndex = Math.max(KEY_SEP.lastIndex, Math.min(value.end, lineEnd(text, at)));
   }
 }
 // Space-separated forms: `--password value`, `ENV DB_PASSWORD value`, `.netrc` `password value`, `curl -u user:pass`.
@@ -242,7 +246,9 @@ const FLAG_SPACE = /(?<![\w-])--([A-Za-z][\w-]{0,63})[ \t]+(?!-)/gu;
 // Space-separated keys only in unambiguous contexts: Dockerfile `ENV`, and `.netrc` after `login`. A bare
 // `password x` in prose is not a key, and matching it would flag words like `reset`.
 const LINE_SPACE = /^[ \t]*ENV[ \t]+([A-Za-z_][\w.-]{0,63})[ \t]+(?![=:])/gmu;
-const NETRC = /(?<![\w-])login[ \t]+\S+[ \t]+password[ \t]+(?![=:])/gu;
+const NETRC = /(?<![\w-])password[ \t]+(?![=:])/gu;
+/** `.netrc` context: `password` directly follows `machine <host>`, `default` or `login <user>` (same or earlier lines). */
+const NETRC_BEFORE = /(?:\bmachine[ \t]+\S+|\bdefault|\blogin[ \t]+\S+)[ \t\r\n]*$/u;
 const CURL_USER = /(?<![\w-])(?:-u|--user)[ \t]+[^\s:]{1,256}:/gu;
 function spacedCandidates(text: string, out: Found[]): void {
   for (const [pattern, keyGroup, rule] of [[FLAG_SPACE, 1, 'context.cli-flag'], [LINE_SPACE, 1, 'context.line-key'],
@@ -252,6 +258,7 @@ function spacedCandidates(text: string, out: Found[]): void {
       if (!match[0].length) { pattern.lastIndex++; continue; }
       const subtype = keyGroup ? subtypeForKey(match[keyGroup]!) : 'PASSWORD';
       if (!subtype) continue;
+      if (pattern === NETRC && !NETRC_BEFORE.test(text.slice(Math.max(0, match.index - 512), match.index))) continue;
       const value = readValue(text, match.index + match[0].length, 'inline');
       if (value && !isReference(text.slice(value.start, value.end))) {
         add(out, { subtype, rule, basis: 'CONTEXT', ...value });
@@ -261,7 +268,9 @@ function spacedCandidates(text: string, out: Found[]): void {
   }
 }
 // XML elements named like credentials: `<password>…</password>`.
-const XML_ELEMENT = /<([A-Za-z_][\w.-]{0,63})(?:\s[^<>]{0,1024})?>(<!\[CDATA\[[^\]]{0,65536}\]\]>|[^<]{1,65536})<\/\1>/gu;
+const XML_ELEMENT = /<([A-Za-z_][\w.-]{0,63})(?:\s[^<>]{0,1024})?>([^<]{1,65536})<\/\1>/gu;
+// CDATA sections are found with a monotonic `]]>` search, never a bounded repeat per opening tag.
+const CDATA_OPEN = /<([A-Za-z_][\w.-]{0,63})(?:\s[^<>]{0,1024})?><!\[CDATA\[/gu;
 // Name/value pairs: `<add key="DbPassword" value="x"/>` and Kubernetes `name: DB_PASSWORD` / `value: x`.
 const NAMED_VALUE = /\b(?:key|name)[ \t]*=[ \t]*"([^"\r\n]{1,64})"[ \t]+value[ \t]*=[ \t]*"([^"\r\n]{0,65536})"|(?<![\w-])name:[ \t]*["']?([A-Za-z_][\w.-]{0,63})["']?[ \t]*\r?\n[ \t]*value:[ \t]*/gu;
 function xmlCandidates(text: string, out: Found[]): void {
@@ -271,6 +280,17 @@ function xmlCandidates(text: string, out: Found[]): void {
     if (!subtype || !inner.trim() || isReference(inner.trim())) continue;
     const start = match.index + match[0].length - inner.length - match[1]!.length - 3;
     add(out, { subtype, rule: 'context.xml-element', basis: 'CONTEXT', start, end: start + inner.length });
+  }
+  let close = -1;
+  for (const match of text.matchAll(CDATA_OPEN)) {
+    const from = match.index + match[0].length;
+    if (close < from) close = text.indexOf(']]>', from);
+    if (close < 0) break;
+    const subtype = subtypeForKey(match[1]!);
+    const inner = text.slice(from, close);
+    if (subtype && inner.trim() && !isReference(inner.trim())) {
+      add(out, { subtype, rule: 'context.xml-cdata', basis: 'CONTEXT', start: from, end: close });
+    }
   }
   for (const match of text.matchAll(NAMED_VALUE)) {
     const subtype = subtypeForKey(match[1] ?? match[3]!);
@@ -339,13 +359,14 @@ function userinfoCandidates(text: string, out: Found[]): void {
     if (colon < 0 || colon >= at) {
       // Token-only userinfo (`https://<token>@host`): a long opaque user part is itself a credential.
       const user = text.slice(from, at);
-      if (/^[A-Za-z0-9_.~-]{16,}$/u.test(user) && !isReference(user)) {
+      // Tokens have no dots and contain a digit; long names and email-style users do not qualify.
+      if (/^[A-Za-z0-9_~-]{16,}$/u.test(user) && /\d/u.test(user) && !isReference(user)) {
         add(out, { subtype: 'ACCESS_TOKEN', rule: 'context.url-token-user', basis: 'CONTEXT', start: from, end: at });
       }
       continue;
     }
     // `host:8443/path/@me` is a port and a path, not a password.
-    if (/^\d{1,5}(?:\/|$)/u.test(text.slice(colon + 1, at))) continue;
+    if (/^\d{1,5}\//u.test(text.slice(colon + 1, at))) continue;
     const value = text.slice(colon + 1, at);
     if (value && !isReference(value)) add(out, { subtype: 'PASSWORD', rule: 'context.url-userinfo', basis: 'CONTEXT', start: colon + 1, end: at });
   }
