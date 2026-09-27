@@ -29,7 +29,8 @@ export interface TermEntry extends Classified { term: string }
 /**
  * `{A}` uppercase letter, `{a}` lowercase letter, `{9}` digit, `{X}` uppercase letter or digit, with an
  * optional count `{9:4}` or range `{9:2-6}`; everything else is literal. A variable-length placeholder must
- * be followed by a literal or the end, so matching never backtracks between adjacent placeholders.
+ * be followed by a literal outside its class or the end, so matching never backtracks between placeholders;
+ * a template may have at most three variable-length placeholders.
  */
 export interface PatternEntry extends Classified { template: string }
 /** A #7 key path such as `asset.tag` or `items.*.drawing`; `*` matches one segment. */
@@ -78,13 +79,17 @@ function classified(entry: unknown): Classified | null {
 
 const TOKEN = /[\p{L}\p{N}_][\p{L}\p{M}\p{N}_]*/gu;
 interface Folded { text: string; origin: number[]; originEnd: number[] }
-function fold(text: string): Folded {
+/**
+ * `invisible` decides what happens to default-ignorable characters: REMOVE joins `North<ZWSP>wind`, SPACE keeps
+ * `Northwind<ZWSP>Synthetic` two words. Term matching runs on both, so neither trick hides a term.
+ */
+function fold(text: string, invisible: 'REMOVE' | 'SPACE' = 'REMOVE'): Folded {
   let folded = '';
   const origin: number[] = [], originEnd: number[] = [];
   for (const match of text.matchAll(/\P{M}\p{M}*|\p{M}+/gsu)) {
     // NFKC plus case folding specials (dotted İ, ß), with invisible characters removed, for terms and text alike.
     const piece = match[0].normalize('NFKC').toLowerCase().replace(/i\u0307/gu, 'i').replace(/ß/gu, 'ss')
-      .replace(/\p{Default_Ignorable_Code_Point}/gu, '');
+      .replace(/\p{Default_Ignorable_Code_Point}/gu, invisible === 'SPACE' ? ' ' : '');
     for (let unit = 0; unit < piece.length; unit++) { origin.push(match.index); originEnd.push(match.index + match[0].length); }
     folded += piece;
   }
@@ -100,7 +105,7 @@ const CLASSES: Readonly<Record<string, string>> = Object.freeze({ A: 'A-Z', a: '
 /** Compile a template to a bounded, backtracking-free regex source, or null when invalid or ambiguous. */
 function compileTemplate(template: unknown): { source: string; wordStart: boolean; wordEnd: boolean } | null {
   if (!label(template, MAX_TEMPLATE)) return null;
-  let source = '', placeholders = 0;
+  let source = '', placeholders = 0, variables = 0;
   // Class of a preceding variable-length placeholder: the next element must not overlap it, so a variable
   // run can only end at a character outside its class and matching never backtracks.
   let pending: string | null = null;
@@ -115,6 +120,8 @@ function compileTemplate(template: unknown): { source: string; wordStart: boolea
       if (min < 1 || max < min || max > 32) return null;
       source += `[${CLASSES[placeholder[1]!]}]{${min}${max === min ? '' : `,${max}`}}`;
       pending = max !== min ? CLASSES[placeholder[1]!]! : null;
+      // At most three variable-length placeholders: each start then scans a short, bounded chain.
+      if (pending && ++variables > 3) return null;
       if (index === 0) wordStart = true;
       wordEnd = true;
       placeholders++;
@@ -131,18 +138,27 @@ function compileTemplate(template: unknown): { source: string; wordStart: boolea
     source += char.replace(/[.*+?^${}()|[\]\\/]/gu, '\\$&');
     index++;
   }
-  // A template must constrain something; a bare literal belongs in the term dictionary.
-  return placeholders ? { source, wordStart, wordEnd } : null;
+  // A template must constrain something; a bare literal belongs in the term dictionary. A word-class start only
+  // matches at an identifier start, so each regex attempt begins at a token boundary, not at every position.
+  return placeholders ? { source: `${wordStart ? '(?<![\\p{L}\\p{M}\\p{N}_])' : ''}${source}`, wordStart, wordEnd } : null;
 }
-// Identifier characters a pattern span is expanded over, so `ÅPMP-0042` or `PN12345.01` is never covered in part.
-const IDENT = /[\p{L}\p{M}\p{N}_.\/:-]/u;
+const WORD = /[\p{L}\p{M}\p{N}_-]/u;
 const MAX_EXPAND = 256;
-function expand(text: string, start: number, end: number, wordStart: boolean, wordEnd: boolean): { start: number; end: number } {
-  if (wordStart) { const floor = Math.max(0, start - MAX_EXPAND); while (start > floor && IDENT.test(text[start - 1]!)) start--; }
-  if (wordEnd) { const ceiling = Math.min(text.length, end + MAX_EXPAND); while (end < ceiling && IDENT.test(text[end]!)) end++; }
-  // Trailing sentence punctuation is not part of an identifier.
-  while (end > start && /[.:/]/u.test(text[end - 1]!)) end--;
-  return { start, end };
+/**
+ * Extend a match forward over the rest of its identifier (`PN12345.01`, `SYN.FT101.PV.X`, `N7:12`, a
+ * trailing mark) so it is never covered in part: word characters, plus `.` or `:` followed by an
+ * alphanumeric. Never across `/`, `://` or whitespace, so URLs, paths and following keys stay outside.
+ */
+function expand(text: string, end: number, wordEnd: boolean): number {
+  if (!wordEnd) return end;
+  const ceiling = Math.min(text.length, end + MAX_EXPAND);
+  while (end < ceiling) {
+    const char = text[end]!;
+    if (WORD.test(char)) { end++; continue; }
+    if ((char === '.' || char === ':') && end + 1 < text.length && /[\p{L}\p{N}]/u.test(text[end + 1]!)) { end++; continue; }
+    break;
+  }
+  return end;
 }
 
 /* ---------- Configuration handle ---------- */
@@ -247,8 +263,11 @@ function engineeringValue(text: string, at: number, keyStart: number, lines: Lin
   let lineStart = keyStart;
   while (lineStart > 0 && keyStart - lineStart <= 64 && text[lineStart - 1] !== '\n') lineStart--;
   let end = at;
-  if (keyStart - lineStart <= 64 && !text.slice(lineStart, keyStart).trim().replace(/^[-"']+/u, '')) end = eol;
-  else while (end < eol && !/[\s,"'}\]]/u.test(text[end]!)) end++;
+  if (keyStart - lineStart <= 64 && !text.slice(lineStart, keyStart).trim().replace(/^[-"']+/u, '')) {
+    // A line-leading value runs to end of line, but stops at a comment or at the next `key=`/`key:`.
+    const stop = /\s#|\s[\w.-]{1,64}[ \t]*[:=]/u.exec(text.slice(at, eol));
+    end = stop ? at + stop.index : eol;
+  } else while (end < eol && !/[\s,"'}\]]/u.test(text[end]!)) end++;
   while (end > at && /\s/u.test(text[end - 1]!)) end--;
   return end > at ? { start: at, end } : null;
 }
@@ -280,7 +299,9 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
     const path = own(request, 'fieldPath');
     if (path !== undefined) {
       if (!Array.isArray(path) || path.length > 128) return failure('INVALID_FIELD_PATH');
-      fieldPath = [...path];
+      const length = path.length;
+      fieldPath = [];
+      for (let index = 0; index < length; index++) fieldPath.push(path[index]);
       if (fieldPath.some((segment) => typeof segment !== 'string')) return failure('INVALID_FIELD_PATH');
     }
   } catch { return failure('INVALID_REQUEST'); }
@@ -313,7 +334,9 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
           if (end > start && hintMatches(path, fieldPath!)) add({ ...entry, rule: `field-hint.${index}`, basis: 'FIELD_HINT', start, end });
         });
       }
-      const folded = fold(text);
+      for (const invisible of ['REMOVE', 'SPACE'] as const) {
+      const folded = fold(text, invisible);
+      if (invisible === 'SPACE' && !/\p{Default_Ignorable_Code_Point}/u.test(text)) break;
       const tokens = [...folded.text.matchAll(TOKEN)];
       for (let index = 0; index < tokens.length;) {
         let node = compiled.root.next.get(edge('', tokens[index]![0]));
@@ -329,14 +352,15 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
           start: folded.origin[first.index]!, end: folded.originEnd[last.index + last[0].length - 1]! });
         index = longest.last + 1;
       }
-      compiled.patterns.forEach(({ regex, entry, wordStart, wordEnd }, index) => {
+      }
+      compiled.patterns.forEach(({ regex, entry, wordEnd }, index) => {
         regex.lastIndex = 0;
         let covered = -1;
         for (const match of text.matchAll(regex)) {
           if (match.index < covered) continue;
-          const span = expand(text, match.index, match.index + match[0].length, wordStart, wordEnd);
-          covered = span.end;
-          add({ ...entry, rule: `pattern.${index}`, basis: 'PATTERN', ...span });
+          const end = expand(text, match.index + match[0].length, wordEnd);
+          covered = end;
+          add({ ...entry, rule: `pattern.${index}`, basis: 'PATTERN', start: match.index, end });
         }
       });
     }
@@ -357,8 +381,11 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
   } catch (error) { return failure(error instanceof RangeError ? 'TOO_MANY_CANDIDATES' : 'INTERNAL_ERROR'); }
 
   found.sort((a, b) => a.start - b.start || a.end - b.end || a.rule.localeCompare(b.rule));
+  // Both folding passes can find the same term span; keep one.
+  const distinct = found.filter((item, index) => index === 0 || item.start !== found[index - 1]!.start ||
+    item.end !== found[index - 1]!.end || item.rule !== found[index - 1]!.rule || item.semanticType !== found[index - 1]!.semanticType);
   const field = createHash('sha256').update(inputRef).digest('hex').slice(0, 16);
-  const candidates = found.map((item, index) => Object.freeze({
+  const candidates = distinct.map((item, index) => Object.freeze({
     semanticType: item.semanticType, ...(item.subtype ? { subtype: item.subtype } : {}),
     ...(item.sensitivity ? { sensitivity: item.sensitivity } : {}), rule: item.rule, basis: item.basis, start: item.start, end: item.end,
     evidence: Object.freeze({

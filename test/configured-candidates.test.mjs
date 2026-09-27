@@ -137,7 +137,7 @@ test('review: templates whose literals overlap a preceding variable class are re
     assert.throws(() => createCandidateConfig(A, { patterns: [{ template, semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ITEM_ID' }] }),
       TypeError, template);
   }
-  const deterministic = createCandidateConfig(A, { patterns: [{ template: '{9:1-32}-{9:1-32}-{9:1-32}-{9:1-32}-{9:1-32}-{9:1-32}-{9:1-32}',
+  const deterministic = createCandidateConfig(A, { patterns: [{ template: '{9:1-32}-{9:1-32}-{9:1-32}-{9:4}-{9:4}-{9:4}-{9:4}',
     semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ITEM_ID' }] });
   const started = process.hrtime.bigint();
   detectConfigured({ text: `${'1-'.repeat(60)}x `.repeat(8000), inputRef: 'x', scope: A, config: deterministic });
@@ -145,7 +145,9 @@ test('review: templates whose literals overlap a preceding variable class are re
 });
 
 test('review: pattern spans expand over the whole identifier token, never covering it in part', () => {
-  for (const [text, value] of [['ÅPMP-0042 x', 'ÅPMP-0042'], ['PMP-0042Ä x', 'PMP-0042Ä'], ['PMP-0042́ x', 'PMP-0042́'],
+  // A different token (`ÅPMP-0042`, `XPMP-0042`) is not a match: patterns start at identifier starts.
+  for (const text of ['ÅPMP-0042 x', 'XPMP-0042 x', 'ABCD-12345']) assert.deepEqual(rows(text, run(text)).filter(([, , b]) => b === 'PATTERN'), [], text);
+  for (const [text, value] of [['PMP-0042Ä x', 'PMP-0042Ä'], ['PMP-0042́ x', 'PMP-0042́'],
     ['part PN12345.01 x', 'PN12345.01'], ['SYN.FT101.PV.X ok', 'SYN.FT101.PV.X'], ['tag PMP-0042.', 'PMP-0042'],
     ['floc=S01.PMP.001 x', '=S01.PMP.001']]) {
     assert.ok(rows(text, run(text)).some(([, , basis, v]) => basis === 'PATTERN' && v === value), `${text} -> ${value}`);
@@ -181,4 +183,36 @@ test('review: requests read own properties only; bad field paths fail with their
   assert.deepEqual(detectConfigured({ text: 'x', inputRef: 'x', scope: A, fieldPath: revoked.proxy }).reasons, ['INVALID_REQUEST']);
   assert.deepEqual(detectConfigured({ text: 'x', inputRef: 'x', scope: A, fieldPath: [1] }).reasons, ['INVALID_FIELD_PATH']);
   assert.equal(detectConfigured({ text: 'x', inputRef: 'x', scope: A, fieldPath: Array.from({ length: 100 }, () => 'a') }).status, 'COMPLETE');
+});
+
+
+test('second review: 64 realistic patterns over adversarial 1 MiB text stay within a bounded-work budget', () => {
+  assert.throws(() => createCandidateConfig(A, { patterns: [{ template: '{X:1-32}-{X:1-32}-{X:1-32}-{X:1-32}-{9}', semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ITEM_ID' }] }), TypeError);
+  for (const template of ['{X:32}{X:32}{9}', '{X:1-32}-{X:1-32}-{X:1-32}-{9}', '{X:1-32}-{9:4}']) {
+    const config = createCandidateConfig(A, { patterns: Array.from({ length: 64 }, () => ({ template, semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ITEM_ID' })) });
+    for (const text of ['A'.repeat(1 << 20), `${'A'.repeat(32)}-`.repeat(31_000)]) {
+      const started = process.hrtime.bigint();
+      detectConfigured({ text: text.slice(0, MAX_TEXT_UNITS), inputRef: 'x', scope: A, config });
+      const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+      assert.ok(elapsedMs < 3000, `${template} ${elapsedMs}ms`);
+    }
+  }
+});
+
+test('second review: expansion stays inside the identifier; keys, URLs and paths are not swallowed', () => {
+  for (const [text, value] of [['asset_tag:PMP-0042', 'PMP-0042'], ['https://portal.example.invalid/api/v2/PMP-0042/details', 'PMP-0042'],
+    ['C:/data/PMP-0042.csv', 'PMP-0042.csv'], ['x.PMP-0042 y', 'PMP-0042']]) {
+    assert.deepEqual(rows(text, run(text)).filter(([, , b]) => b === 'PATTERN').map(([, , , v]) => v), [value], text);
+  }
+});
+
+test('second review: line-leading generic values stop at comments and the next key; invisible separators do not hide terms', () => {
+  const text = 'part_number=PN-1 plc_tag=N7:1';
+  assert.deepEqual(run(text, { config: undefined }).candidates.map((c) => [c.subtype, text.slice(c.start, c.end)]),
+    [['PART_NUMBER', 'PN-1'], ['PLC_TAG', 'N7:1']]);
+  const comment = '- part_number: PN-7 # see drawing_no: D-9';
+  assert.deepEqual(run(comment, { config: undefined }).candidates.map((c) => comment.slice(c.start, c.end)), ['PN-7', 'D-9']);
+  for (const variant of ['Northwind\u200bSynthetic AB', 'Northwind Synthetic\u2060AB', 'North\u200bwind Synthetic AB']) {
+    assert.equal(run(variant).candidates.filter((c) => c.basis === 'DICTIONARY').length, 1, JSON.stringify(variant));
+  }
 });
