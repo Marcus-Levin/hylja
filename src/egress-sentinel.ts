@@ -66,7 +66,7 @@ export interface EgressCheck {
 const CONFUSABLES: Readonly<Record<string, string>> = Object.freeze({
   'а': 'a', 'в': 'b', 'е': 'e', 'ё': 'e', 'і': 'i', 'ј': 'j', 'к': 'k', 'м': 'm', 'н': 'h', 'о': 'o', 'р': 'p', 'с': 'c', 'т': 't',
   'у': 'y', 'х': 'x', 'ѕ': 's', 'ԁ': 'd', 'ɡ': 'g', 'α': 'a', 'β': 'b', 'ε': 'e', 'η': 'n', 'ι': 'i', 'κ': 'k', 'ν': 'v',
-  'ο': 'o', 'ρ': 'p', 'τ': 't', 'υ': 'u', 'χ': 'x', 'ω': 'w', 'օ': 'o', 'ս': 'u', 'ց': 'g', 'հ': 'h', 'ո': 'n',
+  'ı': 'i', 'ο': 'o', 'ρ': 'p', 'τ': 't', 'υ': 'u', 'χ': 'x', 'ω': 'w', 'օ': 'o', 'ս': 'u', 'ց': 'g', 'հ': 'h', 'ո': 'n',
 });
 /**
  * Matching fold for both registered values and payloads: NFKD, marks stripped (`Órla`, `Zoë` -> `orla`,
@@ -254,10 +254,17 @@ const PATTERNS: readonly { rule: string; pattern: RegExp }[] = [
 ];
 // A literal value after a credential-like key. References (`${X}`, `{{x}}`, `<...>`, masks), type names,
 // booleans and identifier/member expressions (`process.env.SECRET`, `config.password`) are not values.
-const CREDENTIAL_ASSIGNMENT = /(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["']?([^\s"',;)}\]]{4,})/giu;
+const CREDENTIAL_ASSIGNMENT = /(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*(?:(["'])([^"'\r\n]{4,})\1|([^\s"',;)]{4,}))/giu;
+const REFERENCE = /^(?:\$\{[^}]*\}|\{\{[^}]*\}\}|<[\w -]{1,40}>|\*{3,}|\[hylja:protected:[A-Z0-9_]+\])$/u;
 const NOT_A_VALUE = /^(?:[$<*{[]|(?:string|number|boolean|bigint|object|any|unknown|undefined|null|none|true|false|nil|str|int|bool|bytes)$|[A-Za-z_$][\w$]*(?:(?:\.|\?\.)[A-Za-z_$][\w$]*|\[[^\]]*\])+$)/iu;
 function credentialAssignment(text: string): boolean {
-  for (const match of text.matchAll(CREDENTIAL_ASSIGNMENT)) if (!NOT_A_VALUE.test(match[1]!)) return true;
+  for (const match of text.matchAll(CREDENTIAL_ASSIGNMENT)) {
+    // A quoted string is a literal unless it is a whole reference or mask; only unquoted values can be
+    // identifiers, member expressions, type names or booleans.
+    // Unquoted: brackets inside the value belong to it; only trailing ones (`false}`) close a surrounding structure.
+    const unquoted = match[3]?.replace(/[}\]]+$/u, '');
+    if (match[2] !== undefined ? !REFERENCE.test(match[2]) : unquoted!.length >= 4 && !NOT_A_VALUE.test(unquoted!)) return true;
+  }
   return false;
 }
 // Long runs that look like encoded data: mixed case plus digits (Base64 of binary), or hex longer than a
@@ -268,13 +275,20 @@ function looksEncoded(run: string): boolean {
   if (/^[0-9A-Fa-f]+$/u.test(run)) return run.length > 128;
   return /[A-Z]/u.test(run) && /[a-z]/u.test(run) && /\d/u.test(run);
 }
-const SHORT_ENCODED_RUN = /(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{16,127}={0,2}|(?:[0-9A-Fa-f]{2}){8,63})(?![A-Za-z0-9+/=_-])/gu;
+const ENCODED_RUN = /(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{16,65536}={0,2})(?![A-Za-z0-9+/=_-])/gu;
+/** Decoded binary at least this long is opaque (compressed, encrypted or archived data), whatever the chunking. */
+const OPAQUE_BYTES = 48;
+// Compression and archive signatures: opaque at any length.
+const MAGIC = [[0x1f, 0x8b], [0x78, 0x01], [0x78, 0x5e], [0x78, 0x9c], [0x78, 0xda], [0x50, 0x4b, 0x03, 0x04], [0x42, 0x5a, 0x68],
+  [0xfd, 0x37, 0x7a, 0x58, 0x5a], [0x37, 0x7a, 0xbc, 0xaf], [0x28, 0xb5, 0x2f, 0xfd]];
+/** SHA-1/SHA-256/SHA-512 hex digests are ordinary text, not payloads (checked after compression signatures). */
+const DIGEST_HEX = /^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64}|[0-9A-Fa-f]{128})$/u;
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 /**
  * The sentinel's own decode of a short encoded run into printable bytes (others become spaces). Known-value
  * matching ignores separators, so a value scattered between binary bytes (`\0orla\3Synthe\7tica`) is found.
  */
-function printableBytes(run: string): string | null {
+function decodeRun(run: string): number[] | null {
   const bytes: number[] = [];
   if (/^(?:[0-9A-Fa-f]{2})+$/u.test(run)) {
     for (let index = 0; index < run.length; index += 2) bytes.push(parseInt(run.slice(index, index + 2), 16));
@@ -288,6 +302,12 @@ function printableBytes(run: string): string | null {
       if (bits >= 8) { bits -= 8; bytes.push((buffer >> bits) & 0xff); }
     }
   }
+  return bytes;
+}
+function isText(bytes: number[]): boolean {
+  try { return !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(utf8.decode(Uint8Array.from(bytes))); } catch { return false; }
+}
+function printable(bytes: number[]): string {
   return bytes.map((byte) => byte >= 0x20 && byte < 0x7f ? String.fromCharCode(byte) : ' ').join('');
 }
 
@@ -339,20 +359,38 @@ function canonicalViews(root: string): { views: View[] } | { reason: string } {
       const normalized = normalizeInput(view.text);
       // Content the sentinel cannot fully inspect, or embedded binary it cannot read, is never presumed clean.
       if (normalized.status !== 'COMPLETE') return { reason: 'UNINSPECTED_CONTENT' };
-      // Long encoded-looking runs must decode to text; short binary decodes become matching views instead.
+      // Opacity is judged on decoded bytes, so chunking or wrapping cannot hide binary: a wrapped/joined #6 view
+      // of binary, any run decoding to compressed data, or any non-text decode of OPAQUE_BYTES or more blocks.
       const textSpans = normalized.views.filter((child) => child.parent === 0 && child.form === 'TEXT').flatMap((child) => child.occurrences);
+      for (const child of normalized.views) {
+        if (child.parent === 0 && child.form === 'STRINGS' && child.parentEnd - child.parentStart >= Math.ceil(OPAQUE_BYTES * 4 / 3)) {
+          return { reason: 'OPAQUE_EMBEDDED' };
+        }
+      }
       for (const run of view.text.matchAll(TEXT_ENCODED_RUN)) {
         const end = run.index + run[0].length;
         if (looksEncoded(run[0]) && !textSpans.some((span) => span.start <= run.index && end <= span.end)) return { reason: 'OPAQUE_EMBEDDED' };
       }
       for (const child of normalized.views.slice(1)) next.push({ name: `${view.name}>${child.encoding}`, text: child.text });
-      // Short encoded runs that are not text still get a printable-bytes view for known-value matching.
-      for (const run of view.text.matchAll(SHORT_ENCODED_RUN)) {
+      // Other encoded runs that are not text: opaque when compressed or large, otherwise their printable bytes join
+      // one per-view matching view (so hundreds of UUIDs or digests cost one view, not hundreds).
+      const printables: string[] = [];
+      for (const run of view.text.matchAll(ENCODED_RUN)) {
         const end = run.index + run[0].length;
         if (textSpans.some((span) => span.start <= run.index && end <= span.end)) continue;
-        const printable = printableBytes(run[0]);
-        if (printable && printable.trim()) views.push({ name: `${view.name}>BINARY_PRINTABLE`, text: printable });
+        const bytes = decodeRun(run[0]);
+        if (!bytes || isText(bytes)) continue;
+        if (DIGEST_HEX.test(run[0]) && !MAGIC.some((magic) => magic.every((byte, index) => bytes[index] === byte))) continue;
+        // Size alone only counts for runs that look encoded (hex, or mixed case with digits); identifiers such as
+        // long snake_case or camelCase names are valid base64url but not payloads.
+        const encodedShape = /^[0-9A-Fa-f]+$/u.test(run[0]) || /[A-Z]/u.test(run[0]) && /[a-z]/u.test(run[0]) && /\d/u.test(run[0]);
+        if (MAGIC.some((magic) => magic.every((byte, index) => bytes[index] === byte)) || encodedShape && bytes.length >= OPAQUE_BYTES) {
+          return { reason: 'OPAQUE_EMBEDDED' };
+        }
+        const text = printable(bytes);
+        if (text.trim()) printables.push(text);
       }
+      if (printables.length) next.push({ name: `${view.name}>BINARY_PRINTABLE`, text: printables.join('\n') });
       const unescaped = unescapeOnce(view.text);
       if (unescaped !== null) next.push({ name: `${view.name}>ESCAPES`, text: unescaped });
     }

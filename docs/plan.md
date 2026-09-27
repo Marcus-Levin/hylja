@@ -133,7 +133,7 @@ A bounded, **NON-ENFORCING** #19 egress sentinel core exists in [`src/egress-sen
 The following all `BLOCK`:
 - invalid UTF-8;
 - uninspectable (#6 PARTIAL) content;
-- embedded opaque binary (runs of 128+ characters mixing case and digits, or hex longer than a SHA-512 digest, that do not decode to text);
+- embedded opaque binary, judged on decoded bytes whatever the chunking or wrapping: any compression or archive signature, any non-text decode of 48+ bytes from an encoded-looking run (hex, or mixed case with digits), and wrapped binary views. SHA-1/256/512 hex digests without a signature are exempt;
 - oversize messages;
 - an exhausted view or verification budget;
 - errors and outage.
@@ -145,6 +145,8 @@ Known limits:
 - confusable coverage is a small table, not full UTS #39;
 - only the listed escape families and a few named HTML entities are decoded;
 - a bare short base64 DER body without a header or known value passes the pattern set;
+- raw deflate under 48 bytes, hex chunks of exactly 128 digits and base32 are not recognized as opaque;
+- short values match on whole-token windows, so prose like `or la` can match a short entry `Orla` and block.
 - large source files can exhaust #6's decode budget and block. **Not yet integrated**: no adapter calls it at a real send point, #13 transformation and #11 judgments do not exist, and the #37-to-egress text slice has not run end to end. Seeded-leak tests are synthetic unit evidence, not a release claim.
 
 ### 2. Reversible identity and vault

@@ -246,3 +246,30 @@ test('second review: the checked copy ignores an overridden iterator', () => {
   const result = checkEgress({ bytes: sneaky, scope: scopeA, destination, authorized: destination, known: null });
   assert.equal(result.decision, 'BLOCK');
 });
+
+test('third review: compressed or opaque binary is blocked however it is chunked or wrapped', async () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const secret = `contact ${PLANTED} re ${CANARY}`;
+  const gz = zlib.gzipSync(Buffer.from(secret));
+  const big = zlib.gzipSync(Buffer.from(`${secret} ${'padding text '.repeat(40)}${Math.random()}`.repeat(3)));
+  const b64 = big.toString('base64');
+  for (const payload of [`{"att":"${gz.toString('base64')}"}`, `raw ${zlib.deflateRawSync(Buffer.from(secret)).toString('base64')}`,
+    `hex ${gz.toString('hex')}`, b64.match(/.{1,76}/gu).join('\r\n'), b64.match(/.{1,100}/gu).join(' '),
+    JSON.stringify(b64.match(/.{1,120}/gu)), big.toString('hex').match(/.{1,128}/gu).join('\n')]) {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', payload.slice(0, 40));
+  }
+});
+
+test('third review: quoted dotted passwords are literals; bracket characters do not hide a value; many UUIDs and digests are fine', () => {
+  for (const payload of ['{"password": "Synthetic.Passw0rd"}', "DB_PASSWORD='Synth.Pass9'", 'password=Syn}theticPass']) {
+    assert.equal(checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null }).decision, 'BLOCK', payload);
+  }
+  const uuid = '123e4567-e89b-12d3-a456-426614174000';
+  const sha = 'a'.repeat(63) + 'b';
+  for (const payload of [JSON.stringify(Array.from({ length: 900 }, () => uuid)), Array.from({ length: 900 }, () => sha).join('\n'),
+    `integrity="sha256-${Buffer.alloc(32, 7).toString('base64')}"`]) {
+    const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+    assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)} ${result.reasons}`);
+  }
+});
