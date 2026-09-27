@@ -157,7 +157,7 @@ test('synthetic golden set: false-positive and false-negative counts by subtype 
   const guid = '00000000-0000-4000-8000-000000000000';
   const golden = [
     ['GET https://api.example.com/v1/ping 200 from 192.0.2.10:443', [['NETWORK_IDENTIFIER', 'URL', 'https://api.example.com/v1/ping'],
-      ['HOST_OR_SERVICE', '', 'api.example.com'], ['NETWORK_IDENTIFIER', 'IP', '192.0.2.10']]],
+      ['HOST_OR_SERVICE', '', 'api.example.com'], ['NETWORK_IDENTIFIER', 'IP', '192.0.2.10'], ['NETWORK_IDENTIFIER', 'PORT', '443']]],
     [`{"server":"plc-gateway-07.internal","port":443,"subscriptionId":"${guid}"}`, [['HOST_OR_SERVICE', '', 'plc-gateway-07.internal'],
       ['CLOUD_RESOURCE', 'SUBSCRIPTION_ID', guid]]],
     ['wrote /srv/app/output.json in 12:30:45 build v1.2.3.4', [['FILE_OR_RESOURCE_PATH', '', '/srv/app/output.json']]],
