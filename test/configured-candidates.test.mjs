@@ -216,3 +216,19 @@ test('second review: line-leading generic values stop at comments and the next k
     assert.equal(run(variant).candidates.filter((c) => c.basis === 'DICTIONARY').length, 1, JSON.stringify(variant));
   }
 });
+
+test('third review: an invisible character cannot lower the sensitivity of a matched term', () => {
+  const config = createCandidateConfig(A, { terms: [{ term: 'Northwind', semanticType: 'CUSTOMER_OR_PARTNER', sensitivity: 'INTERNAL' },
+    { term: 'North Wind', semanticType: 'CUSTOMER_OR_PARTNER', sensitivity: 'RESTRICTED' }] });
+  const context = { interactionRef: 'interaction-a.invalid', sourceRef: 'source-a.invalid', trust: 'UNTRUSTED' };
+  const result = detectConfigured({ text: 'North\u200bWind', inputRef: 'x', scope: A, config });
+  assert.ok(result.candidates.some((c) => c.sensitivity === 'RESTRICTED'));
+  assert.equal(composeClassification({ detectorEvidence: result.candidates.map((c) => c.evidence) }, context).sensitivity, 'RESTRICTED');
+});
+
+test('third review: underscore starts an identifier; generic values keep inner "; s=" and "#42"', () => {
+  assert.ok(rows('tag_PMP-0042 x', run('tag_PMP-0042 x')).some(([, , b, v]) => b === 'PATTERN' && v === 'PMP-0042'));
+  for (const [text, value] of [['opc_nodeid: ns=2; s=Tag.Speed', 'ns=2; s=Tag.Speed'], ['part_number: PN #42', 'PN #42']]) {
+    assert.deepEqual(run(text, { config: undefined }).candidates.map((c) => text.slice(c.start, c.end)), [value], text);
+  }
+});

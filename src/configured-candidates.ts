@@ -140,7 +140,8 @@ function compileTemplate(template: unknown): { source: string; wordStart: boolea
   }
   // A template must constrain something; a bare literal belongs in the term dictionary. A word-class start only
   // matches at an identifier start, so each regex attempt begins at a token boundary, not at every position.
-  return placeholders ? { source: `${wordStart ? '(?<![\\p{L}\\p{M}\\p{N}_])' : ''}${source}`, wordStart, wordEnd } : null;
+  // `_` is a boundary (`tag_PMP-0042`); letters and digits are not (`XPMP-0042` is a different token).
+  return placeholders ? { source: `${wordStart ? '(?<![\\p{L}\\p{M}\\p{N}])' : ''}${source}`, wordStart, wordEnd } : null;
 }
 const WORD = /[\p{L}\p{M}\p{N}_-]/u;
 const MAX_EXPAND = 256;
@@ -265,7 +266,8 @@ function engineeringValue(text: string, at: number, keyStart: number, lines: Lin
   let end = at;
   if (keyStart - lineStart <= 64 && !text.slice(lineStart, keyStart).trim().replace(/^[-"']+/u, '')) {
     // A line-leading value runs to end of line, but stops at a comment or at the next `key=`/`key:`.
-    const stop = /\s#|\s[\w.-]{1,64}[ \t]*[:=]/u.exec(text.slice(at, eol));
+    // A comment is `#` followed by a space or the end (`PN #42` is a value); a key has two or more characters.
+    const stop = /\s#(?:\s|$)|\s[A-Za-z][\w.-]{1,63}[ \t]*[:=]/u.exec(text.slice(at, eol));
     end = stop ? at + stop.index : eol;
   } else while (end < eol && !/[\s,"'}\]]/u.test(text[end]!)) end++;
   while (end > at && /\s/u.test(text[end - 1]!)) end--;
@@ -322,7 +324,13 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
   const partial = reasons.has('INVALID_CONFIG') || reasons.has('CONFIG_SCOPE_MISMATCH');
 
   const found: Found[] = [];
+  // Exact duplicates (both folding passes over one span) are dropped before counting. The key includes
+  // subtype and sensitivity, so a different term over the same span, possibly more sensitive, is kept.
+  const keys = new Set<string>();
   const add = (item: Found): void => {
+    const key = `${item.start}:${item.end}:${item.rule}:${item.semanticType}:${item.subtype ?? ''}:${item.sensitivity ?? ''}`;
+    if (keys.has(key)) return;
+    keys.add(key);
     found.push(item);
     if (found.length > MAX_CANDIDATES) throw new RangeError('too many');
   };
@@ -335,8 +343,8 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
         });
       }
       for (const invisible of ['REMOVE', 'SPACE'] as const) {
-      const folded = fold(text, invisible);
       if (invisible === 'SPACE' && !/\p{Default_Ignorable_Code_Point}/u.test(text)) break;
+      const folded = fold(text, invisible);
       const tokens = [...folded.text.matchAll(TOKEN)];
       for (let index = 0; index < tokens.length;) {
         let node = compiled.root.next.get(edge('', tokens[index]![0]));
@@ -381,11 +389,8 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
   } catch (error) { return failure(error instanceof RangeError ? 'TOO_MANY_CANDIDATES' : 'INTERNAL_ERROR'); }
 
   found.sort((a, b) => a.start - b.start || a.end - b.end || a.rule.localeCompare(b.rule));
-  // Both folding passes can find the same term span; keep one.
-  const distinct = found.filter((item, index) => index === 0 || item.start !== found[index - 1]!.start ||
-    item.end !== found[index - 1]!.end || item.rule !== found[index - 1]!.rule || item.semanticType !== found[index - 1]!.semanticType);
   const field = createHash('sha256').update(inputRef).digest('hex').slice(0, 16);
-  const candidates = distinct.map((item, index) => Object.freeze({
+  const candidates = found.map((item, index) => Object.freeze({
     semanticType: item.semanticType, ...(item.subtype ? { subtype: item.subtype } : {}),
     ...(item.sensitivity ? { sensitivity: item.sensitivity } : {}), rule: item.rule, basis: item.basis, start: item.start, end: item.end,
     evidence: Object.freeze({
