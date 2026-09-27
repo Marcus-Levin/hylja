@@ -5,4 +5,5 @@ declare module 'node:zlib' {
   export function gunzipSync(data: Uint8Array, options?: InflateOptions): Uint8Array;
   export function inflateSync(data: Uint8Array, options?: InflateOptions): Uint8Array;
   export function inflateRawSync(data: Uint8Array, options?: InflateOptions): Uint8Array;
+  export function brotliDecompressSync(data: Uint8Array, options?: InflateOptions): Uint8Array;
 }

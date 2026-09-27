@@ -287,9 +287,9 @@ test('fourth review: chunked or prefixed compressed payloads are inflated and ma
     assert.equal(result.decision, 'BLOCK', payload.slice(0, 40));
     assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED') || result.reasons.includes('CANARY_DETECTED'), result.reasons.join());
   }
-  const bomb = zlib.gzipSync(Buffer.alloc(4 << 20, 65)).toString('base64');
-  assert.deepEqual(check(`x ${bomb}`).reasons, ['OPAQUE_EMBEDDED']);
-  assert.deepEqual(check(`blob ${crypto.randomBytes(2048).toString('base64')}`).reasons, ['OPAQUE_EMBEDDED']);
+  const bomb = zlib.gzipSync(Buffer.alloc(8 << 20, 65)).toString('base64');
+  assert.equal(check(`x ${bomb}`).decision, 'BLOCK');
+  assert.equal(check(`blob ${crypto.randomBytes(2048).toString('base64')}`).decision, 'BLOCK');
 });
 
 test('fourth review: digests, SRI values, SSH keys, session ids, UUIDs and trace ids are ordinary text', () => {
@@ -299,10 +299,33 @@ test('fourth review: digests, SRI values, SSH keys, session ids, UUIDs and trace
   for (let run = 0; run < 40; run++) {
     for (const payload of [`digest ${hex(32)} ok`, `digest ${hex(64)} ok`, `sha384 ${hex(48)}`, Array.from({ length: 5 }, () => hex(20)).join('\n'),
       `image@sha256:${hex(32)}`, `<script integrity="sha384-${b64(48)}"></script>`, `"integrity": "sha512-${b64(64)}"`,
-      `ssh-ed25519 ${b64(51)} user@host.invalid`, `session=${crypto.randomBytes(48).toString('base64url')}`,
+      `ssh-ed25519 ${b64(51)} user@host.invalid`,
       JSON.stringify(Array.from({ length: 300 }, () => crypto.randomUUID())), Array.from({ length: 200 }, () => `trace=${hex(16)}`).join('\n')]) {
       const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
       assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)} ${result.reasons}`);
     }
   }
+});
+
+
+test('fifth review: decoy-interleaved, brotli and container payloads block; random session tokens are credentials; inflate is budgeted', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const secret = `contact ${PLANTED} re ${CANARY} `;
+  const raw = zlib.deflateRawSync(Buffer.from(secret));
+  const decoyed = Array.from({ length: Math.ceil(raw.length / 32) }, (_, i) =>
+    `${raw.subarray(i * 32, (i + 1) * 32).toString('base64')} ${crypto.randomBytes(20).toString('base64')}`).join(' ');
+  const padded = zlib.gzipSync(Buffer.concat([Buffer.from(secret), Buffer.alloc(10)])).toString('base64');
+  const controls = zlib.deflateRawSync(Buffer.from([...secret].map((c) => `${c}\u0001`).join(''))).toString('base64');
+  for (const payload of [decoyed, zlib.brotliCompressSync(Buffer.from(secret)).toString('base64'), padded, controls,
+    `x ${Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), crypto.randomBytes(8)]).toString('base64')}`]) {
+    assert.equal(check(payload).decision, 'BLOCK', payload.slice(0, 40));
+  }
+  const token = checkEgress({ bytes: enc(`session=${crypto.randomBytes(48).toString('base64url')}`), scope: scopeA, destination, authorized: destination, known: null });
+  assert.equal(token.decision, 'BLOCK');
+  const flood = Array.from({ length: 300 }, () => zlib.deflateRawSync(Buffer.alloc((1 << 20) - 100, 97)).toString('base64')).join(' ');
+  const started = process.hrtime.bigint();
+  const heavy = check(flood.slice(0, MAX_MESSAGE_BYTES));
+  assert.equal(heavy.decision, 'BLOCK');
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
 });
