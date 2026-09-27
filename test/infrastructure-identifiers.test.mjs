@@ -260,3 +260,14 @@ test('rereview: private suffixes, newer gTLDs and host context are hosts; code c
   has('net 1.2.3.4/33', 'NETWORK_IDENTIFIER', 'IP', '1.2.3.4');
   has('fd00::1/129', 'NETWORK_IDENTIFIER', 'IP', 'fd00::1');
 });
+
+test('second rereview: upper-case FQDNs, two-letter apex domains and version-like first labels are hosts; code members are not', () => {
+  for (const [text, host] of [['DC01.CORP.LOCAL', 'DC01.CORP.LOCAL'], ['login from DC01.ACME.LOCAL', 'DC01.ACME.LOCAL'],
+    ['SERVER.TENANT.COM', 'SERVER.TENANT.COM'], ['ACME.CORP', 'ACME.CORP'], ['tenant.io', 'tenant.io'], ['acme.co', 'acme.co'],
+    ['v2.api.tenant.com', 'v2.api.tenant.com'], ['1.pool.ntp.org', '1.pool.ntp.org'], ['api-2.prod', 'api-2.prod'],
+    ['vault.service.consul', 'vault.service.consul']]) has(text, 'HOST_OR_SERVICE', '', host);
+  for (const text of ['self.host', 'args.host', 'window.location.host', 'response.data', 'config.data', 'user.domain', 'app.server',
+    'job.run', 'task.build', 'self.site', 'a.prod', 'app.stage', 'console.info', 'data.no']) {
+    assert.deepEqual(found(text).filter(([t]) => t === 'HOST_OR_SERVICE'), [], text);
+  }
+});

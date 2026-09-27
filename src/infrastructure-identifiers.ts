@@ -215,16 +215,31 @@ const COMMON_CC = new Set(['se', 'no', 'dk', 'fi', 'de', 'uk', 'eu', 'fr', 'nl',
 function isHostName(name: string, context: boolean): boolean {
   if (context) return true;
   const original = name.split('.');
-  // `process.env.HOST` (env-var access) and `v1.2.3-beta.rc1` (versions) are code, not hosts.
-  if (/^[A-Z]{3,}$/u.test(original[original.length - 1]!) || /^v?\d+$/iu.test(original[0]!)) return false;
   const labels = name.toLowerCase().split('.');
   const last = labels[labels.length - 1]!;
+  // Versions (`v1.2.3-beta.rc1`, `1.2.3`): the first two labels are numeric.
+  if (/^v?\d+$/iu.test(original[0]!) && /^\d+/u.test(original[1] ?? '')) return false;
+  // Env-var access (`process.env.HOST`): an all-caps last label after a lower-case label. `DC01.CORP.LOCAL` is a host.
+  if (/^[A-Z]{3,}$/u.test(original[original.length - 1]!) && original.slice(0, -1).some((label) => /[a-z]/u.test(label))) return false;
   const evidence = /[\d-]/u.test(name);
   if (labels.length >= 3 && evidence) return true;
-  if (last.startsWith('xn--') || /[^\u0000-\u007f]/u.test(last) || PRIVATE_SUFFIXES.has(last)) return true;
+  // Member access on a common receiver (`self.host`, `config.data`, `window.location.host`) or a one-letter
+  // receiver (`a.prod`) is code unless there is digit/hyphen evidence.
+  const codeShaped = labels.length === 2 || AMBIGUOUS_TLDS.has(last);
+  if (!evidence && codeShaped && !/^[A-Z0-9]+$/u.test(original[0]!) && (CODE_RECEIVERS.has(labels[0]!) || labels[0]!.length === 1)) return false;
+  if (last.startsWith('xn--') || /[^\u0000-\u007f]/u.test(last) || PRIVATE_SUFFIXES.has(last) || TLDS.has(last)) {
+    // Ambiguous code-member words need a third label or digit/hyphen evidence.
+    return !AMBIGUOUS_TLDS.has(last) || labels.length >= 3 || evidence;
+  }
   if (/^[a-z]{2}$/u.test(last)) return labels.length >= 3 || evidence || COMMON_CC.has(last);
-  return TLDS.has(last);
+  return false;
 }
+const CODE_RECEIVERS = new Set(['self', 'this', 'window', 'document', 'args', 'argv', 'config', 'cfg', 'ctx', 'context', 'req', 'res',
+  'request', 'response', 'resp', 'app', 'user', 'job', 'task', 'foo', 'bar', 'obj', 'object', 'console', 'data', 'process', 'module',
+  'exports', 'props', 'state', 'options', 'opts', 'params', 'settings', 'env', 'os', 'sys', 'np', 'pd', 'df', 'math', 'json', 'row',
+  'item', 'event', 'e', 'err', 'error', 'result', 'value', 'values', 'model', 'my', 'location', 'target', 'utils', 'lib']);
+const AMBIGUOUS_TLDS = new Set(['host', 'server', 'data', 'domain', 'site', 'run', 'build', 'report', 'info', 'cluster', 'office', 'int', 'loc', 'services', 'systems', 'support', 'center', 'direct', 'codes', 'network', 'group',
+  'global', 'media', 'tools', 'space', 'page', 'live', 'link', 'store', 'shop', 'email', 'company', 'name', 'app', 'dev', 'test']);
 const URL_RE = /(?<![\w+.-])([A-Za-z][A-Za-z0-9+.-]{0,31}):\/\/([^\s"'<>`/?#]{1,512})([^\s"'<>`]{0,8192})/gu;
 const SCHEMES = new Set(['http', 'https', 'ws', 'wss', 'ftp', 'ftps', 'sftp', 'ssh', 'git', 'file', 'ldap', 'ldaps', 'smb', 'nfs', 'mqtt',
   'mqtts', 'amqp', 'amqps', 'redis', 'rediss', 'postgres', 'postgresql', 'mysql', 'mongodb', 'mongodb+srv', 'jdbc', 'opc.tcp', 'modbus',
