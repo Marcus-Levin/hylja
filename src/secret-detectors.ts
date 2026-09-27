@@ -122,16 +122,26 @@ function keyBlocks(text: string, out: Found[]): void {
     const stop = end ? end.index + end[0].length : text.length;
     const rule = begin[0].includes('PGP') ? 'format.pgp-private-key' : begin[0].includes('SSH2') ? 'format.ssh2-private-key' :
       begin[0].startsWith('PuTTY') ? 'format.putty-private-key' : 'format.pem-private-key';
-    out.push({ subtype: 'PRIVATE_KEY', rule, basis: 'FORMAT', start: begin.index, end: stop });
+    add(out, { subtype: 'PRIVATE_KEY', rule, basis: 'FORMAT', start: begin.index, end: stop });
     KEY_BEGIN.lastIndex = stop;
     if (!end) break;
   }
 }
 
+/** Longest quoted value followed across lines before it is treated as unterminated. */
+const QUOTE_WINDOW = 1 << 16;
+
 /* ---------- Value reading: over-cover rather than stop inside a secret ---------- */
 
 interface Found { subtype: SecretSubtype; rule: string; basis: SecretCandidate['basis']; start: number; end: number }
-// Memo of the last newline search, so repeated lookups on one long line stay linear overall.
+class TooMany extends Error {}
+/** Every rule adds through here, so the candidate cap bounds work while rules run, not only afterwards. */
+function add(out: Found[], found: Found): void {
+  out.push(found);
+  if (out.length > 4 * MAX_CANDIDATES) throw new TooMany();
+}
+// Memo of the last newline search, so repeated lookups on one long line stay linear overall. It is cleared
+// when detectSecrets returns, so no input text outlives the call.
 let lineMemo: { text: string; from: number; newline: number } | null = null;
 function lineEnd(text: string, from: number): number {
   let newline: number;
@@ -160,13 +170,16 @@ function readValue(text: string, at: number, context: 'line' | 'json' | 'query' 
   if (at >= eol) return null;
   const quote = text[at];
   if (quote === '"' || quote === "'" || quote === '`') {
+    // Quoted values may span lines; search a bounded window for the unescaped closing quote.
+    const limit = Math.min(text.length, at + QUOTE_WINDOW);
     let index = at + 1;
-    for (; index < eol; index++) {
+    for (; index < limit; index++) {
       if (text[index] === '\\') { index++; continue; }
       if (text[index] === quote) break;
     }
-    // Unterminated: cover to end of line (a truncated log line still hides its secret).
-    return index > at + 1 ? { start: at + 1, end: Math.min(index, eol) } : index >= eol ? { start: at, end: eol } : null;
+    if (index < limit) return index > at + 1 ? { start: at + 1, end: index } : null;
+    // Unterminated within the window: over-cover the whole window (a truncated line still hides its secret).
+    return limit - at > 1 ? { start: at + 1, end: limit } : null;
   }
   if ((quote === '|' || quote === '>') && /^[|>][+-]?[ \t]*$/u.test(text.slice(at, eol))) {
     const indent = (line: number): number => { let i = line; while (text[i] === ' ' || text[i] === '\t') i++; return i - line; };
@@ -182,8 +195,12 @@ function readValue(text: string, at: number, context: 'line' | 'json' | 'query' 
   }
   let end = at;
   if (context === 'line') end = eol;
-  else {
-    const stop = context === 'json' ? /[\s,}\]]/u : context === 'query' ? /[\s&#]/u : /[\s"'`]/u;
+  else if (context === 'inline') {
+    // Whitespace ends an inline value; a quote only does when it closes an enclosing string (`"k=v"}`).
+    while (end < eol && !/\s/u.test(text[end]!) &&
+      !(/["'`]/u.test(text[end]!) && (end + 1 >= eol || /[\s,;})\]]/u.test(text[end + 1]!)))) end++;
+  } else {
+    const stop = context === 'json' ? /[\s,}\]]/u : /[\s&#]/u;
     while (end < eol && !stop.test(text[end]!)) end++;
   }
   while (end > at && (text[end - 1] === ' ' || text[end - 1] === '\t')) end--;
@@ -194,7 +211,7 @@ function readValue(text: string, at: number, context: 'line' | 'json' | 'query' 
 
 // `key sep` only: values are read separately, so a non-credential key never hides a later assignment
 // inside its own value (`{"env":"DB_PASSWORD=x"}`, `msg=password=x`).
-const KEY_SEP = /(?<![\w.$-])(--?|\$env:|export[ \t]+|ENV[ \t]+)?(["'<]?)([A-Za-z_][\w.-]{0,63})(["'>]?)[ \t]*(:=|=>|=|:(?!\/\/))[ \t]*/gu;
+const KEY_SEP = /(?<![\w.-])(--?|\$env:|export[ \t]+|ENV[ \t]+)?(["'<]?)([A-Za-z_][\w.-]{0,63})(["'>]?)[ \t]*(:=|=>|=|:(?!\/\/))[ \t]*/gu;
 function assignmentCandidates(text: string, out: Found[]): void {
   KEY_SEP.lastIndex = 0;
   for (let match = KEY_SEP.exec(text); match; match = KEY_SEP.exec(text)) {
@@ -215,15 +232,17 @@ function assignmentCandidates(text: string, out: Found[]): void {
     if (isReference(raw) || subtype === 'ACCESS_TOKEN' && /authorization/iu.test(match[3]!) && SCHEME_WORD.test(raw)) continue;
     // `PWD=/home/...` in an env dump is the working directory, not a password.
     if (/^pwd$/iu.test(match[3]!) && /^[/~]/u.test(raw)) continue;
-    out.push({ subtype, rule: 'context.key-assignment', basis: 'CONTEXT', ...value });
+    add(out, { subtype, rule: 'context.key-assignment', basis: 'CONTEXT', ...value });
     // Anything inside a credential value is already covered: resume after it (keeps scanning linear).
     KEY_SEP.lastIndex = Math.max(KEY_SEP.lastIndex, value.end);
   }
 }
 // Space-separated forms: `--password value`, `ENV DB_PASSWORD value`, `.netrc` `password value`, `curl -u user:pass`.
 const FLAG_SPACE = /(?<![\w-])--([A-Za-z][\w-]{0,63})[ \t]+(?!-)/gu;
-const LINE_SPACE = /^[ \t]*(?:ENV[ \t]+)?([A-Za-z_][\w.-]{0,63})[ \t]+(?![=:])/gmu;
-const NETRC = /(?<![\w-])(?:login[ \t]+\S+[ \t]+)?password[ \t]+/gu;
+// Space-separated keys only in unambiguous contexts: Dockerfile `ENV`, and `.netrc` after `login`. A bare
+// `password x` in prose is not a key, and matching it would flag words like `reset`.
+const LINE_SPACE = /^[ \t]*ENV[ \t]+([A-Za-z_][\w.-]{0,63})[ \t]+(?![=:])/gmu;
+const NETRC = /(?<![\w-])login[ \t]+\S+[ \t]+password[ \t]+(?![=:])/gu;
 const CURL_USER = /(?<![\w-])(?:-u|--user)[ \t]+[^\s:]{1,256}:/gu;
 function spacedCandidates(text: string, out: Found[]): void {
   for (const [pattern, keyGroup, rule] of [[FLAG_SPACE, 1, 'context.cli-flag'], [LINE_SPACE, 1, 'context.line-key'],
@@ -235,27 +254,42 @@ function spacedCandidates(text: string, out: Found[]): void {
       if (!subtype) continue;
       const value = readValue(text, match.index + match[0].length, 'inline');
       if (value && !isReference(text.slice(value.start, value.end))) {
-        out.push({ subtype, rule, basis: 'CONTEXT', ...value });
+        add(out, { subtype, rule, basis: 'CONTEXT', ...value });
         pattern.lastIndex = Math.max(pattern.lastIndex, value.end);
       }
     }
   }
 }
 // XML elements named like credentials: `<password>…</password>`.
-const XML_ELEMENT = /<([A-Za-z_][\w.-]{0,63})(?:\s[^<>]{0,1024})?>([^<]{1,65536})<\/\1>/gu;
+const XML_ELEMENT = /<([A-Za-z_][\w.-]{0,63})(?:\s[^<>]{0,1024})?>(<!\[CDATA\[[^\]]{0,65536}\]\]>|[^<]{1,65536})<\/\1>/gu;
+// Name/value pairs: `<add key="DbPassword" value="x"/>` and Kubernetes `name: DB_PASSWORD` / `value: x`.
+const NAMED_VALUE = /\b(?:key|name)[ \t]*=[ \t]*"([^"\r\n]{1,64})"[ \t]+value[ \t]*=[ \t]*"([^"\r\n]{0,65536})"|(?<![\w-])name:[ \t]*["']?([A-Za-z_][\w.-]{0,63})["']?[ \t]*\r?\n[ \t]*value:[ \t]*/gu;
 function xmlCandidates(text: string, out: Found[]): void {
   for (const match of text.matchAll(XML_ELEMENT)) {
     const subtype = subtypeForKey(match[1]!);
     const inner = match[2]!;
     if (!subtype || !inner.trim() || isReference(inner.trim())) continue;
     const start = match.index + match[0].length - inner.length - match[1]!.length - 3;
-    out.push({ subtype, rule: 'context.xml-element', basis: 'CONTEXT', start, end: start + inner.length });
+    add(out, { subtype, rule: 'context.xml-element', basis: 'CONTEXT', start, end: start + inner.length });
+  }
+  for (const match of text.matchAll(NAMED_VALUE)) {
+    const subtype = subtypeForKey(match[1] ?? match[3]!);
+    if (!subtype) continue;
+    let value: { start: number; end: number } | null;
+    if (match[2] !== undefined) {
+      const end = match.index + match[0].length - 1;
+      value = match[2] ? { start: end - match[2].length, end } : null;
+    } else value = readValue(text, match.index + match[0].length, 'line');
+    if (value && !isReference(text.slice(value.start, value.end))) {
+      add(out, { subtype, rule: 'context.named-value', basis: 'CONTEXT', ...value });
+    }
   }
 }
 
 const HEADER = /(?<![\w-])(Proxy-Authorization|Authorization|Cookie|Set-Cookie|X-Api-Key|Api-Key|X-Auth-Token)[ \t]*:[ \t]*/giu;
 function headerCandidates(text: string, out: Found[]): void {
-  for (const match of text.matchAll(HEADER)) {
+  HEADER.lastIndex = 0;
+  for (let match = HEADER.exec(text); match; match = HEADER.exec(text)) {
     const name = match[1]!.toLowerCase();
     let start = match.index + match[0].length;
     let end = lineEnd(text, start);
@@ -280,8 +314,10 @@ function headerCandidates(text: string, out: Found[]): void {
       end = index;
     }
     if (end > start && !isReference(text.slice(start, end))) {
-      out.push({ subtype, rule: `context.header.${name}`, basis: 'CONTEXT', start, end });
+      add(out, { subtype, rule: `context.header.${name}`, basis: 'CONTEXT', start, end });
     }
+    // Another header inside this value is already covered; resuming after it keeps scanning linear.
+    HEADER.lastIndex = Math.max(HEADER.lastIndex, end);
   }
 }
 // URL userinfo: the password runs from the first `:` after the user to the *last* `@` in the token, so
@@ -300,9 +336,18 @@ function userinfoCandidates(text: string, out: Found[]): void {
     if (last < 0) continue;
     const at = from + last;
     const colon = text.indexOf(':', from);
-    if (colon < 0 || colon >= at) continue;
+    if (colon < 0 || colon >= at) {
+      // Token-only userinfo (`https://<token>@host`): a long opaque user part is itself a credential.
+      const user = text.slice(from, at);
+      if (/^[A-Za-z0-9_.~-]{16,}$/u.test(user) && !isReference(user)) {
+        add(out, { subtype: 'ACCESS_TOKEN', rule: 'context.url-token-user', basis: 'CONTEXT', start: from, end: at });
+      }
+      continue;
+    }
+    // `host:8443/path/@me` is a port and a path, not a password.
+    if (/^\d{1,5}(?:\/|$)/u.test(text.slice(colon + 1, at))) continue;
     const value = text.slice(colon + 1, at);
-    if (value && !isReference(value)) out.push({ subtype: 'PASSWORD', rule: 'context.url-userinfo', basis: 'CONTEXT', start: colon + 1, end: at });
+    if (value && !isReference(value)) add(out, { subtype: 'PASSWORD', rule: 'context.url-userinfo', basis: 'CONTEXT', start: colon + 1, end: at });
   }
 }
 
@@ -348,13 +393,19 @@ export function detectSecrets(request: SecretRequest): SecretResult {
       if (found.length > MAX_CANDIDATES) return failure('TOO_MANY_CANDIDATES');
     }
   }
-  keyBlocks(text, found);
-  headerCandidates(text, found);
-  userinfoCandidates(text, found);
-  assignmentCandidates(text, found);
-  spacedCandidates(text, found);
-  xmlCandidates(text, found);
-  if (found.length > 4 * MAX_CANDIDATES) return failure('TOO_MANY_CANDIDATES');
+  try {
+    keyBlocks(text, found);
+    headerCandidates(text, found);
+    userinfoCandidates(text, found);
+    assignmentCandidates(text, found);
+    spacedCandidates(text, found);
+    xmlCandidates(text, found);
+  } catch (error) {
+    if (error instanceof TooMany) return failure('TOO_MANY_CANDIDATES');
+    throw error;
+  } finally {
+    lineMemo = null;
+  }
   // Same span and subtype: keep the FORMAT rule, the strongest evidence.
   const strength = { FORMAT: 0, FIELD_KEY: 1, CONTEXT: 2 };
   found.sort((a, b) => a.start - b.start || a.end - b.end || a.subtype.localeCompare(b.subtype) ||

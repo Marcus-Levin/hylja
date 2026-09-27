@@ -244,3 +244,25 @@ test('fingerprints are domain-separated and a hostile key object fails closed', 
   assert.equal(run('x', { fingerprintKey: hostile }).status, 'FAILURE');
 });
 function await_import_crypto() { return globalThis.process.getBuiltinModule('node:crypto'); }
+
+test('second review: repeated headers on one line stay linear; sigil keys, multi-line quotes and mid-value quotes', () => {
+  for (const text of [' Set-Cookie: a'.repeat(80_000), `${' Cookie:x'.repeat(50_000)}${' '.repeat(500_000)}`,
+    `${' Set-Cookie: a'.repeat(30_000)}${'b'.repeat(500_000)}`, `${' Authorization: x'.repeat(40_000)}${'\t'.repeat(300_000)}`,
+    `${' name:'.repeat(20_000)}${' '.repeat(600_000)}`]) {
+    const started = process.hrtime.bigint();
+    run(text.slice(0, MAX_TEXT_UNITS));
+    assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 3000);
+  }
+  for (const [text, value] of [['$password = "synthphp";', 'synthphp'], ["my $db_pass = 'synthperl';", 'synthperl'],
+    ['$Password = "synthps"', 'synthps'], ['password="line1\nline2"', 'line1\nline2'], ['x=1 password=synth"pass', 'synth"pass'],
+    ['https://synthetictokenvalue0000@h.example.invalid/', 'synthetictokenvalue0000'],
+    ['<password><![CDATA[synthcdata]]></password>', 'synthcdata'], ['<add key="DbPassword" value="synthattr"/>', 'synthattr'],
+    ['env:\n  - name: DB_PASSWORD\n    value: synthk8s', 'synthk8s']]) assert.ok(covers(text, value), text);
+});
+
+test('second review: prose, ports and bare quotes are not candidates', () => {
+  for (const text of ['Password reset email sent', 'Token expired at 12:00', 'https://example.invalid:8443/users/@me',
+    'password="']) {
+    assert.deepEqual(run(text).candidates.map((c) => text.slice(c.start, c.end)), [], text);
+  }
+});
