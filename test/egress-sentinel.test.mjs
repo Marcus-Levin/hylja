@@ -358,7 +358,8 @@ test('sixth review: chunked gzip without digits in some chunks is still joined a
 
 test('sixth review: ordinary code, go.sum, Content-MD5 and public certificates are allowed', () => {
   const crypto = globalThis.process.getBuiltinModule('node:crypto');
-  const cert = ['-----BEGIN CERTIFICATE-----', ...crypto.randomBytes(600).toString('base64').match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
+  const der = Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]), crypto.randomBytes(596)]);
+  const cert = ['-----BEGIN CERTIFICATE-----', ...der.toString('base64').match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
   for (let run = 0; run < 20; run++) {
     for (const payload of ['const http2ServerSessionOptions = convertUtf8ToBase64String(input);',
       'const id = await getEc2InstanceIdentity(ec2InstanceMetadataV2, s3BucketNameForUploads);',
@@ -392,7 +393,7 @@ test('seventh review: nested and gzip-wrapped binary, PEM-wrapped compression an
     b64(zlib.gzipSync(Buffer.concat([Buffer.from([0x50, 0x4b, 3, 4]), random(500)]))),
     `${b64(random(30))} and ${escaped(b64(random(30)))}`, layered,
     Array.from({ length: 16 }, () => b64(random(64))).join(' '), Array.from({ length: 40 }, () => b64(random(16))).join(' '),
-    random(64).toString('hex').match(/.{1,4}/gu).join('-'), random(64).toString('hex').match(/.{1,4}/gu).join('.')];
+    random(64).toString('hex').match(/.{1,4}/gu).join('-'), random(64).toString('hex').match(/.{1,4}/gu).join('_')];
   for (const payload of opaque) {
     assert.equal(checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null }).decision, 'BLOCK', payload.slice(0, 40));
   }
@@ -400,5 +401,49 @@ test('seventh review: nested and gzip-wrapped binary, PEM-wrapped compression an
     'fe80:0000:0000:0000:0202:b3ff:fe1e:8329 and 2001:0db8:85a3:0000:0000:8a2e:0370:7334 and 2001:0db8:0000:0042:0000:8a2e:0370:733a',
     '{"model":"synthetic","messages":[{"role":"user","content":"Why does HTTPS on 443 fail?"}]}']) {
     assert.equal(checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null }).decision, 'ALLOW', payload.slice(0, 40));
+  }
+});
+
+test('eighth review: chunked plain encodings, trailing garbage and unsigned layers are inspected; id lists are ordinary', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const b64 = (bytes) => Buffer.from(bytes).toString('base64');
+  const hex = (bytes) => Buffer.from(bytes).toString('hex');
+  const groups = (text, n, sep) => text.match(new RegExp(`.{1,${n}}`, 'gu')).join(sep);
+  const wrap = (content) => JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content }] });
+  const secret = Buffer.from(`contact ${PLANTED} re ${CANARY}`);
+  for (const payload of [groups(b64(secret), 8, ' '), groups(hex(secret), 4, ','), groups(hex(secret), 20, '\n'),
+    groups(hex(secret), 4, '-'), groups(hex(secret), 4, '_'), groups(hex(secret), 2, ':'), groups(hex(secret), 4, '.'),
+    `data ${groups(hex(zlib.gzipSync(secret)), 8, ' ')}`,
+    groups(b64(zlib.gzipSync(secret)), 8, ' ').split(' ').map((chunk, i) => i % 4 === 0 ? `x ${chunk}` : chunk).join(' ')]) {
+    assert.equal(check(wrap(payload)).decision, 'BLOCK', payload.slice(0, 40));
+    assert.equal(check(payload).decision, 'BLOCK', payload.slice(0, 40));
+  }
+  const random = (n) => crypto.randomBytes(n);
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  for (const payload of [b64(Buffer.concat([zlib.deflateSync('build log: all tests passed'), random(4000)])),
+    b64(Buffer.concat([zlib.brotliCompressSync(Buffer.from('build log: all tests passed')), random(4000)])),
+    `a ${b64(zlib.deflateSync('build log: all tests passed'))} b ${b64(random(4000))}`,
+    b64(zlib.brotliCompressSync(random(1000))), b64(zlib.deflateRawSync(random(1000))), b64(zlib.gzipSync(zlib.deflateRawSync(random(1000)))),
+    b64(zlib.gzipSync(b64(random(1000)))), b64(zlib.brotliCompressSync(Buffer.from(hex(random(500)))))]) {
+    assert.equal(unknown(wrap(payload)).decision, 'BLOCK', payload.slice(0, 40));
+  }
+  const hx = (n) => hex(random(n));
+  const der = Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]), random(596)]);
+  const pem = ['-----BEGIN CERTIFICATE-----', ...b64(der).match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
+  for (let run = 0; run < 20; run++) {
+    for (const payload of [`{"timestamps":[${Array.from({ length: 12 }, (_, i) => 1695826432 + i * 17).join(',')}]}`,
+      `timestamps: ${Array.from({ length: 12 }, (_, i) => 1695826432 + i * 17).join('|')}`,
+      `squashed ${Array.from({ length: 12 }, () => hx(4).slice(0, 7)).join(' ')}`, JSON.stringify(Array.from({ length: 8 }, () => hx(6))),
+      Array.from({ length: 2 }, () => `GET /api 200 traceparent=00-${hx(16)}-${hx(8)}-01`).join('\n'),
+      Array.from({ length: 3 }, () => hx(20).toUpperCase().match(/.{4}/gu).join(' ')).join('\n'), `ids ${hx(12)} ${hx(12)} ${hx(12)}`,
+      `commit ${hx(20)} and integrity sha256-${b64(random(32))}`, pem, `id\n${b64(random(24))}`]) {
+      assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
+    }
+  }
+  // Recognized digests that happen to hold a zlib header are not decompressed into an opaque count.
+  for (const payload of ['commit b41f7f5f4f78175418789c8ae4c4000bc80566f4', 'digest d288ae4aa79c302c06789c73b5885b2537850011778e6d40e40c56fcf6d5bbf9 ok',
+    '"integrity": "sha256-0oiuSqecMCwGeJxztYhbJTeFABF3jm1A5AxW/PbVu/k="']) {
+    assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload);
   }
 });
