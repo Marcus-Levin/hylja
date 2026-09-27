@@ -510,3 +510,33 @@ test('tenth review: uncertain streams keep their tails and layers, wide byte pai
     assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
   }
 });
+
+test('eleventh review: dumps after unrelated ids, pair arrays, text under uncertain layers, and ordinary blobs and paths', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const hex = (bytes) => Buffer.from(bytes).toString('hex');
+  const b64 = (bytes) => Buffer.from(bytes).toString('base64');
+  const wrap = (content) => JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content }] });
+  const T = Buffer.from(`note ${PLANTED} ${CANARY} and some more text`);
+  const gz = zlib.gzipSync(T);
+  const od = hex(gz).match(/.{1,32}/gu).map((line) => ` ${line.match(/../gu).join(' ')}`).join('\n');
+  const pairs = (bytes, sep) => hex(bytes).match(/../gu).join(sep);
+  for (const payload of [`commit ${hex(crypto.randomBytes(20))}\n${od}`, `${crypto.randomUUID()}\n${od}`,
+    Array.from({ length: 300 }, () => `fp ${pairs(crypto.randomBytes(16), ':')}`).join('\n') + `\n${pairs(gz, ' ')}`,
+    `sha256 ${hex(crypto.randomBytes(32))}\n${b64(gz).match(/.{1,12}/gu).join(' ')}`,
+    JSON.stringify(hex(T).match(/../gu)), JSON.stringify(hex(gz).match(/../gu), null, 2), hex(T).match(/../gu).map((pair) => `- ${pair}`).join('\n'),
+    pairs(T, '; '), pairs(T, ',\n    '),
+    pairs(Buffer.concat([zlib.deflateRawSync(Buffer.from('harmless text here')), zlib.gzipSync(b64(T))]), ' '),
+    pairs(zlib.brotliCompressSync(zlib.brotliCompressSync(b64(T))), ' ')]) {
+    assert.equal(check(wrap(payload)).decision, 'BLOCK', payload.slice(0, 40));
+  }
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  assert.equal(unknown(wrap(b64(Buffer.concat([zlib.gzipSync('harmless log line'), crypto.randomBytes(600)])).match(/.{1,12}/gu).join(' '))).decision, 'BLOCK');
+  assert.equal(check('const password = `Synthetic-Passw0rd-1`;').decision, 'BLOCK');
+  assert.equal(check('db=1postgres://admin:Synthetic-pass@db.invalid/x').decision, 'BLOCK');
+  for (const payload of [Array.from({ length: 6 }, (_, i) => `2026-09-27T10:00:0${i}Z INFO event payload=${b64(zlib.deflateSync(JSON.stringify({ event: 'login', n: i })))}`).join('\n'),
+    'PWD=/srv/app\nHOME=/home/app', 'const url = `postgres://${user}:${password}@${host}/db`;', 'postgres://{{user}}:{{password}}@db.invalid',
+    'postgres://$DB_USER:$DB_PASS@db.invalid']) {
+    assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
+  }
+});

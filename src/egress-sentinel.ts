@@ -240,7 +240,7 @@ function matchKnown(known: Known, text: string, budget: { verifications: number;
 
 /* ---------- Independent high-risk patterns (separate from the #8 detector implementation) ---------- */
 
-const PATTERNS: readonly { rule: string; pattern: RegExp }[] = [
+const PATTERNS: readonly { rule: string; pattern: { test(text: string): boolean } }[] = [
   { rule: 'pattern.private-key-block', pattern: /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----|---- BEGIN SSH2 [A-Z ]{0,20}PRIVATE KEY ----|PuTTY-User-Key-File-\d/u },
   { rule: 'pattern.cloud-access-key', pattern: /(?<![0-9A-Z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])/u },
   { rule: 'pattern.source-control-token', pattern: /gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}/u },
@@ -251,14 +251,22 @@ const PATTERNS: readonly { rule: string; pattern: RegExp }[] = [
   { rule: 'pattern.npm-token', pattern: /npm_[A-Za-z0-9]{36}/u },
   { rule: 'pattern.jwt', pattern: /eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\./u },
   { rule: 'pattern.authorization-credential', pattern: /authorization["']?\s*[:=]\s*["']?(?:bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/iu },
-  // The scheme starts at a word boundary, so a long letter run is not rescanned from every position.
-  { rule: 'pattern.url-password', pattern: /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{1,31}:\/\/[^\s:/@"']{1,256}:[^\s/@"']{3,256}@/iu },
+  // Found from each `://`, looking back at most 32 characters for the scheme, so long letter runs stay linear.
+  // A placeholder password (`${password}`, `{{password}}`, `$DB_PASS`, `%s`, `<password>`) is not a value.
+  { rule: 'pattern.url-password', pattern: { test: urlPassword } },
 ];
 // A literal value after a credential-like key. References (`${X}`, `{{x}}`, `<...>`, masks), type names,
 // booleans and identifier/member expressions (`process.env.SECRET`, `config.password`) are not values.
+function urlPassword(text: string): boolean {
+  for (let at = text.indexOf('://'); at >= 0; at = text.indexOf('://', at + 3)) {
+    if (/[a-z][a-z0-9+.-]{1,31}$/iu.test(text.slice(Math.max(0, at - 32), at)) &&
+      /^[^\s:/@"']{1,256}:(?![$%{<])[^\s/@"']{3,256}@/u.test(text.slice(at + 3, at + 3 + 520))) return true;
+  }
+  return false;
+}
 // A bare identifier that repeats the key (`{ password: password }`, `apiKey: apiKey`) is a shorthand, not a value;
 // other bare words are flagged, since unquoted passwords look the same as identifiers.
-const CREDENTIAL_ASSIGNMENT = /(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*(?:(["'])([^"'\r\n]{4,})\2|([^\s"'`,;)]{4,}))/giu;
+const CREDENTIAL_ASSIGNMENT = /(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*(?:(["'`])([^"'`\r\n]{4,})\2|([^\s"'`,;)]{4,}))/giu;
 const REFERENCE = /^(?:\$\{[^}]*\}|\{\{[^}]*\}\}|<[\w -]{1,40}>|\*{3,}|\[hylja:protected:[A-Z0-9_]+\])$/u;
 const NOT_A_VALUE = /^(?:[$<*{[]|(?:string|number|boolean|bigint|object|any|unknown|undefined|null|none|true|false|nil|str|int|bool|bytes)$|[A-Za-z_$][\w$]*(?:(?:\.|\?\.)[A-Za-z_$][\w$]*|\[[^\]]*\])+$)/iu;
 function credentialAssignment(text: string): boolean {
@@ -267,6 +275,8 @@ function credentialAssignment(text: string): boolean {
     // identifiers, member expressions, type names or booleans.
     // Unquoted: brackets inside the value belong to it; only trailing ones (`false}`) close a surrounding structure.
     const unquoted = match[4]?.replace(/[}\]]+$/u, '');
+    // `PWD=/srv/app` is the working directory, not a password.
+    if (/^pwd$/iu.test(match[1]!) && /^[/~]/u.test(match[4] ?? match[3] ?? '')) continue;
     const sameName = unquoted !== undefined && unquoted.replace(/[_-]/gu, '').toLowerCase() === match[1]!.replace(/[_-]/gu, '').toLowerCase();
     if (match[4] !== undefined ? unquoted!.length >= 4 && !NOT_A_VALUE.test(unquoted!) && !sameName : !REFERENCE.test(match[3]!)) return true;
   }
@@ -328,11 +338,15 @@ function isIdentifier(value: string): boolean {
   // Hex split into short groups (`a3f9-01bc-…`) has no word in it and is data, not a name.
   if (value.length > 256 || /[+=]/u.test(value) || !/[g-zG-Z]/u.test(value)) return false;
   const segments = value.split(/[_/.-]+|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/u).filter(Boolean);
+  // Names have few, long segments; random Base64 that happens to split into word-like pieces has many short ones.
+  if (value.replace(/[_/.-]/gu, '').length < segments.length * 3) return false;
   return segments.length >= 2 && segments.every((segment) =>
     /^[A-Z]?[a-z]{2,}$/u.test(segment) || /^[A-Z]{1,5}$/u.test(segment) || /^\d{1,4}$/u.test(segment) || /^[a-z]$/u.test(segment) ||
     /^\d{5,20}$/u.test(segment) && new RegExp(`(?:^|[/._-])${segment}(?:$|[/._-])`, 'u').test(value));
 }
-const HEX_PAIRS = /(?<![0-9A-Fa-f])(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:(?:,?[ \t]{1,16}|[:.;,-]|\\n|\r?\n)(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?![0-9A-Fa-f])){7,4096}/gu;
+// Separators between pairs: whitespace, `,;:|.&`, quotes, brackets, JSON escapes and YAML `- ` list markers, so
+// JSON/YAML arrays of pairs (`["4f","72",…]`) and padded columns decode too.
+const HEX_PAIRS = /(?<![0-9A-Fa-f])(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:(?:[ \t\r\n,;:|.&"'[\]]|\\[nrt"\\]|-(?=[ \t0-9A-Fa-f])){1,24}(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?![0-9A-Fa-f])){7,4096}/gu;
 const SEPARATED_HEX = /^[0-9A-Fa-f]{2,}(?:[-_/][0-9A-Fa-f]{2,})+$/u;
 const UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u;
 interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean; joined?: boolean }
@@ -402,7 +416,10 @@ function* chunkSequences(text: string, separator: RegExp, weakPass: boolean): Ge
     const last = tokens[tokens.length - 1]!;
     // Mostly hex tokens are a hex list (fingerprints, hashes, ids), decoded but not counted.
     const hexTokens = tokens.filter((token) => /^(?:0[xX])?[0-9A-Fa-f]+$/u.test(token[0])).length;
+    // Mostly dash/underscore ids (`D01-DEV-001`, `span_42_ok`) are an id list; random Base64url rarely splits so.
+    const idTokens = tokens.filter((token) => /^[A-Za-z0-9]{1,8}(?:[-_][A-Za-z0-9]{1,8}){1,5}$/u.test(token[0])).length;
     const countable = mayCount && tokens.every((token) => token[0].length <= 17) && hexTokens < tokens.length * 0.75 &&
+      idTokens < tokens.length * 0.75 &&
       tokens.filter((token) => chunkLike(token[0])).length >= tokens.length * 0.75;
     yield { start: tokens[0]!.index!, end: last.index! + last[0].length, value, prefixed: false, separated: true, countable, joined: true };
   };
@@ -413,6 +430,17 @@ function* chunkSequences(text: string, separator: RegExp, weakPass: boolean): Ge
       const words = sequence.filter((token, index) => chunkLikeLoose(token[0]) || index === sequence.length - 1 && index > 0);
       yield* emit(sequence, !weakPass && words.length === sequence.length);
       if (words.length !== sequence.length) yield* emit(words, !weakPass);
+      // Decode-only variants for a prefix that misaligns the chunks (`sha256 <digest> H4sI AAAA …`): the stretches
+      // between long tokens (runs of their own), and the words-free sequence without its first one to three tokens.
+      // Very long sequences are dumps, read by byte-pair runs and the inner stream scan instead.
+      const variants: RegExpMatchArray[][] = [];
+      let stretch: RegExpMatchArray[] = [];
+      for (const token of words.length <= 4096 ? words : []) {
+        if (token[0].length > 17) { if (stretch.length) variants.push(stretch); stretch = []; } else stretch.push(token);
+      }
+      if (stretch.length && stretch.length !== words.length) variants.push(stretch);
+      for (let drop = 1; drop <= 3 && words.length - drop >= 2 && words.length <= 4096; drop++) variants.push(words.slice(drop));
+      for (const variant of variants) yield* emit(variant, false);
     }
     sequence = [];
     weak = false;
@@ -494,6 +522,8 @@ function gzipBody(view: Uint8Array): number {
   return at < view.length ? at : -1;
 }
 const MAX_INFLATE_DEPTH = 4;
+// `consumed`: input accounted for. After a real stream that is all of it: any remainder was decoded along the chain,
+// matched as text or counted as opaque.
 interface Expanded { opaque: number; consumed: number; keep: boolean }
 /**
  * Decompress `bytes` and any compressed layers inside, to MAX_INFLATE_DEPTH. Text layers go to `sink.texts` (views
@@ -502,8 +532,34 @@ interface Expanded { opaque: number; consumed: number; keep: boolean }
  * gzip/zlib output and bytes after a stream's end. `keep` marks binary brotli/raw deflate output, which random
  * bytes produce by accident: the input's own count then stands.
  */
-interface Sink { texts: string[]; printables: string[]; junk: string[] }
-function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, depth = 0): Expanded | null | 'CONTAINER' | 'BUDGET' {
+/**
+ * Views from decompression: `texts` are inspected and counted, `uncertain` texts (found under output that may be
+ * accidental) are decoded further but never counted, `printables` and `junk` are matched only.
+ */
+interface Sink { texts: string[]; uncertain: string[]; printables: string[]; junk: string[] }
+const MAX_STREAM_CHAIN = 256;
+/**
+ * Overlap queries against a set of spans in O(log n): spans sorted by start, with the running maximum end. Some span
+ * overlaps [a, b) exactly when the largest end among spans starting before b exceeds a.
+ */
+function spanIndex(sorted: readonly (readonly [number, number])[]): (span: readonly [number, number]) => boolean {
+  const spans = [...sorted].sort((x, y) => x[0] - y[0]);
+  const maxEnd: number[] = [];
+  for (const [index, span] of spans.entries()) maxEnd.push(Math.max(span[1], index ? maxEnd[index - 1]! : -1));
+  return ([a, b]) => {
+    let low = 0, high = spans.length;
+    while (low < high) { const mid = (low + high) >> 1; if (spans[mid]![0] < b) low = mid + 1; else high = mid; }
+    return low > 0 && maxEnd[low - 1]! > a;
+  };
+}
+/** A gzip or zlib signature in the first 16 bytes, where `inflate` looks for one. */
+function startsStream(bytes: Uint8Array): boolean {
+  for (let offset = 0; offset < Math.min(16, bytes.length - 1); offset++) {
+    if (bytes[offset] === 0x1f && bytes[offset + 1] === 0x8b || bytes[offset] === 0x78 && [0x01, 0x5e, 0x9c, 0xda].includes(bytes[offset + 1]!)) return true;
+  }
+  return false;
+}
+function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, depth = 0, chain = 0): Expanded | null | 'CONTAINER' | 'BUDGET' {
   const inflated = inflate(bytes, budget);
   if (inflated === 'BUDGET' || inflated === null) return inflated;
   const { out, signed, consumed } = inflated;
@@ -516,39 +572,41 @@ function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, dep
   if (!signed && (!inflated.plausible || consumed < bytes.length * 0.9)) {
     sink.junk.push(printable(decoded), utf16Printable(out));
     if (isText(decoded)) sink.junk.push(utf8Lenient.decode(out));
-    // Its nested layers and any stream after it are decoded too, match-only, and never lower the count.
+    // Its nested layers and any stream after it are decoded too; what they hold never lowers the count, but text
+    // found there is decoded further (Base64 or hex inside) as an uncounted view.
     if (depth + 1 < MAX_INFLATE_DEPTH) {
-      const inner: Sink = { texts: [], printables: [], junk: [] };
+      const inner: Sink = { texts: [], uncertain: [], printables: [], junk: [] };
       for (const part of consumed < bytes.length ? [out, bytes.subarray(consumed)] : [out]) {
         const result = expand(part, budget, inner, depth + 1);
         if (result === 'CONTAINER' || result === 'BUDGET') return result;
       }
-      sink.junk.push(...inner.texts, ...inner.printables, ...inner.junk);
+      sink.uncertain.push(...inner.texts, ...inner.uncertain);
+      sink.junk.push(...inner.printables, ...inner.junk);
     }
     return { opaque: 0, consumed, keep: true };
   }
   if (OPAQUE_SIGNATURES.some((signature) => signature.every((byte, index) => out[index] === byte))) return 'CONTAINER';
-  // Bytes after the stream's end: another stream, text, or opaque bytes.
+  // Bytes after the stream's end: another stream (followed along the chain, not nested), text, or opaque bytes.
   let trailing = 0;
   if (consumed < bytes.length) {
     const tail = bytes.subarray(consumed);
-    const next = depth + 1 < MAX_INFLATE_DEPTH ? expand(tail, budget, sink, depth + 1) : null;
+    const next = chain + 1 < MAX_STREAM_CHAIN ? expand(tail, budget, sink, depth, chain + 1) : null;
     if (next === 'CONTAINER' || next === 'BUDGET') return next;
     if (next && !next.keep) trailing = next.opaque;
     else if (isText(tail)) sink.texts.push(utf8Lenient.decode(tail));
     else { trailing = tail.length; sink.printables.push(printable(tail), utf16Printable(tail)); }
   }
-  if (isText(decoded)) { sink.texts.push(utf8Lenient.decode(out)); return { opaque: trailing, consumed, keep: false }; }
+  if (isText(decoded)) { sink.texts.push(utf8Lenient.decode(out)); return { opaque: trailing, consumed: bytes.length, keep: false }; }
   matchBinary();
   const textMark = sink.texts.length;
   const nested = depth + 1 < MAX_INFLATE_DEPTH ? expand(out, budget, sink, depth + 1) : null;
   if (nested === 'CONTAINER' || nested === 'BUDGET') return nested;
-  if (nested && !nested.keep) return { opaque: nested.opaque + trailing, consumed, keep: false };
-  if (signed) return { opaque: out.length + trailing, consumed, keep: false };
-  // Binary brotli/raw deflate output may be an accident: keep matching it (text found below it too, as derived
-  // views), but let the input's own count stand.
-  sink.printables.push(...sink.texts.splice(textMark));
-  return { opaque: trailing, consumed, keep: trailing === 0 };
+  if (nested && !nested.keep) return { opaque: nested.opaque + trailing, consumed: bytes.length, keep: false };
+  if (signed) return { opaque: out.length + trailing, consumed: bytes.length, keep: false };
+  // Binary brotli/raw deflate output may be an accident: keep matching it (text found below it is decoded further
+  // but not counted), and let the input's own count stand.
+  sink.uncertain.push(...sink.texts.splice(textMark));
+  return { opaque: trailing, consumed: bytes.length, keep: trailing === 0 };
 }
 /** UTF-16LE reading of binary, printable characters only, so UTF-16 text inside a binary layer is matched. */
 function utf16Printable(bytes: Uint8Array): string {
@@ -684,7 +742,7 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         const identified = isDigest(run.value) && run.separated !== true && (run.prefixed || DIGEST_HEX.test(run.value) || DIGEST_CONTEXT.test(before)) ||
           publicBlocks.some((block) => block.start <= run.start && run.end <= block.end) || B64_ALPHABET.test(run.value) ||
           SSH_KEY_CONTEXT.test(before) && run.value.length <= 800 || UUID.test(run.value);
-        const recognized = identified || isIdentifier(run.value) || !encodedShape || !run.countable || view.derived === true;
+        const recognized = identified || !encodedShape || !run.countable || view.derived === true || isIdentifier(run.value);
         // A container signature is opaque at once, unless the run is a digest or id that happens to start with one.
         if (!identified && OPAQUE_SIGNATURES.some((signature) => signature.every((byte, index) => bytes[index] === byte))) return { reason: 'OPAQUE_EMBEDDED' };
         binary.push(bytes);
@@ -710,12 +768,18 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         // The concatenation takes whole runs and byte-pair runs first, then chunk joins that overlap none of them, in
         // text order and without overlaps, so one stream is not chained to copies of itself (a chunk join and its
         // word-free variant, or a join across a hex dump's offset column).
+        const bySpan = (a: number, b: number): number => spans[a]![0] - spans[b]![0] || spans[b]![1] - spans[a]![1];
+        const whole = binary.map((_, index) => index).filter((index) => !chunkJoin[index]).sort(bySpan);
+        const wholeOverlaps = spanIndex(whole.map((index) => spans[index]!));
         const taken: number[] = [];
-        const overlaps = (index: number): boolean => taken.some((other) => spans[index]![0] < spans[other]![1] && spans[other]![0] < spans[index]![1]);
-        for (const pass of [false, true]) {
-          const candidates = binary.map((_, index) => index).filter((index) => chunkJoin[index] === pass)
-            .sort((a, b) => spans[a]![0] - spans[b]![0] || spans[b]![1] - spans[a]![1]);
-          for (const index of candidates) if (taken.length < 4096 && !overlaps(index)) taken.push(index);
+        let reach = -1;
+        for (const index of whole) if (spans[index]![0] >= reach) { taken.push(index); reach = spans[index]![1]; }
+        const takenOverlaps = spanIndex(taken.map((index) => spans[index]!));
+        reach = -1;
+        for (const index of binary.map((_, i) => i).filter((i) => chunkJoin[i]).sort(bySpan)) {
+          if (taken.length >= 4096 || spans[index]![0] < reach || takenOverlaps(spans[index]!)) continue;
+          taken.push(index);
+          reach = spans[index]![1];
         }
         taken.sort((a, b) => spans[a]![0] - spans[b]![0]);
         const offsets: number[] = binary.map(() => -1);
@@ -723,27 +787,53 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         for (const index of taken) { offsets[index] = offset; offset += binary[index]!.length; }
         const joined = new Uint8Array(offset);
         for (const [index, start] of offsets.entries()) if (start >= 0) joined.set(binary[index]!, start);
-        const sink: Sink = { texts: [], printables: [], junk: [] };
+        const sink: Sink = { texts: [], uncertain: [], printables: [], junk: [] };
         const covered = new Set<number>();
-        for (const candidate of binary.length > 1 ? [joined, ...binary.slice(0, 256)] : binary) {
-          const single = candidate === joined ? -1 : binary.indexOf(candidate);
+        // A chunk join that overlaps a whole or byte-pair run may be misaligned (across padding or words); a pure one
+        // is the only reading of its chunks.
+        const misalignable = binary.map((_, index) => chunkJoin[index] === true && wholeOverlaps(spans[index]!));
+        // Candidates: the whole concatenation, the concatenation from each later run that starts with a gzip/zlib
+        // signature (a dump after unrelated hex ids), then single runs.
+        const starts = taken.filter((index, position) => position > 0 && startsStream(binary[index]!)).slice(0, 256);
+        const candidates: { bytes: Uint8Array; base: number; single: number }[] = binary.length > 1
+          ? [{ bytes: joined, base: 0, single: -1 }, ...starts.map((index) => ({ bytes: joined.subarray(offsets[index]!), base: offsets[index]!, single: -1 })),
+            ...binary.slice(0, 256).map((bytes, index) => ({ bytes, base: 0, single: index }))]
+          : [{ bytes: binary[0]!, base: 0, single: 0 }];
+        for (const { bytes: candidate, base, single } of candidates) {
           if (single >= 0 && covered.has(single)) continue;
+          if (single < 0 && base > 0 && taken.every((index) => offsets[index]! < base || covered.has(index))) continue;
           const result = expand(candidate, budget, sink);
           if (result === 'BUDGET') return { reason: 'SENTINEL_BUDGET' };
           if (result === 'CONTAINER') return { reason: 'OPAQUE_EMBEDDED' };
           if (result === null || result.keep) continue;
           // Runs the stream consumed are decompressed, not opaque: their count is replaced by what the stream held
           // (binary gzip/zlib output, bytes after its end). Streams in recognized digests count nothing.
-          const runs = single >= 0 ? [single] : offsets.flatMap((start, index) => start >= 0 && start + binary[index]!.length <= result.consumed ? [index] : []);
+          const runs = single >= 0 ? [single] : offsets.flatMap((start, index) =>
+            start >= base && start + binary[index]!.length <= base + result.consumed ? [index] : []);
           if (!runs.length) continue;
           for (const index of runs) { covered.add(index); countable -= runCounts[index]!; runCounts[index] = 0; }
-          // Chunk joins are decode-only: a misaligned join (across padding or words) must not add stream remainders.
-          if (!view.derived && !runs.every((index) => runIdentified[index] || chunkJoin[index])) countable += result.opaque;
+          // A join that may be misaligned must not add stream remainders; digests that look like streams add nothing.
+          if (!view.derived && !runs.every((index) => runIdentified[index] || misalignable[index])) countable += result.opaque;
           if (covered.size === binary.length) break;
+        }
+        // A stream deeper inside a run (a dump after other byte pairs in one long run) is decoded for matching only;
+        // the run's own count stands.
+        let inner = 0;
+        for (const [index, bytes] of binary.entries()) {
+          if (covered.has(index) || inner >= 256) continue;
+          for (let at = 16; at + 2 < bytes.length && inner < 256; at++) {
+            if (!(bytes[at] === 0x1f && bytes[at + 1] === 0x8b && bytes[at + 2] === 8 || bytes[at] === 0x78 && [0x01, 0x5e, 0x9c, 0xda].includes(bytes[at + 1]!))) continue;
+            inner++;
+            const result = expand(bytes.subarray(at), budget, sink);
+            if (result === 'BUDGET') return { reason: 'SENTINEL_BUDGET' };
+            if (result === 'CONTAINER') return { reason: 'OPAQUE_EMBEDDED' };
+            if (result && !result.keep) at += result.consumed - 1;
+          }
         }
         if (sink.texts.length) next.push({ name: `${view.name}>INFLATED`, text: sink.texts.join('\n'), derived: view.derived === true });
         // Binary layers are matched but not decoded further: signed binary output already counts as opaque in full.
         if (sink.printables.length) next.push({ name: `${view.name}>INFLATED_BINARY`, text: sink.printables.join('\n'), derived: true, matchOnly: true });
+        if (sink.uncertain.length) next.push({ name: `${view.name}>INFLATED_UNCERTAIN_TEXT`, text: sink.uncertain.join('\n'), derived: true });
         if (sink.junk.length) next.push({ name: `${view.name}>INFLATED_UNCERTAIN`, text: sink.junk.join('\n'), derived: true, matchOnly: true });
       }
       // One opaque total per message, across all views and rounds (distinct runs are counted once).
