@@ -288,7 +288,69 @@ function isIdentifierRun(run: string): boolean {
   return DIGEST_HEX.test(run) || /^sha(?:1|256|384|512)-[A-Za-z0-9+/]+={0,2}$/u.test(run) ||
     /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u.test(run);
 }
-const DIGEST_CONTEXT = /(?:sha(?:1|256|384|512)[-:]|ssh-(?:ed25519|rsa|dss)\s|ecdsa-sha2-nistp\d{3}\s|sk-ssh-ed25519@openssh\.com\s)$/iu;
+const DIGEST_CONTEXT = /(?:sha(?:1|224|256|384|512)[-:]|h1:|content-md5:\s*|etag:\s*"?)$/iu;
+const SSH_KEY_CONTEXT = /(?:ssh-(?:ed25519|rsa|dss)\s|ecdsa-sha2-nistp\d{3}\s|sk-ssh-ed25519@openssh\.com\s)$/iu;
+// Public certificate and key blocks are not secrets and are exempt from the opaque count.
+const PUBLIC_PEM = /-----BEGIN (?:CERTIFICATE|TRUSTED CERTIFICATE|PUBLIC KEY|RSA PUBLIC KEY|CERTIFICATE REQUEST|NEW CERTIFICATE REQUEST|X509 CRL)-----[\s\S]{0,65536}?-----END [A-Z0-9 ]{1,40}-----/gu;
+/** Exact digest lengths: hex MD5/SHA-1/224/256/384/512, and base64 MD5/SHA-1/256/384/512 with or without padding. */
+function isDigest(value: string): boolean {
+  if (/^[0-9A-Fa-f]+$/u.test(value)) return [32, 40, 56, 64, 96, 128].includes(value.length);
+  return [22, 24, 27, 28, 43, 44, 64, 86, 88].includes(value.length);
+}
+/**
+ * camelCase/PascalCase/snake identifiers and path-like names made of words and short digit groups
+ * (`convertUtf8ToBase64String`, `com/Marcus-Levin/hylja/pull/56`). Random Base64 does not split into words.
+ * A path segment may be a whole numeric id up to int64 width (`actions/runs/36169013008`).
+ */
+function isIdentifier(value: string): boolean {
+  if (/[+=]/u.test(value)) return false;
+  const segments = value.split(/[_/.-]+|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/u).filter(Boolean);
+  return segments.length >= 2 && segments.every((segment) =>
+    /^[A-Z]?[a-z]{2,}$/u.test(segment) || /^[A-Z]{1,5}$/u.test(segment) || /^\d{1,4}$/u.test(segment) || /^[a-z]$/u.test(segment) ||
+    /^\d{5,20}$/u.test(segment) && new RegExp(`(?:^|[/._-])${segment}(?:$|[/._-])`, 'u').test(value));
+}
+interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean }
+const CHUNK = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{4,15}={0,2}(?![A-Za-z0-9+/=_-])/gu;
+/** A chunk that is clearly encoded data: letters with digits, long hex, or padding. */
+function chunkLike(token: string): boolean {
+  return /\d/u.test(token) && /[A-Za-z]/u.test(token) || /^[0-9A-Fa-f]{8,}$/u.test(token) || /=$/u.test(token);
+}
+/** Also possibly encoded: `+`/`/` or a lower-to-upper case switch, which digit-free Base64 chunks usually show. */
+function chunkLikeLoose(token: string): boolean {
+  return chunkLike(token) || /[+/]/u.test(token) || /[a-z][A-Z]/u.test(token);
+}
+/**
+ * Encoded runs: every run of 16+ alphabet characters (a `shaNNN-`/`shaNNN:`/`h1:` prefix stripped), plus
+ * sequences of short chunk-like tokens separated only by whitespace, commas, quotes or brackets, joined into
+ * one run so that chunking below 16 characters cannot hide compressed data. A joined sequence counts toward
+ * OPAQUE_BYTES only when three quarters of its tokens are clearly encoded; looser sequences (digit-free Base64
+ * chunks, but also JSON ids and regex classes) are decoded and decompressed, never counted.
+ */
+function* encodedRuns(text: string): Generator<EncodedRun> {
+  for (const run of text.matchAll(ENCODED_RUN)) {
+    const prefix = /^(?:sha(?:1|224|256|384|512)-|h1:)/iu.exec(run[0]);
+    yield { start: run.index + (prefix?.[0].length ?? 0), end: run.index + run[0].length,
+      value: prefix ? run[0].slice(prefix[0].length) : run[0], prefixed: prefix !== null, countable: true };
+  }
+  let sequence: RegExpMatchArray[] = [];
+  const flush = function* (): Generator<EncodedRun> {
+    if (sequence.length >= 2 && sequence.filter((token) => chunkLikeLoose(token[0])).length >= sequence.length * 0.5) {
+      const value = sequence.map((token) => token[0].replace(/=+$/u, '')).join('');
+      if (value.length >= 16) {
+        const last = sequence[sequence.length - 1]!;
+        yield { start: sequence[0]!.index!, end: last.index! + last[0].length, value, prefixed: false,
+          countable: sequence.filter((token) => chunkLike(token[0])).length >= sequence.length * 0.75 };
+      }
+    }
+    sequence = [];
+  };
+  for (const token of text.matchAll(CHUNK)) {
+    const previous = sequence[sequence.length - 1];
+    if (previous && !/^[\s,"'[\]]{1,4}$/u.test(text.slice(previous.index! + previous[0].length, token.index))) yield* flush();
+    sequence.push(token);
+  }
+  yield* flush();
+}
 /**
  * Decompress binary as gzip or zlib (signature in the first 16 bytes), brotli or raw deflate, tolerating a
  * truncated stream, within the per-message output budget. A successful gzip/zlib/brotli decode is always kept;
@@ -391,6 +453,7 @@ interface View { name: string; text: string; derived?: boolean }
 function canonicalViews(root: string): { views: View[]; opaque: boolean } | { reason: string } {
   const views: View[] = [];
   const budget = { inflated: 0 };
+  const countedValues = new Set<string>();
   let pendingOpaque = false;
   let queue: View[] = [{ name: 'ROOT', text: root }];
   let units = 0;
@@ -420,24 +483,29 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
       const binary: Uint8Array[] = [];
       let binaryTotal = 0, countable = 0;
       const runCounts: number[] = [];
-      for (const run of view.text.matchAll(ENCODED_RUN)) {
-        const end = run.index + run[0].length;
-        if (textSpans.some((span) => span.start <= run.index && end <= span.end)) continue;
-        const decoded = decodeRun(run[0]);
+      const publicBlocks = [...view.text.matchAll(PUBLIC_PEM)].map((block) => ({ start: block.index, end: block.index + block[0].length }));
+      for (const run of encodedRuns(view.text)) {
+        if (textSpans.some((span) => span.start <= run.start && run.end <= span.end)) continue;
+        if (publicBlocks.some((block) => block.start <= run.start && run.end <= block.end)) continue;
+        const decoded = decodeRun(run.value);
         if (!decoded || isText(decoded)) continue;
         const bytes = Uint8Array.from(decoded);
         if (OPAQUE_SIGNATURES.some((signature) => signature.every((byte, index) => bytes[index] === byte))) return { reason: 'OPAQUE_EMBEDDED' };
-        // Not counted: recognized digests/UUIDs/public keys, runs that do not look encoded (lower-case paths,
-        // snake_case ids), and anything inside views derived from decompression or printable bytes.
-        const encodedShape = /^[0-9A-Fa-f]+$/u.test(run[0]) || /=$/u.test(run[0]) ||
-          /[A-Z]/u.test(run[0]) && /[a-z]/u.test(run[0]) && /\d/u.test(run[0]);
-        const recognized = DIGEST_HEX.test(run[0]) || /^sha(?:1|256|384|512)-[A-Za-z0-9+/]+={0,2}$/u.test(run[0]) ||
-          DIGEST_CONTEXT.test(view.text.slice(Math.max(0, run.index - 32), run.index)) ||
-          /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u.test(run[0]) ||
-          !encodedShape || view.derived === true;
+        // Not counted: exact-length digests (with or without a `shaNNN-`/`h1:` prefix), SSH key blobs, UUIDs,
+        // identifiers (`http2ServerSessionOptions`), runs that do not look encoded (lower-case paths, snake_case
+        // ids), and anything inside views derived from decompression or printable bytes.
+        const encodedShape = /^[0-9A-Fa-f]+$/u.test(run.value) || /=$/u.test(run.value) ||
+          /[A-Z]/u.test(run.value) && /[a-z]/u.test(run.value) && /\d/u.test(run.value);
+        const before = view.text.slice(Math.max(0, run.start - 32), run.start);
+        const recognized = isDigest(run.value) && (run.prefixed || DIGEST_HEX.test(run.value) || DIGEST_CONTEXT.test(before) || /=$/u.test(run.value)) ||
+          SSH_KEY_CONTEXT.test(before) && run.value.length <= 800 ||
+          /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u.test(run.value) ||
+          isIdentifier(run.value) || !encodedShape || !run.countable || view.derived === true;
         binary.push(bytes);
         binaryTotal += bytes.length;
-        const counted = recognized ? 0 : bytes.length;
+        // Each distinct run counts once per message (an escape view repeats the runs of its parent).
+        const counted = recognized || countedValues.has(run.value) ? 0 : bytes.length;
+        if (counted) countedValues.add(run.value);
         runCounts.push(counted);
         countable += counted;
         const text = printable(decoded);

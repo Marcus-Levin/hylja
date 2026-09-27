@@ -329,3 +329,45 @@ test('fifth review: decoy-interleaved, brotli and container payloads block; rand
   assert.equal(heavy.decision, 'BLOCK');
   assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
 });
+
+test('sixth review: data chunked under 16 characters is joined, decompressed and counted; digest prefixes are bounded', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const secret = `contact ${PLANTED} re ${CANARY} ${crypto.randomBytes(8).toString('hex')}`;
+  const gz = zlib.gzipSync(Buffer.from(secret));
+  const split = (text, n, sep) => text.match(new RegExp(`.{1,${n}}`, 'gu')).join(sep);
+  for (const payload of [split(gz.toString('base64'), 15, ' '), split(gz.toString('base64'), 12, ' '), split(gz.toString('hex'), 15, ' '),
+    split(zlib.brotliCompressSync(Buffer.from(secret)).toString('base64'), 14, '\n'), `sha512-${gz.toString('base64')}`]) {
+    assert.equal(check(payload).decision, 'BLOCK', payload.slice(0, 30));
+  }
+  for (const payload of [split(crypto.randomBytes(4096).toString('base64'), 15, ' '), `integrity sha512-${crypto.randomBytes(3072).toString('base64')}`,
+    `sha256:${crypto.randomBytes(3072).toString('base64')}`]) {
+    assert.equal(checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null }).decision, 'BLOCK', payload.slice(0, 30));
+  }
+});
+
+test('sixth review: chunked gzip without digits in some chunks is still joined and inflated', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const split = (text, n, sep) => text.match(new RegExp(`.{1,${n}}`, 'gu')).join(sep);
+  for (let run = 0; run < 300; run++) {
+    const gz = zlib.gzipSync(Buffer.from(`contact ${PLANTED} re ${CANARY} ${crypto.randomBytes(8).toString('hex')}`)).toString('base64');
+    for (const width of [15, 12, 8]) assert.equal(check(split(gz, width, ' ')).decision, 'BLOCK', split(gz, width, ' '));
+  }
+});
+
+test('sixth review: ordinary code, go.sum, Content-MD5 and public certificates are allowed', () => {
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const cert = ['-----BEGIN CERTIFICATE-----', ...crypto.randomBytes(600).toString('base64').match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
+  for (let run = 0; run < 20; run++) {
+    for (const payload of ['const http2ServerSessionOptions = convertUtf8ToBase64String(input);',
+      'const id = await getEc2InstanceIdentity(ec2InstanceMetadataV2, s3BucketNameForUploads);',
+      'CI: https://github.com/example-org/example-repo/actions/runs/36169013008 and /runs/36134297661/job/108599394046',
+      Array.from({ length: 520 }, (_, i) => `synthRecordHandler${i}Value`).join(' '),
+      Array.from({ length: 4 }, (_, i) => `example.invalid/mod${i} v1.0.${i} h1:${crypto.randomBytes(32).toString('base64')}`).join('\n'),
+      Array.from({ length: 3 }, () => `Content-MD5: ${crypto.randomBytes(16).toString('base64')}`).join('\n'), cert]) {
+      const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+      assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)} ${result.reasons}`);
+    }
+  }
+});

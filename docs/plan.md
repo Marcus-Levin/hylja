@@ -133,7 +133,7 @@ A bounded, **NON-ENFORCING** #19 egress sentinel core exists in [`src/egress-sen
 The following all `BLOCK`:
 - invalid UTF-8;
 - uninspectable (#6 PARTIAL) content;
-- embedded opaque binary. Encoded runs that are not text are decoded, and their concatenation and up to 256 runs are decompressed (gzip/zlib signatures near the start, brotli, raw deflate), within a 4 MiB per-message output budget. Decompressed text is matched like any other view, so compressed originals are found with a precise reason. Container formats (zip, bzip2, xz, 7z, zstd) block outright. More than 32 bytes of remaining binary that looks encoded blocks, however it is chunked or interleaved, unless it is a recognized digest (hex MD5/SHA, SRI), UUID or SSH public key. Random tokens and session ids therefore block, since in protected egress they are credentials themselves;
+- embedded opaque binary. Encoded runs that are not text are decoded, and their concatenation and up to 256 runs are decompressed (gzip/zlib signatures near the start, brotli, raw deflate), within a 4 MiB per-message output budget. Decompressed text is matched like any other view, so compressed originals are found with a precise reason. Container formats (zip, bzip2, xz, 7z, zstd) block outright. Encoded data split into short chunks (4–15 characters separated by whitespace, commas, quotes or brackets) is joined back into one run first. More than 32 bytes of remaining binary that looks encoded blocks, however it is chunked or interleaved, unless it is an exact-length digest (hex or Base64 MD5/SHA, SRI, go.sum `h1:`, Content-MD5, ETag), a UUID, an SSH public key blob, a public certificate or public-key PEM block, or an identifier or path made of words and numeric ids. Random tokens and session ids therefore block, since in protected egress they are credentials themselves. The guarantee covers known originals in plain, escaped, standard-encoded and standard-compressed forms; opaque-binary counting is a documented heuristic, not a completeness claim;
 - oversize messages;
 - an exhausted view or verification budget;
 - errors and outage.
@@ -146,6 +146,7 @@ Known limits:
 - only the listed escape families and a few named HTML entities are decoded;
 - a bare short base64 DER body without a header or known value passes the pattern set;
 - binary disguised as recognized digests (hex chunks of digest length, or UUID-shaped) is not counted; base32 is not decoded; quoted-printable is decoded only in runs of two or more escapes;
+- chunks shorter than 4 characters are not joined; chunk sequences where fewer than three quarters of the chunks contain a digit, long hex or padding are decoded and decompressed but not counted as opaque, so digit-free chunking of uncompressed random data passes;
 - unquoted dotted credential values (`password=Synthetic.Passw0rd`) read as member expressions and are not flagged by the assignment pattern;
 - short values match on whole-token windows, so prose like `or la` can match a short entry `Orla` and block.
 - large source files can exhaust #6's decode budget and block. **Not yet integrated**: no adapter calls it at a real send point, #13 transformation and #11 judgments do not exist, and the #37-to-egress text slice has not run end to end. Seeded-leak tests are synthetic unit evidence, not a release claim.
