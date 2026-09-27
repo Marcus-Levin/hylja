@@ -176,5 +176,64 @@ test('synthetic golden set: false-positive and false-negative counts by subtype 
   for (const [subtype, { tp, fp, fn }] of Object.entries(stats)) {
     t.diagnostic(`${subtype}: recall ${tp}/${tp + fn}, false positives ${fp}`);
     assert.equal(fn, 0, `${subtype} false negatives`);
+    assert.equal(fp, 0, `${subtype} false positives`);
   }
+});
+
+test('review: hosts in nested URLs, URL paths and user@host get their own candidates', () => {
+  for (const [text, host] of [['https://proxy.invalid/f?url=https://build.tenant-a.invalid/x', 'build.tenant-a.invalid'],
+    ['https://a.invalid/?next=//b.tenant-a.invalid/x', 'b.tenant-a.invalid'], ['https://a.invalid/path/c.tenant-a.invalid/x', 'c.tenant-a.invalid'],
+    ['ssh admin@bastion.tenant-a.invalid', 'bastion.tenant-a.invalid'], ['git@git.example.com:org/repo.git', 'git.example.com'],
+    ['host ärende.tenant.invalid ok', 'ärende.tenant.invalid']]) has(text, 'HOST_OR_SERVICE', '', host);
+});
+
+test('review: IPv4/IPv6 edge forms and scopes', () => {
+  for (const [text, value] of [['at fd00::1.', 'fd00::1'], ['addr 2001:db8::1.', '2001:db8::1'], ['range 10.0.0.1-10.0.0.5', '10.0.0.1'],
+    ['range 10.0.0.1-10.0.0.5', '10.0.0.5'], ['ip-10.0.0.1', '10.0.0.1'], ['10.0.0.1_eth0', '10.0.0.1'], ['10.001.002.003', '10.001.002.003'],
+    ['fd12:3456:789a::10.0.0.1', 'fd12:3456:789a::10.0.0.1'], ['[2001:db8::1]:443', '2001:db8::1'], ['::ffff:192.0.2.1', '::ffff:192.0.2.1']]) {
+    assert.ok(found(text).some(([t, s, v]) => t === 'NETWORK_IDENTIFIER' && (s === 'IP' || s === 'SUBNET') && v === value), `${text} -> ${value}`);
+  }
+  has('fd00::1/64.', 'NETWORK_IDENTIFIER', 'SUBNET', 'fd00::1/64');
+  has('192.0.2.10:8443', 'NETWORK_IDENTIFIER', 'PORT', '8443');
+  has('[2001:db8::1]:443', 'NETWORK_IDENTIFIER', 'PORT', '443');
+  const scope = (text) => run(text).candidates.find((c) => c.semanticType === 'NETWORK_IDENTIFIER').fidelity.scope;
+  assert.equal(scope('192.0.2.0/8'), 'PUBLIC');
+  assert.equal(scope('2001:db8::/16'), 'PUBLIC');
+  assert.equal(scope('3fff::1'), 'DOCUMENTATION');
+  assert.equal(scope('198.18.0.1'), 'RESERVED');
+  assert.equal(scope('::ffff:192.0.2.1'), 'DOCUMENTATION');
+  for (const text of ['dead::beef', 'add::', 'a::b']) assert.deepEqual(found(text).filter(([t]) => t === 'NETWORK_IDENTIFIER'), [], text);
+});
+
+test('review: file URLs, forward-slash and long Windows paths, colon lists and quoted paths with spaces', () => {
+  for (const [text, value] of [['file:///home/synthetic/secret.txt', '/home/synthetic/secret.txt'], ['file:///C:/Users/synthetic/x.txt', '/C:/Users/synthetic/x.txt'],
+    ['C:/Users/synthetic/file.txt', 'C:/Users/synthetic/file.txt'], ['PATH=/usr/bin:/home/synthetic/bin', '/home/synthetic/bin'],
+    ['-v /srv/data:/var/lib/data', '/var/lib/data'], ['open "/Users/John Smith/Documents/x.pdf" now', '/Users/John Smith/Documents/x.pdf'],
+    ['"C:\\Users\\John Smith\\x.txt"', 'C:\\Users\\John Smith\\x.txt']]) {
+    assert.ok(found(text).some(([t, , v]) => t === 'FILE_OR_RESOURCE_PATH' && v === value), `${text} -> ${value}`);
+  }
+});
+
+test('review: code, prose and local paths are not hosts or cloud projects; custom schemes are OTHER', () => {
+  for (const text of ['obj.method.call()', 'np.array', 'e.target.value', 'process.env.HOST', 'java.util.List', 'com.example.app.Main',
+    'e.g. this', 'i.e. that', 'U.S.A', 'Mr.Smith', 'v1.2.3-beta.rc1']) {
+    assert.deepEqual(found(text).filter(([t]) => t === 'HOST_OR_SERVICE'), [], text);
+  }
+  assert.deepEqual(found('~/projects/synthetic/notes.md').filter(([t]) => t === 'CLOUD_RESOURCE'), []);
+  has('projects/synthetic-project/zones/x', 'CLOUD_RESOURCE', 'PROJECT_ID', 'synthetic-project');
+  has('project_id: synthetic-proj-1', 'CLOUD_RESOURCE', 'PROJECT_ID', 'synthetic-proj-1');
+  has('storage.googleapis.com/synthetic-bucket/o', 'CLOUD_RESOURCE', 'BUCKET', 'synthetic-bucket');
+  has('s3a://synthetic-bucket/key', 'CLOUD_RESOURCE', 'BUCKET', 'synthetic-bucket');
+  has('arn:aws-iso-b:iam::123456789012:role/x', 'CLOUD_RESOURCE', 'ACCOUNT_ID', '123456789012');
+  assert.equal(run('tenantacmeerp://open/x').candidates.find((c) => c.subtype === 'URL').fidelity.scheme, 'OTHER');
+  has('(see https://a.invalid/x).', 'NETWORK_IDENTIFIER', 'URL', 'https://a.invalid/x');
+});
+
+test('review: keyed-name rule skips schemes, emails, versions and prose; finds server_name and Data Source', () => {
+  for (const text of ['endpoint=https://x.invalid', 'email_address=a@b.invalid', 'address=Main Street', 'node=v18.1.0']) {
+    assert.deepEqual(found(text).filter(([, , v]) => ['https', 'a', 'Main', 'v18.1.0'].includes(v)), [], text);
+  }
+  has('Server=tcp:sql01,1433', 'HOST_OR_SERVICE', '', 'sql01');
+  has('server_name = web01', 'HOST_OR_SERVICE', '', 'web01');
+  has('Data Source=sql01;', 'HOST_OR_SERVICE', '', 'sql01');
 });
