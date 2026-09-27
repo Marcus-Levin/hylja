@@ -16,6 +16,8 @@ const MAX_ENTRIES = 4096, MIN_ORIGINAL = 4, MAX_ORIGINAL = 1024, GRAM = 8, MAX_T
 const MAX_ROUNDS = 4, MAX_VIEW_UNITS = 8 << 20, MAX_VIEWS = 512;
 /** HMAC verifications per message; prefilters make real matches rare, so exceeding this is itself suspicious. */
 const MAX_VERIFICATIONS = 20_000;
+/** Prefilter probes per message (length buckets and short windows); exceeding it blocks as SENTINEL_BUDGET. */
+const MAX_PROBES = 8_000_000;
 /** Base64/hex runs at least this long must decode to text; otherwise they are opaque embedded binary. */
 const OPAQUE_RUN = 128;
 
@@ -64,7 +66,7 @@ export interface EgressCheck {
 const CONFUSABLES: Readonly<Record<string, string>> = Object.freeze({
   'а': 'a', 'в': 'b', 'е': 'e', 'ё': 'e', 'і': 'i', 'ј': 'j', 'к': 'k', 'м': 'm', 'н': 'h', 'о': 'o', 'р': 'p', 'с': 'c', 'т': 't',
   'у': 'y', 'х': 'x', 'ѕ': 's', 'ԁ': 'd', 'ɡ': 'g', 'α': 'a', 'β': 'b', 'ε': 'e', 'η': 'n', 'ι': 'i', 'κ': 'k', 'ν': 'v',
-  'ο': 'o', 'ρ': 'p', 'τ': 't', 'υ': 'u', 'χ': 'x', 'ω': 'w',
+  'ο': 'o', 'ρ': 'p', 'τ': 't', 'υ': 'u', 'χ': 'x', 'ω': 'w', 'օ': 'o', 'ս': 'u', 'ց': 'g', 'հ': 'h', 'ո': 'n',
 });
 /**
  * Matching fold for both registered values and payloads: NFKD, marks stripped (`Órla`, `Zoë` -> `orla`,
@@ -78,24 +80,16 @@ function fold(text: string): string {
   return out;
 }
 const TOKEN = /[\p{L}\p{N}]+/gu;
-/** Tokens with numeric leading zeros removed (`192.000.002.010` == `192.0.2.10`), and runs of single-character
- * tokens also joined (`o r l a` -> `orla`), so separators cannot split a short value. */
 function tokens(folded: string): string[] {
-  const raw = (folded.match(TOKEN) ?? []).map((token) => /^\d+$/u.test(token) ? token.replace(/^0+(?=\d)/u, '') : token);
-  const out: string[] = [];
-  for (let index = 0; index < raw.length;) {
-    if (raw[index]!.length === 1) {
-      let end = index;
-      while (end < raw.length && raw[end]!.length === 1) end++;
-      if (end - index > 1) { out.push(raw.slice(index, end).join('')); index = end; continue; }
-    }
-    out.push(raw[index]!);
-    index++;
-  }
-  return out;
+  return folded.match(TOKEN) ?? [];
+}
+/** Separator-free form with leading zeros removed from every digit run (`gateway07` == `gateway7`, `010` == `10`). */
+function stripZeros(text: string): string {
+  return text.replace(/(?<!\d)0+(?=\d)/gu, '');
 }
 function compact(folded: string): string {
-  return tokens(folded).join('');
+  // Strip per token, before joining, so `192.000.002.010` compacts like `192.0.2.10`.
+  return tokens(folded).map(stripZeros).join('');
 }
 
 /* ---------- Known originals (keyed fingerprints only) ---------- */
@@ -109,8 +103,12 @@ interface Known {
   base: number;
   /** Prefix gram hash -> length -> suffix gram hash -> entries: three independent keyed checks before any HMAC. */
   grams: Map<number, Map<number, Map<number, LongEntry[]>>>;
-  /** Short values: first-token hash -> token count -> last-token hash -> entries. */
-  firstTokens: Map<number, Map<number, Map<number, { mac: string; entry: number }[]>>>;
+  /**
+   * Short values (under GRAM compact characters): keyed hash of the compact form -> entries. They match a window
+   * of whole consecutive tokens whose compact form is equal, so `Or la`, `o r l a` and `10.0.0.1 x` are found
+   * but `orla` inside `colorlab` is not.
+   */
+  shorts: Map<number, { mac: string; entry: number }[]>;
   entries: { kind: KnownEntry['kind']; ref: string }[];
 }
 const registry = new WeakMap<object, Known>();
@@ -151,7 +149,7 @@ export function createKnownOriginals(scope: SentinelScope, key: Uint8Array, entr
     const random = new Uint32Array(1);
     globalThis.crypto.getRandomValues(random);
     const known: Known = { scope: Object.freeze({ tenantRef: scope.tenantRef, projectRef: scope.projectRef }),
-      key: Uint8Array.from(key), base: (random[0]! | 1) >>> 0, grams: new Map(), firstTokens: new Map(), entries: [] };
+      key: Uint8Array.from(key), base: (random[0]! | 1) >>> 0, grams: new Map(), shorts: new Map(), entries: [] };
     for (const entry of entries as unknown[]) {
       const { kind, value, ref } = (entry ?? {}) as Record<string, unknown>;
       if ((kind !== 'ORIGINAL' && kind !== 'CANARY') || typeof value !== 'string' || !label(ref, 128)) invalid();
@@ -167,13 +165,9 @@ export function createKnownOriginals(scope: SentinelScope, key: Uint8Array, entr
         const suffix = gramHash(packed, packed.length - GRAM, known.base);
         nested(bySuffix, suffix, () => [] as LongEntry[]).push({ length: packed.length, suffix, mac: mac(known, packed), entry: index });
       } else {
-        // Short values match whole token sequences only, so `orla` does not fire inside `colorlab`.
-        const list = tokens(folded);
-        if (!list.length || list.length > MAX_TOKENS) invalid();
-        const byCount = nested(known.firstTokens, tokenHash(list[0]!, known.base), () => new Map<number, Map<number, { mac: string; entry: number }[]>>());
-        const byLast = nested(byCount, list.length, () => new Map<number, { mac: string; entry: number }[]>());
-        nested(byLast, tokenHash(list[list.length - 1]!, known.base), () => [] as { mac: string; entry: number }[])
-          .push({ mac: mac(known, list.join('\u0001')), entry: index });
+        if (tokens(folded).length > MAX_TOKENS) invalid();
+        nested(known.shorts, tokenHash(packed, known.base), () => [] as { mac: string; entry: number }[])
+          .push({ mac: mac(known, packed), entry: index });
       }
     }
     const handle = Object.freeze(Object.create(null)) as KnownOriginalsHandle;
@@ -182,12 +176,13 @@ export function createKnownOriginals(scope: SentinelScope, key: Uint8Array, entr
   } catch { return invalid(); }
 }
 class BudgetExceeded extends Error {}
-function matchKnown(known: Known, text: string, budget: { verifications: number }): Set<number> {
+function matchKnown(known: Known, text: string, budget: { verifications: number; probes: number }): Set<number> {
   const hits = new Set<number>();
   const verify = (candidate: string, expected: string): boolean => {
     if (++budget.verifications > MAX_VERIFICATIONS) throw new BudgetExceeded();
     return mac(known, candidate) === expected;
   };
+  const probe = (): void => { if (++budget.probes > MAX_PROBES) throw new BudgetExceeded(); };
   const folded = fold(text);
   if (known.grams.size) {
     const packed = compact(folded);
@@ -208,6 +203,7 @@ function matchKnown(known: Known, text: string, budget: { verifications: number 
         const byLength = known.grams.get(windows[start]!);
         if (!byLength) continue;
         for (const [length, bySuffix] of byLength) {
+          probe();
           const end = start + length - GRAM;
           if (end >= windows.length) continue;
           const candidates = bySuffix.get(windows[end]!);
@@ -219,18 +215,21 @@ function matchKnown(known: Known, text: string, budget: { verifications: number 
       }
     }
   }
-  if (known.firstTokens.size) {
+  if (known.shorts.size) {
     const list = tokens(folded);
-    const hashes = list.map((token) => tokenHash(token, known.base));
     for (let index = 0; index < list.length; index++) {
-      const byCount = known.firstTokens.get(hashes[index]!);
-      if (!byCount) continue;
-      for (const [count, byLast] of byCount) {
-        if (index + count > list.length) continue;
-        const candidates = byLast.get(hashes[index + count - 1]!);
+      let joined = '';
+      // Windows of whole tokens up to 24 raw characters (room for leading zeros) and MAX_TOKENS tokens.
+      for (let next = index; next < list.length && next - index < MAX_TOKENS; next++) {
+        joined += stripZeros(list[next]!);
+        if (joined.length > 24) break;
+        const packed = joined;
+        if (packed.length >= GRAM) break;
+        probe();
+        const candidates = known.shorts.get(tokenHash(packed, known.base));
         if (!candidates) continue;
         for (const candidate of candidates) {
-          if (!hits.has(candidate.entry) && verify(list.slice(index, index + count).join('\u0001'), candidate.mac)) hits.add(candidate.entry);
+          if (!hits.has(candidate.entry) && verify(packed, candidate.mac)) hits.add(candidate.entry);
         }
       }
     }
@@ -252,10 +251,23 @@ const PATTERNS: readonly { rule: string; pattern: RegExp }[] = [
   { rule: 'pattern.jwt', pattern: /eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\./u },
   { rule: 'pattern.authorization-credential', pattern: /authorization["']?\s*[:=]\s*["']?(?:bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/iu },
   { rule: 'pattern.url-password', pattern: /[a-z][a-z0-9+.-]{1,31}:\/\/[^\s:/@"']{1,256}:[^\s/@"']{3,256}@/iu },
-  // A literal value after a credential-like key; references (`${X}`, `{{x}}`, `<...>`, masks, placeholders) are not values.
-  { rule: 'pattern.credential-assignment', pattern: /(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["']?(?![$<*{[]|null\b|none\b)[^\s"',;]{4,}/iu },
 ];
-const TEXT_ENCODED_RUN = /[A-Za-z0-9+/_-]{128,}={0,2}|(?:[0-9A-Fa-f]{2}){64,}/gu;
+// A literal value after a credential-like key. References (`${X}`, `{{x}}`, `<...>`, masks), type names,
+// booleans and identifier/member expressions (`process.env.SECRET`, `config.password`) are not values.
+const CREDENTIAL_ASSIGNMENT = /(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["']?([^\s"',;)}\]]{4,})/giu;
+const NOT_A_VALUE = /^(?:[$<*{[]|(?:string|number|boolean|bigint|object|any|unknown|undefined|null|none|true|false|nil|str|int|bool|bytes)$|[A-Za-z_$][\w$]*(?:(?:\.|\?\.)[A-Za-z_$][\w$]*|\[[^\]]*\])+$)/iu;
+function credentialAssignment(text: string): boolean {
+  for (const match of text.matchAll(CREDENTIAL_ASSIGNMENT)) if (!NOT_A_VALUE.test(match[1]!)) return true;
+  return false;
+}
+// Long runs that look like encoded data: mixed case plus digits (Base64 of binary), or hex longer than a
+// SHA-512 digest. Lower-case URL paths, snake_case ids and digests are ordinary text.
+const TEXT_ENCODED_RUN = /[A-Za-z0-9+/_-]{128,}={0,2}|(?:[0-9A-Fa-f]{2}){65,}/gu;
+function looksEncoded(run: string): boolean {
+  // Hex up to a SHA-512 digest (128 digits) is a hash, not a payload.
+  if (/^[0-9A-Fa-f]+$/u.test(run)) return run.length > 128;
+  return /[A-Z]/u.test(run) && /[a-z]/u.test(run) && /\d/u.test(run);
+}
 const SHORT_ENCODED_RUN = /(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{16,127}={0,2}|(?:[0-9A-Fa-f]{2}){8,63})(?![A-Za-z0-9+/=_-])/gu;
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 /**
@@ -294,13 +306,15 @@ function unescapeOnce(text: string): string | null {
       if (point >= 0) return point <= 0x10ffff ? String.fromCodePoint(point) : all;
       return NAMED_ENTITIES[(name as string).toLowerCase()] ?? all;
     })
-    .replace(/\\u\{([0-9A-Fa-f]{1,6})\}|\\u([0-9A-Fa-f]{4})|\\x([0-9A-Fa-f]{2})|\\([0-7]{1,3})|\\([\\/"'bfnrt])/gu,
-      (all, cp, u4, x2, octal, simple) => {
-        if (cp) { const point = parseInt(cp, 16); return point <= 0x10ffff ? String.fromCodePoint(point) : all; }
+    .replace(/\\U([0-9A-Fa-f]{8})|\\u\{([0-9A-Fa-f]{1,6})\}|\\u([0-9A-Fa-f]{4})|\\x([0-9A-Fa-f]{2})|\\([0-9A-Fa-f]{1,6}) |\\((?=[0-9A-Fa-f]{0,5}[A-Fa-f])[0-9A-Fa-f]{1,6})|\\([0-7]{1,3})|\\([\\/"'bfnrt])/gu,
+      // CSS escapes (hex with a letter, or followed by a space) take precedence over octal.
+      (all, u8, cp, u4, x2, cssSpaced, cssHex, octal, simple) => {
+        const wide = u8 ?? cp ?? cssSpaced ?? cssHex;
+        if (wide) { const point = parseInt(wide, 16); return point <= 0x10ffff ? String.fromCodePoint(point) : all; }
         if (u4) return String.fromCharCode(parseInt(u4, 16));
         if (x2) return String.fromCharCode(parseInt(x2, 16));
         if (octal) { const value = parseInt(octal, 8); return value <= 255 ? String.fromCharCode(value) : all; }
-        return ({ b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' } as Record<string, string>)[simple] ?? simple;
+        return ({ b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' } as Record<string, string>)[simple!] ?? simple!;
       })
     .replace(/%u([0-9A-Fa-f]{4})/gu, (_all, u4) => String.fromCharCode(parseInt(u4, 16)))
     .replace(/=\r?\n/gu, '')
@@ -325,11 +339,11 @@ function canonicalViews(root: string): { views: View[] } | { reason: string } {
       const normalized = normalizeInput(view.text);
       // Content the sentinel cannot fully inspect, or embedded binary it cannot read, is never presumed clean.
       if (normalized.status !== 'COMPLETE') return { reason: 'UNINSPECTED_CONTENT' };
-      if (normalized.views.some((child) => child.form === 'STRINGS')) return { reason: 'OPAQUE_EMBEDDED' };
-      const textSpans = normalized.views.filter((child) => child.parent === 0).flatMap((child) => child.occurrences);
+      // Long encoded-looking runs must decode to text; short binary decodes become matching views instead.
+      const textSpans = normalized.views.filter((child) => child.parent === 0 && child.form === 'TEXT').flatMap((child) => child.occurrences);
       for (const run of view.text.matchAll(TEXT_ENCODED_RUN)) {
         const end = run.index + run[0].length;
-        if (!textSpans.some((span) => span.start <= run.index && end <= span.end)) return { reason: 'OPAQUE_EMBEDDED' };
+        if (looksEncoded(run[0]) && !textSpans.some((span) => span.start <= run.index && end <= span.end)) return { reason: 'OPAQUE_EMBEDDED' };
       }
       for (const child of normalized.views.slice(1)) next.push({ name: `${view.name}>${child.encoding}`, text: child.text });
       // Short encoded runs that are not text still get a printable-bytes view for known-value matching.
@@ -380,8 +394,9 @@ export function checkEgress(check: EgressCheck): SentinelResult {
   try {
     const { bytes: input, scope, destination, authorized, known: handle } = check;
     if (!(input instanceof Uint8Array) || !scope || typeof scope !== 'object') return blocked(['INVALID_CHECK']);
-    // Copy first: every later step and the released bytes use this private snapshot.
-    const bytes = Uint8Array.from(input);
+    // Copy the underlying bytes (not via an overridable iterator): every later step and `release` use this
+    // snapshot. Callers must send `release`, never their own buffer.
+    const bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice();
     if (bytes.byteLength > MAX_MESSAGE_BYTES) return blocked(['MESSAGE_TOO_LARGE']);
     const observed = snapshot(destination), allowed = snapshot(authorized);
     if (!observed || !allowed || observed.id !== allowed.id || observed.profileDigest !== allowed.profileDigest) {
@@ -401,7 +416,7 @@ export function checkEgress(check: EgressCheck): SentinelResult {
     if ('reason' in canonical) return blocked([canonical.reason]);
     const findings: SentinelFinding[] = [];
     const seen = new Set<string>();
-    const budget = { verifications: 0 };
+    const budget = { verifications: 0, probes: 0 };
     for (const view of canonical.views) {
       if (known) {
         for (const index of matchKnown(known, view.text, budget)) {
@@ -415,6 +430,11 @@ export function checkEgress(check: EgressCheck): SentinelResult {
       for (const { rule, pattern } of PATTERNS) {
         const key = `${rule}|${view.name}`;
         if (!seen.has(key) && (pattern.test(view.text) || pattern.test(compatible))) { seen.add(key); findings.push({ kind: 'PATTERN', rule, view: view.name }); }
+      }
+      const assignmentKey = `pattern.credential-assignment|${view.name}`;
+      if (!seen.has(assignmentKey) && (credentialAssignment(view.text) || credentialAssignment(compatible))) {
+        seen.add(assignmentKey);
+        findings.push({ kind: 'PATTERN', rule: 'pattern.credential-assignment', view: view.name });
       }
     }
     if (findings.length) {
@@ -445,7 +465,7 @@ export function createStreamGate(check: Omit<EgressCheck, 'bytes'>, maxBytes = M
       try {
         if (ended || failed || !(chunk instanceof Uint8Array)) { failed = true; return { accepted: false }; }
         // Copy first and size from the copy, so a lying `length` cannot misstate the buffer.
-        const copy = Uint8Array.from(chunk);
+        const copy = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength).slice();
         size += copy.byteLength;
         if (size > maxBytes) { failed = true; chunks.length = 0; return { accepted: false }; }
         chunks.push(copy);

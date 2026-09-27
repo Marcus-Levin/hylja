@@ -125,22 +125,27 @@ Primary issues: #6-#13, #19, and #37 (PERSON/EMAIL/PHONE candidate source).
 A bounded, **NON-ENFORCING** #37 candidate source exists in [`src/contact-candidates.ts`](../src/contact-candidates.ts). It emits v1 detector evidence and spans, without values, for synthetic EMAIL/PHONE patterns and tenant/project-scoped configured NAME dictionaries, and it rejects dotted IPv4/versions, ISO dates and timestamps, UUIDs, MACs and bare numeric IDs without a phone keyword. It deliberately biases toward recall: numeric ranges, ISBN-like and grouped digit runs are pinned, known over-cloaks, and a phone keyword before a dotted IP also over-cloaks. Dotted phone numbers without a keyword, email local parts over 64 characters, and domains with more than 16 labels are missed, and local parts containing rarer atext (`/ = ? & ~`) are truncated to the part after it. More than 256 candidates in one field fails closed (`FAILURE`) to match the v1 composer limit; hostile or very long logs can trigger it. It operates on text the caller has already normalized, because #6/#7 normalization and parsers are pending; Unicode dashes, full-width digits, special case folds (`İ`, `ß`) and zero-width characters remain gaps until then. Results distinguish `COMPLETE` from `PARTIAL` (a requested name dictionary was invalid or out of scope) and `FAILURE`. It emits no sensitivity, so v1 composition stays unresolved until trusted configuration supplies one. Its synthetic golden check is a development measurement, **not** held-out recall or leak evidence; #37 stays open for #6/#7 integration, held-out evaluation and #19 egress checks.
 
 A bounded, **NON-ENFORCING** #19 egress sentinel core exists in [`src/egress-sentinel.ts`](../src/egress-sentinel.ts). It checks exact outbound bytes independently of the #8 detector stack:
-- known planted originals and canaries, held only as keyed fingerprints. Long values are matched after separators are stripped and short values as whole tokens (including joined single-character runs). Both sides are folded for compatibility, case, marks, invisible characters, common homoglyphs and numeric leading zeros. A three-part keyed prefilter plus a capped number of HMAC verifications keeps work bounded;
-- its own high-risk pattern set, tested on raw and compatibility-normalized case-preserving text;
-- canonical views from #6 decoded views plus its own escape decoding (JSON/JS/octal/`%u`/HTML entities/quoted-printable), iterated to a bounded fixpoint, and printable-byte views of short encoded binary runs;
+- known planted originals and canaries, held only as keyed fingerprints. Long values are matched after separators are stripped, and short values against windows of whole consecutive tokens (so `Or la`, `o r l a` and `10.0.0.1 x` match, but not text inside a longer word). Both sides are folded for compatibility, case, marks, invisible characters, common Cyrillic/Greek/Armenian homoglyphs and leading zeros in every digit run. Keyed prefilters plus capped HMAC verifications and prefilter probes keep work bounded;
+- its own high-risk pattern set, tested on raw and compatibility-normalized case-preserving text; credential assignments ignore type names, booleans and identifier/member expressions;
+- canonical views: #6 decoded views (including printable strings of binary decodes), its own escape decoding (JSON/JS/Python `\U`/octal/CSS/`%u`/HTML entities/quoted-printable) iterated to a bounded fixpoint, and printable-byte views of short encoded binary runs;
 - a destination/profile assertion read once, and tenant-scoped handles that must be passed explicitly (`null` for unprotected egress).
 
 The following all `BLOCK`:
 - invalid UTF-8;
 - uninspectable (#6 PARTIAL) content;
-- embedded opaque binary (long encoded runs that do not decode to text, or STRINGS views);
+- embedded opaque binary (runs of 128+ characters mixing case and digits, or hex longer than a SHA-512 digest, that do not decode to text);
 - oversize messages;
 - an exhausted view or verification budget;
 - errors and outage.
 
 Payloads dense with long alphanumeric identifiers can exhaust #6's decode-work budget and therefore block. A streaming gate holds the complete message and releases nothing before the check. ALLOW returns a private copy of the checked bytes. Results and regression records carry codes and refs, never bytes or values.
 
-Known limits: a short value glued into a longer word (`OrlaSmith`) is not matched; confusable coverage is a small table, not full UTS #39; only the listed escape families are decoded. **Not yet integrated**: no adapter calls it at a real send point, #13 transformation and #11 judgments do not exist, and the #37-to-egress text slice has not run end to end. Seeded-leak tests are synthetic unit evidence, not a release claim.
+Known limits:
+- a short value glued into a longer word (`OrlaSmith`) is not matched;
+- confusable coverage is a small table, not full UTS #39;
+- only the listed escape families and a few named HTML entities are decoded;
+- a bare short base64 DER body without a header or known value passes the pattern set;
+- large source files can exhaust #6's decode budget and block. **Not yet integrated**: no adapter calls it at a real send point, #13 transformation and #11 judgments do not exist, and the #37-to-egress text slice has not run end to end. Seeded-leak tests are synthetic unit evidence, not a release claim.
 
 ### 2. Reversible identity and vault
 

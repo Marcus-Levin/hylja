@@ -207,3 +207,42 @@ test('review: missing known-originals handle, lying destinations and hostile str
   throwing.push(enc('x'));
   assert.equal(throwing.end().result.decision, 'BLOCK');
 });
+
+test('second review: ordinary prose, code, ids and digests are allowed', () => {
+  const uuid = '123e4567-e89b-12d3-a456-426614174000';
+  for (const payload of ['Consider all combinations of inputs.', `ids ${Array.from({ length: 600 }, () => uuid).join(',')}`,
+    `sha512 ${'ab'.repeat(64)}`, `https://docs.example.invalid/${'section-name_part/'.repeat(10)}`, `id ${'snake_case_identifier_'.repeat(8)}`,
+    'call alphaBetaGammaDeltaHandler now', 'interface Login { password: string; secret: boolean }', '{"secret": false}',
+    'const secret = process.env.SECRET_VALUE', 'password = config.db.password']) {
+    const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+    assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 50)} ${result.reasons}`);
+  }
+});
+
+test('second review: zero padding inside tokens, split short values and escape families are blocked', () => {
+  for (const payload of ['reach plc-gateway07.tenant-a.invalid', 'plcgateway07tenantainvalid', 'ask Or la today']) {
+    assert.equal(check(payload).decision, 'BLOCK', payload);
+  }
+  const shorts = createKnownOriginals(scopeA, key, [{ kind: 'ORIGINAL', value: 'Orla K', ref: 's.1' }, { kind: 'ORIGINAL', value: 'A Tan', ref: 's.2' },
+    { kind: 'ORIGINAL', value: '10.0.0.1', ref: 's.3' }]);
+  for (const payload of ['contact Orla K J today', 'Orla K. a lot', 'met B A Tan', 'ping 10.0.0.1 x', '\\4F rla K', 'x \\U0000004Frla K', 'օrla K']) {
+    assert.equal(checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: shorts }).decision, 'BLOCK', payload);
+  }
+});
+
+test('second review: many distinct lengths in one prefix bucket hit the probe budget, not unbounded work', () => {
+  const entries = Array.from({ length: 1000 }, (_, i) => ({ kind: 'ORIGINAL', value: `plcgatew${'q'.repeat(i + 1)}z`, ref: `l.${i}` }));
+  const lengths = createKnownOriginals(scopeA, key, entries);
+  const started = process.hrtime.bigint();
+  const result = checkEgress({ bytes: enc('plcgatew '.repeat(116_000).slice(0, MAX_MESSAGE_BYTES)), scope: scopeA, destination, authorized: destination, known: lengths });
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
+  assert.ok(['ALLOW', 'BLOCK'].includes(result.decision));
+});
+
+test('second review: the checked copy ignores an overridden iterator', () => {
+  const aws = ['AK', 'IA', 'SYNTHETIC0000000'].join('');
+  class Sneaky extends Uint8Array { *[Symbol.iterator]() { yield 104; yield 105; } }
+  const sneaky = new Sneaky(enc(`key ${aws}`));
+  const result = checkEgress({ bytes: sneaky, scope: scopeA, destination, authorized: destination, known: null });
+  assert.equal(result.decision, 'BLOCK');
+});
