@@ -37,6 +37,8 @@ const HARD_LIMITS: Readonly<NormalizationBudget> = Object.freeze({
 const MAX_RUN = 1 << 16;
 /** Disjoint parent spans recorded on one view for identical decoded text before a new view is created. */
 const MAX_OCCURRENCES = 1024;
+/** Work units charged per attempted decode on top of its length (decoding and text checks have fixed costs). */
+const DECODE_OVERHEAD = 64;
 /** Uninspected spans kept before collapsing into one truncation reason. */
 const MAX_UNINSPECTED = 1024;
 /** Printable runs shorter than this inside binary decodes are noise, not text. */
@@ -114,26 +116,26 @@ const BASE64_VALUES = new Int16Array(128).fill(-1);
   BASE64_VALUES[char.charCodeAt(0)] = index;
 });
 
-/**
- * Classify decoded bytes: strict UTF-8 text; else UTF-16LE text when every other byte is mostly zero;
- * else the printable runs (>= MIN_STRING) as STRINGS; else null (no printable content).
- */
-function readable(bytes: Uint8Array): { text: string; form: NormalizedView['form'] } | null {
+/** Strict text: UTF-8, or UTF-16LE when every other byte is mostly zero, with no controls. */
+function textOf(bytes: Uint8Array): string | null {
   if (!bytes.length) return null;
   try {
     const text = utf8.decode(bytes);
-    if (!CONTROL.test(text)) return { text, form: 'TEXT' };
+    if (!CONTROL.test(text)) return text;
   } catch { /* not strict UTF-8 */ }
   if (bytes.length >= 2 * MIN_STRING && bytes.length % 2 === 0) {
     let zeros = 0;
     for (let index = 1; index < bytes.length; index += 2) if (bytes[index] === 0) zeros++;
     if (zeros >= bytes.length / 2 * 0.8) {
       const text = utf16.decode(bytes);
-      if (!CONTROL.test(text) && !text.includes('�')) return { text, form: 'TEXT' };
+      if (!CONTROL.test(text) && !text.includes('\ufffd')) return text;
     }
   }
+  return null;
+}
+/** Printable runs (>= MIN_STRING) from lenient UTF-8, plus ASCII runs from UTF-16LE/BE at both parities. */
+function stringsOf(bytes: Uint8Array): string[] {
   const strings = lenient.decode(bytes).split(NOT_PRINTABLE).filter((piece) => piece.length >= MIN_STRING);
-  // Like `strings -el`/`-eb`: ASCII runs from UTF-16 at both byte parities (odd lengths, controls, BE).
   if (bytes.length >= 2 * MIN_STRING) {
     for (const decoder of [utf16, utf16be]) {
       for (const offset of [0, 1]) {
@@ -142,8 +144,7 @@ function readable(bytes: Uint8Array): { text: string; form: NormalizedView['form
       }
     }
   }
-  const unique = [...new Set(strings)];
-  return unique.length ? { text: unique.join('\n'), form: 'STRINGS' } : null;
+  return strings;
 }
 function decodeBase64(run: string, url: boolean, skip = 0): Uint8Array | null {
   const body = run.replace(/[\r\n \t]/gu, '').replace(/=+$/u, '').slice(skip);
@@ -188,27 +189,39 @@ function decodePercent(run: string): Uint8Array {
 /* ---------- Candidate runs ---------- */
 
 // A Base64 run may end at its padding even when another run follows (concatenated segments).
-const BASE64_RUN = /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{12,}(?:={1,2}|(?![A-Za-z0-9+/=]))/gu;
+// Quantifiers are bounded (MAX_RUN + 1) so regex backtracking cannot exhaust the stack; longer runs are
+// found by a linear scan and recorded as RUN_TOO_LONG.
+const BASE64_RUN = /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{12,65537}(?:={1,2}|(?![A-Za-z0-9+/=]))/gu;
 // Line-wrapped (MIME/PEM-style) Base64: two or more full lines joined into one logical run.
-const BASE64_WRAPPED = /(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{16,}\r?\n[ \t]*){1,4096}[A-Za-z0-9+/]{4,}={0,2}(?![A-Za-z0-9+/=])/gu;
-const BASE64URL_RUN = /(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[_-])[A-Za-z0-9_-]{12,}={0,2}(?![A-Za-z0-9_=-])/gu;
-const HEX_RUN = /(?<![0-9A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Fa-f])/gu;
+const BASE64_WRAPPED = /(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{16,4096}\r?\n[ \t]*){1,4096}[A-Za-z0-9+/]{4,4096}={0,2}(?![A-Za-z0-9+/=])/gu;
+const BASE64URL_RUN = /(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]{0,65537}[_-])[A-Za-z0-9_-]{12,65537}={0,2}(?![A-Za-z0-9_=-])/gu;
+const HEX_RUN = /(?<![0-9A-Fa-f])[0-9A-Fa-f]{16,65537}(?![0-9A-Fa-f])/gu;
 // Percent runs: whole whitespace/quote-delimited tokens that contain an escape (linear: no backtracking).
-const TOKEN_RUN = /[^\s"'<>`]+/gu;
+const TOKEN_RUN = /[^\s"'<>`]{1,65537}/gu;
 const PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/u;
 
 interface Run { start: number; end: number; encoding: Exclude<Encoding, 'ROOT'>; decodes: (() => Uint8Array | null)[] }
-/** Pick the most useful decode: TEXT from any candidate, else the STRINGS with the most printable content. */
-function best(candidates: (Uint8Array | null)[]): { bytes: Uint8Array | null; found: ReturnType<typeof readable> } {
-  let chosen: ReturnType<typeof readable> = null, bytes: Uint8Array | null = null;
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    bytes ??= candidate;
-    const found = readable(candidate);
-    if (found?.form === 'TEXT') return { bytes: candidate, found };
-    if (found && (!chosen || found.text.length > chosen.text.length)) chosen = found;
-  }
-  return { bytes, found: chosen };
+interface Readable { text: string; form: NormalizedView['form'] }
+/**
+ * Decode a run. When the first (aligned) decode is text, that is the view. Otherwise the view is the
+ * de-duplicated union of text and printable strings from *every* alternative decode, so a marker at one
+ * alignment is never discarded in favour of a longer benign string at another.
+ */
+function best(decodes: readonly (() => Uint8Array | null)[]): { bytes: Uint8Array | null; found: Readable | null } {
+  const first = decodes[0]!();
+  const text = first && textOf(first);
+  if (text) return { bytes: first, found: { text, form: 'TEXT' } };
+  const pieces = new Set<string>();
+  let bytes = first;
+  decodes.forEach((decode, index) => {
+    const decoded = index === 0 ? first : decode();
+    if (!decoded) return;
+    bytes ??= decoded;
+    const whole = index === 0 ? null : textOf(decoded);
+    if (whole) pieces.add(whole);
+    else for (const piece of stringsOf(decoded)) pieces.add(piece);
+  });
+  return { bytes, found: pieces.size ? { text: [...pieces].join('\n'), form: 'STRINGS' } : null };
 }
 /** Candidate runs, produced lazily so a budget stop does not first materialize every run of a view. */
 function* runs(text: string): Generator<Run> {
@@ -222,9 +235,8 @@ function* runs(text: string): Generator<Run> {
     const value = match[0], start = match.index, end = start + value.length;
     if (value.length % 2 === 0) yield { start, end, encoding: 'HEX', decodes: [() => decodeHex(value)] };
     else {
-      // Odd length: a stray nibble at either end; try both parities.
-      yield { start: start + 1, end, encoding: 'HEX', decodes: [() => decodeHex(value.slice(1))] };
-      yield { start, end: end - 1, encoding: 'HEX', decodes: [() => decodeHex(value.slice(0, -1))] };
+      // Odd length: a stray nibble at either end; the second parity only runs when the first is not text.
+      yield { start, end, encoding: 'HEX', decodes: [() => decodeHex(value.slice(1)), () => decodeHex(value.slice(0, -1))] };
     }
   }
   // A prefix glued to Base64 (`token<b64>`, a URL path) misaligns it; decoding at offsets 0-3 realigns
@@ -272,6 +284,10 @@ export function sniffContentType(text: string): ContentType {
  * clean: the caller keeps the original and policy treats it conservatively.
  */
 export function normalizeInput(input: unknown, budget?: unknown): NormalizationResult {
+  // Contract: FAILURE or PARTIAL, never a throw (e.g. an engine stack limit on a pathological input).
+  try { return normalizeUnchecked(input, budget); } catch { return failure('INTERNAL_ERROR'); }
+}
+function normalizeUnchecked(input: unknown, budget?: unknown): NormalizationResult {
   const limits = budgetFrom(budget);
   if (!limits) return failure('INVALID_BUDGET');
   let root: string;
@@ -302,22 +318,36 @@ export function normalizeInput(input: unknown, budget?: unknown): NormalizationR
       record({ viewId: view.id, start: 0, end: view.text.length, reason: exhausted });
       continue;
     }
+    // Runs longer than MAX_RUN never match the bounded patterns: find them linearly and record them.
+    let runStart = -1;
+    for (let index = 0; index <= view.text.length; index++) {
+      const code = index < view.text.length ? view.text.charCodeAt(index) : 32;
+      const encoded = code === 37 || code === 43 || code === 45 || (code >= 47 && code <= 57) || code === 61 ||
+        (code >= 65 && code <= 90) || code === 95 || (code >= 97 && code <= 122);
+      if (encoded && runStart < 0) runStart = index;
+      else if (!encoded && runStart >= 0) {
+        if (index - runStart > MAX_RUN) record({ viewId: view.id, start: runStart, end: index, reason: 'RUN_TOO_LONG' });
+        runStart = -1;
+      }
+    }
     // Decoded text already produced from this view, with its disjoint parent spans.
     const produced = new Map<string, MutableView>();
     for (const run of runs(view.text)) {
       if (run.end - run.start > MAX_RUN) { record({ viewId: view.id, start: run.start, end: run.end, reason: 'RUN_TOO_LONG' }); continue; }
-      const cost = (run.end - run.start) * run.decodes.length;
+      // Charge every possible decode plus a fixed per-decode overhead, so many short runs are budgeted too.
+      const cost = (run.end - run.start + DECODE_OVERHEAD) * run.decodes.length;
       if (work + cost > limits.maxDecodeWork) exhausted = 'WORK_LIMIT';
       else {
         work += cost;
-        const { bytes, found } = best(run.decodes.map((decode) => decode()));
+        const { bytes, found } = best(run.decodes);
         if (!found) { if (bytes) binaryDecodes++; continue; }
         if (found.text === view.text.slice(run.start, run.end)) continue;
         const existing = produced.get(found.text);
         if (existing) {
           // Overlapping duplicates (odd-hex parities, alternative encodings of one span) add nothing; a
           // disjoint copy is another occurrence that transformation must also cover.
-          if (existing.occurrences.some((o) => o.start < run.end && run.start < o.end)) continue;
+          // Runs within one pattern pass arrive in order, so recent occurrences suffice for the overlap test.
+          if (existing.occurrences.slice(-4).some((o) => o.start < run.end && run.start < o.end)) continue;
           if (existing.occurrences.length < MAX_OCCURRENCES) { existing.occurrences.push({ start: run.start, end: run.end }); continue; }
         }
         if (view.depth + 1 > limits.maxDepth) {

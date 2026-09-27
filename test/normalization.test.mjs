@@ -267,11 +267,40 @@ test('rereview: ordinary binary attachments stay COMPLETE and produce at most on
   const payload = JSON.stringify({ files: Array.from({ length: 7 }, (_, i) => ({ name: `f${i}.bin`, data: blob() })) });
   const result = normalizeInput(payload);
   assert.equal(result.status, 'COMPLETE');
-  assert.ok(result.views.length <= 8);
+  // One direct view per blob at most; noise strings may themselves nest, which is bounded by the budgets.
+  assert.ok(result.views.filter((v) => v.parent === 0).length <= 7);
   assert.deepEqual(result.uninspected, []);
 });
 
 test('rereview: fold accepts an explicit limit up to the hard input limit', () => {
   assert.equal(foldForDetection('x'.repeat(DEFAULT_BUDGET.maxInputUnits + 1), 2 << 20).text.length, DEFAULT_BUDGET.maxInputUnits + 1);
   assert.throws(() => foldForDetection('x', 1 << 30), RangeError);
+});
+
+
+test('second rereview: a marker at one alignment survives a longer benign string at another', () => {
+  for (const sep of ['x', 'xy', 'xyz']) {
+    const first = Buffer.concat([Buffer.from([0]), Buffer.from(`${MARKER}!`)]).toString('base64');
+    const input = `v=${first}${sep}${b64('a benign printable sentence that is long enough to win')}`;
+    assert.ok(reachable(normalizeInput(input)), sep);
+  }
+});
+
+test('second rereview: a multi-megabyte run is RUN_TOO_LONG, never a throw', () => {
+  for (const input of ['A'.repeat(8 << 20), 'ab'.repeat(4 << 20), `${'/AAAAAAAAAAAAAAA'.repeat(1 << 19)}`]) {
+    const result = normalizeInput(input, { maxInputUnits: 16 << 20 });
+    assert.ok(['PARTIAL', 'FAILURE'].includes(result.status));
+    if (result.status === 'PARTIAL') assert.ok(result.reasons.includes('RUN_TOO_LONG'));
+  }
+});
+
+test('second rereview: many short encoded tokens stay within a bounded-work budget', () => {
+  for (const input of [`${'%01' + 'a'.repeat(17) + '_ '}`.repeat(45_000), '0'.repeat(17).concat(' ').repeat(55_000),
+    'AAAAAAAAAAAA '.repeat(80_000), '%41 '.repeat(260_000)]) {
+    const started = process.hrtime.bigint();
+    const result = normalizeInput(input.slice(0, 1 << 20));
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(['COMPLETE', 'PARTIAL'].includes(result.status));
+    assert.ok(elapsedMs < 5000, `${elapsedMs}ms`);
+  }
 });
