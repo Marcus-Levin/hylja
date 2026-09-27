@@ -371,3 +371,34 @@ test('sixth review: ordinary code, go.sum, Content-MD5 and public certificates a
     }
   }
 });
+
+test('seventh review: nested and gzip-wrapped binary, PEM-wrapped compression and per-view splitting all block', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const b64 = (bytes) => Buffer.from(bytes).toString('base64');
+  const secret = Buffer.from(`note: ${PLANTED} end`);
+  const pem = (label, body, end = label) => [`-----BEGIN ${label}-----`, ...b64(body).match(/.{1,64}/gu), `-----END ${end}-----`].join('\n');
+  const hexGz = zlib.gzipSync(secret).toString('hex');
+  const known = [b64(zlib.gzipSync(zlib.gzipSync(secret))), b64(zlib.gzipSync(zlib.deflateSync(secret))),
+    pem('CERTIFICATE', zlib.gzipSync(secret)), pem('PUBLIC KEY', zlib.deflateSync(secret)),
+    `-----BEGIN CERTIFICATE-----\nsome prose\nblob=${b64(zlib.gzipSync(secret))}\n-----END NOTE-----`,
+    hexGz.match(/.{1,4}/gu).join('-'), hexGz.match(/.{1,12}/gu).join(':'), hexGz.match(/.{1,12}/gu).join('|')];
+  for (const payload of known) assert.equal(check(JSON.stringify({ messages: [{ role: 'user', content: payload }] })).decision, 'BLOCK', payload.slice(0, 40));
+  const random = (n) => crypto.randomBytes(n);
+  const escaped = (text) => [...text].map((char) => `\\u00${char.charCodeAt(0).toString(16).padStart(2, '0')}`).join('');
+  let layered = b64(random(32));
+  for (let i = 0; i < 20; i++) layered = b64(Buffer.from(`layer ${i} x=${b64(random(32))} ${layered.length > 4000 ? '' : layered}`));
+  const opaque = [b64(zlib.gzipSync(random(1000))), b64(zlib.deflateSync(random(1000))),
+    b64(zlib.gzipSync(Buffer.concat([Buffer.from([0x50, 0x4b, 3, 4]), random(500)]))),
+    `${b64(random(30))} and ${escaped(b64(random(30)))}`, layered,
+    Array.from({ length: 16 }, () => b64(random(64))).join(' '), Array.from({ length: 40 }, () => b64(random(16))).join(' '),
+    random(64).toString('hex').match(/.{1,4}/gu).join('-'), random(64).toString('hex').match(/.{1,4}/gu).join('.')];
+  for (const payload of opaque) {
+    assert.equal(checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null }).decision, 'BLOCK', payload.slice(0, 40));
+  }
+  for (const payload of ["const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';",
+    'fe80:0000:0000:0000:0202:b3ff:fe1e:8329 and 2001:0db8:85a3:0000:0000:8a2e:0370:7334 and 2001:0db8:0000:0042:0000:8a2e:0370:733a',
+    '{"model":"synthetic","messages":[{"role":"user","content":"Why does HTTPS on 443 fail?"}]}']) {
+    assert.equal(checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null }).decision, 'ALLOW', payload.slice(0, 40));
+  }
+});
