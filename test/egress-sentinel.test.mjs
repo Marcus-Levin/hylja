@@ -447,3 +447,41 @@ test('eighth review: chunked plain encodings, trailing garbage and unsigned laye
     assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload);
   }
 });
+
+test('ninth review: stream remainders, uncertain layers, dumps and indented chunks are inspected; ordinary logs pass', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const b64 = (bytes) => Buffer.from(bytes).toString('base64');
+  const hex = (bytes) => Buffer.from(bytes).toString('hex');
+  const wrap = (content) => JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content }] });
+  const random = (n) => crypto.randomBytes(n);
+  const T = Buffer.from(`note ${PLANTED} ${CANARY}`);
+  const benign = zlib.gzipSync(Buffer.from('build log ok, all good'));
+  const colon = (bytes) => hex(bytes).match(/../gu).join(':');
+  for (const payload of [`attachment ${b64(Buffer.concat([benign, Buffer.alloc(8), zlib.brotliCompressSync(T)]))}`,
+    colon(Buffer.concat([benign, zlib.brotliCompressSync(T)])), colon(Buffer.concat([zlib.deflateSync('ok'), zlib.gzipSync(T)])),
+    colon(zlib.deflateRawSync(Buffer.concat([random(16), T, random(16)]))),
+    hex(T).match(/../gu).join(' '), hex(T).match(/../gu).map((pair) => `0x${pair}`).join(', '),
+    b64(T).match(/.{1,8}/gu).join('     '), JSON.stringify(b64(zlib.gzipSync(T)).match(/.{1,8}/gu), null, 2),
+    b64(T).match(/.{1,8}/gu).map((chunk) => `      ${chunk}`).join('\n')]) {
+    assert.equal(check(wrap(payload)).decision, 'BLOCK', payload.slice(0, 40));
+  }
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  for (const payload of [`attachment ${b64(Buffer.concat([benign, Buffer.alloc(8), random(2000)]))}`, colon(Buffer.concat([benign, random(4000)]))]) {
+    assert.equal(unknown(wrap(payload)).decision, 'BLOCK', payload.slice(0, 40));
+  }
+  const hx = (n) => hex(random(n));
+  for (let run = 0; run < 20; run++) {
+    for (const payload of [Array.from({ length: 6 }, () => `{"ts":${1695826432123456789n + BigInt(run)}}`).join('\n'),
+      Array.from({ length: 5 }, () => String(Math.random())).join(' '), Array.from({ length: 6 }, () => `RAX=${hx(8).toUpperCase()}`).join(' '),
+      Array.from({ length: 6 }, () => `at 0x${hx(8).toUpperCase()}`).join('\n'), Array.from({ length: 6 }, () => hx(6).toUpperCase().match(/../gu).join('-')).join('\n'),
+      `blob ${Array.from({ length: 20 }, () => hx(4).toUpperCase()).join(' ')}`, Array.from({ length: 3 }, () => hx(16).toUpperCase()).join('\n'),
+      `pub rsa4096\n      ${hx(20).toUpperCase().match(/.{4}/gu).join(' ')}\nsub\n      ${hx(20).toUpperCase().match(/.{4}/gu).join(' ')}`]) {
+      assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
+    }
+  }
+  // A PEM body must be one DER SEQUENCE of exactly its stated length.
+  const pem = (der) => ['-----BEGIN CERTIFICATE-----', ...b64(der).match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
+  assert.equal(unknown(pem(Buffer.concat([Buffer.from([0x30, 0x82, 0x10, 0x00]), random(4000)]))).decision, 'BLOCK');
+  assert.equal(unknown(wrap(pem(Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]), random(596)])))).decision, 'ALLOW');
+});

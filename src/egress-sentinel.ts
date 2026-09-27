@@ -281,8 +281,8 @@ const MAX_INFLATE_TOTAL = 4 << 20;
 // Container and compression formats the sentinel does not decode: opaque at any length.
 const OPAQUE_SIGNATURES: readonly number[][] = [[0x50, 0x4b, 0x03, 0x04], [0x42, 0x5a, 0x68], [0xfd, 0x37, 0x7a, 0x58, 0x5a],
   [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c], [0x28, 0xb5, 0x2f, 0xfd]];
-/** Object ids, MD5/trace ids, SHA-1/256/384/512 hex digests are ordinary text, not payloads. */
-const DIGEST_HEX = /^(?:[0-9A-Fa-f]{24}|[0-9A-Fa-f]{32}|[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64}|[0-9A-Fa-f]{96}|[0-9A-Fa-f]{128})$/u;
+/** 64-bit values and span ids, object ids, MD5/trace ids, SHA-1/256/384/512 hex digests are ordinary text, not payloads. */
+const DIGEST_HEX = /^(?:[0-9A-Fa-f]{16}|[0-9A-Fa-f]{24}|[0-9A-Fa-f]{32}|[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64}|[0-9A-Fa-f]{96}|[0-9A-Fa-f]{128})$/u;
 /** Base64 digests and public keys identified by their context: SRI values and SSH public-key fields. */
 function isIdentifierRun(run: string): boolean {
   return DIGEST_HEX.test(run) || /^sha(?:1|256|384|512)-[A-Za-z0-9+/]+={0,2}$/u.test(run) ||
@@ -294,11 +294,24 @@ const SSH_KEY_CONTEXT = /(?:ssh-(?:ed25519|rsa|dss)\s|ecdsa-sha2-nistp\d{3}\s|sk
 // still decoded and decompressed. The END label must match, the body must be base64 lines only and start like a
 // DER sequence (`M…`). Line breaks may be real or JSON-escaped (`\n`), as in a model request body.
 const PUBLIC_PEM = /-----BEGIN (CERTIFICATE|TRUSTED CERTIFICATE|PUBLIC KEY|RSA PUBLIC KEY|CERTIFICATE REQUEST|NEW CERTIFICATE REQUEST|X509 CRL)-----(?:\r?\n|(?:\\r)?\\n)(?=[ \t]*M)(?:[ \t]*[A-Za-z0-9+/]{1,76}={0,2}[ \t]*(?:\r?\n|(?:\\r)?\\n)){1,1024}[ \t]*-----END \1-----/gu;
-/** The Base64 alphabet itself (a constant in code, not a payload). */
-const B64_ALPHABET = /^(?:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[+/_-]{0,2})$/u;
+/** A PEM block whose body is one DER SEQUENCE whose length header matches the body exactly. */
+function derShaped(block: string): boolean {
+  const body = block.replace(/-----[A-Z0-9 ]+-----/gu, '').replace(/\\[rn]|\s/gu, '');
+  const der = decodeRun(body);
+  if (!der || der[0] !== 0x30 || der.length < 2) return false;
+  const first = der[1]!;
+  if (first < 0x80) return der.length === 2 + first;
+  const size = first & 0x7f;
+  if (size < 1 || size > 3 || der.length < 2 + size) return false;
+  let length = 0;
+  for (let index = 0; index < size; index++) length = length * 256 + der[2 + index]!;
+  return der.length === 2 + size + length;
+}
+/** The Base64 alphabet itself, or a stretch of it (a constant in code, not a payload). */
+const B64_ALPHABET = { test: (value: string): boolean => value.length >= 16 && 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_'.includes(value) };
 /** Exact digest lengths: hex MD5/SHA-1/224/256/384/512, and base64 MD5/SHA-1/256/384/512 with or without padding. */
 function isDigest(value: string): boolean {
-  if (/^[0-9A-Fa-f]+$/u.test(value)) return [24, 32, 40, 56, 64, 96, 128].includes(value.length);
+  if (/^[0-9A-Fa-f]+$/u.test(value)) return [16, 24, 32, 40, 56, 64, 96, 128].includes(value.length);
   return [22, 24, 27, 28, 43, 44, 64, 86, 88].includes(value.length);
 }
 /**
@@ -309,13 +322,13 @@ function isDigest(value: string): boolean {
  */
 function isIdentifier(value: string): boolean {
   // Hex split into short groups (`a3f9-01bc-…`) has no word in it and is data, not a name.
-  if (/[+=]/u.test(value) || !/[g-zG-Z]/u.test(value)) return false;
+  if (value.length > 256 || /[+=]/u.test(value) || !/[g-zG-Z]/u.test(value)) return false;
   const segments = value.split(/[_/.-]+|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/u).filter(Boolean);
   return segments.length >= 2 && segments.every((segment) =>
     /^[A-Z]?[a-z]{2,}$/u.test(segment) || /^[A-Z]{1,5}$/u.test(segment) || /^\d{1,4}$/u.test(segment) || /^[a-z]$/u.test(segment) ||
     /^\d{5,20}$/u.test(segment) && new RegExp(`(?:^|[/._-])${segment}(?:$|[/._-])`, 'u').test(value));
 }
-const HEX_PAIRS = /(?<![0-9A-Fa-f:.])[0-9A-Fa-f]{2}(?:[:.][0-9A-Fa-f]{2}){7,4096}(?![0-9A-Fa-f:.])/gu;
+const HEX_PAIRS = /(?<![0-9A-Fa-f])(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:(?:[:.;,-]|[ \t]{1,3}|, |\\n|\r?\n)(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?![0-9A-Fa-f])){7,4096}/gu;
 const SEPARATED_HEX = /^[0-9A-Fa-f]{2,}(?:[-_/][0-9A-Fa-f]{2,})+$/u;
 const UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u;
 interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean }
@@ -343,23 +356,30 @@ function chunkLikeLoose(token: string): boolean {
  */
 function* encodedRuns(text: string): Generator<EncodedRun> {
   for (const run of text.matchAll(ENCODED_RUN)) {
-    const prefix = /^(?:sha(?:1|224|256|384|512)-|h1:)/iu.exec(run[0]);
+    // A digest prefix, `0x` before hex (`0x0000A1B2C3D4E5F6`), or the letter of a JSON escape before the run
+    // (`\nQUJD…`) is not part of the value.
+    const prefix = /^(?:sha(?:1|224|256|384|512)-|h1:)/iu.exec(run[0]) ?? /^0[xX](?=[0-9A-Fa-f]+$)/u.exec(run[0]) ??
+      (text[run.index - 1] === '\\' ? /^[nrt](?=.{16})/u.exec(run[0]) : null);
     let value = prefix ? run[0].slice(prefix[0].length) : run[0];
     // Hex in dash-separated groups (`a3f9-01bc-…`) is hex data; a UUID keeps its shape and exemption.
     const separated = SEPARATED_HEX.test(value) && !UUID.test(value);
     // Hex split into equal groups (`a3f9-01bc-…`) is a dump and counts; mixed groups (trace parents) are decoded only.
     const groups = separated ? value.split(/[-_/]/u) : [];
-    const uniform = groups.length >= 4 && /[A-Fa-f]/u.test(value) && groups.slice(0, -1).every((group) => group.length === groups[0]!.length) && groups.at(-1)!.length <= groups[0]!.length;
+    // MAC-48/EUI-64 (`00-1A-2B-3C-4D-5E`) are addresses, not dumps.
+    const mac = (groups.length === 6 || groups.length === 8) && groups.every((group) => group.length === 2);
+    const uniform = !mac && groups.length >= 4 && /[A-Fa-f]/u.test(value) && groups.slice(0, -1).every((group) => group.length === groups[0]!.length) && groups.at(-1)!.length <= groups[0]!.length;
     if (separated) value = groups.join('');
-    yield { start: run.index + (prefix?.[0].length ?? 0), end: run.index + run[0].length, value, prefixed: prefix !== null,
+    yield { start: run.index + (prefix?.[0].length ?? 0), end: run.index + run[0].length, value, prefixed: prefix !== null && /^(?:sha|h1)/iu.test(prefix[0]),
       countable: !separated || uniform, separated };
   }
-  // Byte pairs separated by `:` or `.` (`63:6f:6e:…`), eight or more: decoded, not counted (fingerprints, MACs).
+  // Byte pairs (`63:6f:6e:…`, hexdump `63 6f 6e …`, C arrays `0x63, 0x6f, …`), eight or more: decoded, not counted
+  // (fingerprints, MACs).
   for (const run of text.matchAll(HEX_PAIRS)) {
-    yield { start: run.index, end: run.index + run[0].length, value: run[0].replace(/[:.]/gu, ''), prefixed: false, countable: false, separated: true };
+    const value = run[0].replace(/0[xX](?=[0-9A-Fa-f]{2})|\\x|\\n/gu, '').replace(/[^0-9A-Fa-f]/gu, '');
+    yield { start: run.index, end: run.index + run[0].length, value, prefixed: false, countable: false, separated: true };
   }
-  yield* chunkSequences(text, /^(?:[\s,"'[\]]|\\[nrt]){1,4}$/u, false);
-  yield* chunkSequences(text, /^(?:[\s,"'[\]:;|.&]|\\[nrt]){1,4}$/u, true);
+  yield* chunkSequences(text, /^(?:[\s,"'[\]]|\\[nrt]){1,64}$/u, false);
+  yield* chunkSequences(text, /^(?:[\s,"'[\]:;|.&]|\\[nrt]){1,64}$/u, true);
 }
 /**
  * Joined chunk sequences. The strict pass (whitespace, commas, quotes, brackets) may count; the weak pass also
@@ -373,18 +393,22 @@ function* chunkSequences(text: string, separator: RegExp, weakPass: boolean): Ge
   let weak = false;
   const emit = function* (tokens: RegExpMatchArray[], mayCount: boolean): Generator<EncodedRun> {
     if (tokens.length < 2 || tokens.filter((token) => chunkLikeLoose(token[0])).length < tokens.length * 0.5) return;
-    const value = tokens.map((token) => token[0].replace(/=+$/u, '')).join('');
+    const value = tokens.map((token) => token[0].replace(/=+$/u, '').replace(/^0[xX](?=[0-9A-Fa-f]+$)/u, '')).join('');
     if (value.length < 16) return;
     const last = tokens[tokens.length - 1]!;
-    const countable = mayCount && tokens.every((token) => token[0].length <= 17) && !/^[0-9A-Fa-f]+$/u.test(value) &&
+    // Mostly hex tokens are a hex list (fingerprints, hashes, ids), decoded but not counted.
+    const hexTokens = tokens.filter((token) => /^(?:0[xX])?[0-9A-Fa-f]+$/u.test(token[0])).length;
+    const countable = mayCount && tokens.every((token) => token[0].length <= 17) && hexTokens < tokens.length * 0.75 &&
       tokens.filter((token) => chunkLike(token[0])).length >= tokens.length * 0.75;
     yield { start: tokens[0]!.index!, end: last.index! + last[0].length, value, prefixed: false, separated: true, countable };
   };
   const flush = function* (): Generator<EncodedRun> {
     if (!weakPass || weak) {
-      yield* emit(sequence, !weakPass);
-      const words = sequence.filter((token) => chunkLikeLoose(token[0]));
-      if (words.length !== sequence.length) yield* emit(words, false);
+      // A sequence with words between chunks is judged without them (`blob 3F2A9C1B …` is hex, not Base64).
+      // The last token stays even when short: it is usually the remainder of a fixed-width split.
+      const words = sequence.filter((token, index) => chunkLikeLoose(token[0]) || index === sequence.length - 1 && index > 0);
+      yield* emit(sequence, !weakPass && words.length === sequence.length);
+      if (words.length !== sequence.length) yield* emit(words, !weakPass);
     }
     sequence = [];
     weak = false;
@@ -411,21 +435,22 @@ function* chunkSequences(text: string, separator: RegExp, weakPass: boolean): Ge
  * U+FFFD counting as not printable. Returns 'BUDGET' when the message's decompression budget is exhausted.
  */
 const SYNC_FLUSH = 2;
-interface Inflated { out: Uint8Array; signed: boolean; consumed: number }
+interface Inflated { out: Uint8Array; signed: boolean; consumed: number; plausible: boolean }
 type Engine = (buffer: Uint8Array, options: { maxOutputLength: number; finishFlush: number; info: true }) => { buffer: Uint8Array; engine: { bytesWritten: number } };
 function inflate(bytes: Uint8Array, budget: { inflated: number }): Inflated | null | 'BUDGET' {
-  const attempt = (engine: Engine, input: Uint8Array, start: number, signed: boolean): Inflated | null | 'BUDGET' => {
+  const attempt = (engine: Engine, input: Uint8Array, start: number, signed: boolean, trailer = 0): Inflated | null | 'BUDGET' => {
     const remaining = MAX_INFLATE_TOTAL - budget.inflated;
     if (remaining <= 0) return 'BUDGET';
     try {
       const { buffer: out, engine: state } = engine(input, { maxOutputLength: remaining, finishFlush: SYNC_FLUSH, info: true });
       budget.inflated += out.length;
       if (out.length < 4) return null;
-      const result = { out, signed, consumed: Math.min(bytes.length, start + (state.bytesWritten || input.length)) };
-      if (signed) return result;
+      const consumed = Math.min(bytes.length, start + (state.bytesWritten || input.length) + trailer);
+      if (signed) return { out, signed, consumed, plausible: true };
+      // brotli/raw deflate succeed by accident on random bytes; mostly printable output is plausible.
       const text = new TextDecoder('utf-8', { fatal: false }).decode(out).replace(/[\u0000-\u001f\u007f]/gu, '');
       const good = (text.match(/[\p{L}\p{N}\p{P}\p{S}\s]/gu) ?? []).filter((char) => char !== '\ufffd').length;
-      return text.length >= 8 && good >= text.length * 0.9 ? result : null;
+      return { out, signed, consumed, plausible: text.length >= 8 && good >= text.length * 0.9 };
     } catch (error) {
       return (error as { code?: string }).code === 'ERR_BUFFER_TOO_LARGE' ? 'BUDGET' : null;
     }
@@ -442,11 +467,12 @@ function inflate(bytes: Uint8Array, budget: { inflated: number }): Inflated | nu
     }
     const whole = attempt(gunzipSync as unknown as Engine, view, offset, true);
     if (whole === 'BUDGET') return whole;
-    if (whole) return { ...whole, consumed: bytes.length };
+    if (whole) return whole;
     // gunzip rejects bytes after the stream; read the member's deflate body directly instead.
     const body = gzipBody(view);
     if (body >= 0) {
-      const result = attempt(inflateRawSync as unknown as Engine, view.subarray(body), offset + body, true);
+      // The member's 8-byte CRC/size trailer follows its deflate body.
+      const result = attempt(inflateRawSync as unknown as Engine, view.subarray(body), offset + body, true, 8);
       if (result) return result;
     }
   }
@@ -472,36 +498,53 @@ interface Expanded { opaque: number; consumed: number; keep: boolean }
  * gzip/zlib output and bytes after a stream's end. `keep` marks binary brotli/raw deflate output, which random
  * bytes produce by accident: the input's own count then stands.
  */
-function expand(bytes: Uint8Array, budget: { inflated: number }, sink: { texts: string[]; printables: string[] }, depth = 0): Expanded | null | 'CONTAINER' | 'BUDGET' {
+interface Sink { texts: string[]; printables: string[]; junk: string[] }
+function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, depth = 0): Expanded | null | 'CONTAINER' | 'BUDGET' {
   const inflated = inflate(bytes, budget);
   if (inflated === 'BUDGET' || inflated === null) return inflated;
   const { out, signed, consumed } = inflated;
-  const marks = [sink.texts.length, sink.printables.length] as const;
-  // A real brotli/raw deflate stream uses (nearly) all its input; random bytes decode by accident and stop early.
-  // Such output is still matched, as a derived view, but never replaces the input's own count.
-  if (!signed && consumed < bytes.length * 0.9) {
-    const decoded = [...out];
-    if (isText(decoded)) sink.printables.push(utf8Lenient.decode(out));
+  const decoded = [...out];
+  // Every layer is matched: as text when it is text, and as printable bytes and UTF-16 otherwise.
+  const matchBinary = (): void => { sink.printables.push(printable(decoded), utf16Printable(out)); };
+  // A real brotli/raw deflate stream uses (nearly) all its input and usually holds text; random bytes decode by
+  // accident, stop early and yield junk. Such output is still matched for known values and patterns (match-only
+  // views: never decoded further, so junk cannot exhaust #6), but never replaces the input's own count.
+  if (!signed && (!inflated.plausible || consumed < bytes.length * 0.9)) {
+    sink.junk.push(printable(decoded), utf16Printable(out));
+    if (isText(decoded)) sink.junk.push(utf8Lenient.decode(out));
     return { opaque: 0, consumed, keep: true };
   }
   if (OPAQUE_SIGNATURES.some((signature) => signature.every((byte, index) => out[index] === byte))) return 'CONTAINER';
+  // Bytes after the stream's end: another stream, text, or opaque bytes.
   let trailing = 0;
-  const rest = [...bytes.subarray(consumed)];
-  if (rest.length) {
-    if (isText(rest)) sink.texts.push(utf8Lenient.decode(Uint8Array.from(rest)));
-    else { trailing = rest.length; sink.printables.push(printable(rest)); }
+  if (consumed < bytes.length) {
+    const tail = bytes.subarray(consumed);
+    const next = depth + 1 < MAX_INFLATE_DEPTH ? expand(tail, budget, sink, depth + 1) : null;
+    if (next === 'CONTAINER' || next === 'BUDGET') return next;
+    if (next && !next.keep) trailing = next.opaque;
+    else if (isText([...tail])) sink.texts.push(utf8Lenient.decode(tail));
+    else { trailing = tail.length; sink.printables.push(printable([...tail]), utf16Printable(tail)); }
   }
-  const decoded = [...out];
   if (isText(decoded)) { sink.texts.push(utf8Lenient.decode(out)); return { opaque: trailing, consumed, keep: false }; }
-  sink.printables.push(printable(decoded));
+  matchBinary();
+  const textMark = sink.texts.length;
   const nested = depth + 1 < MAX_INFLATE_DEPTH ? expand(out, budget, sink, depth + 1) : null;
   if (nested === 'CONTAINER' || nested === 'BUDGET') return nested;
   if (nested && !nested.keep) return { opaque: nested.opaque + trailing, consumed, keep: false };
   if (signed) return { opaque: out.length + trailing, consumed, keep: false };
-  // Accidental binary from brotli/raw deflate: discard its views (junk) and let the input's own count stand.
-  sink.texts.length = marks[0];
-  sink.printables.length = marks[1];
-  return { opaque: 0, consumed, keep: true };
+  // Binary brotli/raw deflate output may be an accident: keep matching it (text found below it too, as derived
+  // views), but let the input's own count stand.
+  sink.printables.push(...sink.texts.splice(textMark));
+  return { opaque: trailing, consumed, keep: trailing === 0 };
+}
+/** UTF-16LE reading of binary, printable characters only, so UTF-16 text inside a binary layer is matched. */
+function utf16Printable(bytes: Uint8Array): string {
+  let text = '';
+  for (let index = 0; index + 1 < bytes.length; index += 2) {
+    const code = bytes[index]! | (bytes[index + 1]! << 8);
+    text += code >= 0x20 && code !== 0x7f && (code < 0xd800 || code > 0xdfff) && code !== 0xfffd ? String.fromCharCode(code) : ' ';
+  }
+  return text;
 }
 const utf8Lenient = new TextDecoder('utf-8', { fatal: false });
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -564,7 +607,7 @@ function unescapeOnce(text: string): string | null {
   return softBreaks === text ? null : softBreaks;
 }
 
-interface View { name: string; text: string; derived?: boolean }
+interface View { name: string; text: string; derived?: boolean; matchOnly?: boolean }
 /**
  * All canonical views: each text is decoded by #6 (Base64/percent/hex) and by the escape round, and every
  * resulting view is processed again, to MAX_ROUNDS. Returns a block reason when anything is uninspectable.
@@ -573,7 +616,8 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
   const views: View[] = [];
   const budget = { inflated: 0 };
   const countedValues = new Set<string>();
-  let pendingOpaque = false, opaqueTotal = 0;
+  const countedBytes: string[] = [];
+  let opaqueTotal = 0;
   let queue: View[] = [{ name: 'ROOT', text: root }];
   let units = 0;
   for (let round = 0; queue.length && round <= MAX_ROUNDS; round++) {
@@ -581,7 +625,7 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
     for (const view of queue) {
       if (views.length >= MAX_VIEWS || (units += view.text.length) > MAX_VIEW_UNITS) return { reason: 'SENTINEL_BUDGET' };
       views.push(view);
-      if (round === MAX_ROUNDS) continue;
+      if (round === MAX_ROUNDS || view.matchOnly) continue;
       const normalized = normalizeInput(view.text);
       // Content the sentinel cannot fully inspect, or embedded binary it cannot read, is never presumed clean.
       if (normalized.status !== 'COMPLETE') return { reason: 'UNINSPECTED_CONTENT' };
@@ -603,8 +647,9 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
       const binary: Uint8Array[] = [];
       let binaryTotal = 0, countable = 0;
       const runCounts: number[] = [];
-      const runRecognized: boolean[] = [];
-      const publicBlocks = [...view.text.matchAll(PUBLIC_PEM)].map((block) => ({ start: block.index, end: block.index + block[0].length }));
+      const runIdentified: boolean[] = [];
+      const publicBlocks = [...view.text.matchAll(PUBLIC_PEM)].filter((block) => derShaped(block[0]))
+        .map((block) => ({ start: block.index, end: block.index + block[0].length }));
       for (const run of encodedRuns(view.text)) {
         if (textSpans.some((span) => span.start <= run.start && run.end <= span.end)) continue;
         const decoded = decodeRun(run.value);
@@ -612,28 +657,32 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         // Text from joined chunks or separated hex is a layer #6 did not see: inspect it like any decoded view.
         if (isText(decoded)) { if (run.separated) joinedTexts.push(utf8Lenient.decode(Uint8Array.from(decoded))); continue; }
         const bytes = Uint8Array.from(decoded);
-        if (OPAQUE_SIGNATURES.some((signature) => signature.every((byte, index) => bytes[index] === byte))) return { reason: 'OPAQUE_EMBEDDED' };
         // Not counted: exact-length digests (with or without a `shaNNN-`/`h1:` prefix), SSH key blobs, UUIDs,
         // identifiers (`http2ServerSessionOptions`), runs that do not look encoded (lower-case paths, snake_case
         // ids), and anything inside views derived from decompression or printable bytes.
-        const encodedShape = /^[0-9A-Fa-f]+$/u.test(run.value) || /=$/u.test(run.value) ||
+        // All-decimal runs (nanosecond timestamps, snowflake ids, float digits) are numbers, not hex.
+        const encodedShape = /^[0-9A-Fa-f]+$/u.test(run.value) && /[A-Fa-f]/u.test(run.value) || /=$/u.test(run.value) ||
           /[A-Z]/u.test(run.value) && /[a-z]/u.test(run.value) && /\d/u.test(run.value);
         const before = view.text.slice(Math.max(0, run.start - 32), run.start);
         // A digest is one unbroken run; joined chunks or separated hex of digest length are not exempt.
-        const recognized = isDigest(run.value) && run.separated !== true && (run.prefixed || DIGEST_HEX.test(run.value) || DIGEST_CONTEXT.test(before)) ||
+        const identified = isDigest(run.value) && run.separated !== true && (run.prefixed || DIGEST_HEX.test(run.value) || DIGEST_CONTEXT.test(before)) ||
           publicBlocks.some((block) => block.start <= run.start && run.end <= block.end) || B64_ALPHABET.test(run.value) ||
-          SSH_KEY_CONTEXT.test(before) && run.value.length <= 800 ||
-          /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u.test(run.value) ||
-          isIdentifier(run.value) || !encodedShape || !run.countable || view.derived === true;
+          SSH_KEY_CONTEXT.test(before) && run.value.length <= 800 || UUID.test(run.value);
+        const recognized = identified || isIdentifier(run.value) || !encodedShape || !run.countable || view.derived === true;
+        // A container signature is opaque at once, unless the run is a digest or id that happens to start with one.
+        if (!identified && OPAQUE_SIGNATURES.some((signature) => signature.every((byte, index) => bytes[index] === byte))) return { reason: 'OPAQUE_EMBEDDED' };
         binary.push(bytes);
         binaryTotal += bytes.length;
         // Each distinct run counts once per message. An escape view repeats its parent's runs, sometimes with one
         // more or one fewer leading character (`\nQUJD…` becomes a newline and `QUJD…`).
-        const seen = countedValues.has(run.value) || countedValues.has(run.value.slice(1));
+        // A run whose bytes are part of an already counted run (the same token split by an escape) counts once too.
+        const latin1 = String.fromCharCode(...bytes.subarray(0, 4096));
+        const seen = countedValues.has(run.value) || countedValues.has(run.value.slice(1)) ||
+          bytes.length >= 8 && countedBytes.some((counted) => counted.includes(latin1));
         const counted = recognized || seen ? 0 : bytes.length;
-        if (counted) { countedValues.add(run.value); countedValues.add(run.value.slice(1)); }
+        if (counted) { countedValues.add(run.value); countedValues.add(run.value.slice(1)); countedBytes.push(latin1); }
         runCounts.push(counted);
-        runRecognized.push(recognized);
+        runIdentified.push(identified);
         countable += counted;
         const text = printable(decoded);
         if (text.trim()) printables.push(text);
@@ -645,7 +694,7 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         const offsets: number[] = [];
         let offset = 0;
         for (const part of binary) { offsets.push(offset); joined.set(part, offset); offset += part.length; }
-        const sink = { texts: [] as string[], printables: [] as string[] };
+        const sink: Sink = { texts: [], printables: [], junk: [] };
         const covered = new Set<number>();
         for (const candidate of binary.length > 1 ? [joined, ...binary.slice(0, 256)] : binary) {
           const single = candidate === joined ? -1 : binary.indexOf(candidate);
@@ -659,21 +708,24 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
           const runs = single >= 0 ? [single] : offsets.flatMap((start, index) => start + binary[index]!.length <= result.consumed ? [index] : []);
           if (!runs.length) continue;
           for (const index of runs) { covered.add(index); countable -= runCounts[index]!; runCounts[index] = 0; }
-          if (!view.derived && !runs.every((index) => runRecognized[index])) countable += result.opaque;
+          if (!view.derived && !runs.every((index) => runIdentified[index])) countable += result.opaque;
           if (covered.size === binary.length) break;
         }
         if (sink.texts.length) next.push({ name: `${view.name}>INFLATED`, text: sink.texts.join('\n'), derived: view.derived === true });
-        if (sink.printables.length) next.push({ name: `${view.name}>INFLATED_BINARY`, text: sink.printables.join('\n'), derived: true });
+        // Binary layers are matched but not decoded further: signed binary output already counts as opaque in full.
+        if (sink.printables.length) next.push({ name: `${view.name}>INFLATED_BINARY`, text: sink.printables.join('\n'), derived: true, matchOnly: true });
+        if (sink.junk.length) next.push({ name: `${view.name}>INFLATED_UNCERTAIN`, text: sink.junk.join('\n'), derived: true, matchOnly: true });
       }
       // One opaque total per message, across all views and rounds (distinct runs are counted once).
-      if ((opaqueTotal += countable) > OPAQUE_BYTES) pendingOpaque = true;
+      // Once the message is opaque it blocks whatever else it holds: stop decoding and match what is decoded so far.
+      if ((opaqueTotal += countable) > OPAQUE_BYTES) return { views: [...views, ...next], opaque: true };
       const unescaped = unescapeOnce(view.text);
       if (unescaped !== null) next.push({ name: `${view.name}>ESCAPES`, text: unescaped, derived: view.derived === true });
     }
     queue = next;
     if (round === MAX_ROUNDS && queue.length) return { reason: 'SENTINEL_BUDGET' };
   }
-  return { views, opaque: pendingOpaque };
+  return { views, opaque: false };
 }
 
 /* ---------- Check ---------- */
