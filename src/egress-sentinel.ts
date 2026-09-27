@@ -7,6 +7,7 @@
  * is BLOCK. It never returns originals or matched text; on ALLOW it returns a private copy of the bytes.
  */
 import { createHmac } from 'node:crypto';
+import { gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import { normalizeInput } from './normalization.js';
 
 export const SENTINEL_VERSION = 'hylja.egress-sentinel.v1' as const;
@@ -267,22 +268,46 @@ function credentialAssignment(text: string): boolean {
   }
   return false;
 }
-// Long runs that look like encoded data: mixed case plus digits (Base64 of binary), or hex longer than a
-// SHA-512 digest. Lower-case URL paths, snake_case ids and digests are ordinary text.
-const TEXT_ENCODED_RUN = /[A-Za-z0-9+/_-]{128,}={0,2}|(?:[0-9A-Fa-f]{2}){65,}/gu;
-function looksEncoded(run: string): boolean {
-  // Hex up to a SHA-512 digest (128 digits) is a hash, not a payload.
-  if (/^[0-9A-Fa-f]+$/u.test(run)) return run.length > 128;
-  return /[A-Z]/u.test(run) && /[a-z]/u.test(run) && /\d/u.test(run);
-}
 const ENCODED_RUN = /(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{16,65536}={0,2})(?![A-Za-z0-9+/=_-])/gu;
-/** Decoded binary at least this long is opaque (compressed, encrypted or archived data), whatever the chunking. */
-const OPAQUE_BYTES = 48;
-// Compression and archive signatures: opaque at any length.
-const MAGIC = [[0x1f, 0x8b], [0x78, 0x01], [0x78, 0x5e], [0x78, 0x9c], [0x78, 0xda], [0x50, 0x4b, 0x03, 0x04], [0x42, 0x5a, 0x68],
-  [0xfd, 0x37, 0x7a, 0x58, 0x5a], [0x37, 0x7a, 0xbc, 0xaf], [0x28, 0xb5, 0x2f, 0xfd]];
-/** SHA-1/SHA-256/SHA-512 hex digests are ordinary text, not payloads (checked after compression signatures). */
-const DIGEST_HEX = /^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64}|[0-9A-Fa-f]{128})$/u;
+/**
+ * Binary that is neither text, a recognized digest/key field, nor inflatable is opaque once a message holds at
+ * least this many such bytes in total (encrypted or unknown-format data). Tokens and ids below it are ordinary.
+ */
+const OPAQUE_BYTES = 1024;
+/** Upper bound on inflated output per attempt (a decompression bomb is BLOCKed, not expanded). */
+const MAX_INFLATE = 1 << 20;
+/** SHA-1/256/384/512 hex digests are ordinary text, not payloads. */
+const DIGEST_HEX = /^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64}|[0-9A-Fa-f]{96}|[0-9A-Fa-f]{128})$/u;
+/** Base64 digests and public keys identified by their context: SRI values and SSH public-key fields. */
+const DIGEST_CONTEXT = /(?:sha(?:1|256|384|512)[-:]|ssh-(?:ed25519|rsa|dss)\s|ecdsa-sha2-nistp\d{3}\s|sk-ssh-ed25519@openssh\.com\s)$/iu;
+/**
+ * Try to inflate binary as gzip or zlib (signature searched in the first 16 bytes) or raw deflate, tolerating a
+ * truncated stream. Returns the inflated bytes, `null` when it does not inflate to something useful, or 'BOMB'
+ * when the output would exceed MAX_INFLATE. Undecodable data is left to the aggregate opaque-bytes rule.
+ */
+const SYNC_FLUSH = 2;
+function inflate(bytes: Uint8Array): Uint8Array | null | 'BOMB' {
+  const attempt = (run: () => Uint8Array): Uint8Array | null | 'BOMB' => {
+    try {
+      const out = run();
+      // Random bytes occasionally inflate; only a mostly printable result counts.
+      const text = new TextDecoder('utf-8', { fatal: false }).decode(out);
+      return out.length >= 8 && (text.match(/[\p{L}\p{N}\p{P}\p{S}\s]/gu) ?? []).length >= text.length * 0.9 ? out : null;
+    } catch (error) {
+      return (error as { code?: string }).code === 'ERR_BUFFER_TOO_LARGE' ? 'BOMB' : null;
+    }
+  };
+  const options = { maxOutputLength: MAX_INFLATE, finishFlush: SYNC_FLUSH };
+  for (let offset = 0; offset < Math.min(16, bytes.length - 1); offset++) {
+    const view = bytes.subarray(offset);
+    const gzip = view[0] === 0x1f && view[1] === 0x8b;
+    const zlib = view[0] === 0x78 && [0x01, 0x5e, 0x9c, 0xda].includes(view[1]!);
+    if (!gzip && !zlib) continue;
+    const result = attempt(() => (gzip ? gunzipSync : inflateSync)(view, options));
+    if (result) return result;
+  }
+  return attempt(() => inflateRawSync(bytes, options));
+}
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 /**
  * The sentinel's own decode of a short encoded run into printable bytes (others become spaces). Known-value
@@ -362,35 +387,48 @@ function canonicalViews(root: string): { views: View[] } | { reason: string } {
       // Opacity is judged on decoded bytes, so chunking or wrapping cannot hide binary: a wrapped/joined #6 view
       // of binary, any run decoding to compressed data, or any non-text decode of OPAQUE_BYTES or more blocks.
       const textSpans = normalized.views.filter((child) => child.parent === 0 && child.form === 'TEXT').flatMap((child) => child.occurrences);
-      for (const child of normalized.views) {
-        if (child.parent === 0 && child.form === 'STRINGS' && child.parentEnd - child.parentStart >= Math.ceil(OPAQUE_BYTES * 4 / 3)) {
-          return { reason: 'OPAQUE_EMBEDDED' };
-        }
-      }
-      for (const run of view.text.matchAll(TEXT_ENCODED_RUN)) {
-        const end = run.index + run[0].length;
-        if (looksEncoded(run[0]) && !textSpans.some((span) => span.start <= run.index && end <= span.end)) return { reason: 'OPAQUE_EMBEDDED' };
-      }
       for (const child of normalized.views.slice(1)) next.push({ name: `${view.name}>${child.encoding}`, text: child.text });
-      // Other encoded runs that are not text: opaque when compressed or large, otherwise their printable bytes join
-      // one per-view matching view (so hundreds of UUIDs or digests cost one view, not hundreds).
+      // Other encoded runs that are not text: digests and key fields are skipped; the rest are collected in order.
+      // Each run and their concatenation (chunked or wrapped payloads) are inflated when compressed, and the
+      // inflated text becomes a matching view. Only undecodable signatures, bombs, or a large total of binary that
+      // is none of text/digest/compressed count as opaque.
       const printables: string[] = [];
+      const binary: Uint8Array[] = [];
+      let binaryTotal = 0, countable = 0;
       for (const run of view.text.matchAll(ENCODED_RUN)) {
         const end = run.index + run[0].length;
         if (textSpans.some((span) => span.start <= run.index && end <= span.end)) continue;
-        const bytes = decodeRun(run[0]);
-        if (!bytes || isText(bytes)) continue;
-        if (DIGEST_HEX.test(run[0]) && !MAGIC.some((magic) => magic.every((byte, index) => bytes[index] === byte))) continue;
-        // Size alone only counts for runs that look encoded (hex, or mixed case with digits); identifiers such as
-        // long snake_case or camelCase names are valid base64url but not payloads.
-        const encodedShape = /^[0-9A-Fa-f]+$/u.test(run[0]) || /[A-Z]/u.test(run[0]) && /[a-z]/u.test(run[0]) && /\d/u.test(run[0]);
-        if (MAGIC.some((magic) => magic.every((byte, index) => bytes[index] === byte)) || encodedShape && bytes.length >= OPAQUE_BYTES) {
-          return { reason: 'OPAQUE_EMBEDDED' };
-        }
-        const text = printable(bytes);
+        const decoded = decodeRun(run[0]);
+        if (!decoded || isText(decoded)) continue;
+        const bytes = Uint8Array.from(decoded);
+        // Everything is tried for inflation (chunked compressed data may look like ids); only runs that are not
+        // digests, key fields, UUIDs or short tokens (<= 32 bytes) count toward the opaque total.
+        const identifierLike = DIGEST_HEX.test(run[0]) || DIGEST_CONTEXT.test(view.text.slice(Math.max(0, run.index - 32), run.index)) ||
+          /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u.test(run[0]) || bytes.length <= 32;
+        binary.push(bytes);
+        binaryTotal += bytes.length;
+        if (!identifierLike) countable += bytes.length;
+        const text = printable(decoded);
         if (text.trim()) printables.push(text);
       }
       if (printables.length) next.push({ name: `${view.name}>BINARY_PRINTABLE`, text: printables.join('\n') });
+      if (binary.length) {
+        const joined = new Uint8Array(binaryTotal);
+        let offset = 0;
+        for (const part of binary) { joined.set(part, offset); offset += part.length; }
+        let inflatedAll = false;
+        const inflated: string[] = [];
+        // The concatenation first (chunked payloads), then up to 256 individual runs; outputs join one view.
+        for (const candidate of binary.length > 1 ? [joined, ...binary.slice(0, 256)] : binary) {
+          const result = inflate(candidate);
+          if (result === 'BOMB') return { reason: 'OPAQUE_EMBEDDED' };
+          if (!result) continue;
+          inflated.push(new TextDecoder('utf-8', { fatal: false }).decode(result));
+          if (candidate === joined || binary.length === 1) inflatedAll = true;
+        }
+        if (inflated.length) next.push({ name: `${view.name}>INFLATED`, text: inflated.join('\n') });
+        if (!inflatedAll && countable >= OPAQUE_BYTES) return { reason: 'OPAQUE_EMBEDDED' };
+      }
       const unescaped = unescapeOnce(view.text);
       if (unescaped !== null) next.push({ name: `${view.name}>ESCAPES`, text: unescaped });
     }

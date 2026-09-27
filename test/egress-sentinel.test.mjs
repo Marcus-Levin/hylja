@@ -182,7 +182,7 @@ test('review: case-sensitive patterns survive zero-width and full-width tricks; 
 });
 
 test('review: embedded opaque binary is blocked; ordinary hashes are not', () => {
-  const binary = Buffer.concat([Buffer.from([0x1f, 0x8b, 8, 0]), Buffer.alloc(200, 7)]).toString('base64');
+  const binary = Buffer.concat([Buffer.from([0x1f, 0x8b, 8, 0]), globalThis.process.getBuiltinModule('node:crypto').randomBytes(2048)]).toString('base64');
   assert.deepEqual(check(`{"att":"${binary}"}`).reasons, ['OPAQUE_EMBEDDED']);
   const scattered = Buffer.from('\u0000\u0001orla\u0003Synthe\u0007tica').toString('base64');
   assert.equal(check(`x=${scattered}`).decision, 'BLOCK');
@@ -271,5 +271,38 @@ test('third review: quoted dotted passwords are literals; bracket characters do 
     `integrity="sha256-${Buffer.alloc(32, 7).toString('base64')}"`]) {
     const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
     assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)} ${result.reasons}`);
+  }
+});
+
+test('fourth review: chunked or prefixed compressed payloads are inflated and matched; bombs and large opaque binary block', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const secret = `contact ${PLANTED} re ${CANARY} ${crypto.randomBytes(16).toString('hex')} `.repeat(4);
+  const raw = zlib.deflateRawSync(Buffer.from(secret));
+  const chunks = (buffer, size) => Array.from({ length: Math.ceil(buffer.length / size) }, (_, i) => buffer.subarray(i * size, (i + 1) * size));
+  const prefixed = Buffer.concat([Buffer.from([0]), zlib.gzipSync(Buffer.from(secret))]);
+  for (const payload of [chunks(raw, 30).map((c) => c.toString('base64')).join(' '), chunks(raw, 47).map((c) => c.toString('hex')).join(' '),
+    chunks(prefixed, 40).map((c) => c.toString('hex')).join('\n')]) {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', payload.slice(0, 40));
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED') || result.reasons.includes('CANARY_DETECTED'), result.reasons.join());
+  }
+  const bomb = zlib.gzipSync(Buffer.alloc(4 << 20, 65)).toString('base64');
+  assert.deepEqual(check(`x ${bomb}`).reasons, ['OPAQUE_EMBEDDED']);
+  assert.deepEqual(check(`blob ${crypto.randomBytes(2048).toString('base64')}`).reasons, ['OPAQUE_EMBEDDED']);
+});
+
+test('fourth review: digests, SRI values, SSH keys, session ids, UUIDs and trace ids are ordinary text', () => {
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const hex = (n) => crypto.randomBytes(n).toString('hex');
+  const b64 = (n) => crypto.randomBytes(n).toString('base64');
+  for (let run = 0; run < 40; run++) {
+    for (const payload of [`digest ${hex(32)} ok`, `digest ${hex(64)} ok`, `sha384 ${hex(48)}`, Array.from({ length: 5 }, () => hex(20)).join('\n'),
+      `image@sha256:${hex(32)}`, `<script integrity="sha384-${b64(48)}"></script>`, `"integrity": "sha512-${b64(64)}"`,
+      `ssh-ed25519 ${b64(51)} user@host.invalid`, `session=${crypto.randomBytes(48).toString('base64url')}`,
+      JSON.stringify(Array.from({ length: 300 }, () => crypto.randomUUID())), Array.from({ length: 200 }, () => `trace=${hex(16)}`).join('\n')]) {
+      const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+      assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)} ${result.reasons}`);
+    }
   }
 });
