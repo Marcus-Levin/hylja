@@ -85,7 +85,18 @@ Initial categories: PERSON (including EMAIL/PHONE), CREDENTIAL_OR_SECRET, HOST, 
 
 No production vault yet beyond minimal development fixture state. No unverified hosted semantic request, opaque protected content, or unchecked stream is silently released; this slice is not a production traffic claim.
 
-Bounded, **NON-ENFORCING** #8 credential detectors exist in [`src/secret-detectors.ts`](../src/secret-detectors.ts). They use format rules for private-key blocks and common token prefixes (cloud, source-control, chat, payment, npm, JWT) and context rules for authorization/cookie/API-key headers, URL userinfo, credential-like key assignments and trusted #7 field keys. They emit `CREDENTIAL_OR_SECRET` / `SECRET`, non-reversible v1 evidence with spans and optional tenant-keyed HMAC fingerprints, never values. They do not use generic high-entropy detection. Env/template references and masks are skipped, and unknown token formats without a credential-like key are missed. The synthetic golden check measures detector recall only; it is **not** zero-egress evidence, which needs #13 transformation and the #19 sentinel on actual outbound bytes. The detectors are not yet wired to #6 decoded views or #7 fields.
+Bounded, **NON-ENFORCING** #8 credential detectors exist in [`src/secret-detectors.ts`](../src/secret-detectors.ts). Format rules cover private-key blocks (PEM, PGP, SSH2, PuTTY) and common token prefixes (cloud, source-control, chat, payment, npm, JWT/JWE). Context rules cover:
+- authorization, cookie and API-key headers;
+- URL userinfo up to the last `@`;
+- credential-like key assignments, including ones nested inside other values;
+- CLI flags, Dockerfile `ENV`, `.netrc`, `curl -u`, XML elements, YAML block scalars and trusted #7 field keys.
+
+Context values over-cover to the end of the line or quote rather than stop inside a secret. Unterminated quotes are covered to the end of the line. The detectors emit `CREDENTIAL_OR_SECRET` / `SECRET`, non-reversible v1 evidence with spans and optional domain-separated, tenant-keyed HMAC fingerprints, never values. Anyone holding the key can still test guesses of low-entropy values. Whole-value env/template references and explicit masks are skipped. Known gaps:
+- no generic high-entropy detection, so unknown token formats without a credential-like key are missed;
+- attached short flags (`-psecret`) and prose (`the password is x`) are missed;
+- over-covering can span structural characters in inline contexts.
+
+The synthetic golden check is a development measurement of detector recall, **not** held-out or zero-egress evidence; that needs #13 transformation and the #19 sentinel on actual outbound bytes. The detectors are not yet wired to #6 decoded views or #7 fields.
 
 Primary issues: #6-#13, #19, and #37 (PERSON/EMAIL/PHONE candidate source).
 

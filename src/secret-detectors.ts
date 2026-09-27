@@ -57,13 +57,15 @@ export interface SecretRequest {
 
 const KEY_SUBTYPES: readonly [RegExp, SecretSubtype][] = [
   [/refreshtoken/u, 'REFRESH_TOKEN'],
-  [/privatekey|sshkey|pem$/u, 'PRIVATE_KEY'],
+  [/privatekey|sshkey|keypem$/u, 'PRIVATE_KEY'],
   [/connectionstring|accountkey|sharedaccess|sastoken|^sas$|^sig$/u, 'CONNECTION_SECRET'],
-  [/cookie|sessionid|^sid$|^session$/u, 'COOKIE'],
+  [/cookie|sessionid|sessid$|^sid$|^session$/u, 'COOKIE'],
   [/apikey|accesskey|clientsecret|secretkey|appkey|^secret$|secret$/u, 'API_KEY'],
-  // `token` only as a suffix: `access_token`, `x-auth-token`, but not `tokenizer`.
-  [/tokens?$|bearer|authorization|^auth$|jwt/u, 'ACCESS_TOKEN'],
-  [/password|passwd|passphrase|^pwd$|^pass$|pwd$/u, 'PASSWORD'],
+  [/credentials?$/u, 'PASSWORD'],
+  // `token` only as a suffix (`access_token`, `x-auth-token`, not `tokenizer`); usage counters are not secrets.
+  [/^(?!(?:input|output|max|total|num|prompt|completion|cached|reasoning)tokens?$).*tokens?$|bearer|authorization|^auth$|^jwt$|jwttoken$/u,
+    'ACCESS_TOKEN'],
+  [/password|passwd|passphrase|^pwd$|^pass$|pwd$|pass$/u, 'PASSWORD'],
 ];
 /** Credential subtype for a key such as `DB_PASSWORD`, `apiKey`, `x-api-key` or `Client Secret`, else null. */
 export function subtypeForKey(key: string): SecretSubtype | null {
@@ -72,37 +74,45 @@ export function subtypeForKey(key: string): SecretSubtype | null {
   for (const [pattern, subtype] of KEY_SUBTYPES) if (pattern.test(compact)) return subtype;
   return null;
 }
-/** Values that reference a secret rather than contain one: env/template references and Hylja placeholders. */
+/**
+ * Whole values that reference a secret rather than contain one: env/template references, Hylja
+ * placeholders and explicit masks. The *entire* value must match; `${X}rest` is not a reference.
+ */
 function isReference(value: string): boolean {
-  return /^(?:\$\{[A-Za-z_][\w.-]*\}|\$[A-Za-z_]\w*|%[A-Za-z_]\w*%|\{\{\s*[\w.-]+\s*\}\}|\[hylja:protected:[A-Z0-9_]+\])$/u.test(value) ||
-    /^(?:\*{3,}|<[\w -]{1,40}>|null|none|true|false)$/iu.test(value);
+  return /^(?:\$\{[A-Za-z_][\w.-]*\}|\$[A-Z_][A-Z0-9_]*|%[A-Z_][A-Z0-9_]*%|\{\{\s*[\w.-]+\s*\}\}|\[hylja:protected:[A-Z0-9_]+\])$/u.test(value) ||
+    /^(?:\*{3,}|<(?:redacted|hidden|masked|secret|password|token|api[-_ ]?key|your[-_ ][\w -]{1,30})>|null|none|true|false)$/iu.test(value);
 }
+const SCHEME_WORD = /^(?:Bearer|Basic|Token|Digest|Negotiate)$/iu;
 
-/* ---------- Format rules (bounded; each anchored by a literal prefix or block marker) ---------- */
+/* ---------- Format rules (bounded; each anchored by a literal prefix) ---------- */
 
-interface Rule { id: string; subtype: SecretSubtype; pattern: RegExp; group?: number }
-const B = '(?<![A-Za-z0-9_-])';
-const E = '(?![A-Za-z0-9_-])';
+interface Rule { id: string; subtype: SecretSubtype; pattern: RegExp }
+// Prefix tokens have alphanumeric bodies; `_`/`-` next to them (`X_ghp_…`, `ghp_…-suffix`) is a boundary.
+const B = '(?<![A-Za-z0-9])';
+const E = '(?![A-Za-z0-9])';
 const FORMAT_RULES: readonly Rule[] = [
   { id: 'format.aws-access-key-id', subtype: 'API_KEY', pattern: new RegExp(`${B}(?:AKIA|ASIA|AGPA|AROA)[0-9A-Z]{16}${E}`, 'gu') },
   { id: 'format.github-token', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}gh[pousr]_[A-Za-z0-9]{36,255}${E}`, 'gu') },
   { id: 'format.github-fine-grained-pat', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}github_pat_[A-Za-z0-9_]{22,255}${E}`, 'gu') },
-  { id: 'format.gitlab-pat', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}glpat-[A-Za-z0-9_-]{20,255}${E}`, 'gu') },
-  { id: 'format.slack-token', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}xox[abposr]-[A-Za-z0-9-]{10,255}${E}`, 'gu') },
+  { id: 'format.gitlab-pat', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}glpat-[A-Za-z0-9_-]{20,255}(?![A-Za-z0-9_-])`, 'gu') },
+  { id: 'format.slack-token', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}xox[abposr]-[A-Za-z0-9-]{10,255}(?![A-Za-z0-9-])`, 'gu') },
   { id: 'format.slack-webhook', subtype: 'API_KEY',
     pattern: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9]{6,32}\/[A-Za-z0-9]{6,32}\/[A-Za-z0-9]{12,64}/gu },
   { id: 'format.stripe-key', subtype: 'API_KEY', pattern: new RegExp(`${B}(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,255}${E}`, 'gu') },
-  { id: 'format.google-api-key', subtype: 'API_KEY', pattern: new RegExp(`${B}AIza[0-9A-Za-z_-]{35}${E}`, 'gu') },
-  { id: 'format.sk-prefixed-api-key', subtype: 'API_KEY', pattern: new RegExp(`${B}sk-[A-Za-z0-9_-]{20,255}${E}`, 'gu') },
+  { id: 'format.google-api-key', subtype: 'API_KEY', pattern: new RegExp(`${B}AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])`, 'gu') },
+  { id: 'format.sk-prefixed-api-key', subtype: 'API_KEY', pattern: new RegExp(`${B}sk-[A-Za-z0-9_-]{20,255}(?![A-Za-z0-9_-])`, 'gu') },
   { id: 'format.npm-token', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}npm_[A-Za-z0-9]{36}${E}`, 'gu') },
+  // JWE compact form (five parts, the key part may be empty) and JWT (three parts, signature may be empty).
+  { id: 'format.jwe', subtype: 'ACCESS_TOKEN',
+    pattern: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,8192}\.[A-Za-z0-9_-]{0,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,65536}\.[A-Za-z0-9_-]{0,8192}(?![A-Za-z0-9_-])/gu },
   { id: 'format.jwt', subtype: 'ACCESS_TOKEN',
-    pattern: new RegExp(`${B}eyJ[A-Za-z0-9_-]{5,4096}\\.eyJ[A-Za-z0-9_-]{5,8192}\\.[A-Za-z0-9_-]{0,4096}${E}`, 'gu') },
+    pattern: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,8192}\.eyJ[A-Za-z0-9_-]{5,65536}\.[A-Za-z0-9_-]{0,8192}(?![A-Za-z0-9_-])/gu },
 ];
 
 /* ---------- Private key blocks: linear marker scan (a lazy regex would rescan per BEGIN) ---------- */
 
-const KEY_BEGIN = /-----BEGIN (?:(?:[A-Z0-9]+ ){0,3}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----/gu;
-const KEY_END = /-----END (?:(?:[A-Z0-9]+ ){0,3}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----/gu;
+const KEY_BEGIN = /-----BEGIN (?:(?:[A-Z0-9]+ ){0,3}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----|---- BEGIN SSH2 (?:ENCRYPTED )?PRIVATE KEY ----|PuTTY-User-Key-File-\d+:/gu;
+const KEY_END = /-----END (?:(?:[A-Z0-9]+ ){0,3}PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----|---- END SSH2 (?:ENCRYPTED )?PRIVATE KEY ----|Private-MAC:[ \t]*[0-9A-Fa-f]*/gu;
 /** Each block spans BEGIN..END; an unterminated block runs to the end of the text (never truncated). */
 function keyBlocks(text: string, out: Found[]): void {
   KEY_BEGIN.lastIndex = 0;
@@ -110,61 +120,189 @@ function keyBlocks(text: string, out: Found[]): void {
     KEY_END.lastIndex = begin.index + begin[0].length;
     const end = KEY_END.exec(text);
     const stop = end ? end.index + end[0].length : text.length;
-    out.push({ subtype: 'PRIVATE_KEY', rule: begin[0].includes('PGP') ? 'format.pgp-private-key' : 'format.pem-private-key',
-      basis: 'FORMAT', start: begin.index, end: stop });
+    const rule = begin[0].includes('PGP') ? 'format.pgp-private-key' : begin[0].includes('SSH2') ? 'format.ssh2-private-key' :
+      begin[0].startsWith('PuTTY') ? 'format.putty-private-key' : 'format.pem-private-key';
+    out.push({ subtype: 'PRIVATE_KEY', rule, basis: 'FORMAT', start: begin.index, end: stop });
     KEY_BEGIN.lastIndex = stop;
     if (!end) break;
   }
 }
 
-/* ---------- Context rules: headers, URL userinfo, key assignments ---------- */
-
-const HEADER = /(?<![\w-])(Proxy-Authorization|Authorization|Cookie|Set-Cookie|X-Api-Key|Api-Key|X-Auth-Token)[ \t]*:[ \t]*([^\r\n]{1,8192})/giu;
-const USERINFO = /[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/[^\s/?#@:]{0,256}:([^\s/?#@]{1,256})@/gu;
-// `key = value`, `key: value`, `"key": "value"`, `--key value`-free; values quoted or bare.
-const ASSIGNMENT = /(?<![\w-])(["']?)([A-Za-z_][\w.-]{0,63})\1[ \t]*(?:=|:)[ \t]*(?:"((?:[^"\\\r\n]|\\.){1,4096})"|'([^'\r\n]{1,4096})'|(\$\{[A-Za-z_][\w.-]{0,127}\}|\{\{\s*[\w.-]{1,128}\s*\}\}|\[hylja:protected:[A-Z0-9_]{1,64}\]|[^\s"',;&}{)\]]{1,4096}))/gu;
+/* ---------- Value reading: over-cover rather than stop inside a secret ---------- */
 
 interface Found { subtype: SecretSubtype; rule: string; basis: SecretCandidate['basis']; start: number; end: number }
+// Memo of the last newline search, so repeated lookups on one long line stay linear overall.
+let lineMemo: { text: string; from: number; newline: number } | null = null;
+function lineEnd(text: string, from: number): number {
+  let newline: number;
+  if (lineMemo && lineMemo.text === text && from >= lineMemo.from && from <= lineMemo.newline) newline = lineMemo.newline;
+  else {
+    const found = text.indexOf('\n', from);
+    newline = found < 0 ? text.length : found;
+    lineMemo = { text, from, newline };
+  }
+  return newline > from && text[newline - 1] === '\r' ? newline - 1 : newline;
+}
+/** Start of the line containing `at`, looking back at most 256 units (callers only need nearby context). */
+function lineStart(text: string, at: number): number {
+  const floor = Math.max(0, at - 256);
+  for (let index = at - 1; index >= floor; index--) if (text[index] === '\n') return index + 1;
+  return floor;
+}
+/**
+ * Read the value that starts at `at`. Quoted values run to the matching unescaped quote, or to the end of
+ * the line when unterminated. YAML block scalars (`|`, `>`) take the following more-indented lines. Bare
+ * values stop at a context terminator: `line` runs to end of line (YAML, .env, properties), `json` stops
+ * at `,}]`/whitespace, `query` at `&`/`#`/whitespace, `inline` at whitespace or a quote.
+ */
+function readValue(text: string, at: number, context: 'line' | 'json' | 'query' | 'inline'): { start: number; end: number } | null {
+  const eol = lineEnd(text, at);
+  if (at >= eol) return null;
+  const quote = text[at];
+  if (quote === '"' || quote === "'" || quote === '`') {
+    let index = at + 1;
+    for (; index < eol; index++) {
+      if (text[index] === '\\') { index++; continue; }
+      if (text[index] === quote) break;
+    }
+    // Unterminated: cover to end of line (a truncated log line still hides its secret).
+    return index > at + 1 ? { start: at + 1, end: Math.min(index, eol) } : index >= eol ? { start: at, end: eol } : null;
+  }
+  if ((quote === '|' || quote === '>') && /^[|>][+-]?[ \t]*$/u.test(text.slice(at, eol))) {
+    const indent = (line: number): number => { let i = line; while (text[i] === ' ' || text[i] === '\t') i++; return i - line; };
+    const base = indent(lineStart(text, at));
+    let end = eol, next = eol + (text[eol] === '\r' ? 2 : 1);
+    while (next < text.length) {
+      const stop = lineEnd(text, next);
+      if (text.slice(next, stop).trim() && indent(next) <= base) break;
+      end = stop;
+      next = stop + (text[stop] === '\r' ? 2 : 1);
+    }
+    return end > eol ? { start: eol + 1, end } : null;
+  }
+  let end = at;
+  if (context === 'line') end = eol;
+  else {
+    const stop = context === 'json' ? /[\s,}\]]/u : context === 'query' ? /[\s&#]/u : /[\s"'`]/u;
+    while (end < eol && !stop.test(text[end]!)) end++;
+  }
+  while (end > at && (text[end - 1] === ' ' || text[end - 1] === '\t')) end--;
+  return end > at ? { start: at, end } : null;
+}
 
-function headerCandidates(text: string, out: Found[]): void {
-  for (const match of text.matchAll(HEADER)) {
-    const name = match[1]!.toLowerCase();
-    // A quote ends the value: headers are often embedded in quoted command lines.
-    let value = match[2]!.split(/["'`]/u, 1)[0]!.replace(/\s+$/u, '');
-    let start = match.index + match[0].length - match[2]!.length;
-    let subtype: SecretSubtype = 'ACCESS_TOKEN';
-    if (name.endsWith('authorization')) {
-      const scheme = /^(Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|ApiKey)\s+/iu.exec(value);
-      if (scheme) { start += scheme[0].length; value = value.slice(scheme[0].length); }
-      if (scheme && /^basic$/iu.test(scheme[1]!)) subtype = 'PASSWORD';
-    } else if (name.includes('cookie')) {
-      subtype = 'COOKIE';
-      // Set-Cookie attributes after the first `;` are not secret.
-      if (name === 'set-cookie') value = value.split(';', 1)[0]!;
-    } else subtype = 'API_KEY';
-    if (value && !isReference(value) && !/^(?:Bearer|Basic|Token|Digest|Negotiate)$/iu.test(value)) {
-      out.push({ subtype, rule: `context.header.${name}`, basis: 'CONTEXT', start, end: start + value.length });
+/* ---------- Context rules ---------- */
+
+// `key sep` only: values are read separately, so a non-credential key never hides a later assignment
+// inside its own value (`{"env":"DB_PASSWORD=x"}`, `msg=password=x`).
+const KEY_SEP = /(?<![\w.$-])(--?|\$env:|export[ \t]+|ENV[ \t]+)?(["'<]?)([A-Za-z_][\w.-]{0,63})(["'>]?)[ \t]*(:=|=>|=|:(?!\/\/))[ \t]*/gu;
+function assignmentCandidates(text: string, out: Found[]): void {
+  KEY_SEP.lastIndex = 0;
+  for (let match = KEY_SEP.exec(text); match; match = KEY_SEP.exec(text)) {
+    const subtype = subtypeForKey(match[3]!);
+    if (!subtype) continue;
+    const at = match.index + match[0].length;
+    const before = match.index > 0 ? text[match.index - 1] : '\n';
+    // Only a key near the start of its line gets end-of-line values; the check looks back at most 64 units.
+    const head = lineStart(text, match.index);
+    const context = match[2] === '"' || match[2] === "'" ? 'json' : before === '?' || before === '&' ? 'query' :
+      match.index - head <= 64 &&
+      /^[ \t]*(?:--?|export[ \t]+|ENV[ \t]+)?["']?$/u.test(text.slice(head, match.index + (match[1]?.length ?? 0)))
+        ? 'line' : 'inline';
+    const value = readValue(text, at, context);
+    if (!value) continue;
+    const raw = text.slice(value.start, value.end);
+    // Only an Authorization *header* key makes a bare scheme word empty; elsewhere `password=Basic` is a value.
+    if (isReference(raw) || subtype === 'ACCESS_TOKEN' && /authorization/iu.test(match[3]!) && SCHEME_WORD.test(raw)) continue;
+    // `PWD=/home/...` in an env dump is the working directory, not a password.
+    if (/^pwd$/iu.test(match[3]!) && /^[/~]/u.test(raw)) continue;
+    out.push({ subtype, rule: 'context.key-assignment', basis: 'CONTEXT', ...value });
+    // Anything inside a credential value is already covered: resume after it (keeps scanning linear).
+    KEY_SEP.lastIndex = Math.max(KEY_SEP.lastIndex, value.end);
+  }
+}
+// Space-separated forms: `--password value`, `ENV DB_PASSWORD value`, `.netrc` `password value`, `curl -u user:pass`.
+const FLAG_SPACE = /(?<![\w-])--([A-Za-z][\w-]{0,63})[ \t]+(?!-)/gu;
+const LINE_SPACE = /^[ \t]*(?:ENV[ \t]+)?([A-Za-z_][\w.-]{0,63})[ \t]+(?![=:])/gmu;
+const NETRC = /(?<![\w-])(?:login[ \t]+\S+[ \t]+)?password[ \t]+/gu;
+const CURL_USER = /(?<![\w-])(?:-u|--user)[ \t]+[^\s:]{1,256}:/gu;
+function spacedCandidates(text: string, out: Found[]): void {
+  for (const [pattern, keyGroup, rule] of [[FLAG_SPACE, 1, 'context.cli-flag'], [LINE_SPACE, 1, 'context.line-key'],
+    [NETRC, 0, 'context.netrc'], [CURL_USER, 0, 'context.curl-user']] as const) {
+    pattern.lastIndex = 0;
+    for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+      if (!match[0].length) { pattern.lastIndex++; continue; }
+      const subtype = keyGroup ? subtypeForKey(match[keyGroup]!) : 'PASSWORD';
+      if (!subtype) continue;
+      const value = readValue(text, match.index + match[0].length, 'inline');
+      if (value && !isReference(text.slice(value.start, value.end))) {
+        out.push({ subtype, rule, basis: 'CONTEXT', ...value });
+        pattern.lastIndex = Math.max(pattern.lastIndex, value.end);
+      }
     }
   }
 }
-function userinfoCandidates(text: string, out: Found[]): void {
-  for (const match of text.matchAll(USERINFO)) {
-    const end = match.index + match[0].length - 1;
-    const value = match[1]!;
-    if (!isReference(value)) out.push({ subtype: 'PASSWORD', rule: 'context.url-userinfo', basis: 'CONTEXT', start: end - value.length, end });
+// XML elements named like credentials: `<password>…</password>`.
+const XML_ELEMENT = /<([A-Za-z_][\w.-]{0,63})(?:\s[^<>]{0,1024})?>([^<]{1,65536})<\/\1>/gu;
+function xmlCandidates(text: string, out: Found[]): void {
+  for (const match of text.matchAll(XML_ELEMENT)) {
+    const subtype = subtypeForKey(match[1]!);
+    const inner = match[2]!;
+    if (!subtype || !inner.trim() || isReference(inner.trim())) continue;
+    const start = match.index + match[0].length - inner.length - match[1]!.length - 3;
+    out.push({ subtype, rule: 'context.xml-element', basis: 'CONTEXT', start, end: start + inner.length });
   }
 }
-function assignmentCandidates(text: string, out: Found[]): void {
-  for (const match of text.matchAll(ASSIGNMENT)) {
-    const subtype = subtypeForKey(match[2]!);
-    if (!subtype) continue;
-    const group = match[3] !== undefined ? 3 : match[4] !== undefined ? 4 : 5;
-    const value = match[group]!;
-    // Header schemes are handled by the header rule; `Authorization: Bearer` alone is not a value.
-    if (isReference(value) || /^(?:Bearer|Basic|Token|Digest|Negotiate)$/iu.test(value)) continue;
-    const offset = match[0].length - value.length - (group === 5 ? 0 : 1);
-    out.push({ subtype, rule: 'context.key-assignment', basis: 'CONTEXT', start: match.index + offset,
-      end: match.index + offset + value.length });
+
+const HEADER = /(?<![\w-])(Proxy-Authorization|Authorization|Cookie|Set-Cookie|X-Api-Key|Api-Key|X-Auth-Token)[ \t]*:[ \t]*/giu;
+function headerCandidates(text: string, out: Found[]): void {
+  for (const match of text.matchAll(HEADER)) {
+    const name = match[1]!.toLowerCase();
+    let start = match.index + match[0].length;
+    let end = lineEnd(text, start);
+    // Inside a quoted command line (`-H "Authorization: Bearer x"`) the enclosing quote ends the header.
+    const opener = text[match.index - 1];
+    if (opener === '"' || opener === "'") {
+      const close = text.indexOf(opener, start);
+      if (close >= 0 && close < end) end = close;
+    }
+    while (end > start && (text[end - 1] === ' ' || text[end - 1] === '\t')) end--;
+    let subtype: SecretSubtype = subtypeForKey(name) ?? 'API_KEY';
+    if (name.endsWith('authorization')) {
+      subtype = 'ACCESS_TOKEN';
+      const scheme = /^(Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|ApiKey)(?:[ \t]+|$)/iu.exec(text.slice(start, Math.min(end, start + 32)));
+      if (scheme) start += scheme[0].length;
+      if (scheme && /^basic$/iu.test(scheme[1]!)) subtype = 'PASSWORD';
+    } else if (name.includes('cookie')) subtype = 'COOKIE';
+    // Set-Cookie attributes after the first unquoted `;` are not secret; everything else runs to the end.
+    if (name === 'set-cookie') {
+      let index = start, quoted = false;
+      for (; index < end; index++) { if (text[index] === '"') quoted = !quoted; else if (text[index] === ';' && !quoted) break; }
+      end = index;
+    }
+    if (end > start && !isReference(text.slice(start, end))) {
+      out.push({ subtype, rule: `context.header.${name}`, basis: 'CONTEXT', start, end });
+    }
+  }
+}
+// URL userinfo: the password runs from the first `:` after the user to the *last* `@` in the token, so
+// `p@ss` is covered in full.
+const URL_START = /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\//gu;
+function userinfoCandidates(text: string, out: Found[]): void {
+  URL_START.lastIndex = 0;
+  for (let match = URL_START.exec(text); match; match = URL_START.exec(text)) {
+    const from = match.index + match[0].length;
+    let to = from;
+    while (to < text.length && to - from < 4096 && !/[\s"'<>`]/u.test(text[to]!)) to++;
+    // Resume after this token: each character is scanned by at most one URL.
+    URL_START.lastIndex = Math.max(to, from);
+    const token = text.slice(from, to);
+    const last = token.lastIndexOf('@');
+    if (last < 0) continue;
+    const at = from + last;
+    const colon = text.indexOf(':', from);
+    if (colon < 0 || colon >= at) continue;
+    const value = text.slice(colon + 1, at);
+    if (value && !isReference(value)) out.push({ subtype: 'PASSWORD', rule: 'context.url-userinfo', basis: 'CONTEXT', start: colon + 1, end: at });
   }
 }
 
@@ -188,9 +326,11 @@ export function detectSecrets(request: SecretRequest): SecretResult {
   if (typeof text !== 'string' || !label(inputRef) || fieldKey !== undefined && typeof fieldKey !== 'string') {
     return failure('INVALID_REQUEST');
   }
-  if (fingerprintKey !== undefined && (!(fingerprintKey instanceof Uint8Array) || fingerprintKey.length < 32)) {
-    return failure('INVALID_FINGERPRINT_KEY');
-  }
+  try {
+    if (fingerprintKey !== undefined && (!(fingerprintKey instanceof Uint8Array) || !(fingerprintKey.length >= 32))) {
+      return failure('INVALID_FINGERPRINT_KEY');
+    }
+  } catch { return failure('INVALID_FINGERPRINT_KEY'); }
   if (text.length > MAX_TEXT_UNITS) return failure('INPUT_TOO_LARGE');
   if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text)) return failure('INVALID_TEXT');
 
@@ -212,6 +352,9 @@ export function detectSecrets(request: SecretRequest): SecretResult {
   headerCandidates(text, found);
   userinfoCandidates(text, found);
   assignmentCandidates(text, found);
+  spacedCandidates(text, found);
+  xmlCandidates(text, found);
+  if (found.length > 4 * MAX_CANDIDATES) return failure('TOO_MANY_CANDIDATES');
   // Same span and subtype: keep the FORMAT rule, the strongest evidence.
   const strength = { FORMAT: 0, FIELD_KEY: 1, CONTEXT: 2 };
   found.sort((a, b) => a.start - b.start || a.end - b.end || a.subtype.localeCompare(b.subtype) ||
@@ -221,9 +364,17 @@ export function detectSecrets(request: SecretRequest): SecretResult {
   if (unique.length > MAX_CANDIDATES) return failure('TOO_MANY_CANDIDATES');
 
   const field = createHash('sha256').update(inputRef).digest('hex').slice(0, 16);
-  const candidates = unique.map((item) => {
-    const fingerprint = fingerprintKey === undefined ? undefined :
-      createHmac('sha256', fingerprintKey as Uint8Array).update(text.slice(item.start, item.end)).digest('hex').slice(0, 32);
+  // Domain-separated so a tenant key reused for other HMACs never correlates with secret fingerprints.
+  // Anyone holding the key can still test guesses of low-entropy values; keep the key in the trusted plane.
+  const fingerprints: (string | undefined)[] = [];
+  try {
+    for (const item of unique) {
+      fingerprints.push(fingerprintKey === undefined ? undefined : createHmac('sha256', fingerprintKey as Uint8Array)
+        .update(`hylja.secret-fingerprint.v1\u0000${text.slice(item.start, item.end)}`).digest('hex').slice(0, 32));
+    }
+  } catch { return failure('INVALID_FINGERPRINT_KEY'); }
+  const candidates = unique.map((item, index) => {
+    const fingerprint = fingerprints[index];
     return Object.freeze({
       subtype: item.subtype, rule: item.rule, basis: item.basis, start: item.start, end: item.end,
       ...(fingerprint ? { fingerprint } : {}),
