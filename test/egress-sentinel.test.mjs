@@ -485,3 +485,28 @@ test('ninth review: stream remainders, uncertain layers, dumps and indented chun
   assert.equal(unknown(pem(Buffer.concat([Buffer.from([0x30, 0x82, 0x10, 0x00]), random(4000)]))).decision, 'BLOCK');
   assert.equal(unknown(wrap(pem(Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]), random(596)])))).decision, 'ALLOW');
 });
+
+test('tenth review: uncertain streams keep their tails and layers, wide byte pairs and dumps decode, compressed blobs are ordinary', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const hex = (bytes) => Buffer.from(bytes).toString('hex');
+  const b64 = (bytes) => Buffer.from(bytes).toString('base64');
+  const wrap = (content) => JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content }] });
+  const T = Buffer.from(`note ${PLANTED} ${CANARY}`);
+  const H = Buffer.from('harmless text here');
+  const pairs = (bytes, sep) => hex(bytes).match(/../gu).join(sep);
+  const br = (bytes) => zlib.brotliCompressSync(bytes);
+  const raw = (bytes) => zlib.deflateRawSync(bytes);
+  for (const bytes of [Buffer.concat([br(H), zlib.gzipSync(T)]), Buffer.concat([raw(H), br(T)]), br(br(T)), raw(zlib.gzipSync(T)), raw(raw(T))]) {
+    for (const sep of [' ', ':']) assert.equal(check(wrap(pairs(bytes, sep))).decision, 'BLOCK', pairs(bytes, sep).slice(0, 30));
+  }
+  for (const payload of [pairs(T, '    '), pairs(zlib.gzipSync(T), ',    '),
+    hex(zlib.gzipSync(T)).match(/.{1,32}/gu).map((line, i) => `${(i * 16).toString(16).padStart(8, '0')}: ${line.match(/../gu).join(' ')}`).join('\n')]) {
+    assert.equal(check(wrap(payload)).decision, 'BLOCK', payload.slice(0, 30));
+  }
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const blob = (n) => zlib.deflateSync(`config section ${n}: enabled=true, retries=3`);
+  for (const payload of [`${b64(blob(1))}\n${b64(blob(2))}`, `${hex(blob(1))}\n${hex(blob(2))}`, `${b64(zlib.gzipSync('first log line'))} then ${b64(zlib.gzipSync('second log line'))}`,
+    '{ password: password }', 'new Client({ apiKey: apiKey })']) {
+    assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
+  }
+});
