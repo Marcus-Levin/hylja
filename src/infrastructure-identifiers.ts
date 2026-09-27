@@ -224,10 +224,18 @@ function nameCandidates(text: string, out: Found[]): void {
   for (const match of text.matchAll(URL_RE)) {
     const scheme = match[1]!.toLowerCase();
     // Trailing prose punctuation is not part of the URL; an unmatched `)` is prose too.
-    let rest = match[3]!;
-    while (/[.,;:!?'\]}]$/u.test(rest) || rest.endsWith(')') && (rest.match(/\(/gu) ?? []).length < (rest.match(/\)/gu) ?? []).length) {
-      rest = rest.slice(0, -1);
+    // Counts are taken once and updated while trimming, so trimming stays linear.
+    const rest0 = match[3]!;
+    let length = rest0.length;
+    let opens = 0, closes = 0;
+    for (const char of rest0) { if (char === '(') opens++; else if (char === ')') closes++; }
+    for (;;) {
+      const last = rest0[length - 1];
+      if (last !== undefined && /[.,;:!?'\]}]/u.test(last)) { length--; continue; }
+      if (last === ')' && opens < closes) { length--; closes--; continue; }
+      break;
     }
+    const rest = rest0.slice(0, length);
     add(out, { semanticType: 'NETWORK_IDENTIFIER', subtype: 'URL', rule: 'format.url', basis: 'FORMAT', start: match.index,
       end: match.index + match[1]!.length + 3 + match[2]!.length + rest.length, fidelity: { scheme: SCHEMES.has(scheme) ? scheme : 'OTHER' } });
     // The authority host is also a HOST candidate even when it is a single label (`http://db01:5432`).

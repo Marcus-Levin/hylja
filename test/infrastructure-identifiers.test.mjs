@@ -237,3 +237,9 @@ test('review: keyed-name rule skips schemes, emails, versions and prose; finds s
   has('server_name = web01', 'HOST_OR_SERVICE', '', 'web01');
   has('Data Source=sql01;', 'HOST_OR_SERVICE', '', 'sql01');
 });
+
+test('review: URLs ending in long punctuation runs are trimmed in linear time', () => {
+  const started = process.hrtime.bigint();
+  run(`https://a.invalid/${')'.repeat(8000)} `.repeat(130).slice(0, MAX_TEXT_UNITS));
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 3000);
+});
