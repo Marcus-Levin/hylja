@@ -82,7 +82,9 @@ function fold(text: string): Folded {
   let folded = '';
   const origin: number[] = [], originEnd: number[] = [];
   for (const match of text.matchAll(/\P{M}\p{M}*|\p{M}+/gsu)) {
-    const piece = match[0].normalize('NFC').toLowerCase().replace(/(?=\p{M})\p{Default_Ignorable_Code_Point}/gu, '');
+    // NFKC plus case folding specials (dotted İ, ß), with invisible characters removed, for terms and text alike.
+    const piece = match[0].normalize('NFKC').toLowerCase().replace(/i\u0307/gu, 'i').replace(/ß/gu, 'ss')
+      .replace(/\p{Default_Ignorable_Code_Point}/gu, '');
     for (let unit = 0; unit < piece.length; unit++) { origin.push(match.index); originEnd.push(match.index + match[0].length); }
     folded += piece;
   }
@@ -96,31 +98,51 @@ interface TrieNode { entry?: number; next: Map<string, TrieNode> }
 
 const CLASSES: Readonly<Record<string, string>> = Object.freeze({ A: 'A-Z', a: 'a-z', '9': '0-9', X: 'A-Z0-9' });
 /** Compile a template to a bounded, backtracking-free regex source, or null when invalid or ambiguous. */
-function compileTemplate(template: unknown): string | null {
+function compileTemplate(template: unknown): { source: string; wordStart: boolean; wordEnd: boolean } | null {
   if (!label(template, MAX_TEMPLATE)) return null;
-  let source = '', placeholders = 0, pendingVariable = false;
+  let source = '', placeholders = 0;
+  // Class of a preceding variable-length placeholder: the next element must not overlap it, so a variable
+  // run can only end at a character outside its class and matching never backtracks.
+  let pending: string | null = null;
+  const word = /[\p{L}\p{N}_]/u;
+  let wordStart = false, wordEnd = false;
   for (let index = 0; index < template.length;) {
     const placeholder = /^\{([Aa9X])(?::(\d{1,2})(?:-(\d{1,2}))?)?\}/u.exec(template.slice(index));
     if (placeholder) {
-      if (pendingVariable) return null;
+      if (pending) return null;
       const min = placeholder[2] ? Number(placeholder[2]) : 1;
       const max = placeholder[3] ? Number(placeholder[3]) : min;
       if (min < 1 || max < min || max > 32) return null;
       source += `[${CLASSES[placeholder[1]!]}]{${min}${max === min ? '' : `,${max}`}}`;
-      pendingVariable = max !== min;
+      pending = max !== min ? CLASSES[placeholder[1]!]! : null;
+      if (index === 0) wordStart = true;
+      wordEnd = true;
       placeholders++;
       index += placeholder[0].length;
       continue;
     }
     const char = template[index]!;
     if (char === '{' || char === '}') return null;
+    if (pending && new RegExp(`[${pending}]`, 'u').test(char)) return null;
+    if (index === 0) wordStart = word.test(char);
+    wordEnd = word.test(char);
+    pending = null;
     // Only regex syntax characters are escaped; `\\-` is not a valid escape outside a class in `u` mode.
     source += char.replace(/[.*+?^${}()|[\]\\/]/gu, '\\$&');
-    pendingVariable = false;
     index++;
   }
   // A template must constrain something; a bare literal belongs in the term dictionary.
-  return placeholders ? `(?<![A-Za-z0-9_-])${source}(?![A-Za-z0-9_-])` : null;
+  return placeholders ? { source, wordStart, wordEnd } : null;
+}
+// Identifier characters a pattern span is expanded over, so `ÅPMP-0042` or `PN12345.01` is never covered in part.
+const IDENT = /[\p{L}\p{M}\p{N}_.\/:-]/u;
+const MAX_EXPAND = 256;
+function expand(text: string, start: number, end: number, wordStart: boolean, wordEnd: boolean): { start: number; end: number } {
+  if (wordStart) { const floor = Math.max(0, start - MAX_EXPAND); while (start > floor && IDENT.test(text[start - 1]!)) start--; }
+  if (wordEnd) { const ceiling = Math.min(text.length, end + MAX_EXPAND); while (end < ceiling && IDENT.test(text[end]!)) end++; }
+  // Trailing sentence punctuation is not part of an identifier.
+  while (end > start && /[.:/]/u.test(text[end - 1]!)) end--;
+  return { start, end };
 }
 
 /* ---------- Configuration handle ---------- */
@@ -132,7 +154,7 @@ interface Compiled {
   scope: CandidateScope;
   entries: Classified[];
   root: TrieNode;
-  patterns: { regex: RegExp; entry: Classified }[];
+  patterns: { regex: RegExp; entry: Classified; wordStart: boolean; wordEnd: boolean }[];
   hints: { path: readonly string[]; entry: Classified }[];
 }
 const registry = new WeakMap<object, Compiled>();
@@ -170,9 +192,9 @@ export function createCandidateConfig(scope: CandidateScope, config: CandidateCo
     }
     for (const entry of patterns as unknown[]) {
       const meta = classified(entry);
-      const source = compileTemplate((entry as Record<string, unknown>)?.template);
-      if (!meta || !source) invalid();
-      compiled.patterns.push({ regex: new RegExp(source!, 'gu'), entry: meta! });
+      const template = compileTemplate((entry as Record<string, unknown>)?.template);
+      if (!meta || !template) invalid();
+      compiled.patterns.push({ regex: new RegExp(template!.source, 'gu'), entry: meta!, wordStart: template!.wordStart, wordEnd: template!.wordEnd });
     }
     for (const entry of fieldHints as unknown[]) {
       const meta = classified(entry);
@@ -190,13 +212,46 @@ export function createCandidateConfig(scope: CandidateScope, config: CandidateCo
 
 /* ---------- Generic engineering-key context (independent of any tenant configuration) ---------- */
 
-const ENGINEERING_KEYS: readonly [RegExp, string][] = [
-  [/^(?:part|article|material)(?:no|nr|num|number|id)?$/u, 'PART_NUMBER'], [/^(?:drawing|dwg)(?:no|nr|num|number|id)?$/u, 'DRAWING_NUMBER'],
-  [/^(?:item)(?:no|nr|num|number|id)$/u, 'ITEM_ID'], [/^(?:document|doc)(?:no|nr|num|number|id)$/u, 'DOCUMENT_ID'],
-  [/^(?:asset|equipment)(?:tag|no|nr|number|id)$/u, 'ASSET_TAG'], [/^(?:functionallocation|funcloc|floc)$/u, 'FUNCTIONAL_LOCATION'],
-  [/^plc(?:tag|address)$/u, 'PLC_TAG'], [/^(?:scada|historian|opc)(?:tag|point|node|nodeid)?$/u, 'SCADA_TAG'],
+// English and Swedish key names. Part/drawing/item/document/asset values must contain a digit (`Part: Introduction`
+// is prose); PLC, SCADA and functional-location values need not.
+const ENGINEERING_KEYS: readonly [RegExp, string, boolean][] = [
+  [/^(?:part(?:no|nr|num|number|id)?|(?:article|material)(?:no|nr|num|number|id)|artikel(?:nummer|nr))$/u, 'PART_NUMBER', true],
+  [/^(?:(?:drawing|dwg)(?:no|nr|num|number|id)?|ritnings?(?:nummer|nr))$/u, 'DRAWING_NUMBER', true],
+  [/^(?:item(?:no|nr|num|number|id)|post(?:nummer|nr))$/u, 'ITEM_ID', true],
+  [/^(?:(?:document|doc)(?:no|nr|num|number|id)|dokument(?:nummer|nr|id))$/u, 'DOCUMENT_ID', true],
+  [/^(?:(?:asset|equipment)(?:tag|no|nr|number|id)|utrustnings?(?:nummer|nr|id)|objekt(?:nummer|nr|id))$/u, 'ASSET_TAG', true],
+  [/^(?:functionallocation|funcloc|floc|funktionsplats)$/u, 'FUNCTIONAL_LOCATION', false],
+  [/^plc(?:tag|address)$/u, 'PLC_TAG', false], [/^(?:scada|historian|opc)(?:tag|point|node|nodeid)?$/u, 'SCADA_TAG', false],
 ];
-const KEY_VALUE = /(?<![\w-])["']?([A-Za-z][\w.-]{0,63})["']?[ \t]*[:=][ \t]*["']?([A-Za-z0-9][\w./:#-]{0,127})/gu;
+const KEY_VALUE = /(?<![\w-])["']?([A-Za-z][\w.-]{0,63})["']?[ \t]*[:=][ \t]*/gu;
+/** Monotonic end-of-line lookups: each newline search starts where the previous one ended. */
+interface LineCache { end(at: number): number }
+function lineCache(text: string): LineCache {
+  let from = -1, newline = -1;
+  return { end(at: number) {
+    if (at < from || at > newline) { from = at; const found = text.indexOf('\n', at); newline = found < 0 ? text.length : found; }
+    return newline > at && text[newline - 1] === '\r' ? newline - 1 : newline;
+  } };
+}
+/** The value after `key:`: quoted to the closing quote, at line start to end of line, otherwise to whitespace or `,`. */
+function engineeringValue(text: string, at: number, keyStart: number, lines: LineCache): { start: number; end: number } | null {
+  const eol = lines.end(at);
+  if (at >= eol) return null;
+  const quote = text[at];
+  if (quote === '"' || quote === "'") {
+    const close = text.indexOf(quote, at + 1);
+    const end = close < 0 || close > eol ? eol : close;
+    return end > at + 1 ? { start: at + 1, end } : null;
+  }
+  // Look back at most 64 units for the line start (enough to tell a line-leading key from an inline one).
+  let lineStart = keyStart;
+  while (lineStart > 0 && keyStart - lineStart <= 64 && text[lineStart - 1] !== '\n') lineStart--;
+  let end = at;
+  if (keyStart - lineStart <= 64 && !text.slice(lineStart, keyStart).trim().replace(/^[-"']+/u, '')) end = eol;
+  else while (end < eol && !/[\s,"'}\]]/u.test(text[end]!)) end++;
+  while (end > at && /\s/u.test(text[end - 1]!)) end--;
+  return end > at ? { start: at, end } : null;
+}
 
 /* ---------- Detection ---------- */
 
@@ -213,17 +268,23 @@ function hintMatches(hint: readonly string[], path: readonly string[]): boolean 
  * project, or a forged object, never matches: the result is PARTIAL and only generic candidates remain.
  */
 export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
-  let text: unknown, inputRef: unknown, config: unknown, fieldPath: unknown, tenantRef: unknown, projectRef: unknown;
+  let text: unknown, inputRef: unknown, config: unknown, fieldPath: string[] | undefined, tenantRef: unknown, projectRef: unknown;
   try {
-    let scope: unknown;
-    ({ text, inputRef, scope, config, fieldPath } = request);
+    // Own properties only: a polluted prototype cannot supply a configuration or scope.
+    const own = (object: object, key: string): unknown => Object.hasOwn(object, key) ? (object as Record<string, unknown>)[key] : undefined;
+    if (!request || typeof request !== 'object') return failure('INVALID_REQUEST');
+    text = own(request, 'text'); inputRef = own(request, 'inputRef'); config = own(request, 'config');
+    const scope = own(request, 'scope');
     if (!scope || typeof scope !== 'object') return failure('INVALID_REQUEST');
-    ({ tenantRef, projectRef } = scope as Record<string, unknown>);
+    tenantRef = own(scope, 'tenantRef'); projectRef = own(scope, 'projectRef');
+    const path = own(request, 'fieldPath');
+    if (path !== undefined) {
+      if (!Array.isArray(path) || path.length > 128) return failure('INVALID_FIELD_PATH');
+      fieldPath = [...path];
+      if (fieldPath.some((segment) => typeof segment !== 'string')) return failure('INVALID_FIELD_PATH');
+    }
   } catch { return failure('INVALID_REQUEST'); }
   if (typeof text !== 'string' || !label(inputRef, 1024) || !label(tenantRef) || !label(projectRef)) return failure('INVALID_REQUEST');
-  if (fieldPath !== undefined && (!Array.isArray(fieldPath) || fieldPath.length > 64 || fieldPath.some((s) => typeof s !== 'string'))) {
-    return failure('INVALID_REQUEST');
-  }
   if (text.length > MAX_TEXT_UNITS) return failure('INPUT_TOO_LARGE');
   if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text)) return failure('INVALID_TEXT');
 
@@ -249,7 +310,7 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
       if (fieldPath) {
         compiled.hints.forEach(({ path, entry }, index) => {
           const start = text.length - text.trimStart().length, end = text.trimEnd().length;
-          if (end > start && hintMatches(path, fieldPath as string[])) add({ ...entry, rule: `field-hint.${index}`, basis: 'FIELD_HINT', start, end });
+          if (end > start && hintMatches(path, fieldPath!)) add({ ...entry, rule: `field-hint.${index}`, basis: 'FIELD_HINT', start, end });
         });
       }
       const folded = fold(text);
@@ -268,19 +329,32 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
           start: folded.origin[first.index]!, end: folded.originEnd[last.index + last[0].length - 1]! });
         index = longest.last + 1;
       }
-      compiled.patterns.forEach(({ regex, entry }, index) => {
+      compiled.patterns.forEach(({ regex, entry, wordStart, wordEnd }, index) => {
         regex.lastIndex = 0;
-        for (const match of text.matchAll(regex)) add({ ...entry, rule: `pattern.${index}`, basis: 'PATTERN', start: match.index, end: match.index + match[0].length });
+        let covered = -1;
+        for (const match of text.matchAll(regex)) {
+          if (match.index < covered) continue;
+          const span = expand(text, match.index, match.index + match[0].length, wordStart, wordEnd);
+          covered = span.end;
+          add({ ...entry, rule: `pattern.${index}`, basis: 'PATTERN', ...span });
+        }
       });
     }
-    for (const match of text.matchAll(KEY_VALUE)) {
-      const key = match[1]!.toLowerCase().replace(/[^a-z]/gu, '');
-      const subtype = ENGINEERING_KEYS.find(([pattern]) => pattern.test(key))?.[1];
-      if (!subtype) continue;
-      const start = match.index + match[0].length - match[2]!.length;
-      add({ semanticType: 'ENGINEERING_IDENTIFIER', subtype, rule: 'context.engineering-key', basis: 'CONTEXT', start, end: start + match[2]!.length });
+    KEY_VALUE.lastIndex = 0;
+    const lines = lineCache(text);
+    for (let match = KEY_VALUE.exec(text); match; match = KEY_VALUE.exec(text)) {
+      // Dotted keys (`meta.part_number`) use their last segment.
+      const key = match[1]!.split('.').pop()!.toLowerCase().replace(/[^a-z]/gu, '');
+      const rule = ENGINEERING_KEYS.find(([pattern]) => pattern.test(key));
+      if (!rule) continue;
+      const value = engineeringValue(text, match.index + match[0].length, match.index, lines);
+      if (!value) continue;
+      // Resume after the value whether or not it qualifies, so each character is read once.
+      KEY_VALUE.lastIndex = Math.max(KEY_VALUE.lastIndex, value.end);
+      if (rule[2] && !/\d/u.test(text.slice(value.start, value.end))) continue;
+      add({ semanticType: 'ENGINEERING_IDENTIFIER', subtype: rule[1], rule: 'context.engineering-key', basis: 'CONTEXT', ...value });
     }
-  } catch { return failure('TOO_MANY_CANDIDATES'); }
+  } catch (error) { return failure(error instanceof RangeError ? 'TOO_MANY_CANDIDATES' : 'INTERNAL_ERROR'); }
 
   found.sort((a, b) => a.start - b.start || a.end - b.end || a.rule.localeCompare(b.rule));
   const field = createHash('sha256').update(inputRef).digest('hex').slice(0, 16);

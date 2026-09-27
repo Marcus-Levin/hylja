@@ -113,7 +113,7 @@ test('configured sensitivity lets v1 composition resolve; generic candidates sta
 test('failures and missing configuration are explicit', () => {
   assert.deepEqual(detectConfigured({ text: 'x', inputRef: 'x', scope: A }).reasons, ['NO_CONFIG']);
   for (const [request, reason] of [[{ text: 1, inputRef: 'x', scope: A }, 'INVALID_REQUEST'],
-    [{ text: 'x', inputRef: 'x', scope: null }, 'INVALID_REQUEST'], [{ text: 'x', inputRef: 'x', scope: A, fieldPath: 'a.b' }, 'INVALID_REQUEST'],
+    [{ text: 'x', inputRef: 'x', scope: null }, 'INVALID_REQUEST'], [{ text: 'x', inputRef: 'x', scope: A, fieldPath: 'a.b' }, 'INVALID_FIELD_PATH'],
     [{ text: 'x'.repeat(MAX_TEXT_UNITS + 1), inputRef: 'x', scope: A }, 'INPUT_TOO_LARGE'], [{ text: '\uDC00', inputRef: 'x', scope: A }, 'INVALID_TEXT'],
     [{ text: 'PMP-0042 '.repeat(300), inputRef: 'x', scope: A, config: configA }, 'TOO_MANY_CANDIDATES']]) {
     const result = detectConfigured(request);
@@ -130,4 +130,55 @@ test('large dictionaries and adversarial inputs stay within a bounded-work budge
     assert.ok(['COMPLETE', 'FAILURE'].includes(result.status));
     assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 3000);
   }
+});
+
+test('review: templates whose literals overlap a preceding variable class are rejected; accepted ones stay linear', () => {
+  for (const template of ['{9:1-32}1{9:1-32}', '{X:1-8}A{9:2}', '{A:1-4}B', '{a:1-9}x']) {
+    assert.throws(() => createCandidateConfig(A, { patterns: [{ template, semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ITEM_ID' }] }),
+      TypeError, template);
+  }
+  const deterministic = createCandidateConfig(A, { patterns: [{ template: '{9:1-32}-{9:1-32}-{9:1-32}-{9:1-32}-{9:1-32}-{9:1-32}-{9:1-32}',
+    semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ITEM_ID' }] });
+  const started = process.hrtime.bigint();
+  detectConfigured({ text: `${'1-'.repeat(60)}x `.repeat(8000), inputRef: 'x', scope: A, config: deterministic });
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 3000);
+});
+
+test('review: pattern spans expand over the whole identifier token, never covering it in part', () => {
+  for (const [text, value] of [['ÅPMP-0042 x', 'ÅPMP-0042'], ['PMP-0042Ä x', 'PMP-0042Ä'], ['PMP-0042́ x', 'PMP-0042́'],
+    ['part PN12345.01 x', 'PN12345.01'], ['SYN.FT101.PV.X ok', 'SYN.FT101.PV.X'], ['tag PMP-0042.', 'PMP-0042'],
+    ['floc=S01.PMP.001 x', '=S01.PMP.001']]) {
+    assert.ok(rows(text, run(text)).some(([, , basis, v]) => basis === 'PATTERN' && v === value), `${text} -> ${value}`);
+  }
+});
+
+test('review: the generic engineering-key rule reads quoted, full-line, dotted and Swedish keys without prose hits', () => {
+  for (const [text, value] of [['plc_tag: %I0.1', '%I0.1'], ['plc_address=%MW100', '%MW100'], ['opc_node: ns=2;s=Line1.Pump.Speed', 'ns=2;s=Line1.Pump.Speed'],
+    ['scada_tag: "Line 1 Pump Speed"', 'Line 1 Pump Speed'], ['part_number: ABC+123', 'ABC+123'], ['drawing_no: DWG 1234 A', 'DWG 1234 A'],
+    [`part_number: P${'9'.repeat(200)}`, `P${'9'.repeat(200)}`], ['meta.part_number: X-1', 'X-1'], ['artikelnummer: SYN-4711', 'SYN-4711'],
+    ['ritningsnummer = R-1002', 'R-1002'], ['funktionsplats: =A1.B2', '=A1.B2']]) {
+    const found = run(text, { config: undefined }).candidates.map((c) => text.slice(c.start, c.end));
+    assert.ok(found.includes(value), `${text} -> ${JSON.stringify(found)}`);
+  }
+  for (const text of ['Part: Introduction', 'material: steel', 'article: news']) assert.deepEqual(run(text, { config: undefined }).candidates, [], text);
+});
+
+test('review: dictionary folding handles dotted I, sharp s, compatibility forms and invisible characters', () => {
+  const config = createCandidateConfig(A, { terms: [{ term: 'İstanbul Synthetic', semanticType: 'CUSTOMER_OR_PARTNER' },
+    { term: 'Straße Synthetic', semanticType: 'CUSTOMER_OR_PARTNER' }, { term: 'Northwind Synthetic AB', semanticType: 'CUSTOMER_OR_PARTNER' }] });
+  for (const text of ['ISTANBUL SYNTHETIC', 'istanbul synthetic', 'STRASSE SYNTHETIC', 'North​wind Synthetic AB', 'Ｎｏｒｔｈｗｉｎｄ Synthetic AB']) {
+    assert.equal(detectConfigured({ text, inputRef: 'x', scope: A, config }).candidates.length, 1, text);
+  }
+});
+
+test('review: requests read own properties only; bad field paths fail with their own reason', () => {
+  Object.prototype.config = configA;
+  try {
+    assert.deepEqual(detectConfigured({ text: 'Northwind Synthetic AB', inputRef: 'x', scope: A }).candidates, []);
+  } finally { delete Object.prototype.config; }
+  const revoked = Proxy.revocable([], {});
+  revoked.revoke();
+  assert.deepEqual(detectConfigured({ text: 'x', inputRef: 'x', scope: A, fieldPath: revoked.proxy }).reasons, ['INVALID_REQUEST']);
+  assert.deepEqual(detectConfigured({ text: 'x', inputRef: 'x', scope: A, fieldPath: [1] }).reasons, ['INVALID_FIELD_PATH']);
+  assert.equal(detectConfigured({ text: 'x', inputRef: 'x', scope: A, fieldPath: Array.from({ length: 100 }, () => 'a') }).status, 'COMPLETE');
 });
