@@ -92,7 +92,8 @@ Bounded, **NON-ENFORCING** #9 infrastructure detectors exist in [`src/infrastruc
 - keyed single-label hosts and environments.
 
 Each candidate carries derived fidelity facts: IP version and scope (documentation ranges only at /24 or /32 and narrower, reserved and IPv4-mapped handled), well-known port service, URL scheme (custom schemes reported as `OTHER`), path style and name class. Candidates carry v1 evidence without sensitivity or values. Precision limits:
-- a dotted name counts as a host only if its last label is a known or reserved TLD, a two-letter ccTLD or an IDN, so code such as `obj.method.call` is ignored, while unusual gTLDs and some code like `np.ma` are misclassified;
+- a dotted name counts as a host when its last label is a known gTLD, a private or cluster suffix (`svc`, `consul`, `lab`, ...) or an IDN, when a two-letter ccTLD has supporting evidence, or, for any TLD, when there is host context (`@`, `//`, `:port`) or three or more labels with a digit or hyphen;
+- code such as `obj.method.call`, `process.env.HOST` and version strings are ignored, but some two-letter code chains (`row.no`, `df.at`) and unusual gTLDs without context are misclassified;
 - dotted names ending in common file extensions are not hosts;
 - unquoted paths with spaces, relative paths, nested single-label URL hosts and device/session/correlation IDs are out of scope.
 

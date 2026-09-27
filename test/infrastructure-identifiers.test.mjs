@@ -243,3 +243,20 @@ test('review: URLs ending in long punctuation runs are trimmed in linear time', 
   run(`https://a.invalid/${')'.repeat(8000)} `.repeat(130).slice(0, MAX_TEXT_UNITS));
   assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 3000);
 });
+
+test('rereview: private suffixes, newer gTLDs and host context are hosts; code chains still are not', () => {
+  for (const [text, host] of [['db.default.svc', 'db.default.svc'], ['vault.service.consul:8200', 'vault.service.consul'],
+    ['ssh admin@db.default.svc', 'db.default.svc'], ['api.prod', 'api.prod'], ['nas.lab', 'nas.lab'], ['web.dmz', 'web.dmz'], ['app.k8s', 'app.k8s'],
+    ['build-07.tenant-a.host', 'build-07.tenant-a.host'], ['ops.team', 'ops.team'], ['acme.consulting', 'acme.consulting'],
+    ['?u=https://vault.service.consul/x', 'vault.service.consul'], ['//weird.customtld/x', 'weird.customtld'], ['portal.example.se', 'portal.example.se']]) {
+    has(text, 'HOST_OR_SERVICE', '', host);
+  }
+  for (const text of ['user.id', 'self.id', 'Object.is', 'this.me', 'main.cc', 'script.pl', 'module.pm', 'fig.ps', 'app.mk']) {
+    assert.deepEqual(found(text).filter(([t]) => t === 'HOST_OR_SERVICE'), [], text);
+  }
+  has('host=web', 'HOST_OR_SERVICE', '', 'web');
+  has('server: jenkins', 'HOST_OR_SERVICE', '', 'jenkins');
+  has('Server=sqlprod;', 'HOST_OR_SERVICE', '', 'sqlprod');
+  has('net 1.2.3.4/33', 'NETWORK_IDENTIFIER', 'IP', '1.2.3.4');
+  has('fd00::1/129', 'NETWORK_IDENTIFIER', 'IP', 'fd00::1');
+});

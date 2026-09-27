@@ -143,10 +143,13 @@ function parseIpv6(raw: string): number[] | null {
 function networkCandidates(text: string, out: Found[]): void {
   for (const match of text.matchAll(IPV4)) {
     const octets = match[1]!.split('.').map(Number);
-    const prefix = match[2] !== undefined ? Number(match[2]) : undefined;
-    if (octets.some((octet) => octet > 255) || prefix !== undefined && prefix > 32) continue;
+    let prefix = match[2] !== undefined ? Number(match[2]) : undefined;
+    if (octets.some((octet) => octet > 255)) continue;
+    // An impossible prefix (`/33`) does not hide the address: emit it as an IP without the prefix.
+    const validPrefix = prefix === undefined || prefix <= 32;
+    if (!validPrefix) prefix = undefined;
     const fidelity: InfraFidelity = { ipVersion: 4, scope: ipv4Scope(octets, prefix) };
-    const end = match.index + match[1]!.length + (match[2] !== undefined ? match[2].length + 1 : 0);
+    const end = match.index + match[1]!.length + (match[2] !== undefined && validPrefix ? match[2].length + 1 : 0);
     add(out, { semanticType: 'NETWORK_IDENTIFIER', subtype: prefix !== undefined ? 'SUBNET' : 'IP', rule: 'format.ipv4', basis: 'FORMAT',
       start: match.index, end, fidelity });
     if (match[3] !== undefined && Number(match[3]) <= 65535) {
@@ -165,10 +168,11 @@ function networkCandidates(text: string, out: Found[]): void {
     const tailGroups = address.includes('.') ? 7 : 8;
     if (!groups || !address.includes('::') && address.split(':').length !== tailGroups ||
       address.includes('::') && !/\d/u.test(address) && address.split(':').filter(Boolean).length < 3) continue;
-    const prefix = match[3] !== undefined ? Number(match[3]) : undefined;
-    if (prefix !== undefined && prefix > 128) continue;
+    const rawPrefix = match[3] !== undefined ? Number(match[3]) : undefined;
+    const prefix = rawPrefix !== undefined && rawPrefix <= 128 ? rawPrefix : undefined;
     const start = match.index + (match[1] ? 1 : 0);
-    const end = start + match[0].length - (match[1] ? 1 : 0) - (match[4] !== undefined ? match[4].length + 2 : match[1] && match[0].endsWith(']') ? 1 : 0);
+    let end = start + match[0].length - (match[1] ? 1 : 0) - (match[4] !== undefined ? match[4].length + 2 : match[1] && match[0].endsWith(']') ? 1 : 0);
+    if (rawPrefix !== undefined && prefix === undefined) end -= match[3]!.length + 1;
     add(out, { semanticType: 'NETWORK_IDENTIFIER', subtype: prefix !== undefined ? 'SUBNET' : 'IP', rule: 'format.ipv6', basis: 'FORMAT',
       start, end, fidelity: { ipVersion: 6, scope: ipv6Scope(groups, prefix) } });
     if (match[4] !== undefined && Number(match[4]) <= 65535) {
@@ -182,7 +186,7 @@ function networkCandidates(text: string, out: Found[]): void {
 /* ---------- Names, URLs and ports ---------- */
 
 // File extensions that look like TLDs; a dotted name ending in one is a file, not a host, outside a URL.
-const FILE_SUFFIX = new Set(['json', 'html', 'htm', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'md', 'txt', 'yml', 'yaml', 'xml', 'csv',
+const FILE_SUFFIX = new Set(['cc', 'pl', 'pm', 'ps', 'mk', 'json', 'html', 'htm', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'md', 'txt', 'yml', 'yaml', 'xml', 'csv',
   'log', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'pdf', 'zip', 'gz', 'tgz', 'tar', 'py', 'java', 'go', 'rs', 'sh', 'exe', 'dll', 'so',
   'css', 'lock', 'toml', 'ini', 'cfg', 'conf', 'bak', 'tmp', 'jar', 'war', 'class', 'c', 'h', 'cpp', 'hpp', 'cs', 'rb', 'php',
   'sql', 'db', 'dat', 'bin', 'iso', 'img', 'env', 'pem', 'crt', 'key', 'pub', 'map', 'd', 'test', 'spec', 'min', 'bz2', 'xz',
@@ -193,10 +197,33 @@ const DOMAIN = /(?<![\p{L}\p{N}_.-])((?:[\p{L}\p{N}](?:[\p{L}\p{M}\p{N}-]{0,61}[
 const TLDS = new Set(['com', 'net', 'org', 'edu', 'gov', 'mil', 'int', 'info', 'biz', 'io', 'ai', 'app', 'dev', 'cloud', 'tech',
   'online', 'site', 'xyz', 'name', 'pro', 'mobi', 'aero', 'coop', 'museum', 'jobs', 'travel', 'asia', 'arpa', 'local', 'internal',
   'lan', 'corp', 'intranet', 'home', 'invalid', 'test', 'example', 'localhost', 'onion', 'services', 'systems', 'company', 'global',
-  'network', 'digital', 'group', 'solutions', 'industries', 'energy', 'engineering', 'email', 'link', 'live', 'store', 'shop', 'blog']);
-function isTld(label: string): boolean {
-  const lower = label.toLowerCase();
-  return TLDS.has(lower) || /^[a-z]{2}$/u.test(lower) || lower.startsWith('xn--') || /[^\u0000-\u007f]/u.test(lower);
+  'network', 'digital', 'group', 'solutions', 'industries', 'energy', 'engineering', 'email', 'link', 'live', 'store', 'shop', 'blog',
+  'host', 'team', 'zone', 'space', 'page', 'club', 'works', 'agency', 'consulting', 'studio', 'tools', 'media', 'world', 'bank',
+  'health', 'finance', 'care', 'gmbh', 'berlin', 'nyc', 'london', 'stockholm', 'center', 'support', 'software', 'systems', 'security',
+  'services', 'ventures', 'partners', 'capital', 'technology', 'institute', 'academy', 'education', 'hosting', 'server', 'cloud', 'run',
+  'codes', 'build', 'direct', 'report', 'data', 'ltd', 'inc', 'co', 'me', 'tv', 'us', 'uk', 'eu', 'se', 'no', 'dk', 'fi', 'de', 'nl']);
+// Private and cluster-internal suffixes used for internal hosts.
+const PRIVATE_SUFFIXES = new Set(['svc', 'consul', 'lab', 'prod', 'production', 'stage', 'staging', 'dmz', 'k8s', 'priv', 'private', 'intra',
+  'cluster', 'vpn', 'office', 'site', 'plant', 'mgmt', 'infra', 'ad', 'domain', 'dom', 'loc', 'int', 'grp', 'nas', 'srv']);
+// Two-label names with a two-letter TLD are often code (`user.id`, `df.at`); accept these country codes unconditionally.
+const COMMON_CC = new Set(['se', 'no', 'dk', 'fi', 'de', 'uk', 'eu', 'fr', 'nl', 'ch', 'at', 'be', 'us', 'ca', 'au', 'jp', 'cn', 'es', 'pl']);
+/**
+ * Whether a dotted name is a host: a known or private TLD, an IDN/punycode TLD, a two-letter ccTLD with enough
+ * evidence, or any TLD with host context (after `@` or `//`, before `:port`) or three or more labels with a
+ * digit or hyphen. Code chains without such evidence (`obj.method.call`) are not hosts.
+ */
+function isHostName(name: string, context: boolean): boolean {
+  if (context) return true;
+  const original = name.split('.');
+  // `process.env.HOST` (env-var access) and `v1.2.3-beta.rc1` (versions) are code, not hosts.
+  if (/^[A-Z]{3,}$/u.test(original[original.length - 1]!) || /^v?\d+$/iu.test(original[0]!)) return false;
+  const labels = name.toLowerCase().split('.');
+  const last = labels[labels.length - 1]!;
+  const evidence = /[\d-]/u.test(name);
+  if (labels.length >= 3 && evidence) return true;
+  if (last.startsWith('xn--') || /[^\u0000-\u007f]/u.test(last) || PRIVATE_SUFFIXES.has(last)) return true;
+  if (/^[a-z]{2}$/u.test(last)) return labels.length >= 3 || evidence || COMMON_CC.has(last);
+  return TLDS.has(last);
 }
 const URL_RE = /(?<![\w+.-])([A-Za-z][A-Za-z0-9+.-]{0,31}):\/\/([^\s"'<>`/?#]{1,512})([^\s"'<>`]{0,8192})/gu;
 const SCHEMES = new Set(['http', 'https', 'ws', 'wss', 'ftp', 'ftps', 'sftp', 'ssh', 'git', 'file', 'ldap', 'ldaps', 'smb', 'nfs', 'mqtt',
@@ -211,7 +238,9 @@ function nameCandidates(text: string, out: Found[]): void {
     const name = match[1]!;
     const last = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
     // `package.json` is a file; `build.tenant-a.invalid` is a host. Reserved names always count.
-    if (FILE_SUFFIX.has(last) && !RESERVED_NAMES.test(name) || !isTld(last)) continue;
+    const before = text.slice(Math.max(0, match.index - 2), match.index);
+    const context = before.endsWith('@') || before === '//' || match[2] !== undefined;
+    if (FILE_SUFFIX.has(last) && !RESERVED_NAMES.test(name) || !RESERVED_NAMES.test(name) && !isHostName(name, context)) continue;
     const scope = nameScope(name);
     add(out, { semanticType: 'HOST_OR_SERVICE', rule: 'format.dns-name', basis: 'FORMAT', start: match.index,
       end: match.index + name.length, fidelity: { scope } });
@@ -370,8 +399,8 @@ function keyedCandidates(text: string, out: Found[]): void {
     const value = match[2]!;
     if (/^(?:true|false|null|none|\d+)$/iu.test(value) || /^v?\d+(?:\.\d+)+/u.test(value)) continue;
     // A single label must look like a host (`db01`, `sql-synthetic`); `Main` after `address=` is prose.
-    const environmentKey = /(?:^|[_.-])(?:env|environment|stage|tier)$/u.test(match[1]!.toLowerCase());
-    if (!environmentKey && !/[.\d-]/u.test(value)) continue;
+    // Only prose-prone keys (`address`, `service`, `node`) need a host-shaped value; `host=web` is a host.
+    if (/(?:address|service|node)$/u.test(match[1]!.toLowerCase()) && !/[.\d-]/u.test(value)) continue;
     const start = match.index + match[0].length - value.length;
     const environment = /(?:^|[_.-])(?:env|environment|stage|tier)$/u.test(key) || /^(?:env|environment|stage|tier)$/u.test(key);
     add(out, { semanticType: environment ? 'APPLICATION_OR_ENVIRONMENT' : 'HOST_OR_SERVICE', rule: 'context.name-key',
