@@ -92,8 +92,8 @@ Bounded, **NON-ENFORCING** #9 infrastructure detectors exist in [`src/infrastruc
 - keyed single-label hosts and environments.
 
 Each candidate carries derived fidelity facts: IP version and scope (documentation ranges only at /24 or /32 and narrower, reserved and IPv4-mapped handled), well-known port service, URL scheme (custom schemes reported as `OTHER`), path style and name class. Candidates carry v1 evidence without sensitivity or values. Precision limits:
-- a dotted name counts as a host when its last label is a known gTLD, a private or cluster suffix (`svc`, `consul`, `lab`, ...) or an IDN, when a two-letter ccTLD has supporting evidence, or, for any TLD, when there is host context (`@`, `//`, `:port`) or three or more labels with a digit or hyphen;
-- code such as `obj.method.call`, `process.env.HOST` and version strings are ignored, but some two-letter code chains (`row.no`, `df.at`) and unusual gTLDs without context are misclassified;
+- a dotted name counts as a host with host context (`@`, `//`, `:port`), with three or more labels including a digit or hyphen, or with a known gTLD, private/cluster suffix (`svc`, `consul`, `lab`, ...), IDN or two-letter TLD when it is not a code chain. A code chain is a name where every label before the TLD is a common receiver (`self`, `window`, `config`, ...), a single letter, or camelCase/underscore-shaped; `process.env.HOST` and version strings are excluded;
+- remaining misclassifications: unusual gTLDs without context are missed, and code chains whose receivers are not in the list (`server.address.host`, `readme.de`) are treated as hosts;
 - dotted names ending in common file extensions are not hosts;
 - unquoted paths with spaces, relative paths, nested single-label URL hosts and device/session/correlation IDs are out of scope.
 

@@ -271,3 +271,13 @@ test('second rereview: upper-case FQDNs, two-letter apex domains and version-lik
     assert.deepEqual(found(text).filter(([t]) => t === 'HOST_OR_SERVICE'), [], text);
   }
 });
+
+test('third rereview: popular gTLD apex and subdomains, mixed-case TLDs and other ccTLDs are hosts', () => {
+  for (const host of ['tenant.dev', 'acme.app', 'acme.info', 'acme.network', 'acme.group', 'acme.host', 'app.tenant.dev', 'my.tenant.site',
+    'data.tenant.network', 'e.tenant.app', 'db01.Tenant.COM', 'mail.Tenant.COM', 'acme.ru', 'acme.it', 'tenant.br', 'x.com', 't.co']) {
+    has(`see ${host} now`, 'HOST_OR_SERVICE', '', host);
+  }
+  for (const text of ['this.props.data', 'process.env.HOST', 'window.location.host', 'myObject.someField.value']) {
+    assert.deepEqual(found(text).filter(([t]) => t === 'HOST_OR_SERVICE'), [], text);
+  }
+});

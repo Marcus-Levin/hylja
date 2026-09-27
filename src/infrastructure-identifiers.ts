@@ -205,41 +205,36 @@ const TLDS = new Set(['com', 'net', 'org', 'edu', 'gov', 'mil', 'int', 'info', '
 // Private and cluster-internal suffixes used for internal hosts.
 const PRIVATE_SUFFIXES = new Set(['svc', 'consul', 'lab', 'prod', 'production', 'stage', 'staging', 'dmz', 'k8s', 'priv', 'private', 'intra',
   'cluster', 'vpn', 'office', 'site', 'plant', 'mgmt', 'infra', 'ad', 'domain', 'dom', 'loc', 'int', 'grp', 'nas', 'srv']);
-// Two-label names with a two-letter TLD are often code (`user.id`, `df.at`); accept these country codes unconditionally.
-const COMMON_CC = new Set(['se', 'no', 'dk', 'fi', 'de', 'uk', 'eu', 'fr', 'nl', 'ch', 'at', 'be', 'us', 'ca', 'au', 'jp', 'cn', 'es', 'pl']);
 /**
- * Whether a dotted name is a host: a known or private TLD, an IDN/punycode TLD, a two-letter ccTLD with enough
- * evidence, or any TLD with host context (after `@` or `//`, before `:port`) or three or more labels with a
- * digit or hyphen. Code chains without such evidence (`obj.method.call`) are not hosts.
+ * Whether a dotted name is a host: host context (after `@` or `//`, before `:port`), three or more labels with a
+ * digit or hyphen, or a known, private, IDN or two-letter TLD on a name that is not a code chain.
  */
 function isHostName(name: string, context: boolean): boolean {
   if (context) return true;
   const original = name.split('.');
   const labels = name.toLowerCase().split('.');
   const last = labels[labels.length - 1]!;
+  const known = TLDS.has(last) || PRIVATE_SUFFIXES.has(last) || last.startsWith('xn--') || /[^\u0000-\u007f]/u.test(last);
+  // Code: every label before the TLD is a common receiver, a one-letter name, or code-shaped (camelCase, `_`).
+  // `window.location.host` and `self.host` are code; `app.tenant.dev` and `acme.host` are hosts.
+  const codeChain = original.slice(0, -1).every((label) => CODE_RECEIVERS.has(label.toLowerCase()) ||
+    label.length === 1 && !TLDS.has(last) || /[a-z][A-Z]/u.test(label) || label.includes('_'));
   // Versions (`v1.2.3-beta.rc1`, `1.2.3`): the first two labels are numeric.
   if (/^v?\d+$/iu.test(original[0]!) && /^\d+/u.test(original[1] ?? '')) return false;
-  // Env-var access (`process.env.HOST`): an all-caps last label after a lower-case label. `DC01.CORP.LOCAL` is a host.
-  if (/^[A-Z]{3,}$/u.test(original[original.length - 1]!) && original.slice(0, -1).some((label) => /[a-z]/u.test(label))) return false;
+  // Env-var access (`process.env.HOST`): an all-caps last label after code receivers, or after a lower-case label
+  // when the last label is not a known TLD. `DC01.CORP.LOCAL` and `db01.Tenant.COM` are hosts.
+  if (/^[A-Z]{3,}$/u.test(original[original.length - 1]!) && (codeChain || !known && original.slice(0, -1).some((label) => /[a-z]/u.test(label)))) {
+    return false;
+  }
   const evidence = /[\d-]/u.test(name);
   if (labels.length >= 3 && evidence) return true;
-  // Member access on a common receiver (`self.host`, `config.data`, `window.location.host`) or a one-letter
-  // receiver (`a.prod`) is code unless there is digit/hyphen evidence.
-  const codeShaped = labels.length === 2 || AMBIGUOUS_TLDS.has(last);
-  if (!evidence && codeShaped && !/^[A-Z0-9]+$/u.test(original[0]!) && (CODE_RECEIVERS.has(labels[0]!) || labels[0]!.length === 1)) return false;
-  if (last.startsWith('xn--') || /[^\u0000-\u007f]/u.test(last) || PRIVATE_SUFFIXES.has(last) || TLDS.has(last)) {
-    // Ambiguous code-member words need a third label or digit/hyphen evidence.
-    return !AMBIGUOUS_TLDS.has(last) || labels.length >= 3 || evidence;
-  }
-  if (/^[a-z]{2}$/u.test(last)) return labels.length >= 3 || evidence || COMMON_CC.has(last);
-  return false;
+  if (codeChain && !evidence) return false;
+  return known || /^[a-z]{2}$/u.test(last);
 }
 const CODE_RECEIVERS = new Set(['self', 'this', 'window', 'document', 'args', 'argv', 'config', 'cfg', 'ctx', 'context', 'req', 'res',
   'request', 'response', 'resp', 'app', 'user', 'job', 'task', 'foo', 'bar', 'obj', 'object', 'console', 'data', 'process', 'module',
   'exports', 'props', 'state', 'options', 'opts', 'params', 'settings', 'env', 'os', 'sys', 'np', 'pd', 'df', 'math', 'json', 'row',
   'item', 'event', 'e', 'err', 'error', 'result', 'value', 'values', 'model', 'my', 'location', 'target', 'utils', 'lib']);
-const AMBIGUOUS_TLDS = new Set(['host', 'server', 'data', 'domain', 'site', 'run', 'build', 'report', 'info', 'cluster', 'office', 'int', 'loc', 'services', 'systems', 'support', 'center', 'direct', 'codes', 'network', 'group',
-  'global', 'media', 'tools', 'space', 'page', 'live', 'link', 'store', 'shop', 'email', 'company', 'name', 'app', 'dev', 'test']);
 const URL_RE = /(?<![\w+.-])([A-Za-z][A-Za-z0-9+.-]{0,31}):\/\/([^\s"'<>`/?#]{1,512})([^\s"'<>`]{0,8192})/gu;
 const SCHEMES = new Set(['http', 'https', 'ws', 'wss', 'ftp', 'ftps', 'sftp', 'ssh', 'git', 'file', 'ldap', 'ldaps', 'smb', 'nfs', 'mqtt',
   'mqtts', 'amqp', 'amqps', 'redis', 'rediss', 'postgres', 'postgresql', 'mysql', 'mongodb', 'mongodb+srv', 'jdbc', 'opc.tcp', 'modbus',
