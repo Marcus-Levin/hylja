@@ -101,6 +101,8 @@ function whole(format: Format, text: string, status: 'FAILURE' | 'UNSUPPORTED', 
 }
 /** Total path segments across all fields, bounding memory for deep-and-wide inputs. */
 const MAX_PATH_ELEMENTS = 1 << 20;
+/** JSON values of any kind (containers included) per parse. */
+const MAX_NODES = 1 << 20;
 interface Collector { fields: ParsedField[]; max: number; pathElements: number; comments: OpaqueRange[] }
 function push(into: Collector, field: ParsedField): void {
   into.pathElements += field.path.length;
@@ -143,26 +145,32 @@ function parseJson(text: string, budget: ParseBudget, into: Collector, reasons: 
     const end = at++;
     return { value, start, end, escaped };
   };
-  const value = (path: string[], depth: number, key?: { start: number; end: number }): void => {
+  // One shared key stack: leaves copy it once; containers never copy (linear in input, not depth x values).
+  const stack: string[] = [];
+  let nodes = 0;
+  const value = (depth: number, risky: boolean, key?: { start: number; end: number }): void => {
     if (depth > budget.maxDepth) throw new Budget('DEPTH_LIMIT');
+    // Every value, including empty containers, counts against the node budget.
+    if (++nodes > MAX_NODES) throw new Budget('FIELD_LIMIT');
     ws();
     const char = text[at];
     const keyed = key ? { keyStart: key.start, keyEnd: key.end } : {};
-    // A credential-like ancestor makes every nested value high risk (`{"password":["x"]}`).
-    const risky = path.some((segment) => isCredentialKey(segment));
     if (char === '{') {
       at++; ws();
       const seen = new Set<string>();
       if (text[at] === '}') { at++; return; }
-      const first = into.fields.length;
+      const first = into.fields.length, level = stack.length;
       const close = (): void => {
         // `{"name":"DB_PASSWORD","value":"x"}` (Kubernetes env, docker inspect): the sibling names the value.
-        const children = into.fields.slice(first).filter((field) => field.path.length === path.length + 1);
-        const named = children.some((field) => /^(?:name|key)$/iu.test(field.path[path.length]!) &&
-          field.syntax === 'JSON_STRING' && isCredentialKey(field.value));
+        let named = false;
+        for (let index = first; index < into.fields.length && !named; index++) {
+          const field = into.fields[index]!;
+          named = field.path.length === level + 1 && /^(?:name|key)$/iu.test(field.path[level]!) &&
+            field.syntax === 'JSON_STRING' && isCredentialKey(field.value);
+        }
         if (named) {
-          for (const field of into.fields.slice(first)) {
-            if (/^value$/iu.test(field.path[path.length] ?? '')) field.highRisk = true;
+          for (let index = first; index < into.fields.length; index++) {
+            if (/^value$/iu.test(into.fields[index]!.path[level] ?? '')) into.fields[index]!.highRisk = true;
           }
         }
         at++;
@@ -175,7 +183,10 @@ function parseJson(text: string, budget: ParseBudget, into: Collector, reasons: 
         ws();
         if (text[at] !== ':') throw new Malformed('EXPECTED_COLON', at);
         at++;
-        value([...path, name.value], depth + 1, { start: name.start, end: name.end });
+        stack.push(name.value);
+        // A credential-like ancestor makes every nested value high risk (`{"password":["x"]}`).
+        value(depth + 1, risky || isCredentialKey(name.value), { start: name.start, end: name.end });
+        stack.pop();
         ws();
         if (text[at] === ',') { at++; continue; }
         if (text[at] === '}') { close(); return; }
@@ -186,7 +197,9 @@ function parseJson(text: string, budget: ParseBudget, into: Collector, reasons: 
       at++; ws();
       if (text[at] === ']') { at++; return; }
       for (let index = 0; ; index++) {
-        value([...path, String(index)], depth + 1);
+        stack.push(String(index));
+        value(depth + 1, risky);
+        stack.pop();
         ws();
         if (text[at] === ',') { at++; continue; }
         if (text[at] === ']') { at++; return; }
@@ -195,17 +208,17 @@ function parseJson(text: string, budget: ParseBudget, into: Collector, reasons: 
     }
     if (char === '"') {
       const parsed = string();
-      push(into, { path, ...keyed, valueStart: parsed.start, valueEnd: parsed.end, value: parsed.value,
+      push(into, { path: stack.slice(), ...keyed, valueStart: parsed.start, valueEnd: parsed.end, value: parsed.value,
         syntax: 'JSON_STRING', highRisk: risky });
       return;
     }
     const literal = /^(?:-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/u.exec(text.slice(at, at + 400));
     if (!literal) throw new Malformed('UNEXPECTED_TOKEN', at);
-    push(into, { path, ...keyed, valueStart: at, valueEnd: at + literal[0].length, value: literal[0],
+    push(into, { path: stack.slice(), ...keyed, valueStart: at, valueEnd: at + literal[0].length, value: literal[0],
       syntax: 'JSON_LITERAL', highRisk: risky });
     at += literal[0].length;
   };
-  value([], 0);
+  value(0, false);
   ws();
   if (at !== text.length) throw new Malformed('TRAILING_CONTENT', at);
 }
@@ -301,7 +314,7 @@ function percentDecode(text: string, plusIsSpace: boolean): string {
   try { return utf8.decode(Uint8Array.from(bytes)); } catch { throw new Malformed('BAD_PERCENT_UTF8', 0); }
 }
 // A compound scheme such as `jdbc:postgresql://` is accepted as one scheme.
-const URL_SHAPE = /^([A-Za-z][A-Za-z0-9+.-]*(?::[A-Za-z][A-Za-z0-9+.-]*)?):\/\/(?:([^/?#@\s]*)@)?(\[[0-9A-Fa-f:.]+\]|[^/?#:@\s]*)(?::(\d{1,5}))?(\/[^?#\s]*)?(?:\?([^#\s]*))?(?:#(\S*))?$/u;
+const URL_SHAPE = /^([A-Za-z][A-Za-z0-9+.-]*(?::[A-Za-z][A-Za-z0-9+.-]*)?):\/\/(?:([^/?#@\s]*)@)?(\[[0-9A-Fa-f:.]+\]|[^/?#:@\s;=]*)(?::(\d{1,5}))?(;[^/?#\s]*)?(\/[^?#\s]*)?(?:\?([^#\s]*))?(?:#(\S*))?$/u;
 function parseUrl(text: string, into: Collector, base = 0): void {
   const match = URL_SHAPE.exec(text);
   if (!match || match[4] !== undefined && Number(match[4]) > 65535) throw new Malformed('NOT_A_URL', base);
@@ -324,15 +337,17 @@ function parseUrl(text: string, into: Collector, base = 0): void {
   field(['host'], match[3], offset);
   offset += match[3]!.length;
   if (match[4] !== undefined) { field(['port'], match[4], offset + 1); offset += match[4].length + 1; }
-  field(['path'], match[5], offset);
-  offset += match[5]?.length ?? 0;
-  if (match[6] !== undefined) {
-    pairs(['query'], match[6], base + offset + 1, into);
-    offset += match[6].length + 1;
+  // `;key=value` parameters after the authority (SQL Server JDBC) are fields, never part of the host.
+  if (match[5] !== undefined) { pairs(['params'], match[5].slice(1), base + offset + 1, into); offset += match[5].length; }
+  field(['path'], match[6], offset);
+  offset += match[6]?.length ?? 0;
+  if (match[7] !== undefined) {
+    pairs(['query'], match[7], base + offset + 1, into);
+    offset += match[7].length + 1;
   }
   // OAuth implicit-flow fragments carry `access_token=...`: parse key=value fragments like a query.
-  if (match[7] !== undefined && match[7].includes('=')) pairs(['fragment'], match[7], base + offset + 1, into);
-  else field(['fragment'], match[7], offset + 1);
+  if (match[8] !== undefined && match[8].includes('=')) pairs(['fragment'], match[8], base + offset + 1, into);
+  else field(['fragment'], match[8], offset + 1);
 }
 /** `&`- or `;`-separated pairs; a parameter without `=` is still a field (key ''), never dropped. */
 function pairs(prefix: string[], raw: string, start: number, into: Collector): void {

@@ -302,3 +302,26 @@ test('property: rewriting random fields preserves every key and unedited value a
     for (const field of targets) assert.ok(!out.text.includes(field.value), `${format} ${out.text}`);
   }
 });
+
+test('rereview: JSON containers and long ancestor keys stay linear; containers count against the node budget', () => {
+  const key = 'x'.repeat(300);
+  const nested = `${`{"${key}":`.repeat(63)}[${'[],'.repeat(330_000)}[]]${'}'.repeat(63)}`;
+  for (const text of [`[${'['.repeat(63)}${'{},'.repeat(340_000)}{}${']'.repeat(64)}`, nested]) {
+    const started = process.hrtime.bigint();
+    assert.equal(parseStructured(text, 'JSON').status, 'COMPLETE');
+    assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 2000);
+  }
+  assert.deepEqual(parseStructured(`[${'[],'.repeat(349_000)}[]]`, 'JSON').status, 'COMPLETE');
+});
+
+test('rereview: ;key=value after a URL authority is parsed, never hidden in the host', () => {
+  for (const [text, format] of [['jdbc:sqlserver://h.example.invalid;user=u;password=synthetic', 'URL'],
+    ['jdbc:sqlserver://h.example.invalid:1433;user=u;password=synthetic', 'CONNECTION_STRING'],
+    ['https://h.example.invalid;token=synthetic/x', 'URL']]) {
+    const result = parseStructured(text, format);
+    assert.equal(result.status, 'COMPLETE');
+    assert.equal(result.fields.find((f) => f.path[0] === 'host').value, 'h.example.invalid');
+    assert.ok(result.fields.some((f) => f.highRisk && f.value === 'synthetic'), text);
+  }
+  assert.equal(parseStructured('https://h=x.example.invalid/', 'URL').status, 'FAILURE');
+});
