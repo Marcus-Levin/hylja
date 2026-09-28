@@ -35,6 +35,9 @@ const syntheticUUID = () => {
   const hex = syntheticBytes(16).toString('hex');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 };
+const sshEd25519Public = () => Buffer.concat([
+  Buffer.from([0, 0, 0, 11]), Buffer.from('ssh-ed25519'), Buffer.from([0, 0, 0, 32]), syntheticBytes(32),
+]).toString('base64');
 
 test('a clean payload to the authorized destination is allowed', () => {
   const result = check(JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content: 'Why does HTTPS on 443 fail for HOST_12?' }] }));
@@ -309,7 +312,7 @@ test('fourth review: digests, SRI values, SSH keys, session ids, UUIDs and trace
   for (let run = 0; run < 40; run++) {
     for (const payload of [`digest ${hex(32)} ok`, `digest ${hex(64)} ok`, `sha384 ${hex(48)}`, Array.from({ length: 5 }, () => hex(20)).join('\n'),
       `image@sha256:${hex(32)}`, `<script integrity="sha384-${b64(48)}"></script>`, `"integrity": "sha512-${b64(64)}"`,
-      `ssh-ed25519 ${b64(51)} user@host.invalid`,
+      `ssh-ed25519 ${sshEd25519Public()} user@host.invalid`,
       JSON.stringify(Array.from({ length: 300 }, () => syntheticUUID())), Array.from({ length: 200 }, () => `trace=${hex(16)}`).join('\n')]) {
       const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
       assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)} ${result.reasons}`);
@@ -676,8 +679,42 @@ test('independent review: ternary label exemption does not hide a credential ins
 test('independent review: only complete advisory identifiers receive the identifier exemption', () => {
   const unknown = (text) => check(text, { known: null });
   const suffix = createHash('sha256').update('synthetic-advisory-suffix').digest('base64url');
+  const prefix = createHash('sha256').update('synthetic-advisory-prefix').digest('base64url');
   assert.equal(unknown(`GHSA-c2qf-rxjj-qqgw${suffix}`).decision, 'BLOCK');
+  assert.equal(unknown(`${prefix}/GHSA-c2qf-rxjj-qqgw`).decision, 'BLOCK');
   assert.equal(unknown('GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+});
+
+test('independent review: digest and SSH exemptions validate length and wire structure', () => {
+  const unknown = (text) => check(text, { known: null });
+  const blob = Buffer.concat([
+    createHash('sha256').update('synthetic-a').digest(), createHash('sha256').update('synthetic-b').digest(),
+  ]).toString('base64');
+  assert.equal(unknown(blob).decision, 'BLOCK');
+  assert.equal(unknown(`sha256-${blob}`).decision, 'BLOCK');
+  assert.equal(unknown(`Content-MD5: ${blob}`).decision, 'BLOCK');
+  assert.equal(unknown(`ssh-ed25519 ${blob} user@host.invalid`).decision, 'BLOCK');
+  const publicWire = Buffer.concat([Buffer.from([0, 0, 0, 11]), Buffer.from('ssh-ed25519'), Buffer.from([0, 0, 0, 32]), syntheticBytes(32)]);
+  assert.equal(unknown(`xssh-ed25519 ${publicWire.toString('base64')} user@host.invalid`).decision, 'BLOCK');
+  assert.equal(unknown(`ssh-ed25519 ${publicWire.toString('hex')} user@host.invalid`).decision, 'BLOCK');
+  assert.equal(unknown(`sha256-${syntheticBytes(32).toString('base64')}`).decision, 'ALLOW');
+  assert.equal(unknown(`ssh-ed25519 ${sshEd25519Public()} user@host.invalid`).decision, 'ALLOW');
+});
+
+test('independent review: short registered originals are matched under short encodings', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const raw = (value) => zlib.deflateRawSync(value).toString('base64');
+  const pem = (value) => `-----BEGIN CERTIFICATE-----\n${Buffer.concat([Buffer.from([0x30, 0x04]), Buffer.from(value)]).toString('base64')}\n-----END CERTIFICATE-----`;
+  for (const payload of ['T3JsYQ==', '4f726c61', '0x4f726c61', JSON.stringify({ content: 'T3JsYQ==' }),
+    raw('Orla'), zlib.deflateRawSync('Orla').toString('base64url'), pem('Orla')]) {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', payload);
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), `${payload}: ${result.reasons}`);
+  }
+  for (const payload of ['T3JsZQ==', '42656c61', '0x42656c61', JSON.stringify({ content: 'T3JsZQ==' }), raw('Bela'), pem('Bela')]) {
+    assert.equal(check(payload).decision, 'ALLOW', payload);
+  }
 });
 
 test('independent review: ordinary decimals cannot gain opaque authority from tentative raw deflate', () => {

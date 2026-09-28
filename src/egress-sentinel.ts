@@ -291,6 +291,10 @@ function credentialAssignment(text: string): boolean {
   return false;
 }
 const ENCODED_RUN = /(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{16,65536}={0,2})(?![A-Za-z0-9+/=_-])/gu;
+// #6 intentionally requires longer runs. With a registered short original, 6–15-character Base64/hex
+// alphabet runs (plus optional padding) still need a bounded matching pass.
+const SHORT_ENCODED_RUN = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{6,15}={0,2}(?![A-Za-z0-9+/=_-])/gu;
+const MAX_SHORT_RUNS = 8192;
 /**
  * Decoded binary that is not text and not a recognized digest, UUID or public key is opaque once a message holds
  * more than this many bytes in total, however it is chunked or interleaved. Random tokens and session ids count:
@@ -310,8 +314,9 @@ function isIdentifierRun(run: string): boolean {
   return DIGEST_HEX.test(run) || /^sha(?:1|256|384|512)-[A-Za-z0-9+/]+={0,2}$/u.test(run) ||
     /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u.test(run);
 }
-const DIGEST_CONTEXT = /(?:sha(?:1|224|256|384|512)[-:]|h1:|content-md5:\s*|etag:\s*"?)$/iu;
-const SSH_KEY_CONTEXT = /(?:ssh-(?:ed25519|rsa|dss)\s|ecdsa-sha2-nistp\d{3}\s|sk-ssh-ed25519@openssh\.com\s)$/iu;
+const DIGEST_CONTEXT = /(?:sha(1|224|256|384|512)[-:]|(h1:)|(content-md5:\s*)|(etag:\s*"?))$/iu;
+const SSH_ED25519_CONTEXT = /(?:^|\s)ssh-ed25519\s$/u;
+const SSH_ED25519_HEADER = Uint8Array.from([0, 0, 0, 11, ...[...'ssh-ed25519'].map((char) => char.charCodeAt(0)), 0, 0, 0, 32]);
 // Public certificate and key blocks are not secrets: their base64 lines are exempt from the opaque count, but are
 // still decoded and decompressed. The END label must match, the body must be base64 lines only and start like a
 // DER sequence (`M…`). Line breaks may be real or JSON-escaped (`\n`), as in a model request body.
@@ -336,6 +341,22 @@ function isDigest(value: string): boolean {
   if (/^[0-9A-Fa-f]+$/u.test(value)) return [16, 24, 32, 40, 56, 64, 96, 128].includes(value.length);
   return [22, 24, 27, 28, 43, 44, 64, 86, 88].includes(value.length);
 }
+function isContextDigest(context: RegExpExecArray, value: string, decodedLength: number): boolean {
+  const size = context[1] ? ({ '1': 20, '224': 28, '256': 32, '384': 48, '512': 64 } as Record<string, number>)[context[1]!]
+    : context[2] ? 32 : 16; // go.sum h1 is SHA-256; Content-MD5 and the supported ETag form are MD5.
+  if (decodedLength !== size) return false;
+  if (/^[0-9A-Fa-f]+$/u.test(value)) return value.length === size * 2;
+  const bare = value.replace(/=+$/u, '');
+  return /^[A-Za-z0-9+/_-]+={0,2}$/u.test(value) && bare.length === Math.ceil(size * 8 / 6) &&
+    (value.length === bare.length || value.length === Math.ceil(size / 3) * 4);
+}
+function isSshEd25519PublicKey(before: string, value: string, bytes: Uint8Array): boolean {
+  // A 51-byte SSH ed25519 wire key is exactly 68 unpadded standard-Base64 characters. Hex and Base64url
+  // strings with the same decoded bytes are not valid SSH public-key fields.
+  return SSH_ED25519_CONTEXT.test(before) && /^[A-Za-z0-9+/]{68}$/u.test(value) &&
+    bytes.length === SSH_ED25519_HEADER.length + 32 &&
+    SSH_ED25519_HEADER.every((byte, index) => bytes[index] === byte);
+}
 /**
  * camelCase/PascalCase/snake identifiers and path-like names made of words and short digit groups
  * (`convertUtf8ToBase64String`, `com/Marcus-Levin/hylja/pull/56`). Random Base64 does not split into words.
@@ -349,7 +370,15 @@ function isIdentifier(value: string): boolean {
   // Names have few, long segments; random Base64 that happens to split into word-like pieces has many short ones.
   // Advisory ids (`GHSA-jfh8-c2jp-5v3q`, `CVE-2026-12345`) and short `-_.`-separated groups (`Q1_2026_Report_v3_Final.pdf`)
   // are names too. `/` does not count as a separator here: random Base64 contains it.
-  if (/(?:^|\/)(?:GHSA(?:-[0-9a-z]{4}){3}|CVE-\d{4}-\d{4,7})$/iu.test(value)) return true;
+  const advisory = /(?:^|\/)(?:GHSA(?:-[0-9a-z]{4}){3}|CVE-\d{4}-\d{4,7})$/iu.exec(value);
+  if (advisory) {
+    // An advisory at the end of a path exempts only ordinary path components. The prior whole-run exemption
+    // also hid a high-entropy Base64url token placed before `/GHSA-…`.
+    const prefix = value.slice(0, advisory.index);
+    const parts = prefix.split('/').filter(Boolean);
+    return parts.length <= 8 && parts.every((part) => part.length <= 32 &&
+      /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/u.test(part));
+  }
   const groups = value.split(/[-_.]/u).filter(Boolean);
   const shortGroups = groups.length >= 3 && groups.every((group) => group.length <= 12);
   if (!shortGroups && value.replace(/[_/.-]/gu, '').length < segments.length * 3) return false;
@@ -913,9 +942,11 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
           mixedCase && (/\d|\+/u.test(run.value) || (run.value.match(/[a-z][A-Z]/gu)?.length ?? 0) * 6 >= run.value.length);
         const before = view.text.slice(Math.max(0, run.start - 32), run.start);
         // A digest is one unbroken run; joined chunks or separated hex of digest length are not exempt.
-        const identified = isDigest(run.value) && run.separated !== true && (run.prefixed || DIGEST_HEX.test(run.value) || DIGEST_CONTEXT.test(before)) ||
-          publicBlocks.some((block) => block.start <= run.start && run.end <= block.end) || B64_ALPHABET.test(run.value) ||
-          SSH_KEY_CONTEXT.test(before) && run.value.length <= 800 || UUID.test(run.value);
+        const digestContext = DIGEST_CONTEXT.exec(before);
+        const digest = run.separated !== true && (digestContext ? isContextDigest(digestContext, run.value, bytes.length) :
+          DIGEST_HEX.test(run.value) && isDigest(run.value));
+        const identified = digest || publicBlocks.some((block) => block.start <= run.start && run.end <= block.end) ||
+          B64_ALPHABET.test(run.value) || isSshEd25519PublicKey(before, run.value, bytes) || UUID.test(run.value);
         const recognized = identified || !encodedShape || !run.countable || view.derived === true || isIdentifier(run.value);
         // A container signature is opaque at once, unless the run is a digest or id that happens to start with one.
         if (!identified && OPAQUE_SIGNATURES.some((signature) => signature.every((byte, index) => bytes[index] === byte))) return { reason: 'OPAQUE_EMBEDDED' };
@@ -1046,6 +1077,36 @@ function snapshot(value: unknown): { id: string; profileDigest: string } | null 
   const { id, profileDigest } = value as Record<string, unknown>;
   return label(id) && label(profileDigest) ? { id, profileDigest } : null;
 }
+/** Match short encodings only when this scope has short originals. They add no opaque-byte count. */
+function shortKnownMatches(known: Known, views: readonly View[], budget: { verifications: number; probes: number }):
+  Map<number, string> | { reason: string } {
+  const hits = new Map<number, string>();
+  const seen = new Set<string>();
+  const inflateBudget = { inflated: 0 };
+  for (const view of views) {
+    for (const run of view.text.matchAll(SHORT_ENCODED_RUN)) {
+      if (seen.has(run[0])) continue;
+      if (seen.size >= MAX_SHORT_RUNS) return { reason: 'SENTINEL_BUDGET' };
+      seen.add(run[0]);
+      const value = /^0[xX](?=[0-9A-Fa-f]{8,14}$)/u.test(run[0]) ? run[0].slice(2) : run[0];
+      const decoded = decodeRun(value);
+      if (!decoded || decoded.length < MIN_ORIGINAL) continue;
+      const bytes = Uint8Array.from(decoded);
+      const texts = [utf8Lenient.decode(bytes), printable(bytes), utf16Printable(bytes)];
+      const sink: Sink = { texts: [], uncertain: [], printables: [], junk: [] };
+      const expanded = expand(bytes, inflateBudget, sink);
+      if (expanded === 'BUDGET') return { reason: 'SENTINEL_BUDGET' };
+      if (expanded === 'CONTAINER') return { reason: 'OPAQUE_EMBEDDED' };
+      texts.push(...sink.texts, ...sink.uncertain, ...sink.printables, ...sink.junk);
+      for (const text of texts) {
+        for (const index of matchKnown(known, text, budget)) {
+          if (!hits.has(index)) hits.set(index, `${view.name}>SHORT_ENCODED`);
+        }
+      }
+    }
+  }
+  return hits;
+}
 
 /**
  * Check the exact bytes an adapter is about to send. ALLOW only when the bytes are valid UTF-8, fully
@@ -1097,6 +1158,15 @@ export function checkEgress(check: EgressCheck): SentinelResult {
       if (!seen.has(assignmentKey) && (credentialAssignment(view.text) || credentialAssignment(compatible))) {
         seen.add(assignmentKey);
         findings.push({ kind: 'PATTERN', rule: 'pattern.credential-assignment', view: view.name });
+      }
+    }
+    if (known?.shorts.size) {
+      const short = shortKnownMatches(known, canonical.views, budget);
+      if ('reason' in short) return blocked([short.reason], findings);
+      for (const [index, view] of short) {
+        const entry = known.entries[index]!;
+        const key = `${entry.ref}|${view}`;
+        if (!seen.has(key)) { seen.add(key); findings.push({ kind: entry.kind === 'CANARY' ? 'CANARY' : 'KNOWN_ORIGINAL', rule: entry.ref, view }); }
       }
     }
     if (findings.length || canonical.opaque) {
