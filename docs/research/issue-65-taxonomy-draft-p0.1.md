@@ -8,8 +8,8 @@ Each concept is a four-part path plus orthogonal properties, avoiding a flat enu
 
 ```ts
 { semanticType: 'ENGINEERING_IDENTIFIER', domain: 'PLM', subtype: 'PART_NUMBER',
-  form: 'IDENTIFIER', evidence: ['STRUCTURE', 'TENANT_DICTIONARY'], personalDataPrior: 'NOT_BY_ITSELF',
-  v1: { semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'PART_NUMBER' } }
+  form: 'IDENTIFIER', evidence: ['STRUCTURE', 'TENANT_DICTIONARY'],
+  personalDataPrior: 'NOT_BY_ITSELF' }
 ```
 
 - **semanticType**: what kind of thing it is. It carries no sensitivity or treatment.
@@ -26,7 +26,7 @@ Sensitivity, trust and treatment are deliberately absent (decisions 002 and 003)
 
 ### People and personal data
 
-`PERSON` is kept for the natural-person *entity*: `PERSON_NAME` and `PERSON_ALIAS`. Contact points and identifiers that *may* refer to a person move to `PERSONAL_IDENTIFIER`, so that `PERSON` no longer stands in for all personal data:
+`PERSON` is kept for the natural-person *entity*: `PERSON_NAME` and `PERSON_ALIAS`. Contact points and identifiers use the neutral working type `IDENTIFIER`; the type does not assert that a particular occurrence is personal data. This keeps `PERSON` from standing in for all personal data:
 
 | Domain | Subtypes | Notes |
 | --- | --- | --- |
@@ -34,13 +34,13 @@ Sensitivity, trust and treatment are deliberately absent (decisions 002 and 003)
 | `NATIONAL_ID` | `SE_PERSONNUMMER`, `SE_SAMORDNINGSNUMMER`, `NATIONAL_ID_OTHER`, `TRAVEL_OR_LICENCE_DOCUMENT` | See below. Passport and driving-licence numbers have no reliable cross-country format. |
 | `ONLINE` | `ONLINE_IDENTIFIER`, `DEVICE_IDENTIFIER` | Cookie IDs, advertising IDs, device serials in a personal context. |
 | `EMPLOYMENT` | `EMPLOYEE_NUMBER` | Tenant-specific formats. |
-| `FINANCIAL` | `PAYMENT_CARD_NUMBER`, `BANK_ACCOUNT_NUMBER` | Card numbers (Luhn) and IBANs (mod-97) have checkable formats; domestic Swedish account, bankgiro and plusgiro numbers do not, so `FORMAT` applies to IBAN only. Corporate accounts are not personal data. |
+| `FINANCIAL` | `PAYMENT_CARD_NUMBER`, `BANK_ACCOUNT_NUMBER` | A checkable format can support a narrow subtype, but does not establish its account holder or personal-data status. A company account need not be personal data; assess the occurrence in context. |
 
 `PERSONAL_ATTRIBUTE` holds content about a person that is not an identifier: `DATE_OF_BIRTH`, `PRECISE_LOCATION` and `HEALTH_INFORMATION`. All three are `CONTEXTUAL`, because aggregate or anonymous health or location data is not personal data. Health data about an identifiable person is a GDPR Article 9 special category; that is an attribute to assess, not a property of the type.
 
 Personal data can attach to other types. An IP address (`NETWORK_IDENTIFIER` / `IP`) can be personal data in context, as the [European Commission's GDPR guidance](https://commission.europa.eu/law/law-topic/data-protection/information-business-and-organisations/application-gdpr_en) notes, yet it stays semantically an IP. The same holds for `USERNAME`, `HOSTNAME` (device names often embed a person's name), `FILE_PATH` (a home directory), access and refresh tokens (JWT claims often carry a subject or email), `SERIAL_NUMBER`, `MAINTENANCE_RECORD` (a named technician), `INSPECTION_RESULT`, `DEVIATION_REPORT` and `DOCUMENT_CONTROL_METADATA` (approvers).
 
-**Generic PII comparison.** Generic recognizers such as [Presidio's entity catalogue](https://presidio.dataprivacystack.org/supported_entities/) cover roughly this personal and contact layer: person, email, phone, credit card, IBAN, IP, location, date/time, URL and a set of country-specific IDs. The exact list must be verified against its current version. Presidio's `NRP` (nationality, religious or political group) partly overlaps Article 9, and to our knowledge it has no Swedish personnummer recognizer, which is one reason for Swedish subtypes here. Generic recognizers cover none of the engineering layer. This draft's personal-data coverage is **partial**. The following have no subtype yet and are open gaps:
+**Generic PII comparison.** Generic recognizers such as [Presidio's entity catalogue](https://presidio.dataprivacystack.org/supported_entities/) cover many personal and contact types; exact recognizers depend on the configured version. That catalogue does not establish Hylja's engineering coverage or Swedish-ID recognition. This draft's personal-data coverage is **partial**. The following have no subtype yet and are open gaps:
 - other GDPR Article 9 categories (racial or ethnic origin, political opinions, religious beliefs, trade-union membership, genetic and biometric data, sex life or orientation);
 - Article 10 criminal-offence data;
 - photos and voice recordings;
@@ -48,7 +48,7 @@ Personal data can attach to other types. An IP address (`NETWORK_IDENTIFIER` / `
 
 ### Swedish personnummer and samordningsnummer
 
-`SE_PERSONNUMMER` and `SE_SAMORDNINGSNUMMER` are separate subtypes because they are issued differently and a detector must tell them apart. A samordningsnummer's day field is offset, and both carry a check digit, so `FORMAT` evidence is strong but not sufficient: a matching digit string in a part number or log field is not a national ID. Detection should therefore also use `STRUCTURE` (field names, form context). [IMY](https://www.imy.se/verksamhet/dataskydd/det-har-galler-enligt-gdpr/introduktion-till-gdpr/personuppgifter/personnummer/) describes special Swedish safeguards for these numbers while noting they are **not**, merely by being such numbers, GDPR special-category data. The draft therefore records `jurisdictions: ['SE']` and `personalDataPrior: 'ALWAYS'` and does not mark them special-category. Two further rules need legal review before they shape any label. GDPR Article 87 lets member states set conditions for national identification numbers. Sweden's national rule, which is the basis of IMY's safeguards, is understood to sit in the Dataskyddslag (2018:218), chapter 3 § 10; its exact text must be verified. Qualified human review must decide handling. Whether Skatteverket's published *test* identity numbers could serve as positive synthetic cases is a separate policy question. **No example numbers, valid or invalid, appear in this repository**; a test rejects national-ID-shaped digit runs in this document, the draft source and its test.
+`SE_PERSONNUMMER` and `SE_SAMORDNINGSNUMMER` are separate subtypes: [Skatteverket](https://www.skatteverket.se/privat/folkbokforing/samordningsnummer.4.5c281c7015abecc2e201130b.html) documents the coordination number's day offset and check digit. Syntax alone is not identity proof: a matching digit string in a part-number field or log might be unrelated, so a subtype claim also needs credible field or source context. [IMY](https://www.imy.se/verksamhet/dataskydd/det-har-galler-enligt-gdpr/introduktion-till-gdpr/personuppgifter/personnummer/) says both numbers have special Swedish protection without being GDPR Article 9 special-category data merely by their type. [GDPR Article 87](https://eur-lex.europa.eu/eli/reg/2016/679/ojv) permits national conditions, and [Sweden's supplementary law, chapter 3 § 10](https://www.riksdagen.se/sv/dokument-och-lagar/dokument/svensk-forfattningssamling/lag-2018218-med-kompletterande-bestammelser_sfs-2018-218/) sets a condition for processing these numbers without consent. These sources support separate semantic candidates and a Swedish jurisdiction hint; they do not themselves decide Hylja's destination policy or legal basis for a particular processing operation. Qualified legal/policy review must decide handling. Whether official test numbers could serve as synthetic positive cases is a separate policy question. **No example numbers, valid or invalid, appear in this repository**; a test rejects national-ID-shaped digit runs in this document, the draft source and its test.
 
 ### Credentials
 
@@ -69,7 +69,7 @@ Personal data can attach to other types. An IP address (`NETWORK_IDENTIFIER` / `
 
 ### Organizations and business
 
-`CUSTOMER_OR_PARTNER` / `ORGANIZATION_NAME` and `PROJECT_OR_CONTRACT` / `PROJECT_NAME`, `CONTRACT_NUMBER` need tenant dictionaries: there is no format for a customer name. `SE_ORGANISATIONSNUMMER` has a checkable format, and its personal-data prior is `CONTEXTUAL`: a sole trader's (enskild firma) organisationsnummer is their personnummer. Format distinguishes legal-entity numbers only; a sole trader's number is indistinguishable from `SE_PERSONNUMMER`, which a format-only detector should report (the conservative outcome). `BUSINESS_CONFIDENTIAL` holds content: `PRICING`, `CONTRACT_TERMS` and `STRATEGY_OR_PLAN`. This remains an explicit research gap; no external taxonomy for contract or IP content has been validated.
+`CUSTOMER_OR_PARTNER` / `ORGANIZATION_NAME` and `PROJECT_OR_CONTRACT` / `PROJECT_NAME`, `CONTRACT_NUMBER` need tenant dictionaries: there is no universal format for a customer name. `SE_ORGANISATIONSNUMMER` has a contextual personal-data prior; [IMY](https://www.imy.se/verksamhet/dataskydd/det-har-galler-enligt-gdpr/introduktion-till-gdpr/personuppgifter/) distinguishes company registration numbers for legal persons from information that can identify a natural person. A format-only match must not assert legal-person status or clear a personal-data concern. `BUSINESS_CONFIDENTIAL` holds content: `PRICING`, `CONTRACT_TERMS` and `STRATEGY_OR_PLAN`. This remains an explicit research gap; no external taxonomy for contract or IP content has been validated.
 
 ### Engineering: identifiers versus content
 
@@ -92,21 +92,21 @@ Nearly every engineering identifier needs `TENANT_DICTIONARY` or `STRUCTURE` evi
 
 ## Development comparison with current classification
 
-Every v1 default subtype maps to exactly one draft entry, and every v1 class keeps a home (checked by tests):
+This is a comparison of the current classifier with the proposed vocabulary, **not** a machine migration map. The unreleased project has no old-record compatibility requirement:
 
 | v1 | Draft |
 | --- | --- |
 | `PERSON` / `NAME` | `PERSON` / `IDENTITY` / `PERSON_NAME` |
-| `PERSON` / `EMAIL`, `PHONE` | `PERSONAL_IDENTIFIER` / `CONTACT` / `EMAIL_ADDRESS`, `PHONE_NUMBER` (**type changes**) |
+| `PERSON` / `EMAIL`, `PHONE` | `IDENTIFIER` / `CONTACT` / `EMAIL_ADDRESS`, `PHONE_NUMBER` (**type changes**) |
 | `ENGINEERING_IDENTIFIER` / `DOCUMENT_ID` | `ENGINEERING_IDENTIFIER` / `IM` / `DOCUMENT_ID` |
 | other `ENGINEERING_IDENTIFIER` subtypes | same subtype under `PLM`, `ASSET` or `OT` |
 | `CREDENTIAL_OR_SECRET`, `NETWORK_IDENTIFIER`, `CLOUD_RESOURCE` subtypes | unchanged names, domain added |
 | v1 classes without subtypes | gain subtypes (`USERNAME`, `HOSTNAME`, `FILE_PATH`, ...) |
-| new personal identifiers and attributes | class-only mapping to v1 `PERSON` |
-| new engineering identifiers | class-only mapping to v1 `ENGINEERING_IDENTIFIER` |
-| `ENGINEERING_INFORMATION` content | `v1: null` (no fitting v1 class) |
+| new national, online and financial identifiers | neutral `IDENTIFIER` with an appropriate domain; no forced `PERSON` home |
+| new engineering identifiers | `ENGINEERING_IDENTIFIER` with domain and subtype |
+| `ENGINEERING_INFORMATION` content | no fitting current class |
 
-`draftEntriesForV1` currently provides a development comparison, showing which draft entries resemble existing classes. A class-only mapping means v1 could express the concept only as a tenant `extendSubtypeRegistry` subtype of that class. It is **not** a required migration or replay interface. The [subsequent design interview](issue-65-66-grill-working-notes-p0.1.md#third-interview-round-agreed-directions-and-q14-correction) rejected backward-compatibility work for this unreleased project; the helper and its tests may be removed at implementation cutover.
+The earlier `draftEntriesForV1` helper and per-entry `v1` field have been removed from the unwired executable draft. The table above records the semantic gaps required by #65 without promising a reader, converter or replay API.
 
 **Internal cutover impact:** moving EMAIL/PHONE out of `PERSON` changes what current policy rules select on. After human review, update classification, selectors, tests and synthetic evaluation annotations together. Keep version identity on historical development/evaluation evidence, but do not add a v1 reader, replay converter or forced old-to-new mapping. While the draft is unaccepted, the current classifier and policy remain unchanged.
 
@@ -124,7 +124,7 @@ Tenant/project dictionaries or ontologies are needed for `PERSON_NAME`, `PERSON_
 
 ## Recommendation
 
-After human review, record the accepted hierarchy in a new decision record. It would cover the four-part path, form, the `PERSON` / identifier-family split and `ENGINEERING_INFORMATION`, and would be paired with the #66 information-model decision. The [subsequent interview](issue-65-66-grill-working-notes-p0.1.md#third-interview-round-agreed-directions-and-q14-correction) prefers the neutral working name `IDENTIFIER`; this draft table still uses `PERSONAL_IDENTIFIER` and must be revised if the reviewer accepts that direction. Until then the draft is evidence only.
+After independent human review, record the accepted hierarchy in a new decision record. It would cover the four-part path, form, the `PERSON` / `IDENTIFIER` split and `ENGINEERING_INFORMATION`, and would be paired with the #66 information-model decision. The executable draft now uses the neutral working name `IDENTIFIER`; it remains a proposal until reviewed.
 
 ## Open questions for the human reviewers
 
@@ -133,4 +133,4 @@ After human review, record the accepted hierarchy in a new decision record. It w
 - Which CAE, IM and enterprise-architecture sources are authoritative?
 - Should `PRECISE_LOCATION` of equipment (not people) be a separate `ASSET` subtype?
 - How should relationship-level sensitivity be represented, such as a BOM plus a customer name?
-- The draft's comparison still maps financial identifiers to v1 `PERSON` as its nearest class, though corporate accounts are not personal data. Remove that misleading fallback at internal cutover; no v1 home is required.
+- Should `IDENTIFIER` contain financial identifiers whose holder is a legal person, or would a separate financial family make the boundary clearer? The current proposal keeps the neutral family and contextual privacy attributes.
