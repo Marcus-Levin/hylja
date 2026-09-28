@@ -274,8 +274,11 @@ const REFERENCE = /^(?:\$\{[^}]*\}|\{\{[^}]*\}\}|<[\w -]{1,40}>|\*{3,}|\[hylja:p
 const NOT_A_VALUE = /^(?:[$<*{[]|(?:string|number|boolean|bigint|object|any|unknown|undefined|null|none|true|false|nil|str|int|bool|bytes)$|[A-Za-z_$][\w$]*(?:(?:\.|\?\.)[A-Za-z_$][\w$]*|\[[^\]]*\])+$)/iu;
 function credentialAssignment(text: string): boolean {
   for (const match of text.matchAll(CREDENTIAL_ASSIGNMENT)) {
-    // A quoted branch of a conditional (`kind === 'x' ? 'SECRET' : 'INTERNAL'`) is a label, not an assignment.
-    if (/\?\s*["'`]$/u.test(text.slice(Math.max(0, match.index - 8), match.index))) continue;
+    // Only a whole quoted branch label (`? 'SECRET' : 'INTERNAL'`) is a ternary separator. A credential
+    // assignment *inside* a quoted branch (`? 'password: value' : ...`) still contains a value.
+    const prefix = text.slice(Math.max(0, match.index - 8), match.index);
+    const branchQuote = /\?\s*(["'`])$/u.exec(prefix)?.[1];
+    if (branchQuote && text[match.index + match[1]!.length] === branchQuote) continue;
     // A quoted string is a literal unless it is a whole reference or mask; only unquoted values can be
     // identifiers, member expressions, type names or booleans.
     // Unquoted: brackets inside the value belong to it; only trailing ones (`false}`) close a surrounding structure.
@@ -346,7 +349,7 @@ function isIdentifier(value: string): boolean {
   // Names have few, long segments; random Base64 that happens to split into word-like pieces has many short ones.
   // Advisory ids (`GHSA-jfh8-c2jp-5v3q`, `CVE-2026-12345`) and short `-_.`-separated groups (`Q1_2026_Report_v3_Final.pdf`)
   // are names too. `/` does not count as a separator here: random Base64 contains it.
-  if (/GHSA(?:-[0-9a-z]{4}){3}|CVE-\d{4}-\d{4,7}/iu.test(value)) return true;
+  if (/(?:^|\/)(?:GHSA(?:-[0-9a-z]{4}){3}|CVE-\d{4}-\d{4,7})$/iu.test(value)) return true;
   const groups = value.split(/[-_.]/u).filter(Boolean);
   const shortGroups = groups.length >= 3 && groups.every((group) => group.length <= 12);
   if (!shortGroups && value.replace(/[_/.-]/gu, '').length < segments.length * 3) return false;
@@ -364,8 +367,22 @@ const HEX_PAIRS = /(?<![0-9A-Fa-f])(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:(?:[ \t\r\n,;:
  */
 // Lines with an offset column; the line may carry a prefix (a JSON body's first line: `"content":"00000000  78 9c …`).
 // Dumps without offsets (`od -An`) are plain byte-pair runs.
-const DUMP_LINE = /(?:^|[^0-9A-Fa-f])[0-9A-Fa-f]{4,8}:?[ \t]+((?:[0-9A-Fa-f]{2}[ \t]{1,2}){0,31}[0-9A-Fa-f]{2})(?:[ \t]{2,}.*|[ \t]*)$/u;
-const DUMP_WORD_LINE = /(?:^|[^0-9A-Fa-f])[0-9A-Fa-f]{4,8}:?[ \t]+((?:[0-9A-Fa-f]{4}[ \t]){0,15}[0-9A-Fa-f]{4}(?:[ \t][0-9A-Fa-f]{2})?|[0-9A-Fa-f]{2})(?:[ \t]{2,}.*|[ \t]*)$/u;
+const DUMP_OFFSET = /(?:^|[^0-9A-Fa-f])[0-9A-Fa-f]{4,8}:?[ \t]+/u;
+function dumpLineHex(line: string): string | null {
+  const ascii = line.indexOf('  |');
+  const body = ascii >= 0 ? line.slice(0, ascii) : line;
+  const offset = DUMP_OFFSET.exec(body);
+  if (!offset) return null;
+  const field = body.slice(offset.index + offset[0].length);
+  // hexdump -C puts two spaces between halves but marks its ASCII column with `|`. xxd pads with two or
+  // more spaces before an unmarked ASCII column. Split the latter only after the offset has been removed.
+  const hexField = ascii >= 0 ? field : field.split(/[ \t]{2,}/u, 1)[0]!;
+  const groups = hexField.trim().split(/[ \t]+/u);
+  const width = groups[0]?.length;
+  if ((width !== 2 && width !== 4) || groups.length > 32 || groups.some((group, index) =>
+    !/^[0-9A-Fa-f]+$/u.test(group) || group.length !== width && !(width === 4 && index === groups.length - 1 && group.length === 2))) return null;
+  return groups.join('');
+}
 function* dumpRuns(text: string): Generator<EncodedRun> {
   let block: { start: number; end: number; hex: string[]; lines: number } | null = null;
   const flush = function* (): Generator<EncodedRun> {
@@ -379,14 +396,10 @@ function* dumpRuns(text: string): Generator<EncodedRun> {
   for (let found = breaks.exec(text); ; found = breaks.exec(text)) {
     const end = found ? found.index : text.length;
     if (end - start <= 400) {
-      const line = text.slice(start, end);
-      const ascii = line.indexOf('  |');
-      const body = ascii >= 0 ? line.slice(0, ascii) : line;
-      const match = DUMP_LINE.exec(body) ?? DUMP_WORD_LINE.exec(body);
-      const pairs = match?.[1];
-      if (pairs !== undefined && pairs.length >= 5) {
+      const pairs = dumpLineHex(text.slice(start, end));
+      if (pairs !== null) {
         block ??= { start, end, hex: [], lines: 0 };
-        block.hex.push(pairs.replace(/[ \t]/gu, ''));
+        block.hex.push(pairs);
         block.end = end;
         block.lines++;
       } else yield* flush();
@@ -578,13 +591,12 @@ function* escapedByteRuns(text: string): Generator<EncodedRun> {
     }
     if (bytes.length >= 4) yield escapedRun(start, at, bytes, byteSyntax);
   }
-  for (let at = 0; at < text.length; at++) {
-    const quote = text[at];
-    if (quote !== '"' && quote !== "'") continue;
-    const start = at;
+  const quoted = (start: number, prefixed: boolean): { run: EncodedRun | null; end: number } => {
+    const quote = text[start]!;
     const bytes: number[] = [];
-    let escaped = 0, byteSyntax = text[start - 1] === 'b', latin1High = false, valid = true, closed = false;
-    for (at++; at < text.length; at++) {
+    let escaped = 0, byteSyntax = prefixed, latin1High = false, valid = true, closed = false;
+    let at = start + 1;
+    for (; at < text.length; at++) {
       const char = text[at]!;
       if (char === quote) { closed = true; break; }
       // A lone `=EC` in a log assignment is not quoted-printable. Only contiguous QP runs are read above.
@@ -608,18 +620,31 @@ function* escapedByteRuns(text: string): Generator<EncodedRun> {
       if (code >= 128) latin1High = true;
       bytes.push(code);
     }
-    if (valid && closed && bytes.length >= 4 && (escaped >= 2 || latin1High)) yield escapedRun(start + 1, at, bytes, byteSyntax);
+    return { run: valid && closed && bytes.length >= 4 && (escaped >= 2 || latin1High)
+      ? escapedRun(start + 1, at, bytes, byteSyntax) : null, end: at };
+  };
+  for (let at = 0; at < text.length; at++) {
+    if (text[at] !== '"' && text[at] !== "'") continue;
+    const result = quoted(at, text[at - 1] === 'b');
+    if (result.run) yield result.run;
+    at = result.end;
+  }
+  // The outer JSON string can contain a Python byte literal. Scan its `b'…'` span independently after the
+  // JSON escape round; otherwise the outer quote absorbs the literal and a short raw-deflate stream is missed.
+  for (const match of text.matchAll(/\bb(?=["'])/gu)) {
+    const result = quoted(match.index + 1, true);
+    if (result.run) yield result.run;
   }
 }
 /**
  * Decompress binary as gzip or zlib (signature in the first 16 bytes), brotli or raw deflate, tolerating a
  * truncated stream, within the per-message output budget. `consumed` is how many input bytes the stream used, so
  * bytes after the end of a stream are not presumed decompressed. gzip/zlib decodes are `signed`; brotli and raw
- * deflate (which can succeed by accident on random bytes) are kept only when their output is mostly printable,
- * U+FFFD counting as not printable. Returns 'BUDGET' when the message's decompression budget is exhausted.
+ * deflate (which can succeed by accident on ordinary text) are tentative match-only views. Returns 'BUDGET'
+ * when the message's decompression budget is exhausted.
  */
 const SYNC_FLUSH = 2;
-interface Inflated { out: Uint8Array; signed: boolean; consumed: number; plausible: boolean }
+interface Inflated { out: Uint8Array; signed: boolean; consumed: number }
 type Engine = (buffer: Uint8Array, options: { maxOutputLength: number; finishFlush: number; info: true }) => { buffer: Uint8Array; engine: { bytesWritten: number } };
 function inflate(bytes: Uint8Array, budget: { inflated: number }): Inflated | null | 'BUDGET' {
   const attempt = (engine: Engine, input: Uint8Array, start: number, signed: boolean, trailer = 0): Inflated | null | 'BUDGET' => {
@@ -630,12 +655,9 @@ function inflate(bytes: Uint8Array, budget: { inflated: number }): Inflated | nu
       budget.inflated += out.length;
       const consumed = Math.min(bytes.length, start + (state.bytesWritten || input.length) + trailer);
       // A gzip/zlib stream that decoded is a stream even when its output is tiny or empty, so a chain continues.
-      if (signed) return consumed > start ? { out, signed, consumed, plausible: true } : null;
+      if (signed) return consumed > start ? { out, signed, consumed } : null;
       if (out.length < 4) return null;
-      // brotli/raw deflate succeed by accident on random bytes; mostly printable output is plausible.
-      const text = new TextDecoder('utf-8', { fatal: false }).decode(out).replace(/[\u0000-\u001f\u007f]/gu, '');
-      const good = (text.match(/[\p{L}\p{N}\p{P}\p{S}\s]/gu) ?? []).filter((char) => char !== '\ufffd').length;
-      return { out, signed, consumed, plausible: text.length >= 8 && good >= text.length * 0.9 };
+      return { out, signed, consumed };
     } catch (error) {
       return (error as { code?: string }).code === 'ERR_BUFFER_TOO_LARGE' ? 'BUDGET' : null;
     }
@@ -682,8 +704,8 @@ interface Expanded { opaque: number; consumed: number; keep: boolean }
  * Decompress `bytes` and any compressed layers inside, to MAX_INFLATE_DEPTH. Text layers go to `sink.texts` (views
  * that are inspected and counted like any other), binary layers to `sink.printables`. Returns null when nothing
  * decompresses, 'CONTAINER' for a container signature inside, 'BUDGET', or the opaque bytes it found: binary
- * gzip/zlib output and bytes after a stream's end. `keep` marks binary brotli/raw deflate output, which random
- * bytes produce by accident: the input's own count then stands.
+ * gzip/zlib output and bytes after a stream's end. `keep` marks tentative brotli/raw deflate output: the input's
+ * own count then stands, and nested results are matching evidence only.
  */
 /**
  * Views from decompression: `texts` are inspected and counted, `uncertain` texts (found under output that may be
@@ -719,19 +741,17 @@ function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, dep
   const decoded = out;
   // Every layer is matched: as text when it is text, and as printable bytes and UTF-16 otherwise.
   const matchBinary = (): void => { sink.printables.push(printable(decoded), utf16Printable(out)); };
-  // A real brotli/raw deflate stream uses (nearly) all its input and usually holds text; random bytes decode by
-  // accident, stop early and yield junk. Such output is still matched for known values and patterns (match-only
-  // views: never decoded further, so junk cannot exhaust #6), but never replaces the input's own count.
-  if (!signed && (!inflated.plausible || consumed < bytes.length * 0.9)) {
+  // Brotli/raw deflate has no reliable signature. Even plausible printable output from ordinary decimal text
+  // is only tentative: inspect it and its nested layers, but never use it to lower or raise opaque authority.
+  if (!signed) {
     sink.junk.push(printable(decoded), utf16Printable(out));
-    if (isText(decoded)) sink.junk.push(utf8Lenient.decode(out));
-    // Its nested layers and any stream after it are decoded too; what they hold never lowers the count, but text
-    // found there is decoded further (Base64 or hex inside) as an uncounted view.
+    if (isText(decoded)) sink.uncertain.push(utf8Lenient.decode(out));
     if (depth + 1 < MAX_INFLATE_DEPTH) {
       const inner: Sink = { texts: [], uncertain: [], printables: [], junk: [] };
       for (const part of consumed < bytes.length ? [out, bytes.subarray(consumed)] : [out]) {
         const result = expand(part, budget, inner, depth + 1);
-        if (result === 'CONTAINER' || result === 'BUDGET') return result;
+        if (result === 'BUDGET') return result;
+        // A container found only under a tentative decode cannot prove an opaque original.
       }
       sink.uncertain.push(...inner.texts, ...inner.uncertain);
       sink.junk.push(...inner.printables, ...inner.junk);
@@ -751,15 +771,10 @@ function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, dep
   }
   if (isText(decoded)) { sink.texts.push(utf8Lenient.decode(out)); return { opaque: trailing, consumed: bytes.length, keep: false }; }
   matchBinary();
-  const textMark = sink.texts.length;
   const nested = depth + 1 < MAX_INFLATE_DEPTH ? expand(out, budget, sink, depth + 1) : null;
   if (nested === 'CONTAINER' || nested === 'BUDGET') return nested;
   if (nested && !nested.keep) return { opaque: nested.opaque + trailing, consumed: bytes.length, keep: false };
-  if (signed) return { opaque: out.length + trailing, consumed: bytes.length, keep: false };
-  // Binary brotli/raw deflate output may be an accident: keep matching it (text found below it is decoded further
-  // but not counted), and let the input's own count stand.
-  sink.uncertain.push(...sink.texts.splice(textMark));
-  return { opaque: trailing, consumed: bytes.length, keep: trailing === 0 };
+  return { opaque: out.length + trailing, consumed: bytes.length, keep: false };
 }
 /** UTF-16LE reading of binary, printable characters only, so UTF-16 text inside a binary layer is matched. */
 function utf16Printable(bytes: Uint8Array): string {
