@@ -113,18 +113,267 @@ test('logs: header lines and key=value tokens are fields-only coverage', () => {
   ]);
 });
 
-test('YAML, TOML and XML are UNSUPPORTED and wholly opaque; bad input fails closed', () => {
-  for (const format of ['YAML', 'TOML', 'XML']) {
-    const result = parseStructured('password: synthetic', format);
-    assert.equal(result.status, 'UNSUPPORTED');
-    assert.deepEqual(result.opaque.map((r) => [r.start, r.end]), [[0, 19]]);
-  }
+test('unknown formats, invalid input, and over-budget input fail wholly opaque', () => {
   for (const [text, format, budget, reason] of [
     ['x', 'CSV', undefined, 'INVALID_FORMAT'], [7, 'JSON', undefined, 'INVALID_INPUT'],
     ['x'.repeat(DEFAULT_PARSE_BUDGET.maxInputUnits + 1), 'JSON', undefined, 'INPUT_TOO_LARGE'],
     ['"\uD800"', 'JSON', undefined, 'INVALID_TEXT'], ['1', 'JSON', { maxDepth: 1e6 }, 'INVALID_BUDGET'],
     ['1', 'JSON', { other: 1 }, 'INVALID_BUDGET'],
   ]) assert.deepEqual(parseStructured(text, format, budget).reasons, [reason], reason);
+  const unknown = 'password=synthetic';
+  const invalid = parseStructured(unknown, 'CSV');
+  assert.equal(invalid.status, 'FAILURE');
+  assert.deepEqual(invalid.fields, []);
+  assert.deepEqual(invalid.opaque.map((range) => [range.start, range.end]), [[0, unknown.length]]);
+});
+
+test('YAML maps and scalar sequences retain spans, paths, comments and credential ancestry', () => {
+  const text = '---\ndatabase:\n  host: db.example.invalid\n  password: "syn\\u0074hetic" # synthetic note\n  tokens:\n    - first\n    - \'second\'\nmode: safe';
+  const result = parseStructured(text, 'YAML');
+  assert.equal(result.status, 'COMPLETE');
+  assert.deepEqual(view(text, result), [
+    ['database.host', 'db.example.invalid', false], ['database.password', 'synthetic', true],
+    ['database.tokens.0', 'first', true], ['database.tokens.1', 'second', true], ['mode', 'safe', false],
+  ]);
+  assert.equal(sourceOf(text, result.fields[1]), 'syn\\u0074hetic');
+  assert.deepEqual(result.comments.map((range) => text.slice(range.start, range.end)), ['# synthetic note']);
+  assert.deepEqual(rewriteFieldValues(text, 'YAML', [{ field: result.fields[1], replacement: 'masked' }]),
+    { status: 'FAILURE', reason: 'SOURCE_HAS_COMMENTS' });
+  const out = rewriteFieldValues(text, 'YAML', [{ field: result.fields[1], replacement: 'a "quoted" value' }], { comments: 'REMOVE' });
+  assert.equal(out.status, 'OK');
+  assert.equal(parseStructured(out.text, 'YAML').fields[1].value, 'a "quoted" value');
+  assert.ok(!out.text.includes('synthetic note'));
+});
+
+test('TOML tables and dotted keys retain spans, strings, primitive types and credential flags', () => {
+  const text = '[database]\nhost = "db.example.invalid"\npassword = "syn\\u0074hetic"\n[app]\napi.token = \'second\' # synthetic note\nretries = 3';
+  const result = parseStructured(text, 'TOML');
+  assert.equal(result.status, 'COMPLETE');
+  assert.deepEqual(view(text, result), [
+    ['database.host', 'db.example.invalid', false], ['database.password', 'synthetic', true],
+    ['app.api.token', 'second', true], ['app.retries', '3', false],
+  ]);
+  assert.equal(sourceOf(text, result.fields[1]), 'syn\\u0074hetic');
+  assert.deepEqual(rewriteFieldValues(text, 'TOML', [{ field: result.fields[3], replacement: 'four' }], { comments: 'REMOVE' }),
+    { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' });
+  const out = rewriteFieldValues(text, 'TOML', [{ field: result.fields[1], replacement: 'a "quoted" value' }], { comments: 'REMOVE' });
+  assert.equal(out.status, 'OK');
+  assert.equal(parseStructured(out.text, 'TOML').fields[1].value, 'a "quoted" value');
+  assert.ok(!out.text.includes('synthetic note'));
+});
+
+test('XML leaf text and attributes decode predefined and numeric entities with exact source spans', () => {
+  const text = '<?xml version="1.0"?><config><db password="a&amp;b"/><item name="DB_PASSWORD" value="synthetic"/><password>syn&#x74;hetic &lt;value&gt;</password></config>';
+  const result = parseStructured(text, 'XML');
+  assert.equal(result.status, 'COMPLETE');
+  assert.deepEqual(view(text, result), [
+    ['config.db.@password', 'a&b', true], ['config.item.@name', 'DB_PASSWORD', false],
+    ['config.item.@value', 'synthetic', true], ['config.password', 'synthetic <value>', true],
+  ]);
+  assert.equal(sourceOf(text, result.fields[0]), 'a&amp;b');
+  assert.equal(sourceOf(text, result.fields[3]), 'syn&#x74;hetic &lt;value&gt;');
+  const out = rewriteFieldValues(text, 'XML', [
+    { field: result.fields[0], replacement: 'x&"y' }, { field: result.fields[3], replacement: '<masked>&' },
+  ]);
+  assert.equal(out.status, 'OK');
+  assert.deepEqual(parseStructured(out.text, 'XML').fields.map((field) => field.value),
+    ['x&"y', 'DB_PASSWORD', 'synthetic', '<masked>&']);
+});
+
+test('credential name/value siblings are high risk in the new structured formats', () => {
+  for (const [text, format, target] of [
+    ['name: DB_PASSWORD\nvalue: synthetic', 'YAML', 'value'],
+    ['key: DB_PASSWORD\nvalue: synthetic', 'YAML', 'value'],
+    ['Key: DB_PASSWORD\nValue: synthetic', 'YAML', 'Value'],
+    ['[entry]\nname = "API_TOKEN"\nvalue = "synthetic"', 'TOML', 'entry.value'],
+    ['[entry]\nkey = "API_TOKEN"\nvalue = "synthetic"', 'TOML', 'entry.value'],
+    ['[entry]\nName = "API_TOKEN"\nValue = "synthetic"', 'TOML', 'entry.Value'],
+    ['<entry><name>DB_PASSWORD</name><value>synthetic</value></entry>', 'XML', 'entry.value'],
+    ['<entry><Key>DB_PASSWORD</Key><Value>synthetic</Value></entry>', 'XML', 'entry.Value'],
+    ['<entry key="DB_PASSWORD" value="synthetic"/>', 'XML', 'entry.@value'],
+    ['<entry Key="DB_PASSWORD" Value="synthetic"/>', 'XML', 'entry.@Value'],
+  ]) {
+    const parsed = parseStructured(text, format);
+    assert.equal(parsed.status, 'COMPLETE');
+    assert.equal(parsed.fields.find((field) => field.path.join('.') === target).highRisk, true);
+  }
+});
+
+test('XML 1.0 invalid characters and namespace semantics refuse parsing or rewriting', () => {
+  for (const text of ['<r>syn\u0000thetic</r>', '<r a="syn\u001fthetic"/>', '<r>\ufffe</r>', '<r>&#0;</r>', '<r>&#xD800;</r>']) {
+    const parsed = parseStructured(text, 'XML');
+    assert.equal(parsed.status, 'FAILURE');
+    assert.deepEqual(parsed.fields, []);
+    assert.deepEqual(parsed.opaque.map((range) => [range.start, range.end]), [[0, text.length]]);
+  }
+  for (const text of ['<r xmlns="urn:synthetic.invalid"><password>x</password></r>',
+    '<r xmlns:x="urn:synthetic.invalid"><x:password>x</x:password></r>', '<?xml version="1.1"?><r>x</r>']) {
+    const parsed = parseStructured(text, 'XML');
+    assert.notEqual(parsed.status, 'COMPLETE');
+    assert.deepEqual(parsed.opaque.map((range) => [range.start, range.end]), [[0, text.length]]);
+  }
+  const text = '<r password="old">old</r>';
+  const parsed = parseStructured(text, 'XML');
+  for (const field of parsed.fields) for (const replacement of ['syn\u0000thetic', '\ufffe', '\ud800']) {
+    assert.deepEqual(rewriteFieldValues(text, 'XML', [{ field, replacement }]),
+      { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' });
+  }
+});
+
+test('XML inherited object property names are never accepted as entities', () => {
+  for (const name of ['constructor', 'toString', '__proto__']) {
+    for (const source of [`<password>synthetic &${name};</password>`, `<r password="synthetic &${name};"/>`]) {
+      const parsed = parseStructured(source, 'XML');
+      assert.equal(parsed.status, 'FAILURE');
+      assert.deepEqual(parsed.fields, []);
+      assert.deepEqual(parsed.opaque.map((range) => [range.start, range.end]), [[0, source.length]]);
+      assert.deepEqual(rewriteFieldValues(source, 'XML', []), { status: 'FAILURE', reason: 'SOURCE_NOT_COMPLETE' });
+    }
+  }
+});
+
+test('XML comments are listed and removed only with explicit rewrite option', () => {
+  const text = '<!-- synthetic token -->\n<root><password>old</password><!-- synthetic note --></root>';
+  const parsed = parseStructured(text, 'XML');
+  assert.equal(parsed.status, 'COMPLETE');
+  assert.equal(parsed.comments.length, 2);
+  assert.deepEqual(rewriteFieldValues(text, 'XML', [{ field: parsed.fields[0], replacement: 'masked' }]),
+    { status: 'FAILURE', reason: 'SOURCE_HAS_COMMENTS' });
+  const rewritten = rewriteFieldValues(text, 'XML', [{ field: parsed.fields[0], replacement: 'masked' }], { comments: 'REMOVE' });
+  assert.equal(rewritten.status, 'OK');
+  assert.ok(!rewritten.text.includes('synthetic'));
+  assert.equal(parseStructured(rewritten.text, 'XML').fields[0].value, 'masked');
+});
+
+test('new scalar quoting contexts round-trip or explicitly refuse unsafe replacements', () => {
+  for (const [source, format, path, replacement] of [
+    ['password: old', 'YAML', 'password', 'masked'],
+    ["password: 'old'", 'YAML', 'password', "it's masked"],
+    ["password = 'old'", 'TOML', 'password', 'masked'],
+    ["<r password='old'/>", 'XML', 'r.@password', "a'&b"],
+  ]) {
+    const before = parseStructured(source, format);
+    assert.equal(before.status, 'COMPLETE');
+    const field = before.fields.find((candidate) => candidate.path.join('.') === path);
+    const rewritten = rewriteFieldValues(source, format, [{ field, replacement }]);
+    assert.equal(rewritten.status, 'OK');
+    const after = parseStructured(rewritten.text, format);
+    assert.equal(after.status, 'COMPLETE');
+    assert.deepEqual(after.fields.map((candidate) => candidate.path), before.fields.map((candidate) => candidate.path));
+    assert.equal(after.fields[0].value, replacement);
+  }
+  for (const [source, format, replacement] of [
+    ['password: old', 'YAML', '[masked]'],
+    ["password = 'old'", 'TOML', "can't"],
+  ]) {
+    const field = parseStructured(source, format).fields[0];
+    assert.deepEqual(rewriteFieldValues(source, format, [{ field, replacement }]),
+      { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' });
+  }
+});
+
+test('YAML/TOML/XML unsupported constructs and malformed documents never yield partial success', () => {
+  const cases = [
+    ['password: synthetic\nsecret: &anchor hidden', 'YAML', 'UNSUPPORTED'],
+    ['password: synthetic\nsecret: *alias', 'YAML', 'UNSUPPORTED'],
+    ['password: synthetic\nsecret: |\n  hidden', 'YAML', 'UNSUPPORTED'],
+    ['password: synthetic\npassword: hidden', 'YAML', 'FAILURE'],
+    ['password: synthetic\nsecret: [hidden]', 'YAML', 'UNSUPPORTED'],
+    ['password: synthetic\nsecret: @hidden', 'YAML', 'UNSUPPORTED'],
+    ['password = "synthetic"\nsecret = { token = "hidden" }', 'TOML', 'UNSUPPORTED'],
+    ['password = "synthetic"\npassword = "hidden"', 'TOML', 'FAILURE'],
+    ['password = "synthetic"\nsecret = ["hidden"]', 'TOML', 'UNSUPPORTED'],
+    ['a.b = "synthetic"\n[a]\npassword = "hidden"', 'TOML', 'FAILURE'],
+    ['a = "synthetic"\n[a.b]\npassword = "hidden"', 'TOML', 'FAILURE'],
+    ['<root><password>synthetic</password><secret><![CDATA[hidden]]></secret></root>', 'XML', 'UNSUPPORTED'],
+    ['<!DOCTYPE root [<!ENTITY secret "hidden">]><root>&secret;</root>', 'XML', 'UNSUPPORTED'],
+    ['<root><password>synthetic</secret></root>', 'XML', 'FAILURE'],
+    ['<root><password>synthetic</password><secret>&unknown;</secret></root>', 'XML', 'FAILURE'],
+    ['<root><password>synthetic</password><secret>&#x110000;</secret></root>', 'XML', 'FAILURE'],
+    ['<root><password>synthetic</password><item password="a" password="b"/></root>', 'XML', 'FAILURE'],
+    ['<root><password>synthetic</password><!-- malformed---></root>', 'XML', 'FAILURE'],
+    ['<root><password>synthetic</password><item>mixed<child>hidden</child></item></root>', 'XML', 'UNSUPPORTED'],
+  ];
+  for (const [text, format, status] of cases) {
+    const result = parseStructured(text, format);
+    assert.equal(result.status, status, `${format}: ${text.slice(0, 40)}`);
+    assert.deepEqual(result.fields, []);
+    assert.deepEqual(result.opaque.map((range) => [range.start, range.end]), [[0, text.length]]);
+    assert.deepEqual(rewriteFieldValues(text, format, []), { status: 'FAILURE', reason: 'SOURCE_NOT_COMPLETE' });
+  }
+});
+
+test('YAML/TOML/XML bounds cover nested, long and numerous fields', () => {
+  for (const [text, format, budget, reason] of [
+    ['# synthetic note\n'.repeat(90), 'YAML', { maxFields: 4 }, 'COMMENT_LIMIT'],
+    [[...Array(70)].map((_, i) => `${' '.repeat(i)}k${i}:`).join('\n') + '\nvalue: x', 'YAML', { maxDepth: 4 }, 'DEPTH_LIMIT'],
+    [[...Array(20)].map((_, i) => `k${i} = "v"`).join('\n'), 'TOML', { maxFields: 4 }, 'FIELD_LIMIT'],
+    [`<r>${'<a>'.repeat(70)}secret${'</a>'.repeat(70)}</r>`, 'XML', { maxDepth: 4 }, 'DEPTH_LIMIT'],
+    [`<r>${'<a>v</a>'.repeat(1000)}</r>`, 'XML', { maxFields: 4 }, 'FIELD_LIMIT'],
+  ]) {
+    const result = parseStructured(text, format, budget);
+    if (reason) assert.ok(result.reasons.includes(reason), `${format}: ${result.reasons}`);
+    assert.ok(['FAILURE', 'UNSUPPORTED', 'COMPLETE'].includes(result.status));
+    if (result.status !== 'COMPLETE') assert.deepEqual(result.opaque.map((range) => [range.start, range.end]), [[0, text.length]]);
+  }
+  for (const format of ['YAML', 'TOML', 'XML']) {
+    const text = 'x'.repeat(DEFAULT_PARSE_BUDGET.maxInputUnits + 1);
+    assert.deepEqual(parseStructured(text, format).reasons, ['INPUT_TOO_LARGE']);
+  }
+});
+
+test('TOML charges implicit table prefixes and repeated section paths to its expansion budget', () => {
+  const deepSource = `[${Array.from({ length: 128 }, (_, index) => `${'x'.repeat(1000)}${index}`).join('.')}]`;
+  const section = Array.from({ length: 64 }, (_, index) => `${'x'.repeat(96)}${index}`).join('.');
+  const wideSource = `[${section}]\n${Array.from({ length: 1500 }, (_, index) => `k${index} = "synthetic"`).join('\n')}`;
+  for (const source of [deepSource, wideSource]) {
+    assert.ok(source.length < DEFAULT_PARSE_BUDGET.maxInputUnits);
+    const parsed = parseStructured(source, 'TOML', { maxDepth: 128 });
+    assert.equal(parsed.status, 'FAILURE');
+    assert.deepEqual(parsed.reasons, ['PATH_LIMIT']);
+    assert.deepEqual(parsed.fields, []);
+    assert.deepEqual(parsed.opaque.map((range) => [range.start, range.end]), [[0, source.length]]);
+  }
+});
+
+test('new parsers handle long synthetic scalar lines within bounded work', () => {
+  for (const [text, format] of [
+    [`password: "${'s'.repeat(1 << 19)}"`, 'YAML'],
+    [`password = "${'s'.repeat(1 << 19)}"`, 'TOML'],
+    [`<password>${'s'.repeat(1 << 19)}</password>`, 'XML'],
+  ]) {
+    const start = process.hrtime.bigint();
+    const parsed = parseStructured(text, format);
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+    assert.equal(parsed.status, 'COMPLETE');
+    assert.equal(parsed.fields[0].highRisk, true);
+    assert.ok(elapsedMs < 5000, `${format}: ${elapsedMs}ms`);
+  }
+});
+
+test('property: YAML/TOML/XML rewrites keep key paths and unedited values', () => {
+  const random = prng(0x71a0);
+  const alphabet = ['a', 'Z', '0', ' ', '"', "'", '\\', '<', '>', '&', '\n', '\r', '\t', 'é', ':', '/'];
+  for (let run = 0; run < 120; run++) {
+    const replacement = Array.from({ length: 1 + Math.floor(random() * 15) },
+      () => alphabet[Math.floor(random() * alphabet.length)]).join('');
+    for (const [source, format] of [
+      [`host: db.example.invalid\npassword: "old-${run}"`, 'YAML'],
+      [`host = "db.example.invalid"\npassword = "old-${run}"`, 'TOML'],
+      [`<config host="db.example.invalid"><password>old-${run}</password></config>`, 'XML'],
+    ]) {
+      const before = parseStructured(source, format);
+      assert.equal(before.status, 'COMPLETE');
+      const target = before.fields.find((field) => field.value === `old-${run}`);
+      const out = rewriteFieldValues(source, format, [{ field: target, replacement }]);
+      assert.equal(out.status, 'OK', `${format} ${JSON.stringify(replacement)} ${out.reason}`);
+      const after = parseStructured(out.text, format);
+      assert.equal(after.status, 'COMPLETE');
+      assert.deepEqual(after.fields.map((field) => field.path), before.fields.map((field) => field.path));
+      assert.deepEqual(after.fields.map((field) => field.value), before.fields.map((field) => field === target ? replacement : field.value));
+      assert.ok(!out.text.includes(`old-${run}`));
+    }
+  }
 });
 
 test('credential key recognition normalizes case and separators without catching near-misses', () => {

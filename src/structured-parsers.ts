@@ -8,14 +8,16 @@
 
 export const FORMATS = ['JSON', 'DOTENV', 'INI', 'URL', 'CONNECTION_STRING', 'LOG', 'YAML', 'TOML', 'XML'] as const;
 export type Format = (typeof FORMATS)[number];
-const SUPPORTED: readonly Format[] = ['JSON', 'DOTENV', 'INI', 'URL', 'CONNECTION_STRING', 'LOG'];
+const SUPPORTED: readonly Format[] = ['JSON', 'DOTENV', 'INI', 'URL', 'CONNECTION_STRING', 'LOG', 'YAML', 'TOML', 'XML'];
 
 export interface ParseBudget { maxInputUnits: number; maxDepth: number; maxFields: number }
 export const DEFAULT_PARSE_BUDGET: Readonly<ParseBudget> = Object.freeze({ maxInputUnits: 1 << 20, maxDepth: 64, maxFields: 4096 });
 
 /** How a value is written in the source; rewriting must re-encode for the same context. */
 export type ValueSyntax = 'JSON_STRING' | 'JSON_LITERAL' | 'BARE' | 'SINGLE_QUOTED' | 'DOUBLE_QUOTED' | 'BRACED' |
-  'PERCENT_ENCODED' | 'DOUBLED_DOUBLE_QUOTED' | 'DOUBLED_SINGLE_QUOTED';
+  'PERCENT_ENCODED' | 'DOUBLED_DOUBLE_QUOTED' | 'DOUBLED_SINGLE_QUOTED' | 'YAML_PLAIN' | 'YAML_PRIMITIVE' |
+  'YAML_SINGLE_QUOTED' | 'YAML_DOUBLE_QUOTED' | 'TOML_PRIMITIVE' | 'TOML_BASIC' | 'TOML_LITERAL' |
+  'XML_TEXT' | 'XML_DOUBLE_QUOTED' | 'XML_SINGLE_QUOTED';
 export interface ParsedField {
   /** Key path, e.g. ['db', 'password'], ['query', 'token'], ['userinfo', 'password']; array indexes as strings. */
   path: readonly string[];
@@ -73,6 +75,7 @@ export function isCredentialKey(key: string): boolean {
 
 class Budget extends Error { constructor(readonly reason: string) { super(reason); } }
 class Malformed extends Error { constructor(readonly reason: string, readonly at: number) { super(reason); } }
+class Unsupported extends Error { constructor(readonly reason: string) { super(reason); } }
 function budgetFrom(raw: unknown): ParseBudget | null {
   if (raw === undefined) return { ...DEFAULT_PARSE_BUDGET };
   if (raw === null || typeof raw !== 'object') return null;
@@ -109,6 +112,10 @@ function push(into: Collector, field: ParsedField): void {
   if (into.fields.length >= into.max || into.pathElements > MAX_PATH_ELEMENTS) throw new Budget('FIELD_LIMIT');
   into.fields.push(field);
 }
+function pushComment(into: Collector, range: OpaqueRange): void {
+  if (into.comments.length >= into.max) throw new Budget('COMMENT_LIMIT');
+  into.comments.push(range);
+}
 function lines(text: string): { start: number; end: number; line: string }[] {
   const out: { start: number; end: number; line: string }[] = [];
   for (const match of text.matchAll(/[^\r\n]*(?:\r\n|\r|\n|$)/gu)) {
@@ -117,6 +124,16 @@ function lines(text: string): { start: number; end: number; line: string }[] {
     out.push({ start: match.index, end: match.index + line.length, line });
   }
   return out;
+}
+/** Stream lines for formats with no need to materialize every line before the field budget is checked. */
+function* boundedLines(text: string): Generator<{ start: number; line: string }> {
+  let start = 0;
+  while (start < text.length) {
+    let end = start;
+    while (end < text.length && text[end] !== '\n' && text[end] !== '\r') end++;
+    yield { start, line: text.slice(start, end) };
+    start = end + (text[end] === '\r' && text[end + 1] === '\n' ? 2 : end < text.length ? 1 : 0);
+  }
 }
 
 /* ---------- JSON: recursive descent with spans ---------- */
@@ -455,14 +472,385 @@ function parseLog(text: string, into: Collector, opaque: OpaqueRange[]): void {
   });
 }
 
+/* ---------- Conservative YAML and TOML subsets ---------- */
+
+interface Scalar { value: string; start: number; end: number; syntax: ValueSyntax; commentStart?: number }
+const INVALID_UNICODE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+function commentAt(line: string, from: number): number {
+  for (let at = from; at < line.length; at++) if (line[at] === '#' && (at === from || /[ \t]/u.test(line[at - 1]!))) return at;
+  return -1;
+}
+function quoteScalar(line: string, at: number, base: number, dialect: 'YAML' | 'TOML'): Scalar {
+  const quote = line[at]!;
+  let cursor = at + 1, value = '';
+  while (cursor < line.length) {
+    const char = line[cursor]!;
+    if (char === quote) {
+      if (dialect === 'YAML' && quote === "'" && line[cursor + 1] === "'") { value += "'"; cursor += 2; continue; }
+      break;
+    }
+    if (char === '\\' && quote === '"') {
+      const next = line[cursor + 1];
+      if (next === undefined) throw new Malformed('UNTERMINATED_QUOTE', base + cursor);
+      const simple: Record<string, string> = { '"': '"', '\\': '\\', b: '\b', t: '\t', n: '\n', f: '\f', r: '\r' };
+      if (next in simple) { value += simple[next]; cursor += 2; continue; }
+      if (next === 'u' && /^[0-9A-Fa-f]{4}$/u.test(line.slice(cursor + 2, cursor + 6))) {
+        value += String.fromCharCode(parseInt(line.slice(cursor + 2, cursor + 6), 16)); cursor += 6; continue;
+      }
+      // Valid YAML/TOML have more escapes; the bounded subset declines them as a whole.
+      throw new Unsupported('UNSUPPORTED_ESCAPE');
+    }
+    if ((char < ' ' && char !== '\t') || char === '\u007f') throw new Malformed('INVALID_SCALAR', base + cursor);
+    value += char;
+    cursor++;
+  }
+  if (cursor >= line.length) throw new Malformed('UNTERMINATED_QUOTE', base + at);
+  if (/[\u0000-\u0007\u000b\u000e-\u001f\u007f]/u.test(value)) throw new Malformed('INVALID_SCALAR', base + at);
+  if (INVALID_UNICODE.test(value)) throw new Malformed('INVALID_SCALAR', base + at);
+  const rest = line.slice(cursor + 1);
+  if (rest.trim() && !/^[ \t]+#/u.test(rest)) throw new Unsupported('UNSUPPORTED_SCALAR');
+  const marker = rest.indexOf('#');
+  return { value, start: base + at + 1, end: base + cursor,
+    syntax: dialect === 'YAML' ? quote === "'" ? 'YAML_SINGLE_QUOTED' : 'YAML_DOUBLE_QUOTED' :
+      quote === "'" ? 'TOML_LITERAL' : 'TOML_BASIC',
+    ...(marker >= 0 ? { commentStart: base + cursor + 1 + marker } : {}) };
+}
+function yamlScalar(line: string, at: number, base: number): Scalar {
+  if (line[at] === '"' || line[at] === "'") return quoteScalar(line, at, base, 'YAML');
+  const marker = commentAt(line, at);
+  let end = marker >= 0 ? marker : line.length;
+  while (end > at && /[ \t]/u.test(line[end - 1]!)) end--;
+  const value = line.slice(at, end);
+  // Flow syntax, tags, aliases, block scalars and implicit complex keys need a full YAML parser.
+  if (!/^[A-Za-z0-9_.\/+~-][A-Za-z0-9._~@/+:-]*$/u.test(value) || /:[ \t]/u.test(value)) {
+    throw new Unsupported('UNSUPPORTED_YAML_SCALAR');
+  }
+  const primitive = yamlPrimitive(value);
+  return { value, start: base + at, end: base + end, syntax: primitive ? 'YAML_PRIMITIVE' : 'YAML_PLAIN',
+    ...(marker >= 0 ? { commentStart: base + marker } : {}) };
+}
+function yamlPrimitive(value: string): boolean {
+  // YAML 1.1/1.2 implicit scalar rules differ. Refuse rewrites of all numeric-looking forms.
+  return /^(?:true|false|null|~|yes|no|on|off|[-+]?(?:\d|\.inf|\.nan))/iu.test(value);
+}
+const NAME_OR_KEY = /^@?(?:name|key)$/iu;
+const VALUE_KEY = /^@?value$/iu;
+function markNamedValues(fields: ParsedField[]): void {
+  const riskyParents = new Set<string>();
+  for (const field of fields) if (NAME_OR_KEY.test(field.path.at(-1) ?? '') && isCredentialKey(field.value)) {
+    riskyParents.add(JSON.stringify(field.path.slice(0, -1)));
+  }
+  for (const field of fields) if (VALUE_KEY.test(field.path.at(-1) ?? '') &&
+    riskyParents.has(JSON.stringify(field.path.slice(0, -1)))) field.highRisk = true;
+}
+function parseYaml(text: string, budget: ParseBudget, into: Collector): void {
+  type Frame = { indent: number; path: string[]; kind: 'MAP' | 'SEQ'; seen: Set<string>; next: number };
+  const frames: Frame[] = [{ indent: 0, path: [], kind: 'MAP', seen: new Set(), next: 0 }];
+  let pending: { indent: number; path: string[] } | undefined;
+  let documentSeen = false;
+  for (const { start, line } of boundedLines(text)) {
+    if (!line.trim()) continue;
+    const indent = line.length - line.trimStart().length;
+    if (line.slice(0, indent).includes('\t')) throw new Unsupported('UNSUPPORTED_YAML_INDENT');
+    const body = line.slice(indent);
+    if (body.startsWith('#')) { pushComment(into, { start: start + indent, end: start + line.length, reason: 'COMMENT' }); continue; }
+    if (body === '---' && !documentSeen && !pending) { documentSeen = true; continue; }
+    documentSeen = true;
+    if (body === '---' || body === '...' || body.startsWith('%')) throw new Unsupported('UNSUPPORTED_YAML_DOCUMENT');
+    if (pending) {
+      if (indent <= pending.indent) throw new Unsupported('UNSUPPORTED_EMPTY_CONTAINER');
+      frames.push({ indent, path: pending.path, kind: /^-(?:[ \t]|$)/u.test(body) ? 'SEQ' : 'MAP', seen: new Set(), next: 0 });
+      pending = undefined;
+      if (frames.length > budget.maxDepth) throw new Budget('DEPTH_LIMIT');
+    } else {
+      while (frames.length > 1 && indent < frames[frames.length - 1]!.indent) frames.pop();
+      if (indent !== frames[frames.length - 1]!.indent) throw new Unsupported('UNSUPPORTED_YAML_INDENT');
+    }
+    const frame = frames[frames.length - 1]!;
+    if (frame.kind === 'SEQ') {
+      if (!/^-[ \t]+\S/u.test(body)) throw new Unsupported('UNSUPPORTED_YAML_SEQUENCE');
+      const valueAt = indent + 1 + (/^[ \t]*/u.exec(body.slice(1))?.[0].length ?? 0);
+      const scalar = yamlScalar(line, valueAt, start);
+      push(into, { path: [...frame.path, String(frame.next++)], valueStart: scalar.start, valueEnd: scalar.end,
+        value: scalar.value, syntax: scalar.syntax, highRisk: frame.path.some(isCredentialKey) });
+      if (scalar.commentStart !== undefined) pushComment(into, { start: scalar.commentStart, end: start + line.length, reason: 'COMMENT' });
+      continue;
+    }
+    const match = /^([A-Za-z_][A-Za-z0-9_.-]*):(?=[ \t]|$)/u.exec(body);
+    if (!match) throw new Unsupported('UNSUPPORTED_YAML_MAPPING');
+    const key = match[1]!;
+    if (frame.seen.has(key)) throw new Malformed('DUPLICATE_KEY', start + indent);
+    frame.seen.add(key);
+    const path = [...frame.path, key];
+    const restAt = indent + match[0].length;
+    let valueAt = restAt;
+    while (valueAt < line.length && /[ \t]/u.test(line[valueAt]!)) valueAt++;
+    if (valueAt === line.length || line[valueAt] === '#') {
+      if (line[valueAt] === '#') pushComment(into, { start: start + valueAt, end: start + line.length, reason: 'COMMENT' });
+      pending = { indent, path };
+      continue;
+    }
+    const scalar = yamlScalar(line, valueAt, start);
+    push(into, { path, keyStart: start + indent, keyEnd: start + indent + key.length,
+      valueStart: scalar.start, valueEnd: scalar.end, value: scalar.value, syntax: scalar.syntax,
+      highRisk: path.some(isCredentialKey) });
+    if (scalar.commentStart !== undefined) pushComment(into, { start: scalar.commentStart, end: start + line.length, reason: 'COMMENT' });
+  }
+  if (pending) throw new Unsupported('UNSUPPORTED_EMPTY_CONTAINER');
+  markNamedValues(into.fields);
+}
+
+function tomlScalar(line: string, at: number, base: number): Scalar {
+  if (line[at] === '"' || line[at] === "'") return quoteScalar(line, at, base, 'TOML');
+  const marker = commentAt(line, at);
+  let end = marker >= 0 ? marker : line.length;
+  while (end > at && /[ \t]/u.test(line[end - 1]!)) end--;
+  const value = line.slice(at, end);
+  const primitive = /^(?:true|false|[-+]?(?:0|[1-9](?:_?\d)*)(?:\.(?:\d(?:_?\d)*))?(?:[eE][-+]?\d(?:_?\d)*)?)$/u.test(value);
+  if (!primitive) throw new Unsupported('UNSUPPORTED_TOML_VALUE');
+  return { value, start: base + at, end: base + end, syntax: 'TOML_PRIMITIVE',
+    ...(marker >= 0 ? { commentStart: base + marker } : {}) };
+}
+function parseToml(text: string, budget: ParseBudget, into: Collector): void {
+  let section: string[] = [];
+  const tables = new Set<string>(), leaves = new Set<string>(), nodes = new Set<string>();
+  // JSON path IDs repeat section text; cap their total expansion as well as their element count.
+  const maxPathUnits = 8 << 20;
+  const maxPathWorkUnits = 32 << 20;
+  let storedPathUnits = 0, storedPathElements = 0, pathWorkUnits = 0;
+  const pathId = (parts: readonly string[]): string => {
+    const id = JSON.stringify(parts);
+    pathWorkUnits += id.length;
+    if (pathWorkUnits > maxPathWorkUnits) throw new Budget('PATH_LIMIT');
+    return id;
+  };
+  const storePath = (set: Set<string>, id: string, elements: number): void => {
+    if (set.has(id)) return;
+    storedPathUnits += id.length;
+    storedPathElements += elements;
+    if (storedPathUnits > maxPathUnits || storedPathElements > MAX_PATH_ELEMENTS) throw new Budget('PATH_LIMIT');
+    set.add(id);
+  };
+  for (const { start, line } of boundedLines(text)) {
+    if (!line.trim()) continue;
+    const indent = line.length - line.trimStart().length;
+    if (line.slice(0, indent).includes('\t')) throw new Unsupported('UNSUPPORTED_TOML_INDENT');
+    const body = line.slice(indent);
+    if (body.startsWith('#')) { pushComment(into, { start: start + indent, end: start + line.length, reason: 'COMMENT' }); continue; }
+    if (body.startsWith('[')) {
+      const table = /^\[([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)\](?:[ \t]+(#.*))?$/u.exec(body);
+      if (!table) throw new Unsupported('UNSUPPORTED_TOML_TABLE');
+      section = table[1]!.split('.');
+      if (section.length > budget.maxDepth) throw new Budget('DEPTH_LIMIT');
+      const id = pathId(section);
+      if (tables.has(id) || leaves.has(id) || nodes.has(id)) throw new Malformed('DUPLICATE_TABLE', start + indent);
+      if (tables.size >= into.max) throw new Budget('FIELD_LIMIT');
+      storePath(tables, id, section.length);
+      storePath(nodes, id, section.length);
+      for (let count = 1; count < section.length; count++) {
+        const prefix = pathId(section.slice(0, count));
+        if (leaves.has(prefix)) throw new Malformed('KEY_TABLE_COLLISION', start + indent);
+        storePath(nodes, prefix, count);
+      }
+      if (table[2]) pushComment(into, { start: start + indent + body.indexOf('#'), end: start + line.length, reason: 'COMMENT' });
+      continue;
+    }
+    const match = /^([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)[ \t]*=[ \t]*/u.exec(body);
+    if (!match) throw new Unsupported('UNSUPPORTED_TOML_KEY');
+    const key = match[1]!;
+    const path = [...section, ...key.split('.')];
+    if (path.length > budget.maxDepth) throw new Budget('DEPTH_LIMIT');
+    const id = pathId(path);
+    if (leaves.has(id) || nodes.has(id)) throw new Malformed('DUPLICATE_KEY', start + indent);
+    // Section prefixes were checked and stored at the table declaration. Avoid rebuilding them per field.
+    for (let count = section.length + 1; count < path.length; count++) {
+      const prefix = pathId(path.slice(0, count));
+      if (leaves.has(prefix)) throw new Malformed('KEY_TABLE_COLLISION', start + indent);
+      storePath(nodes, prefix, count);
+    }
+    const valueAt = indent + match[0].length;
+    if (valueAt >= line.length || line[valueAt] === '#') throw new Unsupported('UNSUPPORTED_TOML_VALUE');
+    const scalar = tomlScalar(line, valueAt, start);
+    push(into, { path, keyStart: start + indent, keyEnd: start + indent + key.length,
+      valueStart: scalar.start, valueEnd: scalar.end, value: scalar.value, syntax: scalar.syntax,
+      highRisk: path.some(isCredentialKey) });
+    storePath(leaves, id, path.length);
+    if (scalar.commentStart !== undefined) pushComment(into, { start: scalar.commentStart, end: start + line.length, reason: 'COMMENT' });
+  }
+  markNamedValues(into.fields);
+}
+
+/* ---------- XML without DTD, external entities, namespaces or mixed content ---------- */
+
+const XML_NAME = /[A-Za-z_][A-Za-z0-9_.-]*/gy;
+const XML_ENTITIES: Readonly<Record<string, string>> = Object.freeze({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" });
+function xmlValidChar(code: number): boolean {
+  return code === 9 || code === 10 || code === 13 || code >= 0x20 && code <= 0xd7ff ||
+    code >= 0xe000 && code <= 0xfffd || code >= 0x10000 && code <= 0x10ffff;
+}
+function xmlValidText(value: string): boolean {
+  if (INVALID_UNICODE.test(value)) return false;
+  for (const char of value) if (!xmlValidChar(char.codePointAt(0)!)) return false;
+  return true;
+}
+function xmlName(text: string, at: number): { name: string; end: number } {
+  XML_NAME.lastIndex = at;
+  const found = XML_NAME.exec(text);
+  if (!found) throw new Malformed('EXPECTED_XML_NAME', at);
+  return { name: found[0], end: XML_NAME.lastIndex };
+}
+function xmlWhitespace(char: string | undefined): boolean { return char === ' ' || char === '\t' || char === '\n' || char === '\r'; }
+function xmlScalar(raw: string, at: number): string {
+  let value = '';
+  for (let cursor = 0; cursor < raw.length;) {
+    if (raw[cursor] !== '&') { value += raw[cursor++]; continue; }
+    const semi = raw.indexOf(';', cursor + 1);
+    if (semi < 0 || semi - cursor > 12) throw new Malformed('BAD_XML_ENTITY', at + cursor);
+    const entity = raw.slice(cursor + 1, semi);
+    if (Object.hasOwn(XML_ENTITIES, entity)) value += XML_ENTITIES[entity];
+    else {
+      const hex = /^#x([0-9A-Fa-f]+)$/u.exec(entity);
+      const decimal = /^#([0-9]+)$/u.exec(entity);
+      if (!hex && !decimal) throw new Malformed('BAD_XML_ENTITY', at + cursor);
+      const code = Number.parseInt((hex ?? decimal)![1]!, hex ? 16 : 10);
+      if (!xmlValidChar(code)) {
+        throw new Malformed('BAD_XML_ENTITY', at + cursor);
+      }
+      value += String.fromCodePoint(code);
+    }
+    cursor = semi + 1;
+  }
+  return value;
+}
+function parseXml(text: string, budget: ParseBudget, into: Collector): void {
+  if (!xmlValidText(text)) throw new Malformed('INVALID_XML_CHAR', 0);
+  let at = 0, nodes = 0, nodePathElements = 0;
+  const ws = (): void => { while (xmlWhitespace(text[at])) at++; };
+  const comment = (): void => {
+    const end = text.indexOf('-->', at + 4);
+    if (end < 0 || text[end - 1] === '-' || text.slice(at + 4, end).includes('--')) {
+      throw new Malformed('BAD_XML_COMMENT', at);
+    }
+    pushComment(into, { start: at, end: end + 3, reason: 'COMMENT' });
+    at = end + 3;
+  };
+  ws();
+  if (text.startsWith('<?xml', at)) {
+    const end = text.indexOf('?>', at + 5);
+    if (end < 0) throw new Malformed('BAD_XML_DECLARATION', at);
+    const declaration = text.slice(at, end + 2);
+    if (!/^<\?xml[ \t]+version=(?:'1\.0'|"1\.0")(?:[ \t]+encoding=(?:'UTF-8'|"UTF-8"))?(?:[ \t]+standalone=(?:'yes'|"yes"|'no'|"no"))?[ \t]*\?>$/u.test(declaration)) {
+      throw new Unsupported('UNSUPPORTED_XML_DECLARATION');
+    }
+    at = end + 2;
+  }
+  const element = (parent: string[], inheritedRisk: boolean, depth: number): void => {
+    if (depth > budget.maxDepth) throw new Budget('DEPTH_LIMIT');
+    if (++nodes > MAX_NODES) throw new Budget('FIELD_LIMIT');
+    if (text[at] !== '<' || text[at + 1] === '!' || text[at + 1] === '?') throw new Unsupported('UNSUPPORTED_XML_MARKUP');
+    at++;
+    const opening = xmlName(text, at);
+    const path = [...parent, opening.name];
+    nodePathElements += path.length;
+    if (nodePathElements > MAX_PATH_ELEMENTS) throw new Budget('FIELD_LIMIT');
+    const risky = inheritedRisk || isCredentialKey(opening.name);
+    const keyStart = at;
+    at = opening.end;
+    const firstAttr = into.fields.length;
+    const attrNames = new Set<string>();
+    let selfClosing = false;
+    for (;;) {
+      const before = at;
+      ws();
+      if (text.startsWith('/>', at)) { at += 2; selfClosing = true; break; }
+      if (text[at] === '>') { at++; break; }
+      if (before === at) throw new Malformed('BAD_XML_ATTRIBUTE', at);
+      const attrStart = at;
+      const attr = xmlName(text, at);
+      if (attr.name === 'xmlns') throw new Unsupported('UNSUPPORTED_XML_NAMESPACE');
+      if (attrNames.has(attr.name)) throw new Malformed('DUPLICATE_ATTRIBUTE', attrStart);
+      attrNames.add(attr.name);
+      at = attr.end;
+      ws();
+      if (text[at] !== '=') throw new Malformed('BAD_XML_ATTRIBUTE', at);
+      at++; ws();
+      const quote = text[at];
+      if (quote !== '"' && quote !== "'") throw new Malformed('BAD_XML_ATTRIBUTE', at);
+      const valueStart = ++at;
+      const valueEnd = text.indexOf(quote, at);
+      if (valueEnd < 0 || text.slice(at, valueEnd).includes('<')) throw new Malformed('BAD_XML_ATTRIBUTE', at);
+      const raw = text.slice(at, valueEnd);
+      if (/[\r\n\t]/u.test(raw)) throw new Unsupported('UNSUPPORTED_XML_WHITESPACE');
+      push(into, { path: [...path, `@${attr.name}`], keyStart: attrStart, keyEnd: attr.end,
+        valueStart, valueEnd, value: xmlScalar(raw, valueStart),
+        syntax: quote === '"' ? 'XML_DOUBLE_QUOTED' : 'XML_SINGLE_QUOTED',
+        highRisk: risky || isCredentialKey(attr.name) });
+      at = valueEnd + 1;
+    }
+    // XML `name`/`key` and `value` attributes carry the same risk as JSON name/value siblings.
+    const nameAttr = into.fields.slice(firstAttr).find((field) => NAME_OR_KEY.test(field.path.at(-1) ?? '') &&
+      isCredentialKey(field.value));
+    if (nameAttr) for (let index = firstAttr; index < into.fields.length; index++) {
+      if (VALUE_KEY.test(into.fields[index]!.path.at(-1) ?? '')) into.fields[index]!.highRisk = true;
+    }
+    if (selfClosing) return;
+    const firstChild = into.fields.length;
+    let contentStart = at, children = 0, hasComment = false;
+    for (;;) {
+      const next = text.indexOf('<', at);
+      if (next < 0) throw new Malformed('UNCLOSED_XML_ELEMENT', at);
+      const raw = text.slice(contentStart, next);
+      if (text.startsWith('</', next)) {
+        at = next + 2;
+        const closing = xmlName(text, at);
+        if (closing.name !== opening.name) throw new Malformed('MISMATCHED_XML_TAG', at);
+        at = closing.end;
+        ws();
+        if (text[at] !== '>') throw new Malformed('BAD_XML_CLOSE', at);
+        at++;
+        if (children || hasComment) {
+          if (raw.trim()) throw new Unsupported('UNSUPPORTED_XML_MIXED_CONTENT');
+          let named = false;
+          for (let index = firstChild; index < into.fields.length && !named; index++) {
+            const field = into.fields[index]!;
+            named = field.path.length === path.length + 1 && NAME_OR_KEY.test(field.path.at(-1) ?? '') &&
+              isCredentialKey(field.value);
+          }
+          if (named) for (let index = firstChild; index < into.fields.length; index++) {
+            const field = into.fields[index]!;
+            if (field.path.length === path.length + 1 && VALUE_KEY.test(field.path.at(-1) ?? '')) field.highRisk = true;
+          }
+        } else {
+          if (raw.includes('\r') || raw.includes(']]>')) throw new Unsupported('UNSUPPORTED_XML_TEXT');
+          push(into, { path, keyStart, keyEnd: opening.end, valueStart: contentStart, valueEnd: next,
+            value: xmlScalar(raw, contentStart), syntax: 'XML_TEXT', highRisk: risky });
+        }
+        return;
+      }
+      if (raw.trim()) throw new Unsupported('UNSUPPORTED_XML_MIXED_CONTENT');
+      at = next;
+      if (text.startsWith('<!--', at)) { comment(); hasComment = true; }
+      else if (text.startsWith('<!', at) || text.startsWith('<?', at)) throw new Unsupported('UNSUPPORTED_XML_MARKUP');
+      else { element(path, risky, depth + 1); children++; }
+      contentStart = at;
+    }
+  };
+  while (true) { ws(); if (text.startsWith('<!--', at)) comment(); else break; }
+  element([], false, 1);
+  while (true) { ws(); if (text.startsWith('<!--', at)) comment(); else break; }
+  if (at !== text.length) throw new Malformed('TRAILING_XML_CONTENT', at);
+}
+
 /* ---------- Entry point ---------- */
 
 /**
- * Parse `text` as `format` (the caller chooses; #6's content-type sniff is only a hint). YAML, TOML and
- * XML are UNSUPPORTED here and must be treated as opaque by policy.
+ * Parse `text` as `format` (the caller chooses; #6's content-type sniff is only a hint).
+ * YAML, TOML and XML accept conservative subsets; other constructs are wholly opaque UNSUPPORTED.
  */
 export function parseStructured(text: unknown, format: unknown, budget?: unknown): ParseResult {
-  if (!(FORMATS as readonly unknown[]).includes(format)) return whole('JSON', '', 'FAILURE', 'INVALID_FORMAT');
+  if (!(FORMATS as readonly unknown[]).includes(format)) {
+    return whole('JSON', typeof text === 'string' ? text : '', 'FAILURE', 'INVALID_FORMAT');
+  }
   const kind = format as Format;
   if (typeof text !== 'string') return whole(kind, '', 'FAILURE', 'INVALID_INPUT');
   const limits = budgetFrom(budget);
@@ -483,10 +871,14 @@ export function parseStructured(text: unknown, format: unknown, budget?: unknown
       case 'URL': parseUrl(text.trim(), into, text.length - text.trimStart().length); break;
       case 'CONNECTION_STRING': parseConnectionString(text, into); break;
       case 'LOG': parseLog(text, into, opaque); break;
+      case 'YAML': parseYaml(text, limits, into); break;
+      case 'TOML': parseToml(text, limits, into); break;
+      case 'XML': parseXml(text, limits, into); break;
     }
   } catch (error) {
     // No success-shaped partial parse: the whole input becomes opaque.
     if (error instanceof Budget || error instanceof Malformed) return whole(kind, text, 'FAILURE', error.reason);
+    if (error instanceof Unsupported) return whole(kind, text, 'UNSUPPORTED', error.reason);
     return whole(kind, text, 'FAILURE', 'PARSER_ERROR');
   }
   if (opaque.length) reasons.add('OPAQUE_RANGES');
@@ -498,6 +890,8 @@ export function parseStructured(text: unknown, format: unknown, budget?: unknown
 /* ---------- Round-trip rewriting (keys and syntax preserved, or FAILURE) ---------- */
 
 function encodeFor(syntax: ValueSyntax, replacement: string): string | null {
+  if (INVALID_UNICODE.test(replacement)) return null;
+  if (syntax.startsWith('XML_') && !xmlValidText(replacement)) return null;
   switch (syntax) {
     case 'JSON_STRING': return JSON.stringify(replacement).slice(1, -1);
     case 'JSON_LITERAL': return null; // A number/boolean/null cannot take arbitrary text without changing type.
@@ -508,6 +902,20 @@ function encodeFor(syntax: ValueSyntax, replacement: string): string | null {
     case 'BRACED': return replacement.replace(/\}/gu, '}}');
     case 'PERCENT_ENCODED': try { return encodeURIComponent(replacement); } catch { return null; }
     case 'BARE': return /^[A-Za-z0-9._~:@\-[\]<>]*$/u.test(replacement) ? replacement : null;
+    case 'YAML_PLAIN': return /^[A-Za-z0-9_.\/+~-][A-Za-z0-9._~@/+:-]*$/u.test(replacement) &&
+      !yamlPrimitive(replacement) ? replacement : null;
+    case 'YAML_PRIMITIVE':
+    case 'TOML_PRIMITIVE': return null;
+    case 'YAML_SINGLE_QUOTED': return /[\r\n]/u.test(replacement) ? null : replacement.replace(/'/gu, "''");
+    case 'YAML_DOUBLE_QUOTED':
+    case 'TOML_BASIC': return JSON.stringify(replacement).slice(1, -1);
+    case 'TOML_LITERAL': return /['\r\n]/u.test(replacement) ? null : replacement;
+    case 'XML_TEXT': return replacement.replace(/&/gu, '&amp;').replace(/</gu, '&lt;').replace(/>/gu, '&gt;')
+      .replace(/\r/gu, '&#13;');
+    case 'XML_DOUBLE_QUOTED': return replacement.replace(/&/gu, '&amp;').replace(/</gu, '&lt;')
+      .replace(/"/gu, '&quot;').replace(/\t/gu, '&#9;').replace(/\n/gu, '&#10;').replace(/\r/gu, '&#13;');
+    case 'XML_SINGLE_QUOTED': return replacement.replace(/&/gu, '&amp;').replace(/</gu, '&lt;')
+      .replace(/'/gu, '&apos;').replace(/\t/gu, '&#9;').replace(/\n/gu, '&#10;').replace(/\r/gu, '&#13;');
   }
 }
 export interface RewriteEdit { field: ParsedField; replacement: string }
@@ -524,6 +932,7 @@ export function rewriteFieldValues(text: string, format: Format, edits: readonly
   { status: 'OK'; text: string } | { status: 'FAILURE'; reason: string } {
   const before = parseStructured(text, format);
   if (before.status !== 'COMPLETE' || before.coverage !== 'FULL') return { status: 'FAILURE', reason: 'SOURCE_NOT_COMPLETE' };
+  if (before.reasons.includes('DUPLICATE_KEY')) return { status: 'FAILURE', reason: 'SOURCE_AMBIGUOUS' };
   if (before.comments.length && options.comments !== 'REMOVE') return { status: 'FAILURE', reason: 'SOURCE_HAS_COMMENTS' };
   const byStart = new Map(before.fields.map((field, index) => [`${field.valueStart}:${field.valueEnd}`, index]));
   const replacements = new Map<number, string>();
@@ -542,7 +951,8 @@ export function rewriteFieldValues(text: string, format: Format, edits: readonly
     if (encoded === null) return { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' };
     splices.push({ start: field.valueStart, end: field.valueEnd, text: encoded });
   }
-  for (const comment of before.comments) splices.push({ start: comment.start + 1, end: comment.end, text: '' });
+  for (const comment of before.comments) splices.push({ start: format === 'XML' ? comment.start : comment.start + 1,
+    end: comment.end, text: '' });
   splices.sort((a, b) => b.start - a.start);
   let output = text;
   for (const splice of splices) output = output.slice(0, splice.start) + splice.text + output.slice(splice.end);
