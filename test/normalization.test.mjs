@@ -178,6 +178,16 @@ test('detection fold removes invisible characters and maps compatibility forms w
   assert.throws(() => foldForDetection(7), TypeError);
 });
 
+test('detection fold bounds compatibility expansion before allocating origin maps', () => {
+  const phrase = '\uFDFA'; // One source unit expands to 18 units under NFKC.
+  const fold = foldForDetection(phrase.repeat(4));
+  assert.equal(fold.text.length, 72);
+  assert.equal(fold.origin.length, fold.text.length);
+  assert.deepEqual(mapFoldedSpan(fold, 54, 72), { start: 3, end: 4 });
+  assert.throws(() => foldForDetection(phrase.repeat(1 << 20)), RangeError);
+  assert.throws(() => foldForDetection(`x${'\u0301'.repeat(4096)}`), RangeError);
+});
+
 test('review regressions: binary-wrapped text is reached as TEXT or STRINGS, never hidden under COMPLETE', () => {
   const bytes = (...parts) => Buffer.concat(parts.map((p) => typeof p === 'string' ? Buffer.from(p, 'utf8') : Buffer.from(p)));
   const cases = [
