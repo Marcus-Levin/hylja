@@ -375,10 +375,15 @@ function isIdentifier(value: string): boolean {
     // An advisory at the end of a path exempts only ordinary path components. The prior whole-run exemption
     // also hid a high-entropy Base64url token placed before `/GHSA-…`.
     const prefix = value.slice(0, advisory.index);
-    const parts = prefix.split('/').filter(Boolean);
+    // One leading slash is a path root; two may be a URL authority. Interior or extra slashes are
+    // encoded data, not empty path words. Dropping them hid long Base64 slash runs before an advisory.
+    const leading = prefix.startsWith('//') ? 2 : prefix.startsWith('/') ? 1 : 0;
+    const path = prefix.slice(leading);
+    if ((prefix.length > 0 && path.length === 0) || path.startsWith('/') || path.endsWith('/') || path.includes('//')) return false;
+    const parts = path ? path.split('/') : [];
     // Each component must be an ordinary short path word or group of words. A generic alphanumeric
     // component can be a Base32 payload: two 32-character chunks before a real GHSA id previously passed.
-    const words = /^(?:[A-Z]?[a-z]{2,16}(?:[A-Z][a-z]{2,16})*)(?:[.-](?:[A-Z]?[a-z]{2,16}(?:[A-Z][a-z]{2,16})*))*$/u;
+    const words = /^(?:[A-Z]?[a-z]{2,16}(?:[A-Z][a-z]{2,16})*)(?:[._-](?:[A-Z]?[a-z]{2,16}(?:[A-Z][a-z]{2,16})*))*$/u;
     return parts.length <= 8 && parts.every((part) => part.length <= 32 &&
       (words.test(part) || /^\d{1,4}$/u.test(part)));
   }
@@ -941,7 +946,9 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         // Mixed case with a digit, `+`, or frequent case switches (digit-free random Base64); camelCase names are
         // exempted by the identifier check.
         const mixedCase = /[A-Z]/u.test(run.value) && /[a-z]/u.test(run.value);
-        const encodedShape = run.escaped === true || /^[0-9A-Fa-f]+$/u.test(run.value) && /[A-Fa-f]/u.test(run.value) || /=$/u.test(run.value) ||
+        // A long run of `/` is Base64 alphabet data; treating it as plain path punctuation can hide opaque bytes.
+        const encodedShape = run.escaped === true || /^[0-9A-Fa-f]+$/u.test(run.value) && /[A-Fa-f]/u.test(run.value) ||
+          /={1,2}$/u.test(run.value) || /\/{8,}/u.test(run.value) ||
           mixedCase && (/\d|\+/u.test(run.value) || (run.value.match(/[a-z][A-Z]/gu)?.length ?? 0) * 6 >= run.value.length);
         const before = view.text.slice(Math.max(0, run.start - 32), run.start);
         // A digest is one unbroken run; joined chunks or separated hex of digest length are not exempt.
