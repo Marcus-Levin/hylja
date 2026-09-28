@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import {
   checkEgress, createKnownOriginals, createStreamGate, sentinelUnavailable, MAX_MESSAGE_BYTES,
 } from '../dist/egress-sentinel.js';
@@ -23,6 +24,20 @@ const enc = (text) => new TextEncoder().encode(text);
 const check = (text, more = {}) => checkEgress({ bytes: typeof text === 'string' ? enc(text) : text, scope: scopeA, destination,
   authorized: destination, known, ...more });
 const b64 = (text) => Buffer.from(text, 'utf8').toString('base64');
+let syntheticCounter = 0;
+const syntheticBytes = (length) => {
+  const blocks = Array.from({ length: Math.ceil(length / 32) }, () =>
+    createHash('sha256').update(`hylja-sentinel-synthetic-${syntheticCounter++}`).digest());
+  return Buffer.concat(blocks, length);
+};
+const syntheticFraction = () => syntheticBytes(6).readUIntBE(0, 6) / 2 ** 48;
+const syntheticUUID = () => {
+  const hex = syntheticBytes(16).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
+const sshEd25519Public = () => Buffer.concat([
+  Buffer.from([0, 0, 0, 11]), Buffer.from('ssh-ed25519'), Buffer.from([0, 0, 0, 32]), syntheticBytes(32),
+]).toString('base64');
 
 test('a clean payload to the authorized destination is allowed', () => {
   const result = check(JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content: 'Why does HTTPS on 443 fail for HOST_12?' }] }));
@@ -182,7 +197,7 @@ test('review: case-sensitive patterns survive zero-width and full-width tricks; 
 });
 
 test('review: embedded opaque binary is blocked; ordinary hashes are not', () => {
-  const binary = Buffer.concat([Buffer.from([0x1f, 0x8b, 8, 0]), globalThis.process.getBuiltinModule('node:crypto').randomBytes(2048)]).toString('base64');
+  const binary = Buffer.concat([Buffer.from([0x1f, 0x8b, 8, 0]), syntheticBytes(2048)]).toString('base64');
   assert.deepEqual(check(`{"att":"${binary}"}`).reasons, ['OPAQUE_EMBEDDED']);
   const scattered = Buffer.from('\u0000\u0001orla\u0003Synthe\u0007tica').toString('base64');
   assert.equal(check(`x=${scattered}`).decision, 'BLOCK');
@@ -251,7 +266,7 @@ test('third review: compressed or opaque binary is blocked however it is chunked
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
   const secret = `contact ${PLANTED} re ${CANARY}`;
   const gz = zlib.gzipSync(Buffer.from(secret));
-  const big = zlib.gzipSync(Buffer.from(`${secret} ${'padding text '.repeat(40)}${Math.random()}`.repeat(3)));
+  const big = zlib.gzipSync(Buffer.from(`${secret} ${'padding text '.repeat(40)}${syntheticFraction()}`.repeat(3)));
   const b64 = big.toString('base64');
   for (const payload of [`{"att":"${gz.toString('base64')}"}`, `raw ${zlib.deflateRawSync(Buffer.from(secret)).toString('base64')}`,
     `hex ${gz.toString('hex')}`, b64.match(/.{1,76}/gu).join('\r\n'), b64.match(/.{1,100}/gu).join(' '),
@@ -276,8 +291,7 @@ test('third review: quoted dotted passwords are literals; bracket characters do 
 
 test('fourth review: chunked or prefixed compressed payloads are inflated and matched; bombs and large opaque binary block', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
-  const secret = `contact ${PLANTED} re ${CANARY} ${crypto.randomBytes(16).toString('hex')} `.repeat(4);
+  const secret = `contact ${PLANTED} re ${CANARY} ${syntheticBytes(16).toString('hex')} `.repeat(4);
   const raw = zlib.deflateRawSync(Buffer.from(secret));
   const chunks = (buffer, size) => Array.from({ length: Math.ceil(buffer.length / size) }, (_, i) => buffer.subarray(i * size, (i + 1) * size));
   const prefixed = Buffer.concat([Buffer.from([0]), zlib.gzipSync(Buffer.from(secret))]);
@@ -289,18 +303,17 @@ test('fourth review: chunked or prefixed compressed payloads are inflated and ma
   }
   const bomb = zlib.gzipSync(Buffer.alloc(8 << 20, 65)).toString('base64');
   assert.equal(check(`x ${bomb}`).decision, 'BLOCK');
-  assert.equal(check(`blob ${crypto.randomBytes(2048).toString('base64')}`).decision, 'BLOCK');
+  assert.equal(check(`blob ${syntheticBytes(2048).toString('base64')}`).decision, 'BLOCK');
 });
 
 test('fourth review: digests, SRI values, SSH keys, session ids, UUIDs and trace ids are ordinary text', () => {
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
-  const hex = (n) => crypto.randomBytes(n).toString('hex');
-  const b64 = (n) => crypto.randomBytes(n).toString('base64');
+  const hex = (n) => syntheticBytes(n).toString('hex');
+  const b64 = (n) => syntheticBytes(n).toString('base64');
   for (let run = 0; run < 40; run++) {
     for (const payload of [`digest ${hex(32)} ok`, `digest ${hex(64)} ok`, `sha384 ${hex(48)}`, Array.from({ length: 5 }, () => hex(20)).join('\n'),
       `image@sha256:${hex(32)}`, `<script integrity="sha384-${b64(48)}"></script>`, `"integrity": "sha512-${b64(64)}"`,
-      `ssh-ed25519 ${b64(51)} user@host.invalid`,
-      JSON.stringify(Array.from({ length: 300 }, () => crypto.randomUUID())), Array.from({ length: 200 }, () => `trace=${hex(16)}`).join('\n')]) {
+      `ssh-ed25519 ${sshEd25519Public()} user@host.invalid`,
+      JSON.stringify(Array.from({ length: 300 }, () => syntheticUUID())), Array.from({ length: 200 }, () => `trace=${hex(16)}`).join('\n')]) {
       const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
       assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)} ${result.reasons}`);
     }
@@ -310,18 +323,17 @@ test('fourth review: digests, SRI values, SSH keys, session ids, UUIDs and trace
 
 test('fifth review: decoy-interleaved, brotli and container payloads block; random session tokens are credentials; inflate is budgeted', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
   const secret = `contact ${PLANTED} re ${CANARY} `;
   const raw = zlib.deflateRawSync(Buffer.from(secret));
   const decoyed = Array.from({ length: Math.ceil(raw.length / 32) }, (_, i) =>
-    `${raw.subarray(i * 32, (i + 1) * 32).toString('base64')} ${crypto.randomBytes(20).toString('base64')}`).join(' ');
+    `${raw.subarray(i * 32, (i + 1) * 32).toString('base64')} ${syntheticBytes(20).toString('base64')}`).join(' ');
   const padded = zlib.gzipSync(Buffer.concat([Buffer.from(secret), Buffer.alloc(10)])).toString('base64');
   const controls = zlib.deflateRawSync(Buffer.from([...secret].map((c) => `${c}\u0001`).join(''))).toString('base64');
   for (const payload of [decoyed, zlib.brotliCompressSync(Buffer.from(secret)).toString('base64'), padded, controls,
-    `x ${Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), crypto.randomBytes(8)]).toString('base64')}`]) {
+    `x ${Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), syntheticBytes(8)]).toString('base64')}`]) {
     assert.equal(check(payload).decision, 'BLOCK', payload.slice(0, 40));
   }
-  const token = checkEgress({ bytes: enc(`session=${crypto.randomBytes(48).toString('base64url')}`), scope: scopeA, destination, authorized: destination, known: null });
+  const token = checkEgress({ bytes: enc(`session=${syntheticBytes(48).toString('base64url')}`), scope: scopeA, destination, authorized: destination, known: null });
   assert.equal(token.decision, 'BLOCK');
   const flood = Array.from({ length: 300 }, () => zlib.deflateRawSync(Buffer.alloc((1 << 20) - 100, 97)).toString('base64')).join(' ');
   const started = process.hrtime.bigint();
@@ -332,41 +344,38 @@ test('fifth review: decoy-interleaved, brotli and container payloads block; rand
 
 test('sixth review: data chunked under 16 characters is joined, decompressed and counted; digest prefixes are bounded', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
-  const secret = `contact ${PLANTED} re ${CANARY} ${crypto.randomBytes(8).toString('hex')}`;
+  const secret = `contact ${PLANTED} re ${CANARY} ${syntheticBytes(8).toString('hex')}`;
   const gz = zlib.gzipSync(Buffer.from(secret));
   const split = (text, n, sep) => text.match(new RegExp(`.{1,${n}}`, 'gu')).join(sep);
   for (const payload of [split(gz.toString('base64'), 15, ' '), split(gz.toString('base64'), 12, ' '), split(gz.toString('hex'), 15, ' '),
     split(zlib.brotliCompressSync(Buffer.from(secret)).toString('base64'), 14, '\n'), `sha512-${gz.toString('base64')}`]) {
     assert.equal(check(payload).decision, 'BLOCK', payload.slice(0, 30));
   }
-  for (const payload of [split(crypto.randomBytes(4096).toString('base64'), 15, ' '), `integrity sha512-${crypto.randomBytes(3072).toString('base64')}`,
-    `sha256:${crypto.randomBytes(3072).toString('base64')}`]) {
+  for (const payload of [split(syntheticBytes(4096).toString('base64'), 15, ' '), `integrity sha512-${syntheticBytes(3072).toString('base64')}`,
+    `sha256:${syntheticBytes(3072).toString('base64')}`]) {
     assert.equal(checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null }).decision, 'BLOCK', payload.slice(0, 30));
   }
 });
 
 test('sixth review: chunked gzip without digits in some chunks is still joined and inflated', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
   const split = (text, n, sep) => text.match(new RegExp(`.{1,${n}}`, 'gu')).join(sep);
   for (let run = 0; run < 300; run++) {
-    const gz = zlib.gzipSync(Buffer.from(`contact ${PLANTED} re ${CANARY} ${crypto.randomBytes(8).toString('hex')}`)).toString('base64');
+    const gz = zlib.gzipSync(Buffer.from(`contact ${PLANTED} re ${CANARY} ${syntheticBytes(8).toString('hex')}`)).toString('base64');
     for (const width of [15, 12, 8]) assert.equal(check(split(gz, width, ' ')).decision, 'BLOCK', split(gz, width, ' '));
   }
 });
 
 test('sixth review: ordinary code, go.sum, Content-MD5 and public certificates are allowed', () => {
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
-  const der = Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]), crypto.randomBytes(596)]);
+  const der = Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]), syntheticBytes(596)]);
   const cert = ['-----BEGIN CERTIFICATE-----', ...der.toString('base64').match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
   for (let run = 0; run < 20; run++) {
     for (const payload of ['const http2ServerSessionOptions = convertUtf8ToBase64String(input);',
       'const id = await getEc2InstanceIdentity(ec2InstanceMetadataV2, s3BucketNameForUploads);',
       'CI: https://github.com/example-org/example-repo/actions/runs/36169013008 and /runs/36134297661/job/108599394046',
       Array.from({ length: 520 }, (_, i) => `synthRecordHandler${i}Value`).join(' '),
-      Array.from({ length: 4 }, (_, i) => `example.invalid/mod${i} v1.0.${i} h1:${crypto.randomBytes(32).toString('base64')}`).join('\n'),
-      Array.from({ length: 3 }, () => `Content-MD5: ${crypto.randomBytes(16).toString('base64')}`).join('\n'), cert]) {
+      Array.from({ length: 4 }, (_, i) => `example.invalid/mod${i} v1.0.${i} h1:${syntheticBytes(32).toString('base64')}`).join('\n'),
+      Array.from({ length: 3 }, () => `Content-MD5: ${syntheticBytes(16).toString('base64')}`).join('\n'), cert]) {
       const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
       assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)} ${result.reasons}`);
     }
@@ -375,7 +384,6 @@ test('sixth review: ordinary code, go.sum, Content-MD5 and public certificates a
 
 test('seventh review: nested and gzip-wrapped binary, PEM-wrapped compression and per-view splitting all block', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
   const b64 = (bytes) => Buffer.from(bytes).toString('base64');
   const secret = Buffer.from(`note: ${PLANTED} end`);
   const pem = (label, body, end = label) => [`-----BEGIN ${label}-----`, ...b64(body).match(/.{1,64}/gu), `-----END ${end}-----`].join('\n');
@@ -385,7 +393,7 @@ test('seventh review: nested and gzip-wrapped binary, PEM-wrapped compression an
     `-----BEGIN CERTIFICATE-----\nsome prose\nblob=${b64(zlib.gzipSync(secret))}\n-----END NOTE-----`,
     hexGz.match(/.{1,4}/gu).join('-'), hexGz.match(/.{1,12}/gu).join(':'), hexGz.match(/.{1,12}/gu).join('|')];
   for (const payload of known) assert.equal(check(JSON.stringify({ messages: [{ role: 'user', content: payload }] })).decision, 'BLOCK', payload.slice(0, 40));
-  const random = (n) => crypto.randomBytes(n);
+  const random = (n) => syntheticBytes(n);
   const escaped = (text) => [...text].map((char) => `\\u00${char.charCodeAt(0).toString(16).padStart(2, '0')}`).join('');
   let layered = b64(random(32));
   for (let i = 0; i < 20; i++) layered = b64(Buffer.from(`layer ${i} x=${b64(random(32))} ${layered.length > 4000 ? '' : layered}`));
@@ -406,7 +414,6 @@ test('seventh review: nested and gzip-wrapped binary, PEM-wrapped compression an
 
 test('eighth review: chunked plain encodings, trailing garbage and unsigned layers are inspected; id lists are ordinary', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
   const b64 = (bytes) => Buffer.from(bytes).toString('base64');
   const hex = (bytes) => Buffer.from(bytes).toString('hex');
   const groups = (text, n, sep) => text.match(new RegExp(`.{1,${n}}`, 'gu')).join(sep);
@@ -419,7 +426,7 @@ test('eighth review: chunked plain encodings, trailing garbage and unsigned laye
     assert.equal(check(wrap(payload)).decision, 'BLOCK', payload.slice(0, 40));
     assert.equal(check(payload).decision, 'BLOCK', payload.slice(0, 40));
   }
-  const random = (n) => crypto.randomBytes(n);
+  const random = (n) => syntheticBytes(n);
   const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
   for (const payload of [b64(Buffer.concat([zlib.deflateSync('build log: all tests passed'), random(4000)])),
     b64(Buffer.concat([zlib.brotliCompressSync(Buffer.from('build log: all tests passed')), random(4000)])),
@@ -450,11 +457,10 @@ test('eighth review: chunked plain encodings, trailing garbage and unsigned laye
 
 test('ninth review: stream remainders, uncertain layers, dumps and indented chunks are inspected; ordinary logs pass', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
   const b64 = (bytes) => Buffer.from(bytes).toString('base64');
   const hex = (bytes) => Buffer.from(bytes).toString('hex');
   const wrap = (content) => JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content }] });
-  const random = (n) => crypto.randomBytes(n);
+  const random = (n) => syntheticBytes(n);
   const T = Buffer.from(`note ${PLANTED} ${CANARY}`);
   const benign = zlib.gzipSync(Buffer.from('build log ok, all good'));
   const colon = (bytes) => hex(bytes).match(/../gu).join(':');
@@ -473,7 +479,7 @@ test('ninth review: stream remainders, uncertain layers, dumps and indented chun
   const hx = (n) => hex(random(n));
   for (let run = 0; run < 20; run++) {
     for (const payload of [Array.from({ length: 6 }, () => `{"ts":${1695826432123456789n + BigInt(run)}}`).join('\n'),
-      Array.from({ length: 5 }, () => String(Math.random())).join(' '), Array.from({ length: 6 }, () => `RAX=${hx(8).toUpperCase()}`).join(' '),
+      Array.from({ length: 5 }, () => String(syntheticFraction())).join(' '), Array.from({ length: 6 }, () => `RAX=${hx(8).toUpperCase()}`).join(' '),
       Array.from({ length: 6 }, () => `at 0x${hx(8).toUpperCase()}`).join('\n'), Array.from({ length: 6 }, () => hx(6).toUpperCase().match(/../gu).join('-')).join('\n'),
       `blob ${Array.from({ length: 20 }, () => hx(4).toUpperCase()).join(' ')}`, Array.from({ length: 3 }, () => hx(16).toUpperCase()).join('\n'),
       `pub rsa4096\n      ${hx(20).toUpperCase().match(/.{4}/gu).join(' ')}\nsub\n      ${hx(20).toUpperCase().match(/.{4}/gu).join(' ')}`]) {
@@ -513,7 +519,6 @@ test('tenth review: uncertain streams keep their tails and layers, wide byte pai
 
 test('eleventh review: dumps after unrelated ids, pair arrays, text under uncertain layers, and ordinary blobs and paths', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
-  const crypto = globalThis.process.getBuiltinModule('node:crypto');
   const hex = (bytes) => Buffer.from(bytes).toString('hex');
   const b64 = (bytes) => Buffer.from(bytes).toString('base64');
   const wrap = (content) => JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content }] });
@@ -521,9 +526,9 @@ test('eleventh review: dumps after unrelated ids, pair arrays, text under uncert
   const gz = zlib.gzipSync(T);
   const od = hex(gz).match(/.{1,32}/gu).map((line) => ` ${line.match(/../gu).join(' ')}`).join('\n');
   const pairs = (bytes, sep) => hex(bytes).match(/../gu).join(sep);
-  for (const payload of [`commit ${hex(crypto.randomBytes(20))}\n${od}`, `${crypto.randomUUID()}\n${od}`,
-    Array.from({ length: 300 }, () => `fp ${pairs(crypto.randomBytes(16), ':')}`).join('\n') + `\n${pairs(gz, ' ')}`,
-    `sha256 ${hex(crypto.randomBytes(32))}\n${b64(gz).match(/.{1,12}/gu).join(' ')}`,
+  for (const payload of [`commit ${hex(syntheticBytes(20))}\n${od}`, `${syntheticUUID()}\n${od}`,
+    Array.from({ length: 300 }, () => `fp ${pairs(syntheticBytes(16), ':')}`).join('\n') + `\n${pairs(gz, ' ')}`,
+    `sha256 ${hex(syntheticBytes(32))}\n${b64(gz).match(/.{1,12}/gu).join(' ')}`,
     JSON.stringify(hex(T).match(/../gu)), JSON.stringify(hex(gz).match(/../gu), null, 2), hex(T).match(/../gu).map((pair) => `- ${pair}`).join('\n'),
     pairs(T, '; '), pairs(T, ',\n    '),
     pairs(Buffer.concat([zlib.deflateRawSync(Buffer.from('harmless text here')), zlib.gzipSync(b64(T))]), ' '),
@@ -531,7 +536,7 @@ test('eleventh review: dumps after unrelated ids, pair arrays, text under uncert
     assert.equal(check(wrap(payload)).decision, 'BLOCK', payload.slice(0, 40));
   }
   const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
-  assert.equal(unknown(wrap(b64(Buffer.concat([zlib.gzipSync('harmless log line'), crypto.randomBytes(600)])).match(/.{1,12}/gu).join(' '))).decision, 'BLOCK');
+  assert.equal(unknown(wrap(b64(Buffer.concat([zlib.gzipSync('harmless log line'), syntheticBytes(600)])).match(/.{1,12}/gu).join(' '))).decision, 'BLOCK');
   assert.equal(check('const password = `Synthetic-Passw0rd-1`;').decision, 'BLOCK');
   assert.equal(check('db=1postgres://admin:Synthetic-pass@db.invalid/x').decision, 'BLOCK');
   for (const payload of [Array.from({ length: 6 }, (_, i) => `2026-09-27T10:00:0${i}Z INFO event payload=${b64(zlib.deflateSync(JSON.stringify({ event: 'login', n: i })))}`).join('\n'),
@@ -578,4 +583,191 @@ test('twelfth review: dump ASCII columns, empty streams in a chain, advisory ids
     'postgres://admin:<password>@db.invalid/x']) {
     assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
   }
+});
+
+test('issue 88: compressed originals under byte escapes are inflated before release', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const gzip = zlib.gzipSync(Buffer.from(`synthetic note for ${PLANTED} and ${CANARY}`));
+  const hex = (byte) => byte.toString(16).padStart(2, '0');
+  const forms = [
+    [...gzip].map((byte) => `%${hex(byte)}`).join(''),
+    [...gzip].map((byte) => `\\x${hex(byte)}`).join(''),
+    [...gzip].map((byte, index) => index === 0 ? '\\^_' : `\\x${hex(byte)}`).join(''),
+    [...gzip].map((byte) => `\\u00${hex(byte)}`).join(''),
+    [...gzip].map((byte) => `\\${byte.toString(8).padStart(3, '0')}`).join(''),
+    [...gzip].map((byte) => `&#x${hex(byte)};`).join(''),
+    [...gzip].map((byte) => `=${hex(byte).toUpperCase()}`).join(''),
+    `b'${[...gzip].map((byte) => byte >= 32 && byte < 127 && byte !== 39 && byte !== 92 ? String.fromCharCode(byte) : `\\x${hex(byte)}`).join('')}'`,
+  ];
+  for (const body of forms) {
+    const result = check(JSON.stringify({ content: body }));
+    assert.equal(result.decision, 'BLOCK', body.slice(0, 24));
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), `${body.slice(0, 24)}: ${result.reasons}`);
+    assert.equal(result.release, undefined);
+  }
+  const latin1Json = check(JSON.stringify({ content: String.fromCharCode(...gzip) }));
+  assert.ok(latin1Json.reasons.includes('KNOWN_ORIGINAL_DETECTED'), latin1Json.reasons.join(','));
+});
+
+test('issue 88: default two-byte-group xxd rows rebuild a compressed planted leak', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const compressed = zlib.gzipSync(Buffer.from(`note ${PLANTED} ${CANARY} synthetic text`));
+  const dump = Array.from({ length: Math.ceil(compressed.length / 16) }, (_, row) => {
+    const line = compressed.subarray(row * 16, row * 16 + 16);
+    const pairs = [...line].map((byte) => byte.toString(16).padStart(2, '0'));
+    const groups = pairs.join('').match(/.{1,4}/gu).join(' ');
+    const ascii = [...line].map((byte) => byte >= 32 && byte < 127 ? String.fromCharCode(byte) : '.').join('');
+    return `${(row * 16).toString(16).padStart(8, '0')}: ${groups.padEnd(39)}  ${ascii}`;
+  }).join('\n');
+  for (const payload of [dump, JSON.stringify({ content: dump })]) {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK');
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), result.reasons.join(','));
+  }
+});
+
+test('issue 88: escaped opaque bytes block, while ordinary log assignments still pass', () => {
+  const opaque = Buffer.concat(Array.from({ length: 3 }, (_, index) =>
+    createHash('sha256').update(`synthetic-opaque-${index}`).digest()));
+  const escaped = [...opaque].map((byte) => `%${byte.toString(16).padStart(2, '0')}`).join('');
+  assert.ok(check(JSON.stringify({ content: escaped })).reasons.includes('OPAQUE_EMBEDDED'));
+  for (const log of ['GET /api 200 traceparent=00-f569e0751199', 'RAX=EC37B814521BE4FD RAX=073592AFDF35F68']) {
+    assert.equal(check(JSON.stringify({ content: log })).decision, 'ALLOW');
+  }
+  assert.equal(check(`{"content":"${'\\u00e9'.repeat(40)}"}`).decision, 'ALLOW');
+  assert.equal(check(JSON.stringify({ content: 'café '.repeat(40) })).decision, 'ALLOW');
+  assert.deepEqual(check('b"\\400\\377 synthetic"').reasons, ['UNINSPECTED_CONTENT']);
+  assert.deepEqual(check('b"\\777 synthetic"').reasons, ['UNINSPECTED_CONTENT']);
+});
+
+test('independent review: a short final default xxd row retains every byte of a planted zlib stream', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const bytes = zlib.deflateSync('Orla Synthetica ABCDEFG');
+  assert.equal(bytes.length, 31);
+  const dump = Array.from({ length: Math.ceil(bytes.length / 16) }, (_, row) => {
+    const line = bytes.subarray(row * 16, row * 16 + 16);
+    const groups = Buffer.from(line).toString('hex').match(/.{1,4}/gu).join(' ');
+    const ascii = [...line].map((byte) => byte >= 32 && byte < 127 ? String.fromCharCode(byte) : '.').join('');
+    return `${(row * 16).toString(16).padStart(8, '0')}: ${groups.padEnd(39)}  ${ascii}`;
+  }).join('\n');
+  for (const payload of [dump, JSON.stringify({ content: dump })]) {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK');
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), result.reasons.join(','));
+  }
+});
+
+test('independent review: JSON-wrapped Python byte literals expose short raw deflate', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const bytes = zlib.deflateRawSync(PLANTED);
+  assert.equal(bytes.length, 17);
+  const literal = `b'${[...bytes].map((byte) => byte >= 32 && byte < 127 && byte !== 39 && byte !== 92
+    ? String.fromCharCode(byte) : `\\x${byte.toString(16).padStart(2, '0')}`).join('')}'`;
+  const result = check(JSON.stringify({ content: literal }));
+  assert.equal(result.decision, 'BLOCK');
+  assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), result.reasons.join(','));
+});
+
+test('independent review: ternary label exemption does not hide a credential inside a branch', () => {
+  const unknown = (text) => check(text, { known: null });
+  const result = unknown("kind ? 'password: Synthetic-passw0rd' : 'other'");
+  assert.equal(result.decision, 'BLOCK');
+  assert.ok(result.reasons.includes('HIGH_RISK_PATTERN'));
+  assert.equal(unknown("const label = kind === 'credential' ? 'SECRET' : 'INTERNAL';").decision, 'ALLOW');
+});
+
+test('independent review: only complete advisory identifiers receive the identifier exemption', () => {
+  const unknown = (text) => check(text, { known: null });
+  const suffix = createHash('sha256').update('synthetic-advisory-suffix').digest('base64url');
+  const prefix = createHash('sha256').update('synthetic-advisory-prefix').digest('base64url');
+  // Lowercase Base32 prefixes of SHA-256('synthetic-prefix-a/b'), truncated to 32 characters.
+  const base32A = 'vgoo2zy4d7k2i5s4oe4sk32ted5fxioy';
+  const base32B = 'orghtfbubbnd3he4osguykve42a74i47';
+  assert.equal(unknown(`GHSA-c2qf-rxjj-qqgw${suffix}`).decision, 'BLOCK');
+  assert.equal(unknown(`${prefix}/GHSA-c2qf-rxjj-qqgw`).decision, 'BLOCK');
+  assert.equal(unknown(`${base32A}/${base32B}/GHSA-c2qf-rxjj-qqgw`).decision, 'BLOCK');
+  assert.equal(unknown(`${base32A}/${base32B}/GHSX-c2qf-rxjj-qqgw`).decision, 'BLOCK');
+  assert.equal(unknown(`${base32A}/${base32B}/CVE-2026-12345`).decision, 'BLOCK');
+  assert.equal(unknown(`${base32A}/${base32B}/CVX-2026-12345`).decision, 'BLOCK');
+  for (const identifier of ['GHSA-c2qf-rxjj-qqgw', 'CVE-2026-12345', 'GHSX-c2qf-rxjj-qqgw', 'CVX-2026-12345', 'docs/security']) {
+    for (const count of [64, 128]) {
+      assert.equal(unknown(`${'/'.repeat(count)}${identifier}`).decision, 'BLOCK', `${count} ${identifier}`);
+    }
+    for (const slash of ['%2F', '%2f', '\\u002f']) {
+      assert.equal(unknown(`${slash.repeat(64)}${identifier}`).decision, 'BLOCK', `${slash} ${identifier}`);
+    }
+  }
+  assert.equal(unknown(`${'/'.repeat(7)}docs${'/'.repeat(7)}readme${'/'.repeat(7)}CVX-2026-12345`).decision, 'BLOCK');
+  for (const width of [2, 3, 4, 5, 6, 7]) {
+    const prefix = ['docs', 'readme', 'security', 'guides', 'notes', 'issues', 'archive'].join('/'.repeat(width));
+    for (const suffix of ['CVX-2026-12345', 'GHSX-c2qf-rxjj-qqgw', 'docs/security']) {
+      assert.equal(unknown(`${prefix}${'/'.repeat(width)}${suffix}`).decision, 'BLOCK', `${width} ${suffix}`);
+    }
+  }
+  assert.equal(unknown('GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('docs/security/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('https://github.com/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('Engineering/Security/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('https://github.com/SomeOrg/Security/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('Engineering/Security/advisories/CVE-2026-12345').decision, 'ALLOW');
+  assert.equal(unknown('/Engineering/Security/advisories/CVE-2026-12345').decision, 'ALLOW');
+  assert.equal(unknown('https://github.com/my_org/my_repo/security/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('https://github.com/my_org/my_repo/security/GHSX-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('/Engineering/Security/issues/CVX-2026-12345').decision, 'ALLOW');
+  assert.equal(unknown('docs/security').decision, 'ALLOW');
+  assert.equal(unknown('//github/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('docs/security/readme/CVX-2026-12345').decision, 'ALLOW');
+});
+
+test('independent review: digest and SSH exemptions validate length and wire structure', () => {
+  const unknown = (text) => check(text, { known: null });
+  const blob = Buffer.concat([
+    createHash('sha256').update('synthetic-a').digest(), createHash('sha256').update('synthetic-b').digest(),
+  ]).toString('base64');
+  assert.equal(unknown(blob).decision, 'BLOCK');
+  assert.equal(unknown(`sha256-${blob}`).decision, 'BLOCK');
+  assert.equal(unknown(`Content-MD5: ${blob}`).decision, 'BLOCK');
+  assert.equal(unknown(`ssh-ed25519 ${blob} user@host.invalid`).decision, 'BLOCK');
+  const publicWire = Buffer.concat([Buffer.from([0, 0, 0, 11]), Buffer.from('ssh-ed25519'), Buffer.from([0, 0, 0, 32]), syntheticBytes(32)]);
+  assert.equal(unknown(`xssh-ed25519 ${publicWire.toString('base64')} user@host.invalid`).decision, 'BLOCK');
+  assert.equal(unknown(`ssh-ed25519 ${publicWire.toString('hex')} user@host.invalid`).decision, 'BLOCK');
+  assert.equal(unknown(`sha256-${syntheticBytes(32).toString('base64')}`).decision, 'ALLOW');
+  assert.equal(unknown(`ssh-ed25519 ${sshEd25519Public()} user@host.invalid`).decision, 'ALLOW');
+});
+
+test('independent review: short registered originals are matched under short encodings', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const raw = (value) => zlib.deflateRawSync(value).toString('base64');
+  const pem = (value) => `-----BEGIN CERTIFICATE-----\n${Buffer.concat([Buffer.from([0x30, 0x04]), Buffer.from(value)]).toString('base64')}\n-----END CERTIFICATE-----`;
+  for (const payload of ['T3JsYQ==', '4f726c61', '0x4f726c61', JSON.stringify({ content: 'T3JsYQ==' }),
+    raw('Orla'), zlib.deflateRawSync('Orla').toString('base64url'), pem('Orla')]) {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', payload);
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), `${payload}: ${result.reasons}`);
+  }
+  for (const payload of ['T3JsZQ==', '42656c61', '0x42656c61', JSON.stringify({ content: 'T3JsZQ==' }), raw('Bela'), pem('Bela')]) {
+    assert.equal(check(payload).decision, 'ALLOW', payload);
+  }
+});
+
+test('independent review: ordinary decimals cannot gain opaque authority from tentative raw deflate', () => {
+  const unknown = (text) => check(text, { known: null });
+  for (const payload of ['0.7231478778415019', JSON.stringify({ content: '0.7231478778415019' })]) {
+    assert.equal(unknown(payload).decision, 'ALLOW', payload);
+  }
+});
+
+test('independent rereview: a signed container inside tentative raw deflate remains opaque', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const inner = zlib.gzipSync(Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('Orla')]));
+  const outer = zlib.deflateRawSync(inner);
+  assert.equal(inner.length, 28);
+  assert.equal(outer.length, 25);
+  assert.deepEqual(check(inner.toString('base64')).reasons, ['OPAQUE_EMBEDDED']);
+  for (const payload of [outer.toString('base64'), JSON.stringify({ content: outer.toString('base64') })]) {
+    assert.deepEqual(check(payload).reasons, ['OPAQUE_EMBEDDED']);
+  }
+  assert.equal(check('0.7231478778415019', { known: null }).decision, 'ALLOW');
 });
