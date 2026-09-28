@@ -357,6 +357,12 @@ function isSshEd25519PublicKey(before: string, value: string, bytes: Uint8Array)
     bytes.length === SSH_ED25519_HEADER.length + 32 &&
     SSH_ED25519_HEADER.every((byte, index) => bytes[index] === byte);
 }
+/** Allow a URL's initial `//`, but no additional empty slash-delimited component. */
+function repeatedPathSlashes(value: string): boolean {
+  const leading = value.startsWith('//') ? 2 : value.startsWith('/') ? 1 : 0;
+  const rest = value.slice(leading);
+  return rest.startsWith('/') || rest.includes('//');
+}
 /**
  * camelCase/PascalCase/snake identifiers and path-like names made of words and short digit groups
  * (`convertUtf8ToBase64String`, `com/Marcus-Levin/hylja/pull/56`). Random Base64 does not split into words.
@@ -365,8 +371,8 @@ function isSshEd25519PublicKey(before: string, value: string, bytes: Uint8Array)
  */
 function isIdentifier(value: string): boolean {
   // Hex split into short groups (`a3f9-01bc-…`) has no word in it and is data, not a name.
-  // Repeated Base64 slash bytes are data even when an ordinary-looking advisory or other id follows them.
-  if (value.length > 256 || /[+=]|\/{8,}/u.test(value) || !/[g-zG-Z]/u.test(value)) return false;
+  // Interior or extra leading Base64 slash bytes are data even when an ordinary-looking id follows them.
+  if (value.length > 256 || /[+=]/u.test(value) || repeatedPathSlashes(value) || !/[g-zG-Z]/u.test(value)) return false;
   const segments = value.split(/[_/.-]+|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/u).filter(Boolean);
   // Names have few, long segments; random Base64 that happens to split into word-like pieces has many short ones.
   // Advisory ids (`GHSA-jfh8-c2jp-5v3q`, `CVE-2026-12345`) and short `-_.`-separated groups (`Q1_2026_Report_v3_Final.pdf`)
@@ -947,9 +953,9 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         // Mixed case with a digit, `+`, or frequent case switches (digit-free random Base64); camelCase names are
         // exempted by the identifier check.
         const mixedCase = /[A-Z]/u.test(run.value) && /[a-z]/u.test(run.value);
-        // A long run of `/` is Base64 alphabet data; treating it as plain path punctuation can hide opaque bytes.
+        // Repeated `/` is Base64 alphabet data; treating it as plain path punctuation can hide opaque bytes.
         const encodedShape = run.escaped === true || /^[0-9A-Fa-f]+$/u.test(run.value) && /[A-Fa-f]/u.test(run.value) ||
-          /={1,2}$/u.test(run.value) || /\/{8,}/u.test(run.value) ||
+          /={1,2}$/u.test(run.value) || /\/{2,}/u.test(run.value) ||
           mixedCase && (/\d|\+/u.test(run.value) || (run.value.match(/[a-z][A-Z]/gu)?.length ?? 0) * 6 >= run.value.length);
         const before = view.text.slice(Math.max(0, run.start - 32), run.start);
         // A digest is one unbroken run; joined chunks or separated hex of digest length are not exempt.

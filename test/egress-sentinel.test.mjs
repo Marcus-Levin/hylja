@@ -697,6 +697,13 @@ test('independent review: only complete advisory identifiers receive the identif
       assert.equal(unknown(`${slash.repeat(64)}${identifier}`).decision, 'BLOCK', `${slash} ${identifier}`);
     }
   }
+  assert.equal(unknown(`${'/'.repeat(7)}docs${'/'.repeat(7)}readme${'/'.repeat(7)}CVX-2026-12345`).decision, 'BLOCK');
+  for (const width of [2, 3, 4, 5, 6, 7]) {
+    const prefix = ['docs', 'readme', 'security', 'guides', 'notes', 'issues', 'archive'].join('/'.repeat(width));
+    for (const suffix of ['CVX-2026-12345', 'GHSX-c2qf-rxjj-qqgw', 'docs/security']) {
+      assert.equal(unknown(`${prefix}${'/'.repeat(width)}${suffix}`).decision, 'BLOCK', `${width} ${suffix}`);
+    }
+  }
   assert.equal(unknown('GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
   assert.equal(unknown('advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
   assert.equal(unknown('/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
@@ -710,6 +717,8 @@ test('independent review: only complete advisory identifiers receive the identif
   assert.equal(unknown('https://github.com/my_org/my_repo/security/GHSX-c2qf-rxjj-qqgw').decision, 'ALLOW');
   assert.equal(unknown('/Engineering/Security/issues/CVX-2026-12345').decision, 'ALLOW');
   assert.equal(unknown('docs/security').decision, 'ALLOW');
+  assert.equal(unknown('//github/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('docs/security/readme/CVX-2026-12345').decision, 'ALLOW');
 });
 
 test('independent review: digest and SSH exemptions validate length and wire structure', () => {
