@@ -686,3 +686,16 @@ test('independent review: ordinary decimals cannot gain opaque authority from te
     assert.equal(unknown(payload).decision, 'ALLOW', payload);
   }
 });
+
+test('independent rereview: a signed container inside tentative raw deflate remains opaque', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const inner = zlib.gzipSync(Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('Orla')]));
+  const outer = zlib.deflateRawSync(inner);
+  assert.equal(inner.length, 28);
+  assert.equal(outer.length, 25);
+  assert.deepEqual(check(inner.toString('base64')).reasons, ['OPAQUE_EMBEDDED']);
+  for (const payload of [outer.toString('base64'), JSON.stringify({ content: outer.toString('base64') })]) {
+    assert.deepEqual(check(payload).reasons, ['OPAQUE_EMBEDDED']);
+  }
+  assert.equal(check('0.7231478778415019', { known: null }).decision, 'ALLOW');
+});

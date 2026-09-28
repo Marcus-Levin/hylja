@@ -750,8 +750,9 @@ function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, dep
       const inner: Sink = { texts: [], uncertain: [], printables: [], junk: [] };
       for (const part of consumed < bytes.length ? [out, bytes.subarray(consumed)] : [out]) {
         const result = expand(part, budget, inner, depth + 1);
-        if (result === 'BUDGET') return result;
-        // A container found only under a tentative decode cannot prove an opaque original.
+        // Only a successfully decoded signed gzip/zlib layer can return CONTAINER. Preserve that restrictive
+        // finding even when the layer was reached through tentative raw deflate or brotli output.
+        if (result === 'CONTAINER' || result === 'BUDGET') return result;
       }
       sink.uncertain.push(...inner.texts, ...inner.uncertain);
       sink.junk.push(...inner.printables, ...inner.junk);
