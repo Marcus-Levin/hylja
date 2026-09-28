@@ -689,10 +689,12 @@ test('independent review: only complete advisory identifiers receive the identif
   assert.equal(unknown(`${base32A}/${base32B}/GHSX-c2qf-rxjj-qqgw`).decision, 'BLOCK');
   assert.equal(unknown(`${base32A}/${base32B}/CVE-2026-12345`).decision, 'BLOCK');
   assert.equal(unknown(`${base32A}/${base32B}/CVX-2026-12345`).decision, 'BLOCK');
-  for (const advisory of ['GHSA-c2qf-rxjj-qqgw', 'CVE-2026-12345']) {
-    assert.equal(unknown(`${'/'.repeat(64)}${advisory}`).decision, 'BLOCK', advisory);
+  for (const identifier of ['GHSA-c2qf-rxjj-qqgw', 'CVE-2026-12345', 'GHSX-c2qf-rxjj-qqgw', 'CVX-2026-12345', 'docs/security']) {
+    for (const count of [64, 128]) {
+      assert.equal(unknown(`${'/'.repeat(count)}${identifier}`).decision, 'BLOCK', `${count} ${identifier}`);
+    }
     for (const slash of ['%2F', '%2f', '\\u002f']) {
-      assert.equal(unknown(`${slash.repeat(64)}${advisory}`).decision, 'BLOCK', `${slash} ${advisory}`);
+      assert.equal(unknown(`${slash.repeat(64)}${identifier}`).decision, 'BLOCK', `${slash} ${identifier}`);
     }
   }
   assert.equal(unknown('GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
@@ -706,6 +708,8 @@ test('independent review: only complete advisory identifiers receive the identif
   assert.equal(unknown('/Engineering/Security/advisories/CVE-2026-12345').decision, 'ALLOW');
   assert.equal(unknown('https://github.com/my_org/my_repo/security/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
   assert.equal(unknown('https://github.com/my_org/my_repo/security/GHSX-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('/Engineering/Security/issues/CVX-2026-12345').decision, 'ALLOW');
+  assert.equal(unknown('docs/security').decision, 'ALLOW');
 });
 
 test('independent review: digest and SSH exemptions validate length and wire structure', () => {

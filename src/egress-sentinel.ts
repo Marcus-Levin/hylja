@@ -365,7 +365,8 @@ function isSshEd25519PublicKey(before: string, value: string, bytes: Uint8Array)
  */
 function isIdentifier(value: string): boolean {
   // Hex split into short groups (`a3f9-01bc-…`) has no word in it and is data, not a name.
-  if (value.length > 256 || /[+=]/u.test(value) || !/[g-zG-Z]/u.test(value)) return false;
+  // Repeated Base64 slash bytes are data even when an ordinary-looking advisory or other id follows them.
+  if (value.length > 256 || /[+=]|\/{8,}/u.test(value) || !/[g-zG-Z]/u.test(value)) return false;
   const segments = value.split(/[_/.-]+|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/u).filter(Boolean);
   // Names have few, long segments; random Base64 that happens to split into word-like pieces has many short ones.
   // Advisory ids (`GHSA-jfh8-c2jp-5v3q`, `CVE-2026-12345`) and short `-_.`-separated groups (`Q1_2026_Report_v3_Final.pdf`)
