@@ -38,7 +38,7 @@ The lead's output is a short, versioned list of accepted and deferred **v0-relev
 
 The [design interview working notes](issue-65-66-grill-working-notes-p0.1.md) record lead preferences for these questions without changing any pending approval state.
 
-The [independent reviewer handoff](issue-65-66-independent-review-handoff-p0.1.md) gives a bounded review checklist and private verdict format; it appoints nobody and does not approve any #39 gate.
+The [short application review brief](issue-65-66-application-review-brief-p0.1.md) is the self-contained first task for an outside domain specialist. The [formal reviewer handoff](issue-65-66-independent-review-handoff-p0.1.md) gives the project coordinator a source/authority checklist and private verdict format. Neither appoints anyone or approves a #39 gate.
 
 ## Decisions to write down before proposing a new oracle version
 

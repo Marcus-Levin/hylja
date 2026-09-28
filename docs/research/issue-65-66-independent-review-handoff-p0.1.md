@@ -2,7 +2,13 @@
 
 **PUBLIC REVIEW PACKET — not a role appointment, accepted taxonomy, accepted decision 010, #39 approval, benchmark lock or score.** This packet contains only public synthetic examples. Keep reviewer identities, acceptance, conflict declarations, restricted approval records, real data and future blind material out of Git, issues, PRs, CI and chat. [The plan](../plan.md#current-state) alone records implementation status.
 
-## What the reviewer is being asked to decide
+## Start with the short application review
+
+Send an outside application specialist only the [20–30 minute brief](issue-65-66-application-review-brief-p0.1.md) first. It is self-contained and requires no PR, code or standards reading. Their job is to correct domain categories and task-detail assumptions from work experience. The project team turns that feedback into a revised, versioned proposal and handles source, security, legal and policy checks with qualified reviewers. The short reply alone is **not** full #65/#66 independent sign-off.
+
+This longer packet is for the coordinator and any person accepting the subsequent formal independent-review role. Give the formal reviewer a fixed summary of decisions, sources and changes rather than asking them to reconstruct the project from a moving PR.
+
+## What the formal reviewer is being asked to decide
 
 The [#65 taxonomy issue](https://github.com/Marcus-Levin/hylja/issues/65) asks **what kind of information a value is**. The [#66 information-model issue](https://github.com/Marcus-Levin/hylja/issues/66) asks where contextual privacy, disclosure sensitivity, source influence, task needs and policy treatment belong. A label such as `NETWORK_IDENTIFIER / PORT` does not decide whether a value may go to a model. Task usefulness does not grant permission to send it.
 
