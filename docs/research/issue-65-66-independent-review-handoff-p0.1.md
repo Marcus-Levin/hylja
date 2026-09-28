@@ -36,7 +36,7 @@ Use only obviously synthetic, non-routable examples. Do not add real national id
 
 ## #66: challenge the separate information model
 
-Use [proposed decision 010](../decisions/010-separate-information-dimensions-and-task-fidelity.md), the [unwired draft contract](../contracts/information-model-draft.md) and the [interview notes](issue-65-66-grill-working-notes-p0.1.md). The current executable drafts still use `PERSONAL_IDENTIFIER` and task predicate `FORMAT`; the interview prefers neutral `IDENTIFIER` and `VALUE_SHAPE`. Review the direction, then identify exact revisions needed before any accepted contract or implementation.
+Use [proposed decision 010](../decisions/010-separate-information-dimensions-and-task-fidelity.md), the [unwired draft contract](../contracts/information-model-draft.md) and the [interview notes](issue-65-66-grill-working-notes-p0.1.md). The executable drafts now use neutral `IDENTIFIER` and task predicate `VALUE_SHAPE`, without the old-version migration helper. Review those boundaries, then identify exact revisions needed before any accepted contract or implementation.
 
 | Check | Concrete question for the reviewer |
 | --- | --- |

@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { DEFAULT_SUBTYPES, SEMANTIC_CLASSES } from '../dist/classification.js';
 import {
   TAXONOMY_DRAFT, DRAFT_SEMANTIC_TYPES, DRAFT_DOMAINS, FORMS, EVIDENCE_KINDS, PERSONAL_DATA_PRIORS,
-  taxonomyEntryDraft, draftEntriesForV1,
+  taxonomyEntryDraft,
 } from '../dist/taxonomy-draft.js';
 
 const byType = (type) => TAXONOMY_DRAFT.filter((entry) => entry.semanticType === type);
@@ -28,7 +27,7 @@ test('entries are well-formed, frozen and globally unique by subtype', () => {
 
 test('taxonomy describes what information is: no sensitivity, treatment or trust field', () => {
   for (const entry of TAXONOMY_DRAFT) {
-    for (const forbidden of ['sensitivity', 'treatment', 'trust', 'decision', 'reversible']) {
+    for (const forbidden of ['sensitivity', 'treatment', 'trust', 'decision', 'reversible', 'v1']) {
       assert.ok(!(forbidden in entry), `${entry.subtype}.${forbidden}`);
     }
   }
@@ -38,7 +37,9 @@ test('identifiers, content and credentials live under the matching semantic type
   for (const entry of TAXONOMY_DRAFT) {
     if (entry.semanticType === 'CREDENTIAL_OR_SECRET') assert.equal(entry.form, 'CREDENTIAL', entry.subtype);
     else assert.notEqual(entry.form, 'CREDENTIAL', entry.subtype);
-    if (entry.semanticType.endsWith('_IDENTIFIER')) assert.equal(entry.form, 'IDENTIFIER', entry.subtype);
+    if (entry.semanticType === 'IDENTIFIER' || entry.semanticType.endsWith('_IDENTIFIER')) {
+      assert.equal(entry.form, 'IDENTIFIER', entry.subtype);
+    }
     if (['ENGINEERING_INFORMATION', 'PERSONAL_ATTRIBUTE', 'BUSINESS_CONFIDENTIAL'].includes(entry.semanticType)) {
       assert.equal(entry.form, 'CONTENT', entry.subtype);
     }
@@ -55,10 +56,13 @@ test('#65 engineering domains each have both identifier and content coverage whe
   }
 });
 
-test('PERSON is not all personal data: contact and national IDs are personal identifiers', () => {
+test('PERSON is a natural-person entity; neutral identifiers have contextual privacy', () => {
   assert.deepEqual(byType('PERSON').map((e) => e.subtype), ['PERSON_NAME', 'PERSON_ALIAS']);
   for (const subtype of ['EMAIL_ADDRESS', 'PHONE_NUMBER', 'SE_PERSONNUMMER', 'SE_SAMORDNINGSNUMMER']) {
-    assert.equal(taxonomyEntryDraft(subtype).semanticType, 'PERSONAL_IDENTIFIER', subtype);
+    assert.equal(taxonomyEntryDraft(subtype).semanticType, 'IDENTIFIER', subtype);
+  }
+  for (const subtype of ['EMAIL_ADDRESS', 'BANK_ACCOUNT_NUMBER']) {
+    assert.equal(taxonomyEntryDraft(subtype).personalDataPrior, 'CONTEXTUAL', subtype);
   }
   // Personal data status can attach to non-person types without renaming them.
   const ip = taxonomyEntryDraft('IP');
@@ -74,42 +78,16 @@ test('Swedish national identifiers are distinct, SE-scoped and not modelled as s
     assert.deepEqual(entry.jurisdictions, ['SE']);
     assert.equal(entry.personalDataPrior, 'ALWAYS');
     assert.ok(entry.evidence.includes('FORMAT'));
-    assert.deepEqual({ ...entry.v1 }, { semanticType: 'PERSON' });
+    assert.equal(entry.semanticType, 'IDENTIFIER');
   }
   assert.ok(TAXONOMY_DRAFT.filter((e) => e.jurisdictions).every((e) => e.jurisdictions.every((c) => c === 'SE')));
   // A sole trader's organisationsnummer is a personnummer: never NOT_BY_ITSELF.
   assert.equal(taxonomyEntryDraft('SE_ORGANISATIONSNUMMER').personalDataPrior, 'CONTEXTUAL');
 });
 
-test('every v1 default subtype maps to exactly one draft entry and every v1 class has a home', () => {
-  for (const type of SEMANTIC_CLASSES) {
-    assert.ok(draftEntriesForV1(type).length > 0, type);
-    for (const subtype of DEFAULT_SUBTYPES[type]) {
-      assert.equal(draftEntriesForV1(type, subtype).length, 1, `${type}/${subtype}`);
-    }
-  }
-  assert.deepEqual(draftEntriesForV1('PERSON', 'EMAIL').map((e) => e.subtype), ['EMAIL_ADDRESS']);
-  // Replay of tenant-extended v1 subtypes and class-only homes.
-  assert.deepEqual(draftEntriesForV1('ENGINEERING_IDENTIFIER', 'EQUIPMENT_TAG').map((e) => e.subtype), ['EQUIPMENT_TAG']);
-  assert.deepEqual(draftEntriesForV1('USER_ACCOUNT', 'USERNAME').map((e) => e.subtype), ['USERNAME']);
-  assert.ok(draftEntriesForV1('ENGINEERING_IDENTIFIER').every((e) => e.semanticType === 'ENGINEERING_IDENTIFIER'));
-  assert.equal(draftEntriesForV1('ENGINEERING_IDENTIFIER').length, byType('ENGINEERING_IDENTIFIER').length);
-  // Only content without any v1 class stays unmapped.
-  for (const entry of TAXONOMY_DRAFT.filter((e) => e.v1 === null)) assert.equal(entry.semanticType, 'ENGINEERING_INFORMATION');
-  for (const entry of TAXONOMY_DRAFT) {
-    if (!entry.v1) continue;
-    assert.ok(SEMANTIC_CLASSES.includes(entry.v1.semanticType));
-    if (entry.v1.subtype !== undefined) assert.ok(DEFAULT_SUBTYPES[entry.v1.semanticType].includes(entry.v1.subtype));
-  }
-});
-
 test('lookups reject unknown or non-string input', () => {
   assert.equal(taxonomyEntryDraft('NOT_A_SUBTYPE'), undefined);
   assert.equal(taxonomyEntryDraft({ toString: () => 'IP' }), undefined);
-  assert.deepEqual(draftEntriesForV1('ENGINEERING_INFORMATION'), []);
-  assert.deepEqual(draftEntriesForV1('__proto__'), []);
-  assert.deepEqual(draftEntriesForV1('PERSON', 7), []);
-  assert.deepEqual(draftEntriesForV1('PERSON', 'NOT_A_SUBTYPE'), []);
 });
 
 test('FORMAT is not claimed for subtypes whose syntax is shared with unrelated values', () => {

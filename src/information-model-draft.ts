@@ -6,7 +6,7 @@
 import { SENSITIVITIES } from './classification.js';
 import type { Sensitivity } from './classification.js';
 
-export const INFORMATION_MODEL_DRAFT_VERSION = 'draft-1' as const;
+export const INFORMATION_MODEL_DRAFT_VERSION = 'draft-2' as const;
 const MAX_ITEMS = 256;
 
 function plain(value: unknown, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> | null {
@@ -204,7 +204,7 @@ export function resolveAttributeDraft(claims: unknown): AttributeResolutionDraft
 /* ---------- Task fidelity (#68): what the task needs, not what policy allows ---------- */
 
 export const FIDELITY_PREDICATES = [
-  'EXACT_VALUE', 'EXISTENCE', 'KIND', 'FORMAT', 'SYNTAX', 'RELATIONSHIP', 'CONSISTENCY', 'GENERALIZED',
+  'EXACT_VALUE', 'EXISTENCE', 'KIND', 'VALUE_SHAPE', 'SYNTAX', 'RELATIONSHIP', 'CONSISTENCY', 'GENERALIZED',
   'NOT_REQUIRED',
 ] as const;
 export type FidelityPredicate = (typeof FIDELITY_PREDICATES)[number];
@@ -224,7 +224,7 @@ const SATISFIES: Readonly<Record<FidelityPredicate, readonly Representation[]>> 
   // REMOVED erases existence: the #68 failure where a dropped apiKey reads as "no credential supplied".
   EXISTENCE: ['EXACT', 'IDENTITY_SYNTHETIC', 'OPAQUE_TOKEN', 'SEMANTIC_PLACEHOLDER', 'GENERALIZED'],
   KIND: ['EXACT', 'IDENTITY_SYNTHETIC', 'OPAQUE_TOKEN', 'SEMANTIC_PLACEHOLDER', 'GENERALIZED'],
-  FORMAT: ['EXACT', 'IDENTITY_SYNTHETIC'],
+  VALUE_SHAPE: ['EXACT', 'IDENTITY_SYNTHETIC'],
   // Container syntax is a transformer obligation for any released form; see the transformation contract.
   SYNTAX: RELEASED,
   RELATIONSHIP: ['EXACT', 'IDENTITY_SYNTHETIC', 'OPAQUE_TOKEN'],

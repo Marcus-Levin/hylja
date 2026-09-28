@@ -176,6 +176,8 @@ test('#68 fidelity: a dropped credential fails EXISTENCE; a placeholder keeps it
 
 test('#68 fidelity: port 443 needs EXACT; hostnames keep relationships via synthetic identity', () => {
   assert.deepEqual(assessFidelityDraft(['EXACT_VALUE'], 'INTERNAL').satisfying, ['EXACT']);
+  assert.deepEqual(assessFidelityDraft(['VALUE_SHAPE'], 'INTERNAL').satisfying,
+    ['EXACT', 'IDENTITY_SYNTHETIC']);
   assert.deepEqual(assessFidelityDraft(['RELATIONSHIP', 'CONSISTENCY', 'KIND'], 'CONFIDENTIAL').satisfying,
     ['EXACT', 'IDENTITY_SYNTHETIC', 'OPAQUE_TOKEN']);
   assert.deepEqual(assessFidelityDraft(['GENERALIZED'], 'CONFIDENTIAL').satisfying, ['EXACT', 'GENERALIZED']);
@@ -220,7 +222,8 @@ test('property: secrets stay within the non-reversible ceiling and predicates on
 
 test('fidelity requests reject malformed input', () => {
   for (const [predicates, sensitivity] of [[[], 'INTERNAL'], [['EXACT_VALUE', 'EXACT_VALUE'], 'INTERNAL'],
-    [['KEEP'], 'INTERNAL'], [['EXACT_VALUE'], false], [['EXACT_VALUE'], 'TOP_SECRET'], ['EXACT_VALUE', 'INTERNAL'],
+    [['KEEP'], 'INTERNAL'], [['FORMAT'], 'INTERNAL'], [['EXACT_VALUE'], false],
+    [['EXACT_VALUE'], 'TOP_SECRET'], ['EXACT_VALUE', 'INTERNAL'],
     [['NOT_REQUIRED', 'KIND'], 'INTERNAL']]) {
     assert.throws(() => assessFidelityDraft(predicates, sensitivity), TypeError);
   }
@@ -237,7 +240,7 @@ test('semantic placeholders are typed, bounded and never look like a usable cred
 });
 
 const contract = {
-  version: 'draft-1', taskRef: 'task-d02',
+  version: 'draft-2', taskRef: 'task-d02',
   requirements: [
     { targetRef: 'occ-port-attempted', predicates: ['EXACT_VALUE'] },
     { targetRef: 'occ-api-key', predicates: ['EXISTENCE', 'KIND'] },
@@ -251,10 +254,12 @@ test('task fidelity contracts validate strictly and bind requirements to refs, n
   assert.equal(valid.requirements.length, 4);
   assert.ok(Object.isFrozen(valid.requirements[0].predicates));
   for (const mutate of [
-    (c) => { c.version = 1; }, (c) => { c.requirements = []; }, (c) => { c.treatment = 'KEEP'; },
+    (c) => { c.version = 1; }, (c) => { c.version = 'draft-1'; },
+    (c) => { c.requirements = []; }, (c) => { c.treatment = 'KEEP'; },
     (c) => { c.requirements[1].targetRef = 'occ-port-attempted'; },
     (c) => { c.requirements[3].predicates = ['NOT_REQUIRED', 'KIND']; },
     (c) => { c.requirements[0].predicates = ['KEEP']; },
+    (c) => { c.requirements[0].predicates = ['FORMAT']; },
     (c) => { c.requirements[0].targetRef = 'has space'; },
     // Refs are opaque and prefixed: hostnames, IPs and key-shaped strings do not fit the grammar.
     (c) => { c.taskRef = 'plc-gateway-07.internal'; }, (c) => { c.requirements[0].targetRef = '192.0.2.10'; },
@@ -268,7 +273,7 @@ test('task fidelity contracts validate strictly and bind requirements to refs, n
 });
 
 const annotation = {
-  version: 'draft-1', occurrenceRef: 'occ-client-ip', entityRef: 'entity-client-a',
+  version: 'draft-2', occurrenceRef: 'occ-client-ip', entityRef: 'entity-client-a',
   semantic: { semanticType: 'NETWORK_IDENTIFIER', subtype: 'IP' },
   privacy: { personalData: 'YES', specialCategory: 'NO', jurisdictions: ['SE', 'EU'] },
   sensitivity: 'CONFIDENTIAL',
@@ -284,7 +289,8 @@ test('oracle annotations keep IP semantics separate from its contextual personal
 
 test('oracle annotations reject trust, treatment, contradictions and malformed fields', () => {
   for (const mutate of [
-    (a) => { a.trust = 'CONTROL'; }, (a) => { a.treatment = 'KEEP'; }, (a) => { a.sensitivity = 'UNKNOWN'; },
+    (a) => { a.version = 'draft-1'; }, (a) => { a.trust = 'CONTROL'; },
+    (a) => { a.treatment = 'KEEP'; }, (a) => { a.sensitivity = 'UNKNOWN'; },
     (a) => { a.privacy.specialCategory = 'YES'; a.privacy.personalData = 'UNKNOWN'; },
     (a) => { a.privacy.jurisdictions = ['SE', 'SE']; }, (a) => { a.privacy.jurisdictions = ['sweden']; },
     (a) => { a.semantic.semanticType = 'person'; }, (a) => { a.semantic.raw = 'synthetic-value.invalid'; },

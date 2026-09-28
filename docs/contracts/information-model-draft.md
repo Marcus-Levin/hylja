@@ -24,14 +24,14 @@ Checked properties: `effective` never falls below any valid deterministic claim;
 
 ## Task fidelity
 
-A fidelity contract belongs to a **task** and is keyed by occurrence or entity refs, so it answers "per candidate, per task, or both" with both. Its author is an independent task owner, never the payload or the model. `validateTaskFidelityContractDraft` requires opaque prefixed refs (`task-…`, `occ-…`, `entity-…`, lower-case, no dots, colons or underscores), unique targets, known predicates, and `NOT_REQUIRED` only on its own. The ref grammar rejects dotted hostnames and IPs, URLs and `_`/`:`-separated key formats, but it cannot prove that a well-formed ref holds no protected value. The [subsequent interview](../research/issue-65-66-grill-working-notes-p0.1.md#third-interview-round-agreed-directions-and-q14-correction) prefers the name `VALUE_SHAPE` for the current executable draft's `FORMAT` fidelity predicate; source code remains an unwired draft pending review.
+A fidelity contract belongs to a **task** and is keyed by occurrence or entity refs, so it answers "per candidate, per task, or both" with both. Its author is an independent task owner, never the payload or the model. `validateTaskFidelityContractDraft` requires opaque prefixed refs (`task-…`, `occ-…`, `entity-…`, lower-case, no dots, colons or underscores), unique targets, known predicates, and `NOT_REQUIRED` only on its own. The ref grammar rejects dotted hostnames and IPs, URLs and `_`/`:`-separated key formats, but it cannot prove that a well-formed ref holds no protected value. The unwired executable draft now uses `VALUE_SHAPE` for a task need, distinct from classifier `FORMAT` detection evidence. An old `FORMAT` fidelity predicate is rejected; no backward-compatible reader is required for this unreleased draft.
 
 | Predicate | Meaning | Forms that can satisfy it |
 | --- | --- | --- |
 | `EXACT_VALUE` | exact bytes must survive (port `443` for HTTPS diagnosis) | EXACT |
 | `EXISTENCE` | the value's presence must be visible (`apiKey` was supplied) | all released forms except REMOVED |
 | `KIND` | the semantic kind must be recognizable | EXACT, IDENTITY_SYNTHETIC, OPAQUE_TOKEN, SEMANTIC_PLACEHOLDER, GENERALIZED |
-| `FORMAT` | value shape (URL scheme, path style, extension) | EXACT, IDENTITY_SYNTHETIC |
+| `VALUE_SHAPE` | value shape (URL scheme, path style, extension) | EXACT, IDENTITY_SYNTHETIC |
 | `SYNTAX` | the container stays valid (JSON parses) | any released form; a transformer obligation |
 | `RELATIONSHIP` | links to other occurrences or entities survive (primary→backup) | EXACT, IDENTITY_SYNTHETIC, OPAQUE_TOKEN |
 | `CONSISTENCY` | the same entity gets the same representation within scope | EXACT, IDENTITY_SYNTHETIC, OPAQUE_TOKEN |
@@ -51,7 +51,7 @@ A fidelity contract belongs to a **task** and is keyed by occurrence or entity r
 `validateOracleAnnotationDraft` accepts one planted occurrence:
 
 ```ts
-{ version: 'draft-1', occurrenceRef, entityRef?,
+{ version: 'draft-2', occurrenceRef, entityRef?,
   semantic: { semanticType, domain?, subtype? },          // names from the #65 taxonomy once reviewed
   privacy: { personalData, specialCategory, jurisdictions }, // tri-state; codes like 'EU', 'SE'
   sensitivity }
