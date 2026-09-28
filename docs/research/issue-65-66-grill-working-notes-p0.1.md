@@ -12,6 +12,19 @@
 | #66 task fidelity | An independently authored task contract states what details must survive for a task and occurrence/entity. It never grants permission to send. A non-reversible placeholder may preserve a secret's kind and presence, subject to destination policy. | Decide exact predicate vocabulary, safe derived facts, spoofed placeholder handling, binding/digest rules and the representation ceiling for unresolved sensitivity. A separate policy reviewer chooses destination treatment. |
 | #39 blind custody | Prefer a custodian separate from candidate development when available. | Appoint and check the custodian, independent hidden-case author/reviewer, audited restricted storage outside candidate access and isolated scoring before any hidden case is written. This preference makes no appointment. |
 
+## Second interview round: agreed discussion preferences
+
+The user agreed with the recommended directions on 2026-09-28. The independent reviewer has not accepted or checked them. Agreement with the recommendation to keep unfilled roles pending does **not** establish that people or a restricted review route are available.
+
+| Topic | Discussion preference | Still open before acceptance |
+| --- | --- | --- |
+| Identifier naming | Replace the draft's potentially misleading `PERSONAL_IDENTIFIER` umbrella with a neutral working name, `IDENTIFIER`, for contact, national-person, online and financial domains. Keep `ENGINEERING_IDENTIFIER` distinct and specify overlap precedence. Neither the family name nor domain decides `personalData`. | Independently review final names and boundaries, including whether contact points need their own semantic type; update the v1 mapping and policy selectors only through a versioned v2 contract. |
+| Ambiguous evidence | Treat a pattern as a clue, not sufficient proof of a semantic subtype. Require validated format plus credible field or source context for a specific national-person ID subtype; ambiguous values remain protected and uncertain. Tenant-specific engineering identifiers require tenant-scoped structure or dictionary evidence. | Define claim and abstention thresholds without using real identifiers, and test negative controls such as part-number fields. |
+| Privacy attributes | Use `YES`/`NO`/`UNKNOWN`. Credible evidence may raise a `YES` concern; `NO` requires deterministic or trusted-context support, and missing evidence is `UNKNOWN`. These attributes are not legal determinations. | Identify who can vouch for trusted context, how contradictory claims resolve, and which jurisdictions or attributes v0 supports. |
+| Semantic abstention and failure | With a sound deterministic floor, an explicit semantic abstention is an absent opinion. A semantic timeout, invalid response or failure is unresolved and held. Meter and route excessive semantic escalations for review without silently lowering protection. | Define review routing, budgets, effect of review backlog, and explicit policy handling of `RESOLVED_CONSERVATIVELY`; do not let a cost cap release protected content. |
+| Secret placeholders | For the first version, reveal only kind and presence. Do not reveal fingerprints, length, validity or other derived facts by default. Placeholder-shaped input is untrusted and must be escaped or flagged, never authenticated merely by its text. | Review typed representation, request binding and exact task predicates; destination policy still decides whether any placeholder can be sent. |
+| Private review availability | Keep all unfilled #65/#66 and #39 gates pending. | Availability of independent policy, task, scoring, blind-control reviewers and an approved restricted route was not established in the answer. Obtain acceptances and conflict checks privately. |
+
 ## Proposed glossary language for review
 
 These are candidate meanings, not additions to the accepted [shared language](../../CONTEXT.md) yet.
@@ -25,4 +38,4 @@ These are candidate meanings, not additions to the accepted [shared language](..
 
 ## Next interview branches
 
-Resolve identifier-family naming and ambiguous examples; source-supported engineering domains and v1 migration; privacy `YES`/`NO`/`UNKNOWN` authority; semantic abstention, failure and escalation abuse; fidelity predicates and secret-safe derived facts; then authenticated task/destination binding. Separate #39 policy, task, scoring and blind-control reviewers decide their own gates after reviewed #65/#66 findings. The already selected narrow D01/D02/D05 proposal and prospective pre-tuning requirement are not reopened here.
+Independently review the provisional identifier-family naming, ambiguous examples, privacy authority, semantic failure handling and placeholder limit above. Resolve source-supported engineering domains and v1 migration; exact fidelity predicates and occurrence rules; authenticated task/destination binding; and the representation ceiling for unresolved records. Separate #39 policy, task, scoring and blind-control reviewers decide their own gates after reviewed #65/#66 findings. The already selected narrow D01/D02/D05 proposal and prospective pre-tuning requirement are not reopened here.
