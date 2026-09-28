@@ -38,6 +38,8 @@ The lead's output is a short, versioned list of accepted and deferred **v0-relev
 
 The [design interview working notes](issue-65-66-grill-working-notes-p0.1.md) record lead preferences for these questions without changing any pending approval state.
 
+The [independent reviewer handoff](issue-65-66-independent-review-handoff-p0.1.md) gives a bounded review checklist and private verdict format; it appoints nobody and does not approve any #39 gate.
+
 ## Decisions to write down before proposing a new oracle version
 
 1. **#65 vocabulary and internal cutover:** propose types/subtypes relevant to a possible v0 and explicit unstudied families, with definitions, ambiguity rules, a comparison with current classes and a source-backed rationale; the protocol/evaluation owners later decide the benchmark's supported scope. A compatibility map or old-record migration is not required. Broad engineering content is not automatically an `ENGINEERING_IDENTIFIER`; an IP can have personal-data properties in context without becoming `PERSON`. New cases outside the reviewed scope are proposals, not secretly covered blind cases.
