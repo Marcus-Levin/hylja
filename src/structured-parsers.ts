@@ -533,12 +533,14 @@ function yamlPrimitive(value: string): boolean {
   // YAML 1.1/1.2 implicit scalar rules differ. Refuse rewrites of all numeric-looking forms.
   return /^(?:true|false|null|~|yes|no|on|off|[-+]?(?:\d|\.inf|\.nan))/iu.test(value);
 }
+const NAME_OR_KEY = /^@?(?:name|key)$/iu;
+const VALUE_KEY = /^@?value$/iu;
 function markNamedValues(fields: ParsedField[]): void {
   const riskyParents = new Set<string>();
-  for (const field of fields) if (field.path.at(-1) === 'name' && isCredentialKey(field.value)) {
+  for (const field of fields) if (NAME_OR_KEY.test(field.path.at(-1) ?? '') && isCredentialKey(field.value)) {
     riskyParents.add(JSON.stringify(field.path.slice(0, -1)));
   }
-  for (const field of fields) if (field.path.at(-1) === 'value' &&
+  for (const field of fields) if (VALUE_KEY.test(field.path.at(-1) ?? '') &&
     riskyParents.has(JSON.stringify(field.path.slice(0, -1)))) field.highRisk = true;
 }
 function parseYaml(text: string, budget: ParseBudget, into: Collector): void {
@@ -612,6 +614,23 @@ function tomlScalar(line: string, at: number, base: number): Scalar {
 function parseToml(text: string, budget: ParseBudget, into: Collector): void {
   let section: string[] = [];
   const tables = new Set<string>(), leaves = new Set<string>(), nodes = new Set<string>();
+  // JSON path IDs repeat section text; cap their total expansion as well as their element count.
+  const maxPathUnits = 8 << 20;
+  const maxPathWorkUnits = 32 << 20;
+  let storedPathUnits = 0, storedPathElements = 0, pathWorkUnits = 0;
+  const pathId = (parts: readonly string[]): string => {
+    const id = JSON.stringify(parts);
+    pathWorkUnits += id.length;
+    if (pathWorkUnits > maxPathWorkUnits) throw new Budget('PATH_LIMIT');
+    return id;
+  };
+  const storePath = (set: Set<string>, id: string, elements: number): void => {
+    if (set.has(id)) return;
+    storedPathUnits += id.length;
+    storedPathElements += elements;
+    if (storedPathUnits > maxPathUnits || storedPathElements > MAX_PATH_ELEMENTS) throw new Budget('PATH_LIMIT');
+    set.add(id);
+  };
   for (const { start, line } of boundedLines(text)) {
     if (!line.trim()) continue;
     const indent = line.length - line.trimStart().length;
@@ -623,14 +642,16 @@ function parseToml(text: string, budget: ParseBudget, into: Collector): void {
       if (!table) throw new Unsupported('UNSUPPORTED_TOML_TABLE');
       section = table[1]!.split('.');
       if (section.length > budget.maxDepth) throw new Budget('DEPTH_LIMIT');
-      const id = JSON.stringify(section);
+      const id = pathId(section);
       if (tables.has(id) || leaves.has(id) || nodes.has(id)) throw new Malformed('DUPLICATE_TABLE', start + indent);
-      for (let count = 1; count < section.length; count++) if (leaves.has(JSON.stringify(section.slice(0, count)))) {
-        throw new Malformed('KEY_TABLE_COLLISION', start + indent);
-      }
       if (tables.size >= into.max) throw new Budget('FIELD_LIMIT');
-      tables.add(id); nodes.add(id);
-      for (let count = 1; count < section.length; count++) nodes.add(JSON.stringify(section.slice(0, count)));
+      storePath(tables, id, section.length);
+      storePath(nodes, id, section.length);
+      for (let count = 1; count < section.length; count++) {
+        const prefix = pathId(section.slice(0, count));
+        if (leaves.has(prefix)) throw new Malformed('KEY_TABLE_COLLISION', start + indent);
+        storePath(nodes, prefix, count);
+      }
       if (table[2]) pushComment(into, { start: start + indent + body.indexOf('#'), end: start + line.length, reason: 'COMMENT' });
       continue;
     }
@@ -639,10 +660,13 @@ function parseToml(text: string, budget: ParseBudget, into: Collector): void {
     const key = match[1]!;
     const path = [...section, ...key.split('.')];
     if (path.length > budget.maxDepth) throw new Budget('DEPTH_LIMIT');
-    const id = JSON.stringify(path);
+    const id = pathId(path);
     if (leaves.has(id) || nodes.has(id)) throw new Malformed('DUPLICATE_KEY', start + indent);
-    for (let count = 1; count < path.length; count++) if (leaves.has(JSON.stringify(path.slice(0, count)))) {
-      throw new Malformed('KEY_TABLE_COLLISION', start + indent);
+    // Section prefixes were checked and stored at the table declaration. Avoid rebuilding them per field.
+    for (let count = section.length + 1; count < path.length; count++) {
+      const prefix = pathId(path.slice(0, count));
+      if (leaves.has(prefix)) throw new Malformed('KEY_TABLE_COLLISION', start + indent);
+      storePath(nodes, prefix, count);
     }
     const valueAt = indent + match[0].length;
     if (valueAt >= line.length || line[valueAt] === '#') throw new Unsupported('UNSUPPORTED_TOML_VALUE');
@@ -650,8 +674,7 @@ function parseToml(text: string, budget: ParseBudget, into: Collector): void {
     push(into, { path, keyStart: start + indent, keyEnd: start + indent + key.length,
       valueStart: scalar.start, valueEnd: scalar.end, value: scalar.value, syntax: scalar.syntax,
       highRisk: path.some(isCredentialKey) });
-    leaves.add(id);
-    for (let count = 1; count < path.length; count++) nodes.add(JSON.stringify(path.slice(0, count)));
+    storePath(leaves, id, path.length);
     if (scalar.commentStart !== undefined) pushComment(into, { start: scalar.commentStart, end: start + line.length, reason: 'COMMENT' });
   }
   markNamedValues(into.fields);
@@ -660,6 +683,7 @@ function parseToml(text: string, budget: ParseBudget, into: Collector): void {
 /* ---------- XML without DTD, external entities, namespaces or mixed content ---------- */
 
 const XML_NAME = /[A-Za-z_][A-Za-z0-9_.-]*/gy;
+const XML_ENTITIES: Readonly<Record<string, string>> = Object.freeze({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" });
 function xmlValidChar(code: number): boolean {
   return code === 9 || code === 10 || code === 13 || code >= 0x20 && code <= 0xd7ff ||
     code >= 0xe000 && code <= 0xfffd || code >= 0x10000 && code <= 0x10ffff;
@@ -683,8 +707,7 @@ function xmlScalar(raw: string, at: number): string {
     const semi = raw.indexOf(';', cursor + 1);
     if (semi < 0 || semi - cursor > 12) throw new Malformed('BAD_XML_ENTITY', at + cursor);
     const entity = raw.slice(cursor + 1, semi);
-    const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
-    if (entity in named) value += named[entity];
+    if (Object.hasOwn(XML_ENTITIES, entity)) value += XML_ENTITIES[entity];
     else {
       const hex = /^#x([0-9A-Fa-f]+)$/u.exec(entity);
       const decimal = /^#([0-9]+)$/u.exec(entity);
@@ -764,10 +787,11 @@ function parseXml(text: string, budget: ParseBudget, into: Collector): void {
         highRisk: risky || isCredentialKey(attr.name) });
       at = valueEnd + 1;
     }
-    // An XML `name="DB_PASSWORD" value="..."` attribute pair carries the same risk as JSON name/value.
-    const nameAttr = into.fields.slice(firstAttr).find((field) => field.path.at(-1) === '@name');
-    if (nameAttr && isCredentialKey(nameAttr.value)) for (let index = firstAttr; index < into.fields.length; index++) {
-      if (into.fields[index]!.path.at(-1) === '@value') into.fields[index]!.highRisk = true;
+    // XML `name`/`key` and `value` attributes carry the same risk as JSON name/value siblings.
+    const nameAttr = into.fields.slice(firstAttr).find((field) => NAME_OR_KEY.test(field.path.at(-1) ?? '') &&
+      isCredentialKey(field.value));
+    if (nameAttr) for (let index = firstAttr; index < into.fields.length; index++) {
+      if (VALUE_KEY.test(into.fields[index]!.path.at(-1) ?? '')) into.fields[index]!.highRisk = true;
     }
     if (selfClosing) return;
     const firstChild = into.fields.length;
@@ -789,11 +813,12 @@ function parseXml(text: string, budget: ParseBudget, into: Collector): void {
           let named = false;
           for (let index = firstChild; index < into.fields.length && !named; index++) {
             const field = into.fields[index]!;
-            named = field.path.length === path.length + 1 && field.path.at(-1) === 'name' && isCredentialKey(field.value);
+            named = field.path.length === path.length + 1 && NAME_OR_KEY.test(field.path.at(-1) ?? '') &&
+              isCredentialKey(field.value);
           }
           if (named) for (let index = firstChild; index < into.fields.length; index++) {
             const field = into.fields[index]!;
-            if (field.path.length === path.length + 1 && field.path.at(-1) === 'value') field.highRisk = true;
+            if (field.path.length === path.length + 1 && VALUE_KEY.test(field.path.at(-1) ?? '')) field.highRisk = true;
           }
         } else {
           if (raw.includes('\r') || raw.includes(']]>')) throw new Unsupported('UNSUPPORTED_XML_TEXT');
@@ -823,7 +848,9 @@ function parseXml(text: string, budget: ParseBudget, into: Collector): void {
  * YAML, TOML and XML accept conservative subsets; other constructs are wholly opaque UNSUPPORTED.
  */
 export function parseStructured(text: unknown, format: unknown, budget?: unknown): ParseResult {
-  if (!(FORMATS as readonly unknown[]).includes(format)) return whole('JSON', '', 'FAILURE', 'INVALID_FORMAT');
+  if (!(FORMATS as readonly unknown[]).includes(format)) {
+    return whole('JSON', typeof text === 'string' ? text : '', 'FAILURE', 'INVALID_FORMAT');
+  }
   const kind = format as Format;
   if (typeof text !== 'string') return whole(kind, '', 'FAILURE', 'INVALID_INPUT');
   const limits = budgetFrom(budget);

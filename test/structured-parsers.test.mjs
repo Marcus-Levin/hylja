@@ -120,6 +120,11 @@ test('unknown formats, invalid input, and over-budget input fail wholly opaque',
     ['"\uD800"', 'JSON', undefined, 'INVALID_TEXT'], ['1', 'JSON', { maxDepth: 1e6 }, 'INVALID_BUDGET'],
     ['1', 'JSON', { other: 1 }, 'INVALID_BUDGET'],
   ]) assert.deepEqual(parseStructured(text, format, budget).reasons, [reason], reason);
+  const unknown = 'password=synthetic';
+  const invalid = parseStructured(unknown, 'CSV');
+  assert.equal(invalid.status, 'FAILURE');
+  assert.deepEqual(invalid.fields, []);
+  assert.deepEqual(invalid.opaque.map((range) => [range.start, range.end]), [[0, unknown.length]]);
 });
 
 test('YAML maps and scalar sequences retain spans, paths, comments and credential ancestry', () => {
@@ -178,8 +183,15 @@ test('XML leaf text and attributes decode predefined and numeric entities with e
 test('credential name/value siblings are high risk in the new structured formats', () => {
   for (const [text, format, target] of [
     ['name: DB_PASSWORD\nvalue: synthetic', 'YAML', 'value'],
+    ['key: DB_PASSWORD\nvalue: synthetic', 'YAML', 'value'],
+    ['Key: DB_PASSWORD\nValue: synthetic', 'YAML', 'Value'],
     ['[entry]\nname = "API_TOKEN"\nvalue = "synthetic"', 'TOML', 'entry.value'],
+    ['[entry]\nkey = "API_TOKEN"\nvalue = "synthetic"', 'TOML', 'entry.value'],
+    ['[entry]\nName = "API_TOKEN"\nValue = "synthetic"', 'TOML', 'entry.Value'],
     ['<entry><name>DB_PASSWORD</name><value>synthetic</value></entry>', 'XML', 'entry.value'],
+    ['<entry><Key>DB_PASSWORD</Key><Value>synthetic</Value></entry>', 'XML', 'entry.Value'],
+    ['<entry key="DB_PASSWORD" value="synthetic"/>', 'XML', 'entry.@value'],
+    ['<entry Key="DB_PASSWORD" Value="synthetic"/>', 'XML', 'entry.@Value'],
   ]) {
     const parsed = parseStructured(text, format);
     assert.equal(parsed.status, 'COMPLETE');
@@ -205,6 +217,18 @@ test('XML 1.0 invalid characters and namespace semantics refuse parsing or rewri
   for (const field of parsed.fields) for (const replacement of ['syn\u0000thetic', '\ufffe', '\ud800']) {
     assert.deepEqual(rewriteFieldValues(text, 'XML', [{ field, replacement }]),
       { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' });
+  }
+});
+
+test('XML inherited object property names are never accepted as entities', () => {
+  for (const name of ['constructor', 'toString', '__proto__']) {
+    for (const source of [`<password>synthetic &${name};</password>`, `<r password="synthetic &${name};"/>`]) {
+      const parsed = parseStructured(source, 'XML');
+      assert.equal(parsed.status, 'FAILURE');
+      assert.deepEqual(parsed.fields, []);
+      assert.deepEqual(parsed.opaque.map((range) => [range.start, range.end]), [[0, source.length]]);
+      assert.deepEqual(rewriteFieldValues(source, 'XML', []), { status: 'FAILURE', reason: 'SOURCE_NOT_COMPLETE' });
+    }
   }
 });
 
@@ -295,6 +319,20 @@ test('YAML/TOML/XML bounds cover nested, long and numerous fields', () => {
   for (const format of ['YAML', 'TOML', 'XML']) {
     const text = 'x'.repeat(DEFAULT_PARSE_BUDGET.maxInputUnits + 1);
     assert.deepEqual(parseStructured(text, format).reasons, ['INPUT_TOO_LARGE']);
+  }
+});
+
+test('TOML charges implicit table prefixes and repeated section paths to its expansion budget', () => {
+  const deepSource = `[${Array.from({ length: 128 }, (_, index) => `${'x'.repeat(1000)}${index}`).join('.')}]`;
+  const section = Array.from({ length: 64 }, (_, index) => `${'x'.repeat(96)}${index}`).join('.');
+  const wideSource = `[${section}]\n${Array.from({ length: 1500 }, (_, index) => `k${index} = "synthetic"`).join('\n')}`;
+  for (const source of [deepSource, wideSource]) {
+    assert.ok(source.length < DEFAULT_PARSE_BUDGET.maxInputUnits);
+    const parsed = parseStructured(source, 'TOML', { maxDepth: 128 });
+    assert.equal(parsed.status, 'FAILURE');
+    assert.deepEqual(parsed.reasons, ['PATH_LIMIT']);
+    assert.deepEqual(parsed.fields, []);
+    assert.deepEqual(parsed.opaque.map((range) => [range.start, range.end]), [[0, source.length]]);
   }
 });
 
