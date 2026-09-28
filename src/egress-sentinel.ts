@@ -376,8 +376,11 @@ function isIdentifier(value: string): boolean {
     // also hid a high-entropy Base64url token placed before `/GHSA-…`.
     const prefix = value.slice(0, advisory.index);
     const parts = prefix.split('/').filter(Boolean);
+    // Each component must be an ordinary short path word or group of words. A generic alphanumeric
+    // component can be a Base32 payload: two 32-character chunks before a real GHSA id previously passed.
+    const words = /^(?:[A-Z]?[a-z]{2,16}(?:[A-Z][a-z]{2,16})*)(?:[.-](?:[A-Z]?[a-z]{2,16}(?:[A-Z][a-z]{2,16})*))*$/u;
     return parts.length <= 8 && parts.every((part) => part.length <= 32 &&
-      /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/u.test(part));
+      (words.test(part) || /^\d{1,4}$/u.test(part)));
   }
   const groups = value.split(/[-_.]/u).filter(Boolean);
   const shortGroups = groups.length >= 3 && groups.every((group) => group.length <= 12);

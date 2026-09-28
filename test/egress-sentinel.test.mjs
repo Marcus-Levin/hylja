@@ -680,10 +680,22 @@ test('independent review: only complete advisory identifiers receive the identif
   const unknown = (text) => check(text, { known: null });
   const suffix = createHash('sha256').update('synthetic-advisory-suffix').digest('base64url');
   const prefix = createHash('sha256').update('synthetic-advisory-prefix').digest('base64url');
+  // Lowercase Base32 prefixes of SHA-256('synthetic-prefix-a/b'), truncated to 32 characters.
+  const base32A = 'vgoo2zy4d7k2i5s4oe4sk32ted5fxioy';
+  const base32B = 'orghtfbubbnd3he4osguykve42a74i47';
   assert.equal(unknown(`GHSA-c2qf-rxjj-qqgw${suffix}`).decision, 'BLOCK');
   assert.equal(unknown(`${prefix}/GHSA-c2qf-rxjj-qqgw`).decision, 'BLOCK');
+  assert.equal(unknown(`${base32A}/${base32B}/GHSA-c2qf-rxjj-qqgw`).decision, 'BLOCK');
+  assert.equal(unknown(`${base32A}/${base32B}/GHSX-c2qf-rxjj-qqgw`).decision, 'BLOCK');
+  assert.equal(unknown(`${base32A}/${base32B}/CVE-2026-12345`).decision, 'BLOCK');
+  assert.equal(unknown(`${base32A}/${base32B}/CVX-2026-12345`).decision, 'BLOCK');
   assert.equal(unknown('GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
   assert.equal(unknown('advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('docs/security/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('https://github.com/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('Engineering/Security/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('https://github.com/SomeOrg/Security/advisories/GHSA-c2qf-rxjj-qqgw').decision, 'ALLOW');
+  assert.equal(unknown('Engineering/Security/advisories/CVE-2026-12345').decision, 'ALLOW');
 });
 
 test('independent review: digest and SSH exemptions validate length and wire structure', () => {
