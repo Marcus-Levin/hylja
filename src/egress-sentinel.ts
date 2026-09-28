@@ -257,10 +257,13 @@ const PATTERNS: readonly { rule: string; pattern: { test(text: string): boolean 
 ];
 // A literal value after a credential-like key. References (`${X}`, `{{x}}`, `<...>`, masks), type names,
 // booleans and identifier/member expressions (`process.env.SECRET`, `config.password`) are not values.
+const URL_PLACEHOLDER = /^(?:\$\{[^}]*\}|\{\{[^}]*\}\}|\$[A-Za-z_][A-Za-z0-9_]*|%s|<[\w -]{1,40}>)$/u;
 function urlPassword(text: string): boolean {
   for (let at = text.indexOf('://'); at >= 0; at = text.indexOf('://', at + 3)) {
-    if (/[a-z][a-z0-9+.-]{1,31}$/iu.test(text.slice(Math.max(0, at - 32), at)) &&
-      /^[^\s:/@"']{1,256}:(?![$%{<])[^\s/@"']{3,256}@/u.test(text.slice(at + 3, at + 3 + 520))) return true;
+    if (!/[a-z][a-z0-9+.-]{1,31}$/iu.test(text.slice(Math.max(0, at - 32), at))) continue;
+    // The user name may be empty (`redis://:password@host`); a whole placeholder is not a password.
+    const credential = /^[^\s:/@"']{0,256}:([^\s/@"']{3,256})@/u.exec(text.slice(at + 3, at + 3 + 520));
+    if (credential && !URL_PLACEHOLDER.test(credential[1]!)) return true;
   }
   return false;
 }
@@ -271,6 +274,8 @@ const REFERENCE = /^(?:\$\{[^}]*\}|\{\{[^}]*\}\}|<[\w -]{1,40}>|\*{3,}|\[hylja:p
 const NOT_A_VALUE = /^(?:[$<*{[]|(?:string|number|boolean|bigint|object|any|unknown|undefined|null|none|true|false|nil|str|int|bool|bytes)$|[A-Za-z_$][\w$]*(?:(?:\.|\?\.)[A-Za-z_$][\w$]*|\[[^\]]*\])+$)/iu;
 function credentialAssignment(text: string): boolean {
   for (const match of text.matchAll(CREDENTIAL_ASSIGNMENT)) {
+    // A quoted branch of a conditional (`kind === 'x' ? 'SECRET' : 'INTERNAL'`) is a label, not an assignment.
+    if (/\?\s*["'`]$/u.test(text.slice(Math.max(0, match.index - 8), match.index))) continue;
     // A quoted string is a literal unless it is a whole reference or mask; only unquoted values can be
     // identifiers, member expressions, type names or booleans.
     // Unquoted: brackets inside the value belong to it; only trailing ones (`false}`) close a surrounding structure.
@@ -339,14 +344,56 @@ function isIdentifier(value: string): boolean {
   if (value.length > 256 || /[+=]/u.test(value) || !/[g-zG-Z]/u.test(value)) return false;
   const segments = value.split(/[_/.-]+|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])/u).filter(Boolean);
   // Names have few, long segments; random Base64 that happens to split into word-like pieces has many short ones.
-  if (value.replace(/[_/.-]/gu, '').length < segments.length * 3) return false;
+  // Advisory ids (`GHSA-jfh8-c2jp-5v3q`, `CVE-2026-12345`) and short `-_.`-separated groups (`Q1_2026_Report_v3_Final.pdf`)
+  // are names too. `/` does not count as a separator here: random Base64 contains it.
+  if (/GHSA(?:-[0-9a-z]{4}){3}|CVE-\d{4}-\d{4,7}/iu.test(value)) return true;
+  const groups = value.split(/[-_.]/u).filter(Boolean);
+  const shortGroups = groups.length >= 3 && groups.every((group) => group.length <= 12);
+  if (!shortGroups && value.replace(/[_/.-]/gu, '').length < segments.length * 3) return false;
   return segments.length >= 2 && segments.every((segment) =>
-    /^[A-Z]?[a-z]{2,}$/u.test(segment) || /^[A-Z]{1,5}$/u.test(segment) || /^\d{1,4}$/u.test(segment) || /^[a-z]$/u.test(segment) ||
+    /^[A-Z]?[a-z]{2,}$/u.test(segment) || /^[A-Z][a-z]$/u.test(segment) || /^[A-Z]{1,5}$/u.test(segment) || /^\d{1,4}$/u.test(segment) || /^[a-z]$/u.test(segment) ||
     /^\d{5,20}$/u.test(segment) && new RegExp(`(?:^|[/._-])${segment}(?:$|[/._-])`, 'u').test(value));
 }
 // Separators between pairs: whitespace, `,;:|.&`, quotes, brackets, JSON escapes and YAML `- ` list markers, so
 // JSON/YAML arrays of pairs (`["4f","72",…]`) and padded columns decode too.
 const HEX_PAIRS = /(?<![0-9A-Fa-f])(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:(?:[ \t\r\n,;:|.&"'[\]]|\\[nrt"\\]|-(?=[ \t0-9A-Fa-f])){1,24}(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?![0-9A-Fa-f])){7,4096}/gu;
+/**
+ * Hex dump lines (`od`, `xxd -g1`, `hexdump -C` with offsets): an offset, byte pairs, then an optional ASCII column after `  |`
+ * or two or more spaces. The offset and ASCII column are dropped, so hex-looking text in the ASCII column (`|.Ee.`)
+ * cannot corrupt the bytes. Consecutive dump lines (real or JSON-escaped line breaks) form one decode-only run.
+ */
+// Lines with an offset column; the line may carry a prefix (a JSON body's first line: `"content":"00000000  78 9c …`).
+// Dumps without offsets (`od -An`) are plain byte-pair runs.
+const DUMP_LINE = /(?:^|[^0-9A-Fa-f])[0-9A-Fa-f]{4,8}:?[ \t]+((?:[0-9A-Fa-f]{2}[ \t]{1,2}){0,31}[0-9A-Fa-f]{2})(?:[ \t]{2,}.*|[ \t]*)$/u;
+function* dumpRuns(text: string): Generator<EncodedRun> {
+  let block: { start: number; end: number; hex: string[]; lines: number } | null = null;
+  const flush = function* (): Generator<EncodedRun> {
+    if (block && block.lines >= 2 && block.hex.join('').length >= 32) {
+      yield { start: block.start, end: block.end, value: block.hex.join(''), prefixed: false, countable: false, separated: true };
+    }
+    block = null;
+  };
+  const breaks = /\r?\n|\\r\\n|\\n/gu;
+  let start = 0;
+  for (let found = breaks.exec(text); ; found = breaks.exec(text)) {
+    const end = found ? found.index : text.length;
+    if (end - start <= 400) {
+      const line = text.slice(start, end);
+      const ascii = line.indexOf('  |');
+      const match = DUMP_LINE.exec(ascii >= 0 ? line.slice(0, ascii) : line);
+      const pairs = match?.[1];
+      if (pairs !== undefined && pairs.length >= 5) {
+        block ??= { start, end, hex: [], lines: 0 };
+        block.hex.push(pairs.replace(/[ \t]/gu, ''));
+        block.end = end;
+        block.lines++;
+      } else yield* flush();
+    } else yield* flush();
+    if (!found) break;
+    start = found.index + found[0].length;
+  }
+  yield* flush();
+}
 const SEPARATED_HEX = /^[0-9A-Fa-f]{2,}(?:[-_/][0-9A-Fa-f]{2,})+$/u;
 const UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u;
 interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean; joined?: boolean }
@@ -390,6 +437,7 @@ function* encodedRuns(text: string): Generator<EncodedRun> {
     yield { start: run.index + (prefix?.[0].length ?? 0), end: run.index + run[0].length, value, prefixed: prefix !== null && /^(?:sha|h1)/iu.test(prefix[0]),
       countable: !separated || uniform, separated };
   }
+  yield* dumpRuns(text);
   // Byte pairs (`63:6f:6e:…`, hexdump `63 6f 6e …`, C arrays `0x63, 0x6f, …`), eight or more: decoded, not counted
   // (fingerprints, MACs).
   for (const run of text.matchAll(HEX_PAIRS)) {
@@ -476,9 +524,10 @@ function inflate(bytes: Uint8Array, budget: { inflated: number }): Inflated | nu
     try {
       const { buffer: out, engine: state } = engine(input, { maxOutputLength: remaining, finishFlush: SYNC_FLUSH, info: true });
       budget.inflated += out.length;
-      if (out.length < 4) return null;
       const consumed = Math.min(bytes.length, start + (state.bytesWritten || input.length) + trailer);
-      if (signed) return { out, signed, consumed, plausible: true };
+      // A gzip/zlib stream that decoded is a stream even when its output is tiny or empty, so a chain continues.
+      if (signed) return consumed > start ? { out, signed, consumed, plausible: true } : null;
+      if (out.length < 4) return null;
       // brotli/raw deflate succeed by accident on random bytes; mostly printable output is plausible.
       const text = new TextDecoder('utf-8', { fatal: false }).decode(out).replace(/[\u0000-\u001f\u007f]/gu, '');
       const good = (text.match(/[\p{L}\p{N}\p{P}\p{S}\s]/gu) ?? []).filter((char) => char !== '\ufffd').length;
@@ -735,8 +784,11 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         // identifiers (`http2ServerSessionOptions`), runs that do not look encoded (lower-case paths, snake_case
         // ids), and anything inside views derived from decompression or printable bytes.
         // All-decimal runs (nanosecond timestamps, snowflake ids, float digits) are numbers, not hex.
+        // Mixed case with a digit, `+`, or frequent case switches (digit-free random Base64); camelCase names are
+        // exempted by the identifier check.
+        const mixedCase = /[A-Z]/u.test(run.value) && /[a-z]/u.test(run.value);
         const encodedShape = /^[0-9A-Fa-f]+$/u.test(run.value) && /[A-Fa-f]/u.test(run.value) || /=$/u.test(run.value) ||
-          /[A-Z]/u.test(run.value) && /[a-z]/u.test(run.value) && /\d/u.test(run.value);
+          mixedCase && (/\d|\+/u.test(run.value) || (run.value.match(/[a-z][A-Z]/gu)?.length ?? 0) * 6 >= run.value.length);
         const before = view.text.slice(Math.max(0, run.start - 32), run.start);
         // A digest is one unbroken run; joined chunks or separated hex of digest length are not exempt.
         const identified = isDigest(run.value) && run.separated !== true && (run.prefixed || DIGEST_HEX.test(run.value) || DIGEST_CONTEXT.test(before)) ||
@@ -818,16 +870,18 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         }
         // A stream deeper inside a run (a dump after other byte pairs in one long run) is decoded for matching only;
         // the run's own count stands.
-        let inner = 0;
+        // At most 256 decoded streams per run and 8192 attempts per view, skipping bytes a decoded stream covered.
+        // Failed attempts are cheap, so decoy signatures cannot use up the stream budget.
+        let attempts = 0;
         for (const [index, bytes] of binary.entries()) {
-          if (covered.has(index) || inner >= 256) continue;
-          for (let at = 16; at + 2 < bytes.length && inner < 256; at++) {
+          if (covered.has(index) || attempts >= 8192) continue;
+          for (let at = 16, streams = 0; at + 2 < bytes.length && streams < 256 && attempts < 8192; at++) {
             if (!(bytes[at] === 0x1f && bytes[at + 1] === 0x8b && bytes[at + 2] === 8 || bytes[at] === 0x78 && [0x01, 0x5e, 0x9c, 0xda].includes(bytes[at + 1]!))) continue;
-            inner++;
+            attempts++;
             const result = expand(bytes.subarray(at), budget, sink);
             if (result === 'BUDGET') return { reason: 'SENTINEL_BUDGET' };
             if (result === 'CONTAINER') return { reason: 'OPAQUE_EMBEDDED' };
-            if (result && !result.keep) at += result.consumed - 1;
+            if (result && !result.keep) { streams++; at += result.consumed - 1; }
           }
         }
         if (sink.texts.length) next.push({ name: `${view.name}>INFLATED`, text: sink.texts.join('\n'), derived: view.derived === true });

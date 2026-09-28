@@ -391,7 +391,7 @@ test('seventh review: nested and gzip-wrapped binary, PEM-wrapped compression an
   for (let i = 0; i < 20; i++) layered = b64(Buffer.from(`layer ${i} x=${b64(random(32))} ${layered.length > 4000 ? '' : layered}`));
   const opaque = [b64(zlib.gzipSync(random(1000))), b64(zlib.deflateSync(random(1000))),
     b64(zlib.gzipSync(Buffer.concat([Buffer.from([0x50, 0x4b, 3, 4]), random(500)]))),
-    `${b64(random(30))} and ${escaped(b64(random(30)))}`, layered,
+    `${b64(random(31))} and ${escaped(b64(random(31)))}`, layered,
     Array.from({ length: 16 }, () => b64(random(64))).join(' '), Array.from({ length: 40 }, () => b64(random(16))).join(' '),
     random(64).toString('hex').match(/.{1,4}/gu).join('-'), random(64).toString('hex').match(/.{1,4}/gu).join('_')];
   for (const payload of opaque) {
@@ -537,6 +537,45 @@ test('eleventh review: dumps after unrelated ids, pair arrays, text under uncert
   for (const payload of [Array.from({ length: 6 }, (_, i) => `2026-09-27T10:00:0${i}Z INFO event payload=${b64(zlib.deflateSync(JSON.stringify({ event: 'login', n: i })))}`).join('\n'),
     'PWD=/srv/app\nHOME=/home/app', 'const url = `postgres://${user}:${password}@${host}/db`;', 'postgres://{{user}}:{{password}}@db.invalid',
     'postgres://$DB_USER:$DB_PASS@db.invalid']) {
+    assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
+  }
+});
+
+test('twelfth review: dump ASCII columns, empty streams in a chain, advisory ids, URL placeholders and conditionals', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const hex = (bytes) => Buffer.from(bytes).toString('hex');
+  const wrap = (content) => JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content }] });
+  const T = Buffer.from(`note ${PLANTED} ${CANARY} and some more text`);
+  const printableColumn = (bytes) => [...bytes].map((byte) => byte >= 0x20 && byte < 0x7f ? String.fromCharCode(byte) : '.').join('');
+  const hexdump = (bytes) => Array.from({ length: Math.ceil(bytes.length / 16) }, (_, row) => {
+    const line = bytes.subarray(row * 16, row * 16 + 16);
+    const pairs = [...line].map((byte) => byte.toString(16).padStart(2, '0'));
+    return `${(row * 16).toString(16).padStart(8, '0')}  ${pairs.slice(0, 8).join(' ')}  ${pairs.slice(8).join(' ')}`.padEnd(60) + `|${printableColumn(line)}|`;
+  }).join('\n');
+  const xxd = (bytes) => Array.from({ length: Math.ceil(bytes.length / 16) }, (_, row) => {
+    const line = bytes.subarray(row * 16, row * 16 + 16);
+    return `${(row * 16).toString(16).padStart(8, '0')}: ${[...line].map((byte) => byte.toString(16).padStart(2, '0')).join(' ')}`.padEnd(59) + printableColumn(line);
+  }).join('\n');
+  const words = Array.from({ length: 300 }, (_, i) => `word${i % 17}`).join(' ');
+  for (const body of [zlib.deflateSync(Buffer.from(`${words} ${T} ${words}`)), zlib.gzipSync(Buffer.from(`${words} ${T} ${words}`)),
+    Buffer.concat([Buffer.from('x'.repeat(15)), zlib.deflateSync(T)])]) {
+    for (const dump of [hexdump(body), xxd(body)]) {
+      assert.equal(check(dump).decision, 'BLOCK', dump.slice(0, 40));
+      assert.equal(check(wrap(dump)).decision, 'BLOCK', dump.slice(0, 40));
+    }
+  }
+  const z0 = zlib.deflateSync(Buffer.alloc(0));
+  const pairs = (bytes) => hex(bytes).match(/../gu).join(' ');
+  const decoy = Buffer.concat([Buffer.alloc(16), Buffer.from('7801'.repeat(300), 'hex')]);
+  assert.equal(check(wrap(`${pairs(decoy)}\n\n${pairs(Buffer.concat([z0, z0, zlib.deflateSync(T)]))}`)).decision, 'BLOCK');
+  for (const payload of ['postgres://admin:$ynthetic-pass@db.invalid/x', 'postgres://admin:{Synthetic-pass}@db.invalid/x', 'redis://:Synthetic-pass@cache.invalid:6379']) {
+    assert.equal(check(payload).decision, 'BLOCK', payload);
+  }
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  for (const payload of ['Bump deps for GHSA-c2qf-rxjj-qqgw, GHSA-72xf-g2v4-qvf3 and GHSA-j8xg-fqg3-53r7',
+    'see https://github.com/advisories/GHSA-c2qf-rxjj-qqgw https://github.com/advisories/GHSA-72xf-g2v4-qvf3 https://github.com/advisories/GHSA-j8xg-fqg3-53r7',
+    'files: Q1_2026_Report_v3_Final.pdf Q2_2026_Report_v1_Draft.pdf Q3_2026_Report_v2_Final.pdf', "const label = kind === 'credential' ? 'SECRET' : 'INTERNAL';",
+    'postgres://admin:<password>@db.invalid/x']) {
     assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
   }
 });
