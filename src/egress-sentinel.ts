@@ -358,13 +358,14 @@ function isIdentifier(value: string): boolean {
 // JSON/YAML arrays of pairs (`["4f","72",…]`) and padded columns decode too.
 const HEX_PAIRS = /(?<![0-9A-Fa-f])(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:(?:[ \t\r\n,;:|.&"'[\]]|\\[nrt"\\]|-(?=[ \t0-9A-Fa-f])){1,24}(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?![0-9A-Fa-f])){7,4096}/gu;
 /**
- * Hex dump lines (`od`, `xxd -g1`, `hexdump -C` with offsets): an offset, byte pairs, then an optional ASCII column after `  |`
+ * Hex dump lines (`od`, `xxd`, `xxd -g1`, `hexdump -C` with offsets): an offset, byte pairs or two-byte groups, then an optional ASCII column after `  |`
  * or two or more spaces. The offset and ASCII column are dropped, so hex-looking text in the ASCII column (`|.Ee.`)
  * cannot corrupt the bytes. Consecutive dump lines (real or JSON-escaped line breaks) form one decode-only run.
  */
 // Lines with an offset column; the line may carry a prefix (a JSON body's first line: `"content":"00000000  78 9c …`).
 // Dumps without offsets (`od -An`) are plain byte-pair runs.
 const DUMP_LINE = /(?:^|[^0-9A-Fa-f])[0-9A-Fa-f]{4,8}:?[ \t]+((?:[0-9A-Fa-f]{2}[ \t]{1,2}){0,31}[0-9A-Fa-f]{2})(?:[ \t]{2,}.*|[ \t]*)$/u;
+const DUMP_WORD_LINE = /(?:^|[^0-9A-Fa-f])[0-9A-Fa-f]{4,8}:?[ \t]+((?:[0-9A-Fa-f]{4}[ \t]){0,15}[0-9A-Fa-f]{4}(?:[ \t][0-9A-Fa-f]{2})?|[0-9A-Fa-f]{2})(?:[ \t]{2,}.*|[ \t]*)$/u;
 function* dumpRuns(text: string): Generator<EncodedRun> {
   let block: { start: number; end: number; hex: string[]; lines: number } | null = null;
   const flush = function* (): Generator<EncodedRun> {
@@ -380,7 +381,8 @@ function* dumpRuns(text: string): Generator<EncodedRun> {
     if (end - start <= 400) {
       const line = text.slice(start, end);
       const ascii = line.indexOf('  |');
-      const match = DUMP_LINE.exec(ascii >= 0 ? line.slice(0, ascii) : line);
+      const body = ascii >= 0 ? line.slice(0, ascii) : line;
+      const match = DUMP_LINE.exec(body) ?? DUMP_WORD_LINE.exec(body);
       const pairs = match?.[1];
       if (pairs !== undefined && pairs.length >= 5) {
         block ??= { start, end, hex: [], lines: 0 };
@@ -396,7 +398,7 @@ function* dumpRuns(text: string): Generator<EncodedRun> {
 }
 const SEPARATED_HEX = /^[0-9A-Fa-f]{2,}(?:[-_/][0-9A-Fa-f]{2,})+$/u;
 const UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u;
-interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean; joined?: boolean }
+interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean; joined?: boolean; escaped?: boolean }
 // Chunks of any length: a fixed-width split ends in a short remainder (`…Ghs2 M=`), and short words between chunks
 // are dropped by the word-free variant.
 const CHUNK = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{1,1024}={0,2}(?![A-Za-z0-9+/=_-])/gu;
@@ -444,6 +446,7 @@ function* encodedRuns(text: string): Generator<EncodedRun> {
     const value = run[0].replace(/0[xX](?=[0-9A-Fa-f]{2})|\\x|\\n/gu, '').replace(/[^0-9A-Fa-f]/gu, '');
     yield { start: run.index, end: run.index + run[0].length, value, prefixed: false, countable: false, separated: true };
   }
+  yield* escapedByteRuns(text);
   yield* chunkSequences(text, /^(?:[\s,"'[\]]|\\[nrt]){1,64}$/u, false);
   yield* chunkSequences(text, /^(?:[\s,"'[\]:;|.&]|\\[nrt]){1,64}$/u, true);
 }
@@ -506,6 +509,107 @@ function* chunkSequences(text: string, separator: RegExp, weakPass: boolean): Ge
     sequence.push(token);
   }
   yield* flush();
+}
+
+/** Read a byte-valued escape without interpreting it as a Unicode replacement character. */
+function escapedByteAt(text: string, at: number, allowQuotedPrintable = true): { byte: number; end: number } | null {
+  const lead = text[at];
+  const hex = (from: number, length: number): number | null => {
+    const digits = text.slice(from, from + length);
+    return digits.length === length && /^[0-9A-Fa-f]+$/u.test(digits) ? parseInt(digits, 16) : null;
+  };
+  if (lead === '%' || lead === '=' && allowQuotedPrintable) {
+    if (lead === '%' && text[at + 1] === 'u') {
+      const value = hex(at + 2, 4);
+      return value !== null && value <= 255 ? { byte: value, end: at + 6 } : null;
+    }
+    const value = hex(at + 1, 2);
+    return value !== null ? { byte: value, end: at + 3 } : null;
+  }
+  if (lead === '\\') {
+    if (text[at + 1] === 'x') {
+      const value = hex(at + 2, 2);
+      return value !== null ? { byte: value, end: at + 4 } : null;
+    }
+    if (text[at + 1] === 'u' || text[at + 1] === 'U') {
+      const length = text[at + 1] === 'u' ? 4 : 8;
+      const value = hex(at + 2, length);
+      return value !== null && value <= 255 ? { byte: value, end: at + 2 + length } : null;
+    }
+    const control = text.charCodeAt(at + 2);
+    if (text[at + 1] === '^' && control >= 64 && control <= 95) {
+      return { byte: control ^ 64, end: at + 3 };
+    }
+    const octal = /^[0-7]{1,3}/u.exec(text.slice(at + 1, at + 4))?.[0];
+    if (octal) {
+      const value = parseInt(octal, 8);
+      return value <= 255 ? { byte: value, end: at + 1 + octal.length } : null;
+    }
+  }
+  if (lead === '&' && text[at + 1] === '#') {
+    const entity = /^&#(?:[xX]([0-9A-Fa-f]{1,2})|(\d{1,3}));?/u.exec(text.slice(at, at + 10));
+    if (entity) {
+      const value = entity[1] ? parseInt(entity[1], 16) : Number(entity[2]);
+      if (value <= 255) return { byte: value, end: at + entity[0].length };
+    }
+  }
+  return null;
+}
+
+function escapedRun(start: number, end: number, bytes: number[], byteSyntax: boolean): EncodedRun {
+  return { start, end, value: bytes.map((byte) => byte.toString(16).padStart(2, '0')).join(''),
+    // Unicode escapes for ordinary accented prose are ambiguous Latin-1, so inspect them without opaque counting
+    // unless control bytes or explicitly byte-oriented syntax make the representation binary.
+    prefixed: false, countable: byteSyntax || bytes.some((byte) => byte < 32 || byte === 127), separated: true, escaped: true };
+}
+
+/** Direct escape runs plus mixed byte string literals, including Latin-1 JSON and Python/JS strings. */
+function* escapedByteRuns(text: string): Generator<EncodedRun> {
+  for (let at = 0; at < text.length;) {
+    const first = escapedByteAt(text, at);
+    if (!first) { at++; continue; }
+    const start = at;
+    const bytes: number[] = [];
+    let byteSyntax = false;
+    for (let token: { byte: number; end: number } | null = first; token; token = escapedByteAt(text, at)) {
+      bytes.push(token.byte);
+      if (text[at] === '%' || text[at] === '=' || text[at] === '\\' && !/[uU]/u.test(text[at + 1]!)) byteSyntax = true;
+      at = token.end;
+    }
+    if (bytes.length >= 4) yield escapedRun(start, at, bytes, byteSyntax);
+  }
+  for (let at = 0; at < text.length; at++) {
+    const quote = text[at];
+    if (quote !== '"' && quote !== "'") continue;
+    const start = at;
+    const bytes: number[] = [];
+    let escaped = 0, byteSyntax = text[start - 1] === 'b', latin1High = false, valid = true, closed = false;
+    for (at++; at < text.length; at++) {
+      const char = text[at]!;
+      if (char === quote) { closed = true; break; }
+      // A lone `=EC` in a log assignment is not quoted-printable. Only contiguous QP runs are read above.
+      const token = escapedByteAt(text, at, false);
+      if (token) {
+        bytes.push(token.byte);
+        escaped++;
+        if (char === '%' || char === '\\' && !/[uU]/u.test(text[at + 1]!)) byteSyntax = true;
+        at = token.end - 1;
+        continue;
+      }
+      if (char === '\\') {
+        const simple: Readonly<Record<string, number>> = { '0': 0, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, '\\': 92, '"': 34, "'": 39 };
+        const value = simple[text[at + 1]!];
+        if (value !== undefined) { bytes.push(value); at++; continue; }
+        valid = false;
+        break;
+      }
+      const code = text.charCodeAt(at);
+      if (code > 255) { valid = false; break; }
+      if (code >= 128) latin1High = true;
+      bytes.push(code);
+    }
+    if (valid && closed && bytes.length >= 4 && (escaped >= 2 || latin1High)) yield escapedRun(start + 1, at, bytes, byteSyntax);
+  }
 }
 /**
  * Decompress binary as gzip or zlib (signature in the first 16 bytes), brotli or raw deflate, tolerating a
@@ -729,6 +833,7 @@ function unescapeOnce(text: string): string | null {
 }
 
 interface View { name: string; text: string; derived?: boolean; matchOnly?: boolean }
+const INVALID_BYTE_OCTAL = /\\[4-7][0-7]{2}/u;
 /**
  * All canonical views: each text is decoded by #6 (Base64/percent/hex) and by the escape round, and every
  * resulting view is processed again, to MAX_ROUNDS. Returns a block reason when anything is uninspectable.
@@ -746,6 +851,7 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
     for (const view of queue) {
       if (views.length >= MAX_VIEWS || (units += view.text.length) > MAX_VIEW_UNITS) return { reason: 'SENTINEL_BUDGET' };
       views.push(view);
+      if (INVALID_BYTE_OCTAL.test(view.text)) return { reason: 'UNINSPECTED_CONTENT' };
       if (round === MAX_ROUNDS || view.matchOnly) continue;
       const normalized = normalizeInput(view.text);
       // Content the sentinel cannot fully inspect, or embedded binary it cannot read, is never presumed clean.
@@ -787,7 +893,7 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         // Mixed case with a digit, `+`, or frequent case switches (digit-free random Base64); camelCase names are
         // exempted by the identifier check.
         const mixedCase = /[A-Z]/u.test(run.value) && /[a-z]/u.test(run.value);
-        const encodedShape = /^[0-9A-Fa-f]+$/u.test(run.value) && /[A-Fa-f]/u.test(run.value) || /=$/u.test(run.value) ||
+        const encodedShape = run.escaped === true || /^[0-9A-Fa-f]+$/u.test(run.value) && /[A-Fa-f]/u.test(run.value) || /=$/u.test(run.value) ||
           mixedCase && (/\d|\+/u.test(run.value) || (run.value.match(/[a-z][A-Z]/gu)?.length ?? 0) * 6 >= run.value.length);
         const before = view.text.slice(Math.max(0, run.start - 32), run.start);
         // A digest is one unbroken run; joined chunks or separated hex of digest length are not exempt.

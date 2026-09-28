@@ -579,3 +579,59 @@ test('twelfth review: dump ASCII columns, empty streams in a chain, advisory ids
     assert.equal(unknown(wrap(payload)).decision, 'ALLOW', payload.slice(0, 40));
   }
 });
+
+test('issue 88: compressed originals under byte escapes are inflated before release', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const gzip = zlib.gzipSync(Buffer.from(`synthetic note for ${PLANTED} and ${CANARY}`));
+  const hex = (byte) => byte.toString(16).padStart(2, '0');
+  const forms = [
+    [...gzip].map((byte) => `%${hex(byte)}`).join(''),
+    [...gzip].map((byte) => `\\x${hex(byte)}`).join(''),
+    [...gzip].map((byte, index) => index === 0 ? '\\^_' : `\\x${hex(byte)}`).join(''),
+    [...gzip].map((byte) => `\\u00${hex(byte)}`).join(''),
+    [...gzip].map((byte) => `\\${byte.toString(8).padStart(3, '0')}`).join(''),
+    [...gzip].map((byte) => `&#x${hex(byte)};`).join(''),
+    [...gzip].map((byte) => `=${hex(byte).toUpperCase()}`).join(''),
+    `b'${[...gzip].map((byte) => byte >= 32 && byte < 127 && byte !== 39 && byte !== 92 ? String.fromCharCode(byte) : `\\x${hex(byte)}`).join('')}'`,
+  ];
+  for (const body of forms) {
+    const result = check(JSON.stringify({ content: body }));
+    assert.equal(result.decision, 'BLOCK', body.slice(0, 24));
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), `${body.slice(0, 24)}: ${result.reasons}`);
+    assert.equal(result.release, undefined);
+  }
+  const latin1Json = check(JSON.stringify({ content: String.fromCharCode(...gzip) }));
+  assert.ok(latin1Json.reasons.includes('KNOWN_ORIGINAL_DETECTED'), latin1Json.reasons.join(','));
+});
+
+test('issue 88: default two-byte-group xxd rows rebuild a compressed planted leak', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const compressed = zlib.gzipSync(Buffer.from(`note ${PLANTED} ${CANARY} synthetic text`));
+  const dump = Array.from({ length: Math.ceil(compressed.length / 16) }, (_, row) => {
+    const line = compressed.subarray(row * 16, row * 16 + 16);
+    const pairs = [...line].map((byte) => byte.toString(16).padStart(2, '0'));
+    const groups = pairs.join('').match(/.{1,4}/gu).join(' ');
+    const ascii = [...line].map((byte) => byte >= 32 && byte < 127 ? String.fromCharCode(byte) : '.').join('');
+    return `${(row * 16).toString(16).padStart(8, '0')}: ${groups.padEnd(39)}  ${ascii}`;
+  }).join('\n');
+  for (const payload of [dump, JSON.stringify({ content: dump })]) {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK');
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), result.reasons.join(','));
+  }
+});
+
+test('issue 88: escaped opaque bytes block, while ordinary log assignments still pass', () => {
+  const crypto = globalThis.process.getBuiltinModule('node:crypto');
+  const opaque = Buffer.concat(Array.from({ length: 3 }, (_, index) =>
+    crypto.createHash('sha256').update(`synthetic-opaque-${index}`).digest()));
+  const escaped = [...opaque].map((byte) => `%${byte.toString(16).padStart(2, '0')}`).join('');
+  assert.ok(check(JSON.stringify({ content: escaped })).reasons.includes('OPAQUE_EMBEDDED'));
+  for (const log of ['GET /api 200 traceparent=00-f569e0751199', 'RAX=EC37B814521BE4FD RAX=073592AFDF35F68']) {
+    assert.equal(check(JSON.stringify({ content: log })).decision, 'ALLOW');
+  }
+  assert.equal(check(`{"content":"${'\\u00e9'.repeat(40)}"}`).decision, 'ALLOW');
+  assert.equal(check(JSON.stringify({ content: 'café '.repeat(40) })).decision, 'ALLOW');
+  assert.deepEqual(check('b"\\400\\377 synthetic"').reasons, ['UNINSPECTED_CONTENT']);
+  assert.deepEqual(check('b"\\777 synthetic"').reasons, ['UNINSPECTED_CONTENT']);
+});
