@@ -24,7 +24,7 @@ Checked properties: `effective` never falls below any valid deterministic claim;
 
 ## Task fidelity
 
-A fidelity contract belongs to a **task** and is keyed by occurrence or entity refs, so it answers "per candidate, per task, or both" with both. Its author is an independent task owner, never the payload or the model. `validateTaskFidelityContractDraft` requires opaque prefixed refs (`task-…`, `occ-…`, `entity-…`, lower-case, no dots, colons or underscores), unique targets, known predicates, and `NOT_REQUIRED` only on its own. The ref grammar rejects dotted hostnames and IPs, URLs and `_`/`:`-separated key formats, but it cannot prove that a well-formed ref holds no protected value.
+A fidelity contract belongs to a **task** and is keyed by occurrence or entity refs, so it answers "per candidate, per task, or both" with both. Its author is an independent task owner, never the payload or the model. `validateTaskFidelityContractDraft` requires opaque prefixed refs (`task-…`, `occ-…`, `entity-…`, lower-case, no dots, colons or underscores), unique targets, known predicates, and `NOT_REQUIRED` only on its own. The ref grammar rejects dotted hostnames and IPs, URLs and `_`/`:`-separated key formats, but it cannot prove that a well-formed ref holds no protected value. The [subsequent interview](../research/issue-65-66-grill-working-notes-p0.1.md#third-interview-round-agreed-directions-and-q14-correction) prefers the name `VALUE_SHAPE` for the current executable draft's `FORMAT` fidelity predicate; source code remains an unwired draft pending review.
 
 | Predicate | Meaning | Forms that can satisfy it |
 | --- | --- | --- |
@@ -59,10 +59,10 @@ A fidelity contract belongs to a **task** and is keyed by occurrence or entity r
 
 Trust is not annotated, because it comes from the interaction context. Treatment is not annotated, because a separate policy reviewer owns it. `specialCategory: YES` requires `personalData: YES`. Unknown fields are rejected, and refs use the opaque prefixed grammar above. Semantic names are checked only for grammar here; the #65 taxonomy review supplies the allowed set.
 
-## Migration path
+## Internal cutover path
 
 1. Human review accepts or amends decision 010.
-2. Classification v2 adds `domain`, privacy attributes and `RESOLVED_CONSERVATIVELY`, with a new version and digest coverage. v1 records and policy stay unchanged, and v1 policy keeps denying anything that is not `RESOLVED`.
+2. An accepted internal contract revision adds `domain`, privacy attributes and `RESOLVED_CONSERVATIVELY`, with a new version and digest coverage. Change classifier and policy selectors together; no backward-compatible v1 reader or record migration is required during this unreleased development stage. Label historical evaluation evidence with its producer version. Until cutover, v1 policy keeps denying anything that is not `RESOLVED`.
 3. Policy adds explicit rules for `RESOLVED_CONSERVATIVELY`, optionally routing semantic-only escalation to `REQUIRE_REVIEW`. It also accepts a bound fidelity-contract digest as a cost input, never as a selector that widens release.
 4. The transformation engine (#13) implements placeholders and fidelity checks; the egress sentinel (#19) recognizes placeholders.
 

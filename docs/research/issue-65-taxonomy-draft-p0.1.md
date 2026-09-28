@@ -90,7 +90,7 @@ v1's `ENGINEERING_IDENTIFIER` covers only tags and numbers. The draft keeps it f
 
 Nearly every engineering identifier needs `TENANT_DICTIONARY` or `STRUCTURE` evidence. Part-number, tag and functional-location schemes are organization-specific, and no global pattern should be shipped for them. `NC_PROGRAM` (G-code) has a recognizable text syntax (`FORMAT`), but recognizing it is not parser support. `CONTROL_LOGIC` is usually held in proprietary binary PLC project files; only textual forms such as IEC 61131-3 Structured Text or PLCopen XML could be recognized, so the draft lists `STRUCTURE`/`CONTEXT` rather than `FORMAT`.
 
-## Mapping from classification v1
+## Development comparison with current classification
 
 Every v1 default subtype maps to exactly one draft entry, and every v1 class keeps a home (checked by tests):
 
@@ -106,9 +106,9 @@ Every v1 default subtype maps to exactly one draft entry, and every v1 class kee
 | new engineering identifiers | class-only mapping to v1 `ENGINEERING_IDENTIFIER` |
 | `ENGINEERING_INFORMATION` content | `v1: null` (no fitting v1 class) |
 
-`draftEntriesForV1` provides this mapping for migration and replay. A class-only mapping means v1 can hold the concept only as a tenant `extendSubtypeRegistry` subtype of that class. A tenant-extended v1 subtype with the same name, such as `ENGINEERING_IDENTIFIER` / `EQUIPMENT_TAG`, replays to that draft entry.
+`draftEntriesForV1` currently provides a development comparison, showing which draft entries resemble existing classes. A class-only mapping means v1 could express the concept only as a tenant `extendSubtypeRegistry` subtype of that class. It is **not** a required migration or replay interface. The [subsequent design interview](issue-65-66-grill-working-notes-p0.1.md#third-interview-round-agreed-directions-and-q14-correction) rejected backward-compatibility work for this unreleased project; the helper and its tests may be removed at implementation cutover.
 
-**Compatibility impact:** moving EMAIL/PHONE out of `PERSON` changes the semantic type that policy rules select on. A migration therefore needs a classification version bump, a policy bundle version that re-targets rules, and replay of v1 records through the mapping. The v1 enum must not be edited in place.
+**Internal cutover impact:** moving EMAIL/PHONE out of `PERSON` changes what current policy rules select on. After human review, update classification, selectors, tests and synthetic evaluation annotations together. Keep version identity on historical development/evaluation evidence, but do not add a v1 reader, replay converter or forced old-to-new mapping. While the draft is unaccepted, the current classifier and policy remain unchanged.
 
 ## Tenant-specific classification required
 
@@ -124,13 +124,13 @@ Tenant/project dictionaries or ontologies are needed for `PERSON_NAME`, `PERSON_
 
 ## Recommendation
 
-After human review, record the accepted hierarchy in a new decision record. It would cover the four-part path, form, the `PERSON` / `PERSONAL_IDENTIFIER` split and `ENGINEERING_INFORMATION`, and would be paired with the #66 information-model decision, since classification v2 needs both. Until then the draft is evidence only.
+After human review, record the accepted hierarchy in a new decision record. It would cover the four-part path, form, the `PERSON` / identifier-family split and `ENGINEERING_INFORMATION`, and would be paired with the #66 information-model decision. The [subsequent interview](issue-65-66-grill-working-notes-p0.1.md#third-interview-round-agreed-directions-and-q14-correction) prefers the neutral working name `IDENTIFIER`; this draft table still uses `PERSONAL_IDENTIFIER` and must be revised if the reviewer accepts that direction. Until then the draft is evidence only.
 
 ## Open questions for the human reviewers
 
-- Should `PERSONAL_IDENTIFIER` and `PERSON` merge, with entity linking handled separately?
+- Should contact points share the neutral `IDENTIFIER` family with national-person, online and financial identifiers, or have a separate `CONTACT_POINT` type? The provisional interview prefers the shared family; independent review must check the boundary.
 - Is `ENGINEERING_INFORMATION` one type with domains, or several types (`PRODUCT_DEFINITION`, `PROCESS_DEFINITION`, `CONTROL_SYSTEM`)?
 - Which CAE, IM and enterprise-architecture sources are authoritative?
 - Should `PRECISE_LOCATION` of equipment (not people) be a separate `ASSET` subtype?
 - How should relationship-level sensitivity be represented, such as a BOM plus a customer name?
-- Financial identifiers map to v1 `PERSON` as their nearest class, though corporate accounts are not personal data. Is a separate v1 home preferable during migration?
+- The draft's comparison still maps financial identifiers to v1 `PERSON` as its nearest class, though corporate accounts are not personal data. Remove that misleading fallback at internal cutover; no v1 home is required.
