@@ -36,6 +36,8 @@ The [#65 taxonomy draft](issue-65-taxonomy-draft-p0.1.md), [public source index]
 
 The lead's output is a short, versioned list of accepted and deferred **v0-relevant research findings**, citations checked, ambiguity rules and migration/evaluation effects. The separate reviewer checks that list and records objections and conflicts through the private route. Broader #65/#66 issue acceptance remains a distinct question; neither finding list may silently close an issue or rewrite accepted decisions 001–009. Any accepted architecture change needs its own decision record; decision 010 remains **proposed** until human acceptance or amendment.
 
+The [design interview working notes](issue-65-66-grill-working-notes-p0.1.md) record lead preferences for these questions without changing any pending approval state.
+
 ## Decisions to write down before proposing a new oracle version
 
 1. **#65 vocabulary and compatibility:** propose types/subtypes relevant to a possible v0 and explicit unstudied families, with definitions, ambiguity rules, mapping from current classes and a source-backed rationale; the protocol/evaluation owners later decide the benchmark's supported scope. Broad engineering content is not automatically an `ENGINEERING_IDENTIFIER`; an IP can have personal-data properties in context without becoming `PERSON`. New cases outside the reviewed scope are proposals, not secretly covered blind cases.
