@@ -391,36 +391,59 @@ export interface DetectionFold {
 }
 const DASHES = /[‐-―−﹘﹣－]/gu;
 const IGNORABLE = /\p{Default_Ignorable_Code_Point}/u;
+const MARK = /\p{M}/u;
+const MAX_FOLD_CLUSTER_UNITS = 4096;
+const FOLD_TEXT_CHUNK_UNITS = 1 << 16;
+/**
+ * Visit clusters after deleting default-ignorable code points. A pathological combining-mark run is
+ * explicitly rejected before it becomes a giant normalization argument or an offset-map allocation.
+ */
+function foldClusters(input: string, visit: (cluster: string, start: number, end: number) => void): void {
+  let cluster = '', start = 0, end = 0;
+  for (let index = 0; index < input.length;) {
+    const char = String.fromCodePoint(input.codePointAt(index)!);
+    if (!IGNORABLE.test(char)) {
+      if (cluster && !MARK.test(char)) { visit(cluster, start, end); cluster = ''; }
+      if (!cluster) start = index;
+      if (cluster.length + char.length > MAX_FOLD_CLUSTER_UNITS) throw new RangeError('Fold cluster too large');
+      cluster += char;
+      end = index + char.length;
+    }
+    index += char.length;
+  }
+  if (cluster) visit(cluster, start, end);
+}
 /**
  * NFKC per cluster (a base plus its marks) after removing default-ignorable characters (zero-width, bidi
  * controls, variation selectors, soft hyphen), with Unicode dashes mapped to `-`. Removing ignorables first
  * lets a mark rejoin its base (`o<SHY>́` -> `ó`). Detectors match on `text` and map spans back with
- * `origin`/`originEnd`; the input is never rewritten. `maxUnits` (default 1 MiB, at most 16 MiB) bounds memory;
- * callers fold larger allowed inputs in chunks.
+ * `origin`/`originEnd`; the input is never rewritten. `maxUnits` (default 1 MiB, at most 16 MiB) bounds
+ * both input and folded output. An overlong cluster or expansion throws before output maps are allocated.
  */
 export function foldForDetection(input: string, maxUnits: number = DEFAULT_BUDGET.maxInputUnits): DetectionFold {
   if (typeof input !== 'string') throw new TypeError('Invalid fold input');
   if (!Number.isSafeInteger(maxUnits) || maxUnits < 0 || maxUnits > HARD_LIMITS.maxInputUnits) throw new RangeError('Invalid fold limit');
   if (input.length > maxUnits) throw new RangeError('Fold input too large');
-  let kept = '';
-  const keptOrigin: number[] = [];
-  for (let index = 0; index < input.length;) {
-    const char = String.fromCodePoint(input.codePointAt(index)!);
-    if (!IGNORABLE.test(char)) { kept += char; for (let unit = 0; unit < char.length; unit++) keptOrigin.push(index); }
-    index += char.length;
-  }
-  let text = '';
-  const origin: number[] = [];
-  const originEnd: number[] = [];
-  for (const match of kept.matchAll(/\P{M}\p{M}*|\p{M}+/gsu)) {
-    const from = keptOrigin[match.index]!;
-    const last = keptOrigin[match.index + match[0].length - 1]!;
-    const to = last + (input.codePointAt(last)! > 0xffff ? 2 : 1);
-    const piece = match[0].normalize('NFKC').replace(DASHES, '-');
-    for (let unit = 0; unit < piece.length; unit++) { origin.push(from); originEnd.push(to); }
-    text += piece;
-  }
-  return Object.freeze({ text, origin: Uint32Array.from(origin), originEnd: Uint32Array.from(originEnd) });
+  const normalizedPiece = (cluster: string): string => cluster.normalize('NFKC').replace(DASHES, '-');
+  let outputUnits = 0;
+  foldClusters(input, (cluster) => {
+    const pieceUnits = normalizedPiece(cluster).length;
+    if (pieceUnits > maxUnits - outputUnits) throw new RangeError('Fold output too large');
+    outputUnits += pieceUnits;
+  });
+  const origin = new Uint32Array(outputUnits), originEnd = new Uint32Array(outputUnits);
+  const chunks: string[] = [];
+  let chunk = '', offset = 0;
+  foldClusters(input, (cluster, start, end) => {
+    const piece = normalizedPiece(cluster);
+    origin.fill(start, offset, offset + piece.length);
+    originEnd.fill(end, offset, offset + piece.length);
+    offset += piece.length;
+    chunk += piece;
+    if (chunk.length >= FOLD_TEXT_CHUNK_UNITS) { chunks.push(chunk); chunk = ''; }
+  });
+  if (chunk) chunks.push(chunk);
+  return Object.freeze({ text: chunks.join(''), origin, originEnd });
 }
 /** Map a folded span back to the smallest covering input span. */
 export function mapFoldedSpan(fold: DetectionFold, start: number, end: number): { start: number; end: number } {

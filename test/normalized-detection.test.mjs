@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { createNameDictionary } from '../dist/contact-candidates.js';
 import { detectNormalizedCandidates } from '../dist/normalized-detection.js';
@@ -168,4 +169,24 @@ test('adversarial long encoded-looking input remains bounded and explicitly opaq
   assert.ok(result.uninspected.length <= 1024);
   assert.equal(result.uninspected[0].original.kind, 'ORIGINAL_EXACT');
   assert.equal(input.length, 1 << 20);
+});
+
+test('compatibility expansion is PARTIAL with an opaque root even under a 256 MiB heap', () => {
+  const script = `
+    import { detectNormalizedCandidates } from './dist/normalized-detection.js';
+    const result = detectNormalizedCandidates({
+      input: '\\uFDFA'.repeat(1 << 20), inputRef: 'synthetic-expansion',
+      scope: { tenantRef: 'tenant-a', projectRef: 'project-a' },
+    });
+    process.stdout.write(JSON.stringify({ status: result.status, reasons: result.reasons,
+      opaque: result.uninspected.length, kind: result.uninspected[0]?.original.kind }));
+  `;
+  const child = spawnSync(process.execPath, ['--max-old-space-size=256', '--input-type=module', '-e', script],
+    { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 });
+  assert.equal(child.status, 0, `child exit ${child.status}, signal ${child.signal}`);
+  const result = JSON.parse(child.stdout);
+  assert.equal(result.status, 'PARTIAL');
+  assert.ok(result.reasons.includes('FOLD_FAILURE'));
+  assert.ok(result.opaque > 0);
+  assert.equal(result.kind, 'ORIGINAL_EXACT');
 });
