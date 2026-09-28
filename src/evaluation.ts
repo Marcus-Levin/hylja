@@ -495,6 +495,9 @@ export function createDevelopmentEvaluation(): DevelopmentEvaluation {
         let taskCorrect: boolean | null = null;
         if (!record.task || oracle.taskExpected === undefined) missing.push(untested('task-correctness', 'no-task-control'));
         else if (!taskResults.has(key)) missing.push(untested('task-correctness', 'no-task-result'));
+        // A response with no observed send may be a blocked or unobserved attempt. The
+        // development seam cannot distinguish those states, so it cannot grade utility.
+        else if (!captures.length) missing.push(untested('task-correctness', 'no-capture'));
         else if (typeof gradeTask !== 'function') missing.push(untested('task-correctness', 'no-grader'));
         else {
           // A grader's exception/non-boolean result is an unknown measurement, never a pass.

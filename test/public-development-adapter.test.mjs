@@ -293,6 +293,67 @@ test('D05 task from candidate-visible config/prompt yields valid edit and final 
   assert.equal(observed(report, 'task-correctness').outcome, 'pass');
 });
 
+// This is a test-local seam control, not an approved D05 occurrence, destination
+// treatment, task rubric, or scored #39 result. The candidate below receives only
+// projected input; the planted truth and expected task outcome stay evaluator-side.
+test('one D05 local send is measured for both planted SECRET bytes and task correctness', async () => {
+  const fixture = publicFixture('D05-DEV-001');
+  fixture.fixtureId = 'D05-DEV-JOINT';
+  const plantedValue = 'DEMO-NONLIVE-JOINT-CONTROL-NOT-VALID';
+  fixture.input.value.syntheticCredential = plantedValue;
+  const run = setup('D05-DEV-001', { fixture });
+  const source = run.projection.developmentCase.fields[0].content;
+  const position = source.indexOf(plantedValue);
+  assert.ok(position >= 0 && source.lastIndexOf(plantedValue) === position);
+  const start = bytes(source.slice(0, position)).length;
+  const oracle = { version: 1, caseId: fixture.fixtureId, occurrences: [{
+    id: 'test-only-secret-control', fieldRef: 'field-0', start,
+    end: start + bytes(plantedValue).length, value: plantedValue,
+    semanticType: 'CREDENTIAL_OR_SECRET', sensitivity: 'SECRET', trust: 'UNTRUSTED',
+    // Test-only expectation: the candidate removes this invented field entirely.
+    critical: true, expectedBySink: [{ sinkId: localSink.id, treatment: 'REMOVE' }],
+  }], taskExpected: 'test-only-https-443-config-edit' };
+  const result = await run.run({ oracle, candidate(input) {
+    const visible = JSON.parse(input.fields[0].text);
+    delete visible.syntheticCredential;
+    const edited = { ...visible, port: 443 };
+    const endpoint = new URL(edited.endpointUrl);
+    endpoint.port = '';
+    edited.endpointUrl = endpoint.toString();
+    return { disposition: 'TRANSFORMED', events: [],
+      transformedFields: [{ id: 'f0', hint: 'json', text: JSON.stringify(visible) }],
+      taskResponse: JSON.stringify(edited) };
+  } });
+  assert.deepEqual(result, { disposition: 'TRANSFORMED' });
+  const releases = run.capture.forCase(fixture.fixtureId);
+  assert.equal(releases.length, 1);
+  assert.equal(decode(releases[0].body).includes(plantedValue), false);
+  assert.equal(decode(releases[0].metadata).includes(plantedValue), false);
+  const body = JSON.parse(decode(releases[0].body));
+  const visible = JSON.parse(body.fields[0].text);
+  assert.equal(Object.hasOwn(visible, 'syntheticCredential'), false);
+  const report = run.evaluation.report(fixture.fixtureId, run.capture, (expected, actual) => {
+    const edited = JSON.parse(actual);
+    const endpoint = new URL(edited.endpointUrl);
+    const prior = new URL(visible.endpointUrl);
+    return expected === 'test-only-https-443-config-edit' && edited.port === 443 &&
+      endpoint.protocol === 'https:' && Number(endpoint.port || 443) === 443 &&
+      endpoint.pathname === '/v1/ping' && endpoint.hostname === prior.hostname &&
+      edited.customer === visible.customer && edited.project === visible.project &&
+      edited.os === 'linux' && edited.timeoutMs === 2500 &&
+      edited.outputPath === visible.outputPath && edited.outputPath.startsWith('/');
+  });
+  assert.equal(report.privacy.secretPlanted, 1);
+  assert.equal(report.privacy.testedSinkPairs, 1);
+  assert.equal(report.privacy.criticalPlaintextEscapes, 0);
+  assert.equal(report.candidates.misses, 1,
+    'a missing source event remains a miss even when this exact-byte check passes');
+  assert.equal(observed(report, 'secret-plaintext-escape').outcome, 'pass');
+  assert.equal(observed(report, 'task-correctness').outcome, 'pass');
+  assert.equal(report.utility.taskCorrect, true);
+  assert.equal(JSON.stringify(report).includes(plantedValue), false);
+});
+
 test('independently planted secret in serialized BODY is a failure despite zero candidate events', async () => {
   const token = 'synthetic-planted-leak-01.invalid';
   const fixture = { fixtureId: 'D01-DEV-BODY', familyId: 'D01', partition: 'development',
