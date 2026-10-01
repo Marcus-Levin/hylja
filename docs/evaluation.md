@@ -29,6 +29,8 @@ Maintain distinct sets:
 
 The eval corpus itself is sensitive infrastructure. Restricted real incidents are encrypted, access-controlled, minimized, and converted to synthetic regression cases whenever possible. Held-out fixtures are frozen separately from tuning and have planted ground truth independent of whichever detector is being evaluated; changes to the held-out set require a documented new version rather than silent retuning.
 
+A proposed, non-normative source of development-partition evidence is the human annotation/active-learning design in [specs/gym-annotation-design.md](specs/gym-annotation-design.md). It is not accepted, not implemented, and not a prerequisite for any frozen protocol: its artifacts carry no protected values, stay development-only, and feed evaluation through the same review path as any other dataset.
+
 An executable invariant test must assert a behavior and fail on a counterexample: skipped or placeholder cross-tenant tests do not count as foundation exit evidence. Before a vault exists, exercise the tenant-scoped policy/authorization contract with synthetic fixtures; later vault and cache implementations must run the same invariant against real storage and brokers.
 
 ## Core metrics

@@ -14,6 +14,11 @@
  * re-checks what actually left, so a recoverable encoding of a planted original, a payload that is not
  * the copy the control cleared, and a destination that was never asserted are all observed failures.
  *
+ * Scope: every bounded record and every returned field is bound and checked **on its own**. A planted
+ * original is never searched for across a join, because an adversarial split across two individually
+ * authorized records to the same destination could hide it. Detecting such a concatenation is a
+ * declared limit of this harness and of the #19 single-message sentinel it uses, not a guarantee.
+ *
  * Case outcomes name the violated invariant from a fixed vocabulary and never contain request text,
  * field values, captured bytes or matched content.
  *
@@ -417,6 +422,10 @@ export function runAdapterConformance(input: ConformanceInput): ConformanceEvide
 
     // Independent observation of what actually left, and of what the adapter handed back. Each byte
     // is inspected exactly once: the verdict drives both the unreviewed and the planted finding.
+    // Per record, and only per record: a planted value is never searched for across a join, where an
+    // adversarial split across two records this harness already cleared individually could hide it.
+    // That cross-record concatenation is a declared limit here and in the #19 sentinel, not a
+    // guarantee; reassembling two authorized records is the destination's application concern.
     for (const record of records) {
       const verdict = observer.inspect(record.bytes, record.destinationId, spec.authorizedDestinationId);
       if (verdict === 'BUDGET') failures.add('BUDGET_EXCEEDED');
@@ -442,6 +451,8 @@ export function runAdapterConformance(input: ConformanceInput): ConformanceEvide
           return returnedValid && sameFields(returned, spec.expectedFields ?? [])
             && records.length === (spec.expectedSendCount ?? -1);
         case 'PLANTED_ORIGINAL_ABSENT':
+          // Absent from each record and each returned field as the harness saw them; the harness
+          // never joins records, so this is not a claim about a value reassembled downstream.
           return !failures.has('PLANTED_ORIGINAL_RELEASED') && !failures.has('PLANTED_ORIGINAL_RETURNED');
         case 'PRE_SEND_CHECK_CONSULTED':
           return preSendCalls > 0;
