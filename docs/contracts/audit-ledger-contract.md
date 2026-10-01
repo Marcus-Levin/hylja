@@ -92,28 +92,55 @@ Every crossing value — draft, context, ledger, entry, checkpoint array, query,
 through one bounded `Reflect.ownKeys` snapshot with a key cap, own **data** descriptors only, no
 getters, no inherited properties, and no second enumeration. A time-varying Proxy therefore cannot
 grow the inspected key set between a size check and a value read. Arrays are checked against a
-declared length, the key count, and per-index descriptors. Every work step is linear in the bounded
-input.
+declared length, the key count, and per-index descriptors, and the declared `length` — an O(1) own
+data property — is bounded **before** the key set is enumerated, so an over-long container is refused
+without work proportional to it. Objects carry no such cheap size: a plain object, or a hostile
+`ownKeys` trap that reports millions of keys, costs one enumeration before it can be refused. These
+bounds therefore bound the *inspected* work the module performs; they are not immunity from
+arbitrary host-level resource exhaustion, and no such guarantee is claimed.
 
 Two paths read a stream, with deliberately different scopes. The **append path** inspects the array
-identity, takes **one** `length` read and validates only the entry it will extend, then pushes into
-exactly that captured array; it does not re-validate the whole stream, because doing so makes append
-cost quadratic in stream length and an audit sink that degrades as evidence accumulates is itself an
-audit-outage risk. The **verification, checkpoint and read/export paths** rebuild every entry from
-its own bounded descriptors. An append into a stream already corrupt further back therefore
-succeeds and is reported by `verifyAuditStream` as `CHAIN_BROKEN`, not by the append; this is a stated
-limit, not a detection claim at append time.
+identity, takes **one** `length` read, validates only the entry it will extend, pushes into exactly
+that captured array and confirms the commit; it does not re-validate the whole stream, because doing
+so makes append cost quadratic in stream length and an audit sink that degrades as evidence
+accumulates is itself an audit-outage risk. It also does **not** enumerate the container's own key
+set, for the same reason: a container carrying extra own keys is refused as `INVALID_LEDGER` by the
+paths that do enumerate it (verification, checkpoint, read and export). The **verification,
+checkpoint and read/export paths** rebuild every entry from its own bounded descriptors. An append
+into a stream already corrupt further back therefore succeeds and is reported by `verifyAuditStream`
+as `CHAIN_BROKEN` — or `SCOPE_MISMATCH` when a tenant-substituted entry is what is corrupt — not by
+the append; this is a stated limit, not a detection claim at append time.
 
 ## Append, tamper evidence and anchoring
 
 `appendAuditEvent` returns `{ status: 'RECORDED', receipt }` or a typed restrictive failure. It is
 all-or-nothing: the event is fully validated, pseudonymized and HMAC'd before the stream is touched,
 so a rejected append never advances the sequence, never writes a partial entry and never leaves a
-gap. It does not throw for a caller-supplied value: a stream that cannot commit (a sealed or
-non-extensible entries array) returns `AUDIT_UNAVAILABLE`, the same code as a sink that has cleared
-`accepting`, so an uncommittable ledger is a typed audit outage rather than an exception a caller
-could catch and route around. At `maxEntries` the append returns `EVENT_CAPACITY` and changes nothing.
-`accepting: false` models an audit sink that cannot commit and returns `AUDIT_UNAVAILABLE`.
+gap. It does not throw for a caller-supplied value.
+
+**The commit is confirmed, not assumed.** The write into a caller-supplied container is a dynamic
+call that can return normally and store nothing — an own no-op `push`, or a `Proxy` whose
+`set`/`defineProperty` traps report success without writing. Before any receipt exists, the module
+reads the record back through its own bounded descriptors: this exact record must be readable at the
+slot it occupies in this exact array, and the array's own `length` must be the one value that grew by
+one. A container that is sealed, read-only, non-extensible, mis-reports its length, stores a
+different record, lies about the read-back, or refuses the descriptor read is `AUDIT_UNAVAILABLE` —
+the same code as a sink that has cleared `accepting`. An uncommittable or unverifiable ledger is
+therefore a typed audit outage rather than an exception a caller could catch and route around, and no
+dependent high-risk effect proceeds against it. A decorated container is also never left looking like
+healthy empty evidence: `verifyAuditStream`, `readAuditEvents` and `exportAuditEvents` refuse the
+same array as `INVALID_LEDGER` instead of reporting an empty stream.
+
+Honest storage trust boundary: confirmation proves that the record is in **this** array at **this**
+sequence at **this** moment. It is not durability, replication or retention, and a container that
+lies about both the write and the read-back cannot be distinguished in language (this is pinned by
+test as a stated limit). The two HMAC keys are additionally refused when all-zero, because an empty
+publicly derivable key would make a "verified" chain authenticate nothing; every other property of
+key quality — distribution, generation, custody, rotation, destruction — remains a key-management
+obligation this module neither performs nor claims.
+
+At `maxEntries` the append returns `EVENT_CAPACITY` and changes nothing. `accepting: false` models an
+audit sink that cannot commit and returns `AUDIT_UNAVAILABLE`.
 
 Each entry carries `sequence`, `prevDigest`, and
 `entryDigest = HMAC-SHA256(chainKey, canonicalJson({ version, sequence, prevDigest, event }))`,
@@ -149,7 +176,14 @@ transparency log, notarization) and is future work.
 ## Read, export and availability gate
 
 `readAuditEvents` and `exportAuditEvents` require an authority whose `scope` equals the stream
-scope exactly; anything else is `SCOPE_MISMATCH` with no entries returned. Selection is bounded
+scope exactly; anything else is `SCOPE_MISMATCH` with no entries returned. **Scope isolation is
+per entry, not merely per declared label**: every delivered entry's own `scope` must equal the
+trusted access scope before anything is selected, exactly as `verifyAuditStream` requires. A ledger
+whose outer label was switched to another tenant while its entries still belong to the first, or a
+stream into which one substituted entry was spliced, returns `SCOPE_MISMATCH` with **no entries and
+no foreign metadata** — not a pseudonym, digest, actor, bundle or tenant identifier — whether or not
+the query would have selected those entries. One foreign entry denies the whole read rather than
+returning the in-scope remainder. Selection is bounded
 (sequence range, `kind` filter, `limit` ≤ 1000, default 100) and reports `matched` and `truncated`.
 Returned entries are independent, deeply frozen rebuilds of the stored evidence: two readers never
 share an object, no delivered copy aliases the ledger, and a reader cannot reach back through a
@@ -180,25 +214,42 @@ tenant/project variations proving reference non-correlation across tenants; host
 that throw on `get`, `ownKeys` or `getOwnPropertyDescriptor`, plus over-cap key sets and oversized
 references); modified, deleted, reordered, tail-truncated, emptied, key-holder-rewritten and
 cross-tenant-substituted streams; changed, wrong-scope, duplicate, unsorted and over-count
-checkpoints; append unavailability, uncommittable streams and capacity; atomicity of rejected
-appends; append bounded work over a 2,000-entry stream; frozen, non-aliasing read/export copies;
-absence of grant-like fields, keys in the ledger, and logging.
+checkpoints; append unavailability, uncommittable streams and capacity; a generated matrix of sinks
+that accept a write and discard, substitute or hide it, with a positive control that every `RECORDED`
+result corresponds to a record readable in that array; atomicity of rejected appends; append bounded
+work over a 2,000-entry stream; an over-long `entries` array refused before its key set is
+enumerated; all-zero HMAC keys refused; a caller-supplied `occurredAt` recorded verbatim and bound by
+the digest; relabelled and partly substituted streams refused on read **and** export, with 32
+generated tenant substitutions returning nothing; frozen, non-aliasing read/export copies; absence of
+grant-like fields, keys in the ledger, and logging. The stated limits that remain are also pinned by
+test rather than left implicit: a container that lies about both the write and the commit read-back,
+and a fabricated append result passed to `gateHighRiskEffect`.
 
 Not covered here, and therefore not claimed: buffering tamper-evident evidence locally across a sink
 outage (the security model allows "buffer where allowed **or** block"; only the blocking branch is
 implemented, so an outage denies the dependent high-risk effect rather than deferring it);
 production durability, replication or backup of audit
 evidence; an external checkpoint/WORM/transparency authority; key management, key rotation and KMS
-integration for the two HMAC keys; authenticated identity and project membership for actor
+integration for the two HMAC keys (only the all-zero case is refused here); authenticated identity
+and project membership for actor
 attribution (an upstream obligation this module cannot check); separation of duties for
 administrators; retention, expiry and deletion of audit evidence; multi-writer concurrency,
-sequence arbitration and distributed append ordering; integrity re-checking on read (`readAuditEvents`
-structurally validates and rebuilds each entry but does not recompute digests — callers needing an
-assurance must run `verifyAuditStream` against a retained checkpoint); whole-stream validation on
+sequence arbitration and distributed append ordering; **auditing of the audit trail itself** — no
+event kind or operation records a read or an export, and `fromSequence` + `limit` walks a whole
+stream in `ceil(n/1000)` calls, so bulk enumeration is neither recorded nor rate-limited and a future
+`AUDIT_ACCESS` kind/operation is needed; **integrity re-checking on read** — `readAuditEvents` and
+`exportAuditEvents` structurally validate and rebuild each entry, enforce per-entry scope congruence
+and enforce query bounds, but do not recompute chain digests, so an anchored integrity judgement on a
+read result is **conditional on the caller separately running `verifyAuditStream` against a
+retained checkpoint**; whole-stream validation on
 the append path (see above: a stream already corrupt away from the append head is caught at
 verification, not at append); fabrication or replay of an append **result** passed to
 `gateHighRiskEffect`; abuse/rate signals such as bulk-resolution and enumeration detection; and
 integration with the #17 broker, #18 lifecycle, #19 Egress Sentinel or any adapter. A protected
-original that is a legal token in an identity field is not detectable here. The two HMAC keys are
+original that is a legal token in an identity field is not detectable here. **`occurredAt` is
+caller-supplied and unverified**: there is no injected clock, only a shape and `Date.parse`
+acceptance check, so a caller can backdate, forward-date or roll over the calendar date of any event
+and the HMAC-bound value still looks authoritative; a trusted clock is future work. A confirmed
+commit proves presence in this in-memory array, not durability. The two HMAC keys are
 supplied by the caller and never rotated, versioned or destroyed by this module, and key management
 for them is future work.

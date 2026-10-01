@@ -647,6 +647,226 @@ test('a stream that cannot commit is a typed restrictive failure and never a thr
   assert.equal(gateHighRiskEffect(blocked).finding, 'EVIDENCE_UNAVAILABLE');
 });
 
+test('a degenerate all-zero key is refused, while other entropy quality stays a KMS obligation', () => {
+  // An all-zero HMAC key is publicly derivable, so a chain "verified" under it would authenticate
+  // nothing. That single degenerate case is refused. Distribution, generation, custody, rotation
+  // and destruction remain key-management obligations this module does not take over.
+  const zero = new Uint8Array(32);
+  const trusted = context();
+  const ledger = createInMemoryAuditLedger(trusted.scope);
+  for (const bad of [context({ chainKey: zero }), context({ pseudonymKey: zero }),
+    context({ chainKey: new Uint8Array(128) }), context({ pseudonymKey: new Uint8Array(3) })]) {
+    const result = appendAuditEvent(ledger, draft(), bad);
+    assertRestricted(result, 'KEY_UNAVAILABLE', JSON.stringify(Object.keys(bad)));
+    assert.equal(gateHighRiskEffect(result).permitted, false);
+  }
+  assert.equal(ledger.entries.length, 0);
+  // Verification cannot claim tamper evidence under a key it refuses, and no anchor is minted.
+  assert.equal(verifyAuditStream(ledger, trusted, []).status, 'UNANCHORED');
+  assert.equal(verifyAuditStream(ledger, context({ chainKey: zero }), []).finding, 'KEY_UNAVAILABLE');
+  assert.throws(() => createAuditCheckpoint(ledger, context({ chainKey: zero })), /Invalid audit ledger/);
+  // Positive control: a non-degenerate key with a zero byte is ordinary, not rejected.
+  assert.equal(appendAuditEvent(ledger, draft(), context({ chainKey: key(0), pseudonymKey: key(0) }))
+    .status, 'RECORDED');
+  assert.equal(verifyAuditStream(ledger, context({ chainKey: key(0) }),
+    [createAuditCheckpoint(ledger, context({ chainKey: key(0) }))]).status, 'VERIFIED');
+});
+
+test('occurredAt is the caller-supplied instant: recorded verbatim, never independently verified', () => {
+  // Stated limit: there is no injected clock. A shape-valid backdated or forward-dated instant is
+  // recorded exactly as supplied, and altering it afterwards is tamper evidence, not a silent fix.
+  const trusted = context();
+  const ledger = createInMemoryAuditLedger(trusted.scope);
+  const backdated = '2001-01-01T00:00:00.000Z';
+  const recorded = appendAuditEvent(ledger, draft({ occurredAt: backdated }), trusted);
+  assert.equal(recorded.status, 'RECORDED', JSON.stringify(recorded));
+  assert.equal(ledger.entries[0].event.occurredAt, backdated);
+  assert.equal(recorded.receipt.occurredAt, backdated);
+  const anchor = createAuditCheckpoint(ledger, trusted);
+  assert.equal(verifyAuditStream(ledger, trusted, [anchor]).status, 'VERIFIED');
+  // Altering the instant afterwards is tamper evidence, not a silent correction: the digest is
+  // bound to the event, so an un-rekeyed edit breaks the chain and a rekeyed one breaks the anchor.
+  const edited = { ...ledger, entries: [{ ...ledger.entries[0],
+    event: { ...ledger.entries[0].event, occurredAt: '2026-09-20T10:11:12.130Z' } }] };
+  assert.equal(verifyAuditStream(edited, trusted, [anchor]).finding, 'CHAIN_BROKEN');
+  // Shape and parse acceptance are the whole clock check: a rolled-over calendar date is recorded
+  // exactly as supplied, and an instant that is not parseable is not stored at all.
+  const rolled = appendAuditEvent(ledger, draft({ occurredAt: '2001-02-30T00:00:00.000Z' }), trusted);
+  assert.equal(rolled.status, 'RECORDED', JSON.stringify(rolled));
+  assert.equal(ledger.entries[1].event.occurredAt, '2001-02-30T00:00:00.000Z');
+  assertRestricted(appendAuditEvent(ledger, draft({ occurredAt: '2026-13-45T99:99:99.999Z' }), trusted),
+    'INVALID_DRAFT');
+  assert.equal(ledger.entries.length, 2);
+});
+
+test('a sink that accepts the write and discards it is an outage, never a recorded receipt', () => {
+  // The write into a caller-supplied container is a dynamic call: it can succeed and store nothing.
+  // A receipt is therefore only issued once the commit is *confirmed* by a bounded descriptor
+  // read-back, so no dependent high-risk effect can be permitted over evidence that was lost.
+  const trusted = context();
+  const value = draft();
+  const outliving = (result) => {
+    assertRestricted(result, 'AUDIT_UNAVAILABLE');
+    assert.equal(gateHighRiskEffect(result).permitted, false);
+    assert.equal(gateHighRiskEffect(result).finding, 'EVIDENCE_UNAVAILABLE');
+  };
+
+  // An own no-op `push`: the call returns normally and nothing is stored anywhere.
+  const ownNoopPush = createInMemoryAuditLedger(trusted.scope);
+  Object.defineProperty(ownNoopPush.entries, 'push',
+    { value: () => 0, writable: true, configurable: true });
+  outliving(appendAuditEvent(ownNoopPush, value, trusted));
+  assert.equal(ownNoopPush.entries.length, 0, 'nothing may be reported recorded when nothing was stored');
+
+  // A Proxy whose traps report success without writing: two appends, still no evidence.
+  const sink = createInMemoryAuditLedger(trusted.scope);
+  const silent = new Proxy(sink.entries, { set: () => true, defineProperty: () => true });
+  const discarding = { ...sink, entries: silent };
+  for (const sequence of [1, 2]) {
+    outliving(appendAuditEvent(discarding, draft({ correlationRef: `correlation-${sequence}` }), trusted));
+  }
+  assert.equal(sink.entries.length, 0);
+
+  // A sink that stores something other than the record it was handed is equally unverifiable.
+  const donor = createInMemoryAuditLedger(trusted.scope);
+  assert.equal(appendAuditEvent(donor, value, trusted).status, 'RECORDED');
+  const impostor = createInMemoryAuditLedger(trusted.scope);
+  const swapping = new Proxy(impostor.entries, {
+    defineProperty(target, key, descriptor) {
+      Object.defineProperty(target, key, key === 'length' ? descriptor
+        : { ...descriptor, value: donor.entries[0] });
+      return true;
+    },
+  });
+  outliving(appendAuditEvent({ ...impostor, entries: swapping }, value, trusted));
+
+  // A descriptor read-back that throws is an outage, never an unverified receipt.
+  const exploding = createInMemoryAuditLedger(trusted.scope);
+  const unreadable = new Proxy(exploding.entries, {
+    getOwnPropertyDescriptor(target, key) {
+      if (key === 'length') return Reflect.getOwnPropertyDescriptor(target, key);
+      throw new Error('planted commit acknowledgement');
+    },
+  });
+  outliving(appendAuditEvent({ ...exploding, entries: unreadable }, value, trusted));
+  for (const result of [appendAuditEvent({ ...exploding, entries: unreadable }, value, trusted),
+    appendAuditEvent({ ...sink, entries: new Proxy(sink.entries, {
+      get() { throw new Error('planted sink trap'); } }) }, value, trusted)]) {
+    assertRestricted(result, 'AUDIT_UNAVAILABLE');
+    assert.ok(!JSON.stringify(result).includes('planted'));
+  }
+
+  // A decorated container is never left looking like a healthy empty stream either.
+  const decorated = verifyAuditStream(ownNoopPush, trusted, []);
+  assert.equal(decorated.status, 'UNAVAILABLE', JSON.stringify(decorated));
+  assert.equal(decorated.finding, 'INVALID_LEDGER', 'a sink that hides its own shape is not empty evidence');
+  assert.equal(decorated.entriesChecked, 0);
+
+  // Positive control: an honest sink is confirmed, recorded, and verifiable against a checkpoint.
+  const honest = createInMemoryAuditLedger(trusted.scope);
+  const recorded = appendAuditEvent(honest, value, trusted);
+  assert.equal(recorded.status, 'RECORDED', JSON.stringify(recorded));
+  assert.equal(honest.entries.length, 1);
+  assert.equal(honest.entries[0].entryDigest, recorded.receipt.entryDigest);
+  assert.equal(gateHighRiskEffect(recorded).permitted, true);
+  assert.equal(verifyAuditStream(honest, trusted, [createAuditCheckpoint(honest, trusted)]).status,
+    'VERIFIED');
+});
+
+test('generated hostile sinks never yield a receipt over evidence that was not committed', () => {
+  const trusted = context();
+  const impostor = Object.freeze({ version: 1, sequence: 1, prevDigest: ZERO64,
+    entryDigest: HEX64, event: Object.freeze({ kind: 'CLOAK' }) });
+  const shapes = [
+    (entries) => new Proxy(entries, { set: () => true, defineProperty: () => true }),
+    (entries) => new Proxy(entries, { set: () => true }),
+    (entries) => new Proxy(entries, { defineProperty: () => true }),
+    (entries) => new Proxy(entries, { get: (target, key) => (
+      key === 'length' ? 0 : Reflect.get(target, key)) }),
+    (entries) => { Object.defineProperty(entries, 'push',
+      { value: () => 0, writable: true, configurable: true }); return entries; },
+    (entries) => { Object.defineProperty(entries, 'push',
+      { value: function push() { return 0; }, writable: true, configurable: true }); return entries; },
+    (entries) => new Proxy(entries, { defineProperty: (target, key, descriptor) => {
+      Object.defineProperty(target, key, key === 'length' ? descriptor
+        : { ...descriptor, value: impostor });
+      return true;
+    } }),
+    (entries) => new Proxy(entries, { getOwnPropertyDescriptor: (target, key) => {
+      if (key === 'length') return Reflect.getOwnPropertyDescriptor(target, key);
+      throw new Error('planted commit acknowledgement');
+    } }),
+    (entries) => new Proxy(entries, { get() { throw new Error('planted sink trap'); } }),
+  ];
+  for (const [index, shape] of shapes.entries()) {
+    const ledger = createInMemoryAuditLedger(trusted.scope);
+    const wrapped = shape(ledger.entries);
+    const stream = { ...ledger, entries: wrapped };
+    for (const sequence of [1, 2]) {
+      const result = appendAuditEvent(stream, draft({ correlationRef: `correlation-${sequence}` }), trusted);
+      assert.ok(result.status === 'RECORDED' || result.status === 'RESTRICTED', index);
+      if (result.status === 'RECORDED') {
+        // A receipt is only ever issued over a record that is actually readable in this array.
+        const stored = Object.getOwnPropertyDescriptor(wrapped, String(result.receipt.sequence - 1));
+        assert.ok(stored && stored.value === ledger.entries[result.receipt.sequence - 1],
+          `shape ${index}: a receipt over evidence that cannot be read back`);
+        assert.equal(ledger.entries.length, result.receipt.sequence, `shape ${index}`);
+        continue;
+      }
+      // Every other outcome is restrictive: an uncommittable/unverifiable commit, or a container
+      // that is no longer readable as a stream. Neither ever satisfies the effect precondition.
+      assert.ok(['AUDIT_UNAVAILABLE', 'INVALID_LEDGER'].includes(result.finding),
+        `shape ${index}: ${JSON.stringify(result)}`);
+      assert.equal(result.receipt, undefined, `shape ${index}`);
+      assert.equal(gateHighRiskEffect(result).permitted, false, `shape ${index}`);
+      assert.equal(gateHighRiskEffect(result).finding, result.finding === 'AUDIT_UNAVAILABLE'
+        ? 'EVIDENCE_UNAVAILABLE' : 'EVIDENCE_INVALID', `shape ${index}`);
+      assert.ok(!JSON.stringify(result).includes('planted'), `shape ${index}`);
+    }
+    // Whatever the sink did, the module never hands out a receipt it cannot read back.
+    const verified = verifyAuditStream(stream, trusted, []);
+    assert.ok(['VERIFIED', 'UNANCHORED', 'TAMPERED'].includes(verified.status) ||
+      verified.finding === 'INVALID_LEDGER' || verified.finding === 'CHAIN_BROKEN', `shape ${index}`);
+    if (verified.status === 'VERIFIED' || verified.status === 'UNANCHORED') {
+      assert.equal(verified.entriesChecked, ledger.entries.length, `shape ${index}`);
+    }
+  }
+});
+
+test('a container that lies about both the write and the read-back is a stated in-language limit', () => {
+  // Honest boundary: confirmation reads the record back through the *same* container it was written
+  // into. A container that accepts the record, stores nothing and reports it back is not
+  // distinguishable, in language, from one that committed it. That is why the substrate is an
+  // in-memory array with no durability claim, and why an integrating storage adapter's own durable
+  // commit acknowledgment is a trust obligation this module cannot discharge - exactly like the
+  // effect gate's inability to bind a receipt to an entry.
+  const trusted = context();
+  const phantom = [];
+  const claimed = [];
+  const entries = new Proxy(phantom, {
+    set(target, key, value) {
+      if (key === 'length') claimed.length = Number(value); else claimed[Number(key)] = value;
+      return true;
+    },
+    getOwnPropertyDescriptor(target, key) {
+      if (key === 'length') return { value: claimed.length, writable: true, enumerable: false,
+        configurable: false };
+      if (Number(key) < claimed.length) return { value: claimed[Number(key)], writable: true,
+        enumerable: true, configurable: true };
+      return undefined;
+    },
+  });
+  const ledger = createInMemoryAuditLedger(trusted.scope);
+  const result = appendAuditEvent({ ...ledger, entries }, draft(), trusted);
+  assert.equal(phantom.length, 0, 'the real array holds nothing');
+  assert.equal(claimed.length, 1, 'the container claims one committed record');
+  // Stated limit: the receipt reflects what the container reported, not external durability.
+  assert.equal(result.status, 'RECORDED', JSON.stringify(result));
+  assert.equal(verifyAuditStream({ ...ledger, entries }, trusted, []).finding, 'INVALID_LEDGER');
+  // Nothing about this weakens the ordinary substrate: an honest ledger is still appendable.
+  assert.equal(appendAuditEvent(ledger, draft(), trusted).status, 'RECORDED');
+});
+
 test('an unreadable ledger is reported as INVALID_LEDGER, not as a caller or authority failure', () => {
   const trusted = context();
   const good = createInMemoryAuditLedger(trusted.scope);
@@ -800,7 +1020,8 @@ test('ledger construction and checkpoint serialization reject bad input with a f
 
 test('a lying stream length can neither bypass the capacity bound nor hide a chain fork', () => {
   // The append path takes exactly one `length` read. A hostile container that reports a length it
-  // does not have is rejected at the bound; one that hides its entries is caught at verification.
+  // does not have is rejected at the bound, and its commit can never be confirmed, so it is a
+  // typed audit outage rather than a receipt over evidence the container never kept.
   const inflating = (entries, reported) => new Proxy(entries, {
     getOwnPropertyDescriptor(target, key) {
       if (key === 'length') {
@@ -820,14 +1041,15 @@ test('a lying stream length can neither bypass the capacity bound nor hide a cha
   const hidden = createInMemoryAuditLedger(trusted.scope);
   const liar = { ...hidden, entries: inflating(hidden.entries, 0) };
   for (let i = 1; i <= 3; i += 1) {
-    assert.equal(appendAuditEvent(liar, draft({ correlationRef: `correlation-${i}` }), trusted).status,
-      'RECORDED');
+    const result = appendAuditEvent(liar, draft({ correlationRef: `correlation-${i}` }), trusted);
+    assertRestricted(result, 'AUDIT_UNAVAILABLE', `append ${i}: ${JSON.stringify(result)}`);
+    assert.equal(gateHighRiskEffect(result).permitted, false);
   }
-  // Every append read a length of zero, so the stored sequences repeat; verification says so.
-  assert.deepEqual(hidden.entries.map((entry) => entry.sequence), [1, 1, 1]);
-  const forked = verifyAuditStream(hidden, trusted, []);
-  assert.equal(forked.status, 'TAMPERED', JSON.stringify(forked));
-  assert.equal(forked.finding, 'CHAIN_BROKEN');
+  // The stream is not silently presented as healthy, empty evidence either.
+  const forked = verifyAuditStream(liar, trusted, []);
+  assert.equal(forked.status, 'UNAVAILABLE', JSON.stringify(forked));
+  assert.equal(forked.finding, 'INVALID_LEDGER');
+  assert.ok(!JSON.stringify([forked, appendAuditEvent(liar, draft(), trusted)]).includes('planted'));
 });
 
 test('read access is scope-isolated, bounded and never returns another tenant stream', () => {
@@ -894,6 +1116,138 @@ test('export requires an explicit, scope-matched export authority and stays boun
   assert.equal(readAuditEvents(ledger, readOnly, {}).status, 'OK');
   assertRestricted(readAuditEvents(ledger, exporter, {}), 'INVALID_AUTHORITY');
   assertRestricted(exportAuditEvents(ledger, readOnly, {}), 'EXPORT_NOT_AUTHORIZED');
+});
+
+test('a relabelled ledger returns no foreign event or foreign metadata on read or export', () => {
+  // Scope isolation is per entry, not merely per declared label: relabelling the outer ledger while
+  // the entries still belong to another tenant must not hand that stream (or any of its metadata)
+  // to the relabelled tenant, on any path, under any query.
+  const tenantA = context();
+  const scopeB = { tenantId: 'tenant-b.invalid', projectId: 'project-b.invalid' };
+  const tenantB = context({ scope: scopeB, actor: { principalId: 'principal-b.invalid' },
+    integrationId: 'integration-b.invalid', pseudonymKey: key(41), chainKey: key(42) });
+  const streamA = createInMemoryAuditLedger(tenantA.scope);
+  for (let i = 1; i <= 3; i += 1) {
+    assert.equal(appendAuditEvent(streamA, draft({ correlationRef: `correlation-a-${i}` }),
+      tenantA).status, 'RECORDED');
+  }
+  const relabelled = { ...streamA, scope: scopeB };
+  const readB = { version: 1, scope: scopeB, principalId: 'auditor-b.invalid' };
+  const exportB = { ...readB, exportAuthorized: true };
+  const attempts = [
+    readAuditEvents(relabelled, readB, {}),
+    exportAuditEvents(relabelled, exportB, {}),
+    // A query that selects none of the foreign entries is still refused: the check is stream-wide.
+    readAuditEvents(relabelled, readB, { fromSequence: 99 }),
+    readAuditEvents(relabelled, readB, { kinds: ['CLOAK'], limit: 1 }),
+    exportAuditEvents(relabelled, exportB, { kinds: ['KEY_OPERATION'] }),
+  ];
+  for (const result of attempts) {
+    assert.equal(result.status, 'RESTRICTED', JSON.stringify(result));
+    assert.equal(result.finding, 'SCOPE_MISMATCH');
+    assert.equal(result.entries, undefined);
+    assert.equal(result.matched, 0);
+    assert.equal(result.truncated, false);
+    const wire = JSON.stringify(result);
+    assert.ok(!wire.includes('tenant-a.invalid') && !wire.includes('principal-a.invalid'), wire);
+    assert.ok(!wire.includes('workload-a.invalid') && !wire.includes('integration-a.invalid'), wire);
+    for (const entry of streamA.entries) {
+      assert.ok(!wire.includes(entry.event.correlationRef), 'foreign correlation pseudonym disclosed');
+      assert.ok(!wire.includes(entry.event.entityRef), 'foreign entity pseudonym disclosed');
+      assert.ok(!wire.includes(entry.entryDigest), 'foreign chain digest disclosed');
+    }
+  }
+  // Verification already called this structure tampered; read and export now agree with it.
+  const verified = verifyAuditStream(relabelled, tenantB, []);
+  assert.equal(verified.status, 'TAMPERED', JSON.stringify(verified));
+  assert.equal(verified.finding, 'SCOPE_MISMATCH');
+
+  // A single substituted entry poisons the whole read: nothing in scope is delivered either.
+  const donorB = createInMemoryAuditLedger(scopeB);
+  assert.equal(appendAuditEvent(donorB, draft({ correlationRef: 'correlation-b-1' }), tenantB).status,
+    'RECORDED');
+  const mixed = { ...streamA, entries: [...streamA.entries.slice(0, 2), donorB.entries[0]] };
+  const readA = { version: 1, scope: tenantA.scope, principalId: 'auditor-a.invalid' };
+  for (const result of [readAuditEvents(mixed, readA, {}),
+    readAuditEvents(mixed, readA, { toSequence: 1 }),
+    exportAuditEvents(mixed, { ...readA, exportAuthorized: true }, {})]) {
+    assert.equal(result.status, 'RESTRICTED', JSON.stringify(result));
+    assert.equal(result.finding, 'SCOPE_MISMATCH');
+    assert.equal(result.entries, undefined);
+    assert.equal(result.matched, 0);
+    assert.ok(!JSON.stringify(result).includes('correlation-b-1'));
+  }
+  // Tenant A's own stream is untouched and still fully readable under A's authority.
+  assert.equal(readAuditEvents(streamA, readA, {}).status, 'OK');
+  assert.equal(readAuditEvents(streamA, readA, {}).entries.length, 3);
+});
+
+test('generated tenant substitutions never return the foreign stream they are labelled with', () => {
+  for (let i = 0; i < 32; i += 1) {
+    const scopeA = { tenantId: `tenant-a${i}.invalid`, projectId: `project-a${i}.invalid` };
+    const scopeB = { tenantId: `tenant-b${i}.invalid`, projectId: `project-b${i}.invalid` };
+    const a = context({ scope: scopeA, actor: { principalId: `principal-a${i}.invalid` },
+      pseudonymKey: key(100 + i), chainKey: key(200 + i) });
+    const b = context({ scope: scopeB, actor: { principalId: `principal-b${i}.invalid` },
+      pseudonymKey: key(300 + i), chainKey: key(400 + i) });
+    const streamA = createInMemoryAuditLedger(scopeA);
+    for (const sequence of [1, 2]) {
+      assert.equal(appendAuditEvent(streamA, draft({ correlationRef: `correlation-a${i}-${sequence}` }),
+        a).status, 'RECORDED', JSON.stringify(scopeA));
+    }
+    const relabelled = { ...streamA, scope: scopeB };
+    const readB = { version: 1, scope: scopeB, principalId: `auditor-b${i}.invalid` };
+    const foreign = [readAuditEvents(relabelled, readB, {}),
+      exportAuditEvents(relabelled, { ...readB, exportAuthorized: true }, {})];
+    for (const result of foreign) {
+      assert.equal(result.status, 'RESTRICTED', `pair ${i}: ${JSON.stringify(result)}`);
+      assert.equal(result.finding, 'SCOPE_MISMATCH', `pair ${i}`);
+      assert.equal(result.entries, undefined, `pair ${i}`);
+      assert.equal(result.matched, 0, `pair ${i}`);
+      const wire = JSON.stringify(result);
+      for (const entry of streamA.entries) {
+        assert.ok(!wire.includes(entry.event.correlationRef), `pair ${i}`);
+        assert.ok(!wire.includes(entry.event.entityRef), `pair ${i}`);
+      }
+      assert.ok(!wire.includes(scopeA.tenantId), `pair ${i}`);
+    }
+    assert.equal(verifyAuditStream(relabelled, b, []).finding, 'SCOPE_MISMATCH', `pair ${i}`);
+    assert.equal(readAuditEvents(streamA, { version: 1, scope: scopeA, principalId: `auditor-a${i}.invalid` },
+      {}).entries.length, 2, `pair ${i}`);
+  }
+});
+
+test('an over-long entries array is refused before its key set is enumerated', () => {
+  // A bound that is only applied after materialising the whole key set is not a bound. The length
+  // descriptor is O(1), so an over-long container is refused without proportional own-key work.
+  let enumerations = 0;
+  const trusted = context();
+  const ledger = createInMemoryAuditLedger(trusted.scope);
+  assert.equal(appendAuditEvent(ledger, draft(), trusted).status, 'RECORDED');
+  const overlength = new Proxy(ledger.entries, {
+    getOwnPropertyDescriptor(target, key) {
+      if (key === 'length') {
+        return { value: 1_000_000, writable: true, enumerable: false, configurable: false };
+      }
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+    ownKeys(target) { enumerations += 1; return Reflect.ownKeys(target); },
+  });
+  const stream = { ...ledger, entries: overlength };
+  const authority = { version: 1, scope: trusted.scope, principalId: 'auditor-a.invalid' };
+  const verified = verifyAuditStream(stream, trusted, []);
+  assert.equal(verified.status, 'UNAVAILABLE', JSON.stringify(verified));
+  assert.equal(verified.finding, 'INVALID_LEDGER');
+  for (const read of [readAuditEvents(stream, authority, {}),
+    exportAuditEvents(stream, { ...authority, exportAuthorized: true }, {})]) {
+    assertRestricted(read, 'INVALID_LEDGER');
+    assert.equal(read.entries, undefined);
+    assert.equal(read.matched, 0);
+  }
+  assertRestricted(appendAuditEvent(stream, draft({ correlationRef: 'correlation-2' }), trusted),
+    'INVALID_LEDGER');
+  assert.equal(enumerations, 0, 'the length bound must be decided without enumerating the key set');
+  assert.equal(ledger.entries.length, 1, 'a refused append never touches the stream');
 });
 
 test('checkpoints serialize deterministically and expose no opaque reference material', () => {

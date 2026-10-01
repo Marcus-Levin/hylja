@@ -303,13 +303,15 @@ function member<T extends string>(value: unknown, choices: readonly T[]): T {
 function items<T>(value: unknown, convert: (part: unknown) => T, limit: number,
   nonempty = false): T[] {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) fail('INVALID_INPUT');
-  const keys = Reflect.ownKeys(value);
-  if (keys.length > limit + 1 || keys.some((key) => typeof key !== 'string')) fail('INVALID_INPUT');
+  // The declared length is read first and bounded first: an over-long array is refused from this
+  // one O(1) descriptor read, without materialising a key set proportional to it. Only a container
+  // inside the length bound has its own-key set enumerated, and exactly once.
   const length: unknown = Object.getOwnPropertyDescriptor(value, 'length')?.value;
   if (!Number.isSafeInteger(length) || (length as number) < 0 || (length as number) > limit ||
-    (nonempty && length === 0) || keys.length !== (length as number) + 1 || !keys.includes('length')) {
-    fail('INVALID_INPUT');
-  }
+    (nonempty && length === 0)) fail('INVALID_INPUT');
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== (length as number) + 1 || keys.some((key) => typeof key !== 'string') ||
+    !keys.includes('length')) fail('INVALID_INPUT');
   const result: T[] = [];
   for (let i = 0; i < (length as number); i++) {
     const part = Object.getOwnPropertyDescriptor(value, String(i));
@@ -340,6 +342,13 @@ function when(value: unknown): string {
 function secretKey(value: unknown): Uint8Array {
   if (!(value instanceof Uint8Array) || value.byteLength < LIMIT.keyBytes ||
     value.byteLength > 128) fail('KEY_UNAVAILABLE');
+  // An all-zero key is not a key: it is empty, publicly derivable, and a chain "verified" under it
+  // would authenticate nothing. That single degenerate case is refused here. Key *quality* beyond it
+  // - distribution, generation, custody, rotation, destruction - stays a key-management obligation
+  // this module neither performs nor claims.
+  let filled = false;
+  for (let i = 0; i < value.byteLength && !filled; i += 1) filled = value[i] !== 0;
+  if (!filled) fail('KEY_UNAVAILABLE');
   return value;
 }
 
@@ -493,7 +502,8 @@ export function createInMemoryAuditLedger(scopeValue: unknown, options?: unknown
   } catch { throw new TypeError('Invalid audit ledger scope'); }
 }
 
-/** Appends one event. Returns a typed restrictive failure; nothing here grants an effect. */
+/** Appends one event. Returns a typed restrictive failure; nothing here grants an effect. A receipt
+ *  is issued only for a commit confirmed in this substrate, never for a reported-but-unkept write. */
 export function appendAuditEvent(ledgerValue: unknown, draftValue: unknown,
   contextValue: unknown): AuditAppendResult {
   const restricted = (finding: AuditAppendFinding): AuditAppendResult =>
@@ -524,9 +534,22 @@ export function appendAuditEvent(ledgerValue: unknown, draftValue: unknown,
   const digest = entryDigest(trusted.chainKey, { sequence, prevDigest: stream.prevDigest, event: built });
   const record = Object.freeze({ version: AUDIT_SCHEMA_VERSION, sequence,
     prevDigest: stream.prevDigest, entryDigest: digest, event: built });
-  // A sink that cannot commit (sealed, read-only or non-extensible array) is an audit outage, not
-  // an exception the caller has to catch and not a reason to proceed unrecorded.
-  try { stream.entries.push(record); } catch { return restricted('AUDIT_UNAVAILABLE'); }
+  // A sink that cannot commit (sealed, read-only or non-extensible array), or that reports a write
+  // it did not perform, is an audit outage: not an exception the caller has to catch, and not a
+  // reason to proceed unrecorded. The write into a caller-supplied container is a dynamic call that
+  // can succeed and store nothing, so the commit is *confirmed* before any receipt exists: this
+  // exact record must be readable at the slot it occupies in this exact array (the 0-based index
+  // just below its 1-based sequence), and the array's own length must be the one value that grew by
+  // one (it equals that 1-based sequence). Unconfirmed is AUDIT_UNAVAILABLE, which
+  // gateHighRiskEffect never turns into `permitted`.
+  const entries = stream.entries;
+  try {
+    entries.push(record);
+    const stored = Object.getOwnPropertyDescriptor(entries, String(sequence - 1));
+    const size = Object.getOwnPropertyDescriptor(entries, 'length');
+    if (!stored || !('value' in stored) || stored.value !== record || !size ||
+      size.value !== sequence) return restricted('AUDIT_UNAVAILABLE');
+  } catch { return restricted('AUDIT_UNAVAILABLE'); }
   return { version: AUDIT_SCHEMA_VERSION, status: 'RECORDED', finding: 'RECORDED',
     receipt: Object.freeze({ version: AUDIT_SCHEMA_VERSION, scope: target, sequence,
       entryDigest: digest, correlationRef: built.correlationRef, occurredAt: built.occurredAt }) };
@@ -537,7 +560,17 @@ export function appendAuditEvent(ledgerValue: unknown, draftValue: unknown,
  * entry that becomes the chain predecessor are inspected, so appending costs one event instead of
  * re-validating the whole stream; whole-stream validation is a verification/read concern, where it
  * happens once per call. The captured `entries` array and `length` are exactly the ones the append
- * pushes into and extends, never a second read of a time-varying container.
+ * pushes into and extends, never a second read of a time-varying container. The append path
+ * therefore does **not** enumerate the container's own key set: doing so per event would make
+ * append cost quadratic in stream length, which is itself an audit-outage risk. A container
+ * carrying extra own keys is instead refused as `INVALID_LEDGER` by the paths that do enumerate it
+ * (verification, checkpoint, read and export).
+ *
+ * Honest storage trust boundary: confirming the commit proves that this record is in **this**
+ * in-memory array at **this** sequence at **this** moment. It is not external durability,
+ * replication or retention, and a container that lies about both the write and the read-back cannot
+ * be distinguished in language. Those remain obligations of the integrating storage adapter and its
+ * commit acknowledgment.
  */
 interface StreamHead {
   scope: AuditScope; entries: AuditEntry[]; maxEntries: number; accepting: boolean;
@@ -739,8 +772,11 @@ function select(entries: readonly AuditEntry[], q: BoundedQuery): { entries: Aud
 }
 
 /**
- * Bounded, scope-isolated read of one tenant/project stream. There is no cross-tenant listing and no
- * bulk API of any kind: the ledger holds pseudonyms and privacy-safe metadata, never originals.
+ * Bounded, scope-isolated read of one tenant/project stream. Scope isolation is enforced **per
+ * entry** against the trusted access scope, not merely against the ledger's declared label, so a
+ * relabelled or partly substituted stream returns no entry at all. There is no cross-tenant listing
+ * and no bulk API of any kind: the ledger holds pseudonyms and privacy-safe metadata, never
+ * originals.
  */
 export function readAuditEvents(ledgerValue: unknown, authorityValue: unknown,
   queryValue: unknown): AuditReadResult {
@@ -765,6 +801,13 @@ function access(ledgerValue: unknown, authorityValue: unknown, queryValue: unkno
     return denied('INVALID_AUTHORITY');
   }
   if (!equal(a.scope, snapshot.scope)) return denied('SCOPE_MISMATCH');
+  // Per-entry scope congruence, the same guard verifyAuditStream applies, checked against the
+  // trusted access scope before any selection: a ledger relabelled to another tenant, or one stream
+  // with a single substituted entry, discloses neither the foreign events nor any foreign metadata
+  // (pseudonyms, digests, actor or bundle identity). One foreign entry denies the whole read.
+  if (snapshot.entries.some((item) => !equal(item.event.scope, a.scope))) {
+    return denied('SCOPE_MISMATCH');
+  }
   let q: BoundedQuery;
   try { q = query(queryValue); } catch { return denied('INVALID_QUERY'); }
   const selected = select(snapshot.entries, q);
