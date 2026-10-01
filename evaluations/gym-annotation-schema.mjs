@@ -8,7 +8,15 @@
 // authentication, authorization or tenancy boundary: scope labels inside an artifact are
 // self-declared data, exactly like #39 fixture metadata, so a caller able to fabricate an
 // artifact can fabricate its scope. It reads no files, opens no network connection and holds no
-// state. Failures return fixed reason codes only and never echo input content.
+// state. Failures return fixed reason codes only and never echo input content. It is a text file
+// (no raw control bytes), so it stays greppable and diffable as reviewable evidence.
+//
+// Time handling: `validateGymAnnotationArtifact`, `gymEffectiveLabel` and `gymReviewQueue` are pure and
+// time-independent. `gymOracleEligibility` is the only function that consults a clock, by default
+// `Date.now()`; pass an explicit `now` for deterministic callers and tests. An unreadable clock, an
+// unreadable expiry date or an unparseable calendar instant blocks rather than defaulting to
+// "not expired", and every timestamp the format stores must be a real instant, not only a
+// well-shaped one.
 //
 // Value-free by construction: every string leaf in an artifact is an opaque ref, a fixed enum, a
 // bounded version label, a UTC timestamp, an uppercase name, a two-letter code, a producer id, or a
@@ -151,6 +159,21 @@ function ref(value, prefixes) {
 function count(value) { return Number.isSafeInteger(value) && value >= 0 ? value : undefined; }
 function offset(value) { return Number.isSafeInteger(value) && value >= 0 ? value : undefined; }
 function timestamp(value) { return typeof value === 'string' && TIMESTAMP.test(value) ? value : undefined; }
+/**
+ * A real instant in epoch milliseconds. The shape regex alone accepts `2026-13-45T00:00:00Z` and
+ * `2026-02-30T00:00:00Z`, whose `Date.parse` is either NaN or a silently rolled-over date; a gate that
+ * cannot read its own input must fail closed rather than treat an unreadable date as "not expired", and
+ * a rolled-over retention deadline is moved rather than enforced. The round-trip comparison rejects
+ * both, so an authoring slip blocks instead of shifting the deadline.
+ */
+function instant(value) {
+  if (timestamp(value) === undefined) return undefined;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return undefined;
+  // Compare the normalized instant, not just the shape: a rolled-over month, day, hour, minute or
+  // second (e.g. `2026-02-30T00:00:00Z`, which V8 parses as 2 March) must not move a deadline.
+  return new Date(milliseconds).toISOString().replace('.000Z', 'Z') === value ? milliseconds : undefined;
+}
 function name(value) { return typeof value === 'string' && NAME.test(value) ? value : undefined; }
 function versionLabel(value) {
   return typeof value === 'string' && VERSION_LABEL.test(value) ? value : undefined;
@@ -194,16 +217,17 @@ function collect(result, fail) {
 function samePayload(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
 /**
  * The effective label is the newest history entry. There is no edit and no delete: a correction is
- * a new append. Disagreement is measured against the newest *earlier assertion*, not against the
- * immediately previous entry, so a human `UNKNOWN` in the middle can never hide a conflict:
+ * a new append. Disagreement is order-independent: agreement means **every** recorded assertion in the
+ * history carries the identical payload, so an older dissent can never be outvoted by a later repeat,
+ * and only an explicit final adjudication settles a contested occurrence.
  *   - a final `adjudication` entry decides the occurrence either way;
- *   - a newest `UNKNOWN`/`ABSTAINED` entry after an assertion is an open disagreement (a
+ *   - a newest `UNKNOWN`/`ABSTAINED` entry after any assertion is an open disagreement (a
  *     qualification, not a silent withdrawal), and is `UNDECIDED` only when nothing asserted yet;
  *   - a newest asserted entry with no earlier assertion is `SOLE_ENTRY` (recorded, uncorroborated),
  *     which is also the state reached by answering an earlier `UNKNOWN` or abstention;
- *   - otherwise the newest assertion is compared with the newest earlier assertion: identical
- *     payloads are `AGREED`, different ones are `OPEN_DISAGREEMENT`. A 2-to-1 split therefore stays
- *     contested: there is no majority vote here.
+ *   - otherwise the newest assertion is compared with *all* earlier assertions: identical payloads
+ *     everywhere are `AGREED`, any difference (including a different confidence band) is
+ *     `OPEN_DISAGREEMENT`. `[A,B,A]`, `[B,A,A]`, `[A,A,B]` and `[A,B,B]` are therefore all contested.
  */
 function labelState(history) {
   if (!history.length) return 'UNDECIDED';
@@ -214,8 +238,8 @@ function labelState(history) {
     return asserted.length ? 'OPEN_DISAGREEMENT' : 'UNDECIDED';
   }
   if (asserted.length < 2) return 'SOLE_ENTRY';
-  const previous = asserted[asserted.length - 2];
-  return samePayload(previous.groundTruth, newest.groundTruth) ? 'AGREED' : 'OPEN_DISAGREEMENT';
+  return asserted.every((entry) => samePayload(entry.groundTruth, newest.groundTruth))
+    ? 'AGREED' : 'OPEN_DISAGREEMENT';
 }
 
 /* --------------------------------- parsing --------------------------------- */
@@ -297,7 +321,7 @@ function parseHistory(raw, fail) {
     const entry = shape(items[index], ['version', 'decidedByRoleRef', 'decidedAt', 'groundTruth'],
       ['taskPreference', 'adjudication']);
     const decider = entry ? ref(entry.decidedByRoleRef, ['role']) : undefined;
-    if (!entry || entry.version !== index + 1 || !decider || !timestamp(entry.decidedAt)) {
+    if (!entry || entry.version !== index + 1 || !decider || instant(entry.decidedAt) === undefined) {
       fail('LABEL_HISTORY_INVALID');
       continue;
     }
@@ -351,23 +375,25 @@ function parse(raw) {
   const retention = shape(top.retention, ['class', 'expiresAt', 'deletionState', 'tombstonedAt']);
   const retentionClass = retention ? member(retention.class, GYM_RETENTION_CLASSES) : undefined;
   const deletionState = retention ? member(retention.deletionState, GYM_DELETION_STATES) : undefined;
-  if (!retention || !retentionClass || !deletionState || !timestamp(retention.expiresAt)) {
-    fail('RETENTION_INVALID');
+  const expiresAtMs = retention ? instant(retention.expiresAt) : undefined;
+  if (!retention || !retentionClass || !deletionState || expiresAtMs === undefined) {
+    fail(retention ? 'RETENTION_TIMESTAMP_INVALID' : 'RETENTION_INVALID');
   } else if ((level === 'TENANT') !== (retentionClass === 'TENANT_RESTRICTED')) {
     fail('RETENTION_SCOPE_CONFLICT');
   } else if (deletionState === 'ACTIVE') {
     if (retention.tombstonedAt !== null) fail('TOMBSTONE_CONFLICT');
-  } else if (!timestamp(retention.tombstonedAt)) fail('TOMBSTONE_CONFLICT');
+  } else if (instant(retention.tombstonedAt) === undefined) fail('TOMBSTONE_CONFLICT');
 
   const provenance = shape(top.provenance, ['createdAt', 'questionnaireVersion', 'vocabularyVersion',
     'informationModelVersion', 'toolchainVersion', 'intelligenceBundleRef', 'proposalProducers']);
-  // Declared producers are collected independently, so one unusable provenance field does not turn
-  // every field and occurrence check into a second, misleading reason code. An empty list is legal:
-  // a manual-only artifact proposes nothing.
+  // Declared producers are collected independently, so an unrelated bad provenance field (a prose
+  // version string, say) is reported once as PROVENANCE_INCOMPLETE instead of also failing every
+  // producer-containment check. A missing or duplicated producer list still fails both ways, which
+  // is intended: an artifact whose provenance is unreadable must not authorize per-occurrence claims.
   const listed = provenance ? producerList(provenance.proposalProducers) : null;
   const distinct = listed !== null && new Set(listed).size === listed.length;
   const producers = distinct ? listed : [];
-  if (!provenance || !timestamp(provenance.createdAt) || !versionRef(provenance.questionnaireVersion) ||
+  if (!provenance || instant(provenance.createdAt) === undefined || !versionRef(provenance.questionnaireVersion) ||
       !versionLabel(provenance.vocabularyVersion) || !versionLabel(provenance.informationModelVersion) ||
       !versionRef(provenance.toolchainVersion) || !ref(provenance.intelligenceBundleRef, ['bundle']) ||
       listed === null) fail('PROVENANCE_INCOMPLETE');
@@ -428,8 +454,11 @@ function parse(raw) {
     if (byteLength < codePointLength) fail('BYTE_MAPPING_INCONSISTENT');
     if (field.byteMapping === 'IDENTICAL' && byteLength !== codePointLength) fail('BYTE_MAPPING_INCONSISTENT');
     // One field record per (import, path, normalization) view: a second view of the same text is a
-    // second record with its own lengths and spans, never this record reinterpreted.
-    const viewKey = `${importRef} ${String(field.sourcePath)} ${String(field.normalization)}`;
+    // second record with its own lengths and spans, never this record reinterpreted. The separator is
+    // written as an escape so this reviewable source file stays text: a raw NUL byte would make
+    // grep and `file` treat the module as binary. JSON forbids raw control characters inside strings,
+    // so U+0000 cannot collide with a real field value.
+    const viewKey = `${importRef}\u0000${String(field.sourcePath)}\u0000${String(field.normalization)}`;
     if (fieldViews.has(viewKey)) { fail('DUPLICATE_FIELD_VIEW'); continue; }
     fieldViews.add(viewKey);
     fields.set(fieldRef, { fieldRef, importRef, byteMapping: member(field.byteMapping, GYM_BYTE_MAPPINGS),
@@ -568,7 +597,7 @@ function parse(raw) {
   }
   const artifact = reasons.size ? null : frozen({
     artifactId: top.artifactId, artifactKind: top.artifactKind, status: top.status, level,
-    deletionState, expiresAt: retention.expiresAt, occurrences, contracts,
+    deletionState, expiresAtMs, occurrences, contracts,
   });
   return { reasons, artifact };
 }
@@ -686,8 +715,8 @@ export function gymOracleEligibility(raw, now) {
     else if (artifact.status !== 'REVIEWED') blockers.add('ARTIFACT_UNREVIEWED');
     if (artifact.deletionState === 'TOMBSTONED') blockers.add('ARTIFACT_TOMBSTONED');
     const clock = clockMs(now);
-    if (clock === undefined) blockers.add('EXPIRY_UNVERIFIABLE');
-    else if (clock > Date.parse(artifact.expiresAt)) blockers.add('ARTIFACT_EXPIRED');
+    if (clock === undefined || !Number.isFinite(artifact.expiresAtMs)) blockers.add('EXPIRY_UNVERIFIABLE');
+    else if (clock > artifact.expiresAtMs) blockers.add('ARTIFACT_EXPIRED');
     if (!artifact.occurrences.length) blockers.add('NO_OCCURRENCES');
     for (const occurrence of artifact.occurrences) {
       if (occurrence.state === 'OPEN_DISAGREEMENT') blockers.add('OPEN_DISAGREEMENT_PRESENT');
@@ -700,10 +729,9 @@ export function gymOracleEligibility(raw, now) {
     return frozen({ eligible: false, reasons: frozen(['ARTIFACT_INVALID']) });
   }
 }
-/** An evaluation clock, or undefined when the caller supplied something unusable. */
+/** An evaluation clock in epoch milliseconds, or undefined when the caller supplied something unusable. */
 function clockMs(now) {
-  if (now === undefined) return Date.now();
-  if (typeof now === 'number') return Number.isSafeInteger(now) ? now : undefined;
-  if (typeof now === 'string' && TIMESTAMP.test(now)) return Date.parse(now);
-  return undefined;
+  const value = now === undefined ? Date.now() :
+    (typeof now === 'number' ? (Number.isSafeInteger(now) ? now : undefined) : instant(now));
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }

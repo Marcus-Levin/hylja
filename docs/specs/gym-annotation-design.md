@@ -193,19 +193,22 @@ scored against a planted expectation.
   `CONFLICTING_EVIDENCE`). `ABSTAINED` means the annotator declined (`NOT_QUALIFIED_FOR_DOMAIN`,
   `OUT_OF_OWNERSHIP`, `TIME_BUDGET`, `POLICY_QUESTION_ESCALATED`). A payload that claims `UNKNOWN` while also
   carrying a sensitivity is rejected. `UNKNOWN` is never read as "not sensitive".
-- **The effective label is the newest entry**, and disagreement is measured against the newest *earlier assertion*
-  rather than against the immediately previous entry, so a human `UNKNOWN` in the middle can never hide a conflict:
+- **The effective label is the newest entry**, and agreement is **order-independent**: it means *every* recorded
+  assertion in the history carries the identical payload, so an older dissent can never be outvoted by a later
+  repeat. An intervening `UNKNOWN` changes nothing:
   - a final entry carrying `adjudication: ADJUDICATED` -> `ADJUDICATED`; with `UNRESOLVED` -> `UNRESOLVED`;
   - newest is `UNKNOWN`/`ABSTAINED` and some earlier entry asserted -> `OPEN_DISAGREEMENT` (a qualification, not a
     deletion); newest is `UNKNOWN`/`ABSTAINED` and nothing asserted yet -> `UNDECIDED`;
   - newest asserts a value and only one assertion exists -> `SOLE_ENTRY` (recorded, uncorroborated). This is also
     the state reached by answering an earlier `UNKNOWN` or abstention: a resolution, not a conflict;
-  - newest asserts a value matching the newest earlier assertion -> `AGREED`; any different payload, including a
-    different confidence band, -> `OPEN_DISAGREEMENT`.
-  - `[LABELED(A), UNKNOWN, LABELED(B)]` is therefore `OPEN_DISAGREEMENT`, and so is a 2-to-1 split
-    `[LABELED(A), LABELED(B), LABELED(A)]`.
+  - otherwise the newest assertion is compared with *all* earlier assertions: identical payloads everywhere are
+    `AGREED`, and any difference - including a different confidence band - is `OPEN_DISAGREEMENT`.
+  - `[A,B,A]`, `[B,A,A]`, `[A,A,B]`, `[A,B,B]` and a 2-to-1 split are therefore all contested, and only an explicit
+    adjudication settles any of them. Nothing is lost either way: the history is immutable, so an earlier dissent
+    stays visible after adjudication.
 - **No majority vote, ever.** Adjudication is an explicit act by a reviewer role, recorded with a resolution. A
-  2-to-1 split is not a resolution; it stays an open disagreement with all three entries visible.
+  repeat of the same answer by the same or another annotator is not a resolution, and neither is a chronological
+  win.
 - **Rationales are fixed codes.** v0 has no free-text rationale field in any space, and the two version-shaped
   provenance fields are bounded `name/version` identifiers rather than prose. A free-text field is the easiest way
   for a protected value to enter an artifact, an issue body or a chat message, so longer rationales belong in the
@@ -437,7 +440,10 @@ Deliberate omissions, each of which is a decision rather than an oversight:
 - **no treatment/authorization/policy field** in `groundTruth` - strict key sets make the separation mechanical;
 - **no `datasetScores` or `passed` field** - an artifact is input to evaluation, never its outcome;
 - **no timestamped value history** - only labels are versioned, so a stale value cannot be replayed;
-- **no `retention`-less artifact** - expiry and deletion state are mandatory;
+- **no `retention`-less artifact** - expiry and deletion state are mandatory, and every timestamp in the format
+  must be a **real instant**, not merely a well-shaped string: `2026-13-01T00:00:00Z` and the rolled-over
+  `2026-02-30T00:00:00Z` are both rejected (`RETENTION_TIMESTAMP_INVALID`), because a retention deadline that
+  silently moves, or a date a gate cannot read, is exactly the failure mode a retention rule must not have;
 - **no free-form `dictionaryState`** - it is a four-value enum, because the tenant's dictionary *terms* belong in the
   separate tenant-scoped dictionary artifact, never inside an annotation;
 - **no duplicate field view** - one record per `(importRef, sourcePath, normalization)`.
@@ -455,19 +461,25 @@ pass an explicit evaluation clock for determinism.
 
 ## 13. The evaluation-only validator
 
-[`evaluations/gym-annotation-schema.mjs`](../../evaluations/gym-annotation-schema.mjs) is a small, pure, **unwired**
+[`evaluations/gym-annotation-schema.mjs`](../../evaluations/gym-annotation-schema.mjs) is a small, **unwired**
 checker for the format above. It is evaluation-only and NON-ENFORCING, reads no files and opens no network
 connection, reuses the frozen sensitivity / treatment / fidelity / privacy vocabularies from the existing modules so
 the proposal cannot drift from contract names, and returns fixed reason codes only. It is not a tenancy,
-authentication or authorization boundary: the scope inside an artifact is self-declared data.
+authentication or authorization boundary: the scope inside an artifact is self-declared data. It is a text file with
+no raw control bytes, so it stays greppable and diffable as reviewable evidence.
+
+Purity: `validateGymAnnotationArtifact`, `gymEffectiveLabel` and `gymReviewQueue` are pure and time-independent.
+`gymOracleEligibility` is the one function that consults a clock - `Date.now()` by default - so it is deterministic
+only when a caller passes `now`; tests and reproducible replays must. Validation itself never reads a clock, which
+keeps an artifact's shape independent of when it is checked.
 
 Its behaviors are the observable part of this proposal: strict key sets (so mixing spaces or adding a value field
 is a rejection), span-unit and byte-mapping rules, occurrence/relationship/reference integrity, append-only version
-sequences with disagreement measured against the newest earlier assertion, adjudication placement, coverage
-consistency, a bounded escape-free pointer grammar, fixed-enum leaves, scope-escalation and blind-partition
+sequences with order-independent agreement, adjudication placement, coverage consistency, a bounded escape-free
+pointer grammar, fixed-enum leaves, real-instant timestamp validation, scope-escalation and blind-partition
 rejection, the derived label-state function, the deterministic review queue, a local development-ground-truth
-eligibility predicate that honours deletion, expiry and emptiness, and bounded, non-echoing failure on malformed,
-hostile or oversized artifacts.
+eligibility predicate that honours deletion, expiry and emptiness and fails closed on an input it cannot read, and
+bounded, non-echoing failure on malformed, hostile or oversized artifacts.
 [`evaluations/gym-annotation-schema.test.mjs`](../../evaluations/gym-annotation-schema.test.mjs) exercises those
 behaviors with synthetic artifacts; the interface and its limits are documented in
 [`evaluations/README.md`](../../evaluations/README.md).
@@ -483,8 +495,14 @@ Known limits, stated rather than implied:
 - **the checker has no clock and does not decode.** Expiry is consulted only by the eligibility predicate (with an
   optional explicit evaluation clock, failing closed when unusable), and the surrogate/normalization/byte-length
   rules in §4.2 belong to a future importer and UI, not here;
+- **timestamp strictness is a documented choice, not a calendar library.** A timestamp must round-trip through
+  `Date.parse` and the ISO string, so out-of-range months, days, hours, minutes and seconds are rejected. That
+  accepts every instant ECMAScript can represent and no rolled-over or imaginary one; it does not attempt
+  leap-second or calendar-reform semantics, which this format does not need;
 - it reports one generic `FIELD_INVALID` code rather than a per-field reason, and it does not detect duplicate JSON
-  keys (that needs a raw-byte pre-parse, as the D05 projector does).
+  keys (that needs a raw-byte pre-parse, as the D05 projector does). A missing or duplicated producer list also
+  fails the per-occurrence containment checks, so such an artifact reports several codes at once; the artifact is
+  invalid either way.
 
 ## 14. Integration with #5/#39 evaluation and later #27 promotion
 
@@ -494,7 +512,7 @@ Known limits, stated rather than implied:
 | `occurrences[].span` (code points) | #5 oracle UTF-8 byte occurrence offsets | join only through a declared, verified `byteMapping`; otherwise `untested` |
 | `labels.groundTruth` | the draft-2 oracle annotation record (`occurrenceRef`, `entityRef?`, `semantic`, `privacy`, `sensitivity`) in [contracts/information-model-draft.md](../contracts/information-model-draft.md) | a *mapping proposal*, not an identity; trust and treatment stay absent |
 | `labels.taskPreference` | #5 `expectedTreatments` | **never** mapped: preference is not an oracle expectation, and the #39 policy reviewer owns expected treatments |
-| `labelHistory` disagreement | #5 has no disagreement concept | an artifact with an open, undecided or unresolved label, or one that is unreviewed, superseded, tombstoned, expired or empty, is **ineligible** as registered ground truth |
+| `labelHistory` disagreement | #5 has no disagreement concept | an artifact with an open, undecided or unresolved label, or one that is unreviewed, superseded, tombstoned, expired, unreadably dated or empty, is **ineligible** as registered ground truth |
 | `partition: DEVELOPMENT` | #39 development vs held-out families | Gym artifacts are development/regression evidence only |
 | `artifactId@version`, `scope`, `provenance` | #27 bundle registry and replay record | recorded with every replay, including the reason the artifact was admitted |
 | dictionary proposals | #10 configured candidate sources | a reviewed, tenant-scoped configuration change, never a runtime annotation read |
@@ -524,7 +542,7 @@ These are decisions, not questions to be answered later by an implementer. Each 
 | G5 | Retention periods, deletion SLA and the restricted-store design | the `expiresAt` default and any importer | concrete numbers, key scope, destruction evidence |
 | G6 | Promotion approver and the minimum cell size for aggregate statistics | any tenant-to-global artifact | approver role, threshold, audit requirement |
 | G7 | Inter-annotator agreement method and threshold, and whether two annotators are required at all | any "agreed" claim used as a quality gate | method choice (see §17) and a minimum-agreement bar per class |
-| G8 | Whether `SOLE_ENTRY` may be used as evaluation ground truth, or only `AGREED`/`ADJUDICATED` | the local eligibility predicate | reviewer ruling |
+| G8 | Whether `SOLE_ENTRY` may be used as evaluation ground truth, or only `AGREED`/`ADJUDICATED` | the local eligibility predicate | reviewer ruling; with order-independent agreement (section 6) an occurrence now needs either a matching second assertion or an explicit adjudication, so this gate also decides whether a single annotator can ground-truth anything |
 | G9 | Whether a deterministic sensitivity **floor** may ever be raised by tenant annotations, and how over-hiding is bounded | any "Gym improves recall" claim | policy review plus an over-hiding metric |
 | G10 | #39 protocol freeze ordering: whether any Gym artifact may be admitted to a development family after the pre-tuning lock | scored comparisons | the protocol steward, under independent review |
 

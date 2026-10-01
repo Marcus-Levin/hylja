@@ -494,7 +494,46 @@ test('an ambiguous, unreviewed, tombstoned, expired or empty artifact is ineligi
   assert.ok(gymOracleEligibility(reviewed, '2026-06-01T00:00:00Z').reasons.includes('ARTIFACT_EXPIRED'));
   assert.ok(!gymOracleEligibility(reviewed, CLOCK).reasons.includes('ARTIFACT_EXPIRED'));
   assert.ok(gymOracleEligibility(reviewed, Date.parse(CLOCK)).eligible, 'epoch-millisecond clock');
-  assert.ok(gymOracleEligibility(reviewed, 'nonsense').reasons.includes('EXPIRY_UNVERIFIABLE'));
+  for (const unusable of ['nonsense', NaN, 1.5, null, {}, new Date(NaN)]) {
+    assert.ok(gymOracleEligibility(reviewed, unusable).reasons.includes('EXPIRY_UNVERIFIABLE'),
+      `an unusable clock must block, got ${String(unusable)}`);
+  }
+  // A well-shaped clock that is not a real instant must block too, not read as "now".
+  for (const unreal of ['9999-99-99T00:00:00Z', '2026-13-45T00:00:00Z', '0000-00-00T00:00:00Z',
+    '2026-02-30T00:00:00Z', '2026-04-01T24:00:00Z', '2026-04-01T00:00:60Z']) {
+    const result = gymOracleEligibility(reviewed, unreal);
+    assert.equal(result.eligible, false, `${unreal} must not be treated as a usable clock`);
+    assert.ok(result.reasons.includes('EXPIRY_UNVERIFIABLE'));
+  }
+  assert.ok(gymOracleEligibility(reviewed, Number.MAX_SAFE_INTEGER).reasons.includes('ARTIFACT_EXPIRED'));
+  assert.ok(gymOracleEligibility(reviewed, 0).eligible, 'epoch 0 is a real, non-expired clock');
+  // A retention date that is not a real instant is a validation failure, so such an artifact can
+  // never reach the eligibility gate and can never "never expire".
+  for (const [trail, value, code] of [
+    [['retention', 'expiresAt'], '9999-99-99T00:00:00Z', 'RETENTION_TIMESTAMP_INVALID'],
+    [['retention', 'expiresAt'], '2026-13-01T00:00:00Z', 'RETENTION_TIMESTAMP_INVALID'],
+    [['retention', 'expiresAt'], '2026-04-00T00:00:00Z', 'RETENTION_TIMESTAMP_INVALID'],
+    [['retention', 'expiresAt'], '2026-02-30T00:00:00Z', 'RETENTION_TIMESTAMP_INVALID'],
+    [['retention', 'expiresAt'], '2026-04-01T00:00:60Z', 'RETENTION_TIMESTAMP_INVALID'],
+    [['retention', 'expiresAt'], '2026-04-01T00:00:00.000Z', 'RETENTION_TIMESTAMP_INVALID'],
+    [['provenance', 'createdAt'], '2026-02-30T09:00:00Z', 'PROVENANCE_INCOMPLETE'],
+  ]) {
+    const target = artifact();
+    let node = target;
+    for (const key of trail.slice(0, -1)) node = node[key];
+    node[trail.at(-1)] = value;
+    const result = validateGymAnnotationArtifact(target);
+    assert.equal(result.status, 'INVALID');
+    assert.ok(result.reasons.includes(code), `${trail.join('.')}=${value} must be ${code}`);
+    assert.deepEqual([...gymOracleEligibility(target, '2099-01-01T00:00:00Z').reasons], ['ARTIFACT_INVALID']);
+  }
+  const unrealTombstone = artifact();
+  unrealTombstone.retention.deletionState = 'TOMBSTONED';
+  unrealTombstone.retention.tombstonedAt = '2026-13-01T00:00:00Z';
+  assert.ok(reasons(unrealTombstone).includes('TOMBSTONE_CONFLICT'));
+  const unrealDecision = artifact();
+  occurrence(unrealDecision, 'occ-0001').labelHistory[0].decidedAt = '2026-02-30T09:00:00Z';
+  assert.ok(reasons(unrealDecision).includes('LABEL_HISTORY_INVALID'));
   // A superseded artifact is reported as superseded, not merely unreviewed.
   const superseded = artifact();
   superseded.status = 'SUPERSEDED';
@@ -540,6 +579,59 @@ test('review prioritization is deterministic, non-learned and never drops an occ
   // An invalid or unreadable artifact yields an empty queue, never a partial ordering.
   assert.deepEqual([...gymReviewQueue({ artifactVersion: 'gym-annotation/0.1-draft' })], []);
   assert.deepEqual([...gymReviewQueue(PROBE)], []);
+});
+
+test('agreement is order-independent: an older dissent is never outvoted', () => {
+  const history = (subtypes) => {
+    const target = artifact();
+    const disputed = occurrence(target, 'occ-0001');
+    disputed.labelHistory = subtypes.map((subtype, index) =>
+      entry(index + 1, `role-annotator-${index + 1}`, judged({ semantic: { semanticType: 'ENGINEERING_IDENTIFIER',
+        domain: 'PLM', subtype } })));
+    return target;
+  };
+  for (const [A, B] of [['A', 'B'], ['DRAWING_NUMBER', 'PARTITION_NUMBER']]) {
+    for (const order of [[A, B, A], [B, A, A], [A, A, B], [A, B, B], [B, A, B], [B, B, A]]) {
+      const target = history(order);
+      assert.equal(gymEffectiveLabel(target, 'occ-0001').state, 'OPEN_DISAGREEMENT',
+        `[${order.join(',')}] must stay contested`);
+      const result = gymOracleEligibility(target, CLOCK);
+      assert.equal(result.eligible, false);
+      assert.ok(result.reasons.includes('OPEN_DISAGREEMENT_PRESENT'));
+    }
+    // Every assertion identical is agreement, whatever the order or the number of repeats.
+    for (const order of [[A, A, A], [A, A], [A, A, A, A]]) {
+      assert.equal(gymEffectiveLabel(history(order), 'occ-0001').state, 'AGREED');
+    }
+    // An intervening doubt does not decide the verdict either way: the same three human answers with
+    // one abstention spliced into the middle are still contested, and adjudication still settles them.
+    const doubted = history([A, B, A]);
+    const contested = occurrence(doubted, 'occ-0001').labelHistory;
+    const doubt = entry(2, 'role-annotator-9',
+      { status: 'UNKNOWN', unknownReason: 'INSUFFICIENT_CONTEXT' });
+    const spliced = [contested[0], doubt, contested[1], contested[2]]
+      .map((item, index) => ({ ...structuredClone(item), version: index + 1 }));
+    occurrence(doubted, 'occ-0001').labelHistory = spliced;
+    assert.equal(gymEffectiveLabel(doubted, 'occ-0001').state, 'OPEN_DISAGREEMENT');
+    assert.deepEqual(gymEffectiveLabel(doubted, 'occ-0001').versions, [1, 2, 3, 4]);
+    occurrence(doubted, 'occ-0001').labelHistory.push(entry(5, 'role-reviewer-1', judged(),
+      { adjudication: { resolution: 'ADJUDICATED' } }));
+    assert.equal(gymEffectiveLabel(doubted, 'occ-0001').state, 'ADJUDICATED');
+  }
+  // A single assertion, with or without a later doubt, is recorded but uncorroborated.
+  assert.equal(gymEffectiveLabel(history(['A']), 'occ-0001').state, 'SOLE_ENTRY');
+});
+
+test('the exported checker and its tests stay greppable text, not binary blobs', () => {
+  // The module is the reviewable evidence artifact for this design, so a raw control byte in it would
+  // silently turn `grep`/`file` output into "binary file matches" for the next reviewer.
+  for (const name of ['evaluations/gym-annotation-schema.mjs', 'evaluations/gym-annotation-schema.test.mjs',
+    'docs/examples/gym-annotation-export-draft-0.1.json']) {
+    const bytes = readFileSync(resolve(sourceRoot, name));
+    const controls = [...bytes].filter((byte) => byte < 0x20 && byte !== 0x09 && byte !== 0x0a);
+    assert.deepEqual(controls, [], `${name} must contain no raw control bytes`);
+    assert.equal(bytes.includes(0x00), false, `${name} must contain no NUL byte`);
+  }
 });
 
 test('every label status and preference status is representable, and malformed variants are rejected', () => {
