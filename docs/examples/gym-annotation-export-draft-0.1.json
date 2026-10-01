@@ -1,0 +1,304 @@
+{
+  "artifactVersion": "gym-annotation/0.1-draft",
+  "artifactId": "artifact-demo-0001",
+  "artifactKind": "ANNOTATION_EXPORT",
+  "status": "DRAFT_UNREVIEWED",
+  "evaluationOnly": true,
+  "releaseAuthority": false,
+  "partition": "DEVELOPMENT",
+  "containsProtectedValues": false,
+  "rawMaterialIncluded": false,
+  "scope": {
+    "level": "TENANT",
+    "tenantRef": "tenant-demo-a",
+    "projectRef": "project-demo-01"
+  },
+  "retention": {
+    "class": "TENANT_RESTRICTED",
+    "expiresAt": "2026-04-01T00:00:00Z",
+    "deletionState": "ACTIVE",
+    "tombstonedAt": null
+  },
+  "provenance": {
+    "createdAt": "2026-01-15T09:00:00Z",
+    "questionnaireVersion": "gym-questionnaire/0.1-draft",
+    "vocabularyVersion": "taxonomy-draft-2",
+    "informationModelVersion": "draft-2",
+    "toolchainVersion": "gym-annotator/0.1-draft",
+    "intelligenceBundleRef": "bundle-draft-1",
+    "proposalProducers": [
+      "hylja.contact-candidates/2",
+      "hylja.infrastructure-identifiers/1",
+      "hylja.secret-detectors/1"
+    ]
+  },
+  "sources": [
+    {
+      "importRef": "import-demo-0001",
+      "importKind": "SYNTHETIC_GENERATED",
+      "rawMaterialStore": "NONE",
+      "rawMaterialRef": null,
+      "fieldCount": 1
+    },
+    {
+      "importRef": "import-demo-0002",
+      "importKind": "TENANT_APPROVED_SANITIZED",
+      "rawMaterialStore": "RESTRICTED_TENANT_IMPORT",
+      "rawMaterialRef": "store-restricted-demo-01",
+      "fieldCount": 1
+    }
+  ],
+  "fields": [
+    {
+      "fieldRef": "field-0",
+      "importRef": "import-demo-0001",
+      "sourcePath": "/input/text",
+      "unitKind": "TEXT_UNIT",
+      "codePointLength": 152,
+      "byteLength": 152,
+      "normalization": "IDENTITY",
+      "byteMapping": "IDENTICAL",
+      "proposalCoverage": "COMPLETE",
+      "proposalProducers": [
+        "hylja.contact-candidates/2",
+        "hylja.infrastructure-identifiers/1"
+      ]
+    },
+    {
+      "fieldRef": "field-1",
+      "importRef": "import-demo-0002",
+      "sourcePath": "/input/lines/0",
+      "unitKind": "TEXT_UNIT",
+      "codePointLength": 96,
+      "byteLength": 118,
+      "normalization": "NFC",
+      "byteMapping": "UNVERIFIED",
+      "proposalCoverage": "PARTIAL",
+      "proposalProducers": [
+        "hylja.contact-candidates/2"
+      ]
+    }
+  ],
+  "occurrences": [
+    {
+      "occurrenceRef": "occ-0001",
+      "fieldRef": "field-0",
+      "span": { "unit": "CODE_POINT", "start": 12, "end": 20 },
+      "origin": "PROPOSED",
+      "proposalProducers": ["hylja.infrastructure-identifiers/1"],
+      "dictionaryState": "NO_MATCH",
+      "entityRef": "entity-0001",
+      "relationships": [],
+      "labelHistory": [
+        {
+          "version": 1,
+          "decidedByRoleRef": "role-annotator-1",
+          "decidedAt": "2026-01-15T09:05:00Z",
+          "groundTruth": {
+            "status": "LABELED",
+            "semantic": {
+              "semanticType": "ENGINEERING_IDENTIFIER",
+              "domain": "PLM",
+              "subtype": "DRAWING_NUMBER"
+            },
+            "privacy": { "personalData": "UNKNOWN", "specialCategory": "UNKNOWN", "jurisdictions": [] },
+            "sensitivity": "INTERNAL",
+            "confidence": "MEDIUM"
+          }
+        }
+      ]
+    },
+    {
+      "occurrenceRef": "occ-0002",
+      "fieldRef": "field-0",
+      "span": { "unit": "CODE_POINT", "start": 0, "end": 12 },
+      "origin": "PROPOSED",
+      "proposalProducers": ["hylja.infrastructure-identifiers/1"],
+      "dictionaryState": "NO_MATCH",
+      "entityRef": "entity-0001",
+      "relationships": [
+        { "kind": "SAME_AS", "targetOccurrenceRef": "occ-0001", "status": "SETTLED" }
+      ],
+      "labelHistory": [
+        {
+          "version": 1,
+          "decidedByRoleRef": "role-annotator-1",
+          "decidedAt": "2026-01-15T09:06:00Z",
+          "groundTruth": {
+            "status": "LABELED",
+            "semantic": {
+              "semanticType": "ENGINEERING_IDENTIFIER",
+              "domain": "PLM",
+              "subtype": "DRAWING_NUMBER"
+            },
+            "privacy": { "personalData": "UNKNOWN", "specialCategory": "UNKNOWN", "jurisdictions": [] },
+            "sensitivity": "INTERNAL",
+            "confidence": "MEDIUM"
+          }
+        },
+        {
+          "version": 2,
+          "decidedByRoleRef": "role-annotator-2",
+          "decidedAt": "2026-01-15T10:12:00Z",
+          "groundTruth": {
+            "status": "LABELED",
+            "semantic": {
+              "semanticType": "ENGINEERING_IDENTIFIER",
+              "domain": "PLM",
+              "subtype": "PARTITION_NUMBER"
+            },
+            "privacy": { "personalData": "UNKNOWN", "specialCategory": "UNKNOWN", "jurisdictions": [] },
+            "sensitivity": "INTERNAL",
+            "confidence": "MEDIUM"
+          }
+        }
+      ]
+    },
+    {
+      "occurrenceRef": "occ-0003",
+      "fieldRef": "field-0",
+      "span": { "unit": "CODE_POINT", "start": 44, "end": 60 },
+      "origin": "MANUAL",
+      "proposalProducers": [],
+      "missReason": "DETECTOR_MISS_CONFIRMED",
+      "dictionaryState": "NO_MATCH",
+      "entityRef": "entity-0002",
+      "relationships": [],
+      "labelHistory": [
+        {
+          "version": 1,
+          "decidedByRoleRef": "role-annotator-1",
+          "decidedAt": "2026-01-15T09:18:00Z",
+          "groundTruth": {
+            "status": "LABELED",
+            "semantic": {
+              "semanticType": "USER_ACCOUNT",
+              "domain": "IT",
+              "subtype": "USERNAME"
+            },
+            "privacy": { "personalData": "UNKNOWN", "specialCategory": "UNKNOWN", "jurisdictions": [] },
+            "sensitivity": "INTERNAL",
+            "confidence": "LOW"
+          }
+        }
+      ]
+    },
+    {
+      "occurrenceRef": "occ-0004",
+      "fieldRef": "field-0",
+      "span": { "unit": "CODE_POINT", "start": 61, "end": 68 },
+      "origin": "PROPOSED",
+      "proposalProducers": ["hylja.infrastructure-identifiers/1"],
+      "dictionaryState": "NOT_APPLICABLE",
+      "relationships": [],
+      "labelHistory": [
+        {
+          "version": 1,
+          "decidedByRoleRef": "role-annotator-1",
+          "decidedAt": "2026-01-15T09:24:00Z",
+          "groundTruth": {
+            "status": "LABELED",
+            "semantic": {
+              "semanticType": "NETWORK_IDENTIFIER",
+              "domain": "IT",
+              "subtype": "PORT"
+            },
+            "privacy": { "personalData": "NO", "specialCategory": "NO", "jurisdictions": [] },
+            "sensitivity": "INTERNAL",
+            "confidence": "HIGH"
+          },
+          "taskPreference": {
+            "status": "LABELED",
+            "taskRef": "task-demo-0001",
+            "destinationRef": "sink-profile-demo-external",
+            "exactValueRequired": "SOMETIMES",
+            "preferredRepresentation": "KEEP"
+          }
+        }
+      ]
+    },
+    {
+      "occurrenceRef": "occ-0005",
+      "fieldRef": "field-1",
+      "span": { "unit": "CODE_POINT", "start": 7, "end": 19 },
+      "origin": "PROPOSED",
+      "proposalProducers": ["hylja.contact-candidates/2"],
+      "dictionaryState": "MATCHED",
+      "entityRef": "entity-0003",
+      "relationships": [],
+      "labelHistory": [
+        {
+          "version": 1,
+          "decidedByRoleRef": "role-annotator-2",
+          "decidedAt": "2026-01-15T11:02:00Z",
+          "groundTruth": { "status": "UNKNOWN", "unknownReason": "INSUFFICIENT_CONTEXT" }
+        }
+      ]
+    },
+    {
+      "occurrenceRef": "occ-0006",
+      "fieldRef": "field-1",
+      "span": { "unit": "CODE_POINT", "start": 30, "end": 42 },
+      "origin": "PROPOSED",
+      "proposalProducers": ["hylja.contact-candidates/2"],
+      "dictionaryState": "MATCHED",
+      "entityRef": "entity-0004",
+      "relationships": [],
+      "labelHistory": [
+        {
+          "version": 1,
+          "decidedByRoleRef": "role-annotator-2",
+          "decidedAt": "2026-01-15T11:09:00Z",
+          "groundTruth": { "status": "ABSTAINED", "abstainReason": "POLICY_QUESTION_ESCALATED" },
+          "taskPreference": {
+            "status": "LABELED",
+            "taskRef": "task-demo-0001",
+            "destinationRef": "sink-profile-demo-external",
+            "exactValueRequired": "SOMETIMES",
+            "preferredRepresentation": "SYNTHETIC"
+          }
+        }
+      ]
+    },
+    {
+      "occurrenceRef": "occ-0007",
+      "fieldRef": "field-0",
+      "span": { "unit": "CODE_POINT", "start": 12, "end": 24 },
+      "origin": "MANUAL",
+      "proposalProducers": [],
+      "missReason": "COMPOUND_OR_COMPOSITE_SPAN",
+      "dictionaryState": "NO_MATCH",
+      "relationships": [
+        { "kind": "REFERENCES", "targetOccurrenceRef": "occ-0001", "status": "SETTLED" }
+      ],
+      "labelHistory": [
+        {
+          "version": 1,
+          "decidedByRoleRef": "role-annotator-1",
+          "decidedAt": "2026-01-15T09:31:00Z",
+          "groundTruth": {
+            "status": "LABELED",
+            "semantic": {
+              "semanticType": "ENGINEERING_IDENTIFIER",
+              "domain": "PLM",
+              "subtype": "REVISION_ID"
+            },
+            "privacy": { "personalData": "UNKNOWN", "specialCategory": "UNKNOWN", "jurisdictions": [] },
+            "sensitivity": "INTERNAL",
+            "confidence": "MEDIUM"
+          }
+        }
+      ]
+    }
+  ],
+  "taskFidelityContracts": [
+    {
+      "contractRef": "contract-demo-0001",
+      "taskRef": "task-demo-0001",
+      "ownerRoleRef": "role-task-owner-1",
+      "requirements": [
+        { "targetRef": "occ-0003", "predicates": ["EXISTENCE", "KIND"] }
+      ]
+    }
+  ]
+}
