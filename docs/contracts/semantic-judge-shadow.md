@@ -50,6 +50,10 @@ Rules:
   never writes raw input text into either;
 - a `propose` block may name a semantic class only. Sensitivity, reversibility and scope are not
   accepted as shadow claims, and an unknown field is `UNEXPECTED_FIELD`;
+- a `noul` question proposes one class (`semanticType`); a `choice` or `score` question maps every
+  option or level (`byLabel`). A bare `semanticType` on a labelled question, or `byLabel` on a Noul,
+  is refused (`INVALID_REQUEST`) rather than accepted and silently ignored, which would leave the
+  question abstaining forever;
 - a duplicate id, an over-long question set or an out-of-range option or level count is refused
   before any request exists;
 - changing a set changes its version. A record from a previous version is not comparable evidence.
@@ -99,9 +103,45 @@ caller cancellation aborts the judge's own work, while the deadline only stops *
 answer is discarded and never merged into the record. Failures never produce an empty-looking
 success: the outcome is always explicit and every reason is a closed code.
 
+`runShadowJudgment` never throws and neither promise it returns ever rejects. A hostile or
+time-varying caller object, a script that cannot be interpreted, or a caller object whose `Proxy`
+traps throw all resolve a conservative record with closed codes; identity that was never validated
+is reported as the fixed placeholder `unbound`, never as the value that failed. This matters
+because `settlement` is the documented way to observe late work: a rejected `record` promise would
+have no handler attached and would terminate the process under Node's default
+`--unhandled-rejections=throw`.
+
+The caller's `input` is read exactly once. The candidate, its neighbours and its context are taken
+from a single validated descriptor snapshot, so an object that answers differently on a second read
+cannot substitute a value that was never validated for the one that was.
+
 An option object with an unknown key (`safe`, `synthetic`, `trusted`, `destinationPolicy`,
 `routeBinding`, `byteVerified`, `authorization`, ...) is refused. A caller flag is not an
 authorization primitive, and neither is a token-shaped string in a candidate reference.
+
+## Data-only input and output
+
+A local script, and any body a protocol adapter validates, is **data**, never behavior:
+
+- `createLocalShadowJudge` copies each answer through own enumerable **data** descriptors into frozen
+  JSON values under a depth, key, string and byte budget (`SHADOW_MAX_JSON_DEPTH`,
+  `SHADOW_MAX_JSON_KEYS`, `SHADOW_MAX_JSON_STRING`, `SHADOW_MAX_RESPONSE_COPY_BYTES`). An accessor,
+  a function, a `toJSON` method, a symbol, a BigInt, a cycle, a sparse array, a non-finite number, a
+  custom prototype or an over-budget value is refused there, with `INVALID_REQUEST`, **before any
+  caller code can run**. Nothing a caller supplied is executed later by parsing, measuring or
+  recording, and later caller mutation cannot change an issued judge.
+- A script may answer at most `SHADOW_MAX_SCRIPT_ANSWER_KEYS` keys (the whole question set). The
+  parser allows a surplus of `expected.size + SHADOW_MAX_QUESTIONS` keys, so a module-issued judge
+  can never produce a payload the seam then refuses to interpret: a surplus answer is an explicit
+  `UNKNOWN_ANSWER` reason, not a failed run.
+- Serialization for the size checks is Hylja's own bounded walk, not `JSON.stringify`: it reads only
+  own enumerable data descriptors, never consults `toJSON`, a prototype or `[[Get]]`, and stops at a
+  byte ceiling that is a multiple of the documented limit, so an oversized request or response is
+  still refused by its own closed over-limit code.
+- A caller `Proxy`'s traps are the one thing JavaScript still runs before they can be contained. A
+  trap that throws is reported as the context's own closed code (`INVALID_REQUEST` for
+  configuration and requests, `MALFORMED_RESPONSE` for responses), so no caller exception message
+  leaves this module or its adapter.
 
 ## Records and privacy
 
@@ -111,10 +151,14 @@ authorization primitive, and neither is a token-shaped string in a candidate ref
 - Nothing in a record, a reason, a thrown code or a diagnostic contains a raw value, a model answer's
   free text, a provider error body or an arbitrary exception message. Rubric text a provider echoes in
   a Score legend is shape-checked and counted, never returned.
-- Failure, timeout, cancellation and refusal keep interaction, tenant, candidate, question-set and
-  judge identity plus the echoed deterministic floor, so an outage is attributable without carrying
-  anything protected. `deterministicFloor` is a caller assertion recorded for evaluation; nothing in
-  this module reads it, and no field of a record can lower it.
+- Failure, timeout and cancellation **after a request was built**, and any refusal of a response the
+  seam could not interpret, keep interaction, tenant, candidate, question-set and judge identity plus
+  the echoed deterministic floor, so an outage is attributable without carrying anything protected. A
+  refusal decided **before** a request exists — `EXTERNAL`, a forged set or judge, input that cannot
+  be validated — carries the fixed `unbound` placeholder instead, because no identity was ever
+  validated; it never carries an unvalidated or raw value, and the floor is echoed once it was read.
+  `deterministicFloor` is a caller assertion recorded for evaluation; nothing in this module reads it,
+  and no field of a record can lower it.
 - Evidence is shaped for the #3 composer's `semanticJudgments` channel (`version`, `id`, `status`,
   `provenance`, `claim`). The channel names the source, so a record carries no `source` field of its
   own, and a claim carries `semanticType` plus `confidence` only. A caller supplies the evidence to
@@ -191,6 +235,7 @@ Adapter rules:
 | late answer changing a final record | deadline stops waiting only; `settlement.late` observed and the late payload discarded |
 | judge failure mislabelled as a real answer | per-answer `INVALID`/`MISSING` status, closed reasons, `INCOMPLETE_ANSWERS` |
 | oversized or malformed metadata | `RESPONSE_TOO_LARGE` before parsing; usage, served model and answer-shape validation |
+| a rejected promise, or an exception thrown out of the entry point | `record` and `settlement` resolve for every input; a child process running the documented settlement-only usage exits 0 |
 | adversarial KEEP suggestion | a `keep_original_value` option yields a semantic claim only; shadow evidence alone stays `UNRESOLVED`, a deterministic `SECRET` credential floor survives, and policy denies the external sink with `semanticRecommendation: 'KEEP'` |
 | model-generated control text | `treatment`, `sensitivity`, `trust`, `instructions` and `authorization` fields are `UNEXPECTED_FIELD`; question ids are shape-constrained |
 | caller flags as authorization | `safe`/`synthetic`/`trusted`/`destinationPolicy`/`routeBinding`/`byteVerified` options are refused |
@@ -205,6 +250,16 @@ Known limits, stated rather than hidden:
   privacy-safe opaque; the integration must mint them, and this seam does not sanitize them;
 - question instruction and criteria text is trusted configuration; this seam cannot verify that it
   embeds no protected text, only that the core never writes raw input text into it;
+- reported probabilities are checked for complete, finite, in-range coverage of exactly the supplied
+  options or levels, but they are **not** required to sum to 1. That is a deliberate relaxation of the
+  documented distribution: a sum check would need an invented numeric tolerance, and a distribution
+  that does not normalize cannot change the locally derived argmax. A sum assertion is a candidate
+  evaluation question, not something this seam may calibrate;
+- a Score `score` reported by the provider is recorded but never used as the level, and a level is
+  never interpolated (see the model-jaggedness note above);
+- a timed-out run leaves the local double's own script timer pending, so a process can stay alive up
+  to `SHADOW_MAX_SCRIPT_LATENCY_MS`. The deadline only stops waiting; the late settlement is still
+  observable through `settlement.late`;
 - the local judge is a deterministic script; no model, provider, latency or cost behavior is measured
   here, and served-model, latency and usage metadata describe the double, not a hosted model;
 - no score is computed against any #39 protocol, and no held-out corpus, blind split, planted oracle

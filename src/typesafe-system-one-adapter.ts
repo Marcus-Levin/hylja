@@ -127,6 +127,14 @@ function closed(value: unknown, limit: number, code: ShadowReasonCode): string {
  */
 export function buildSystemOneBody(request: unknown, set: unknown,
   model?: string): SystemOneRequestBody {
+  try {
+    return readSystemOneBody(request, set, model);
+  } catch (error) {
+    // A caller-supplied Proxy exception is not a Hylja reason code and never leaves this module.
+    throw error instanceof Invalid ? error : new Invalid('INVALID_REQUEST');
+  }
+}
+function readSystemOneBody(request: unknown, set: unknown, model?: string): SystemOneRequestBody {
   if (!isIssuedShadowRequest(request) || !isIssuedShadowQuestionSet(set)) fail('INVALID_REQUEST');
   const value = request as MinimizedShadowRequest;
   const questions = value.questions;
@@ -219,6 +227,15 @@ export interface ParsedSystemOneResponse {
  * defects become closed problems, so one bad answer cannot hide the rest.
  */
 export function parseSystemOneResponse(body: unknown, set: unknown): ParsedSystemOneResponse {
+  try {
+    return readSystemOneResponse(body, set);
+  } catch (error) {
+    // A body that cannot even be read is one malformed response, and a caller's own exception
+    // message is never a Hylja reason code.
+    throw error instanceof Invalid ? error : new Invalid('MALFORMED_RESPONSE');
+  }
+}
+function readSystemOneResponse(body: unknown, set: unknown): ParsedSystemOneResponse {
   if (!isIssuedShadowQuestionSet(set)) fail('INVALID_REQUEST');
   const setValue = set as ShadowQuestionSet;
   const v = fields(body, ['model', 'answers', 'usage'], [], 'MALFORMED_RESPONSE');

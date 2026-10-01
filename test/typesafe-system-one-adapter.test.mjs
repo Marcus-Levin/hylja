@@ -242,6 +242,31 @@ test('a Noul without criteria and a non-map legend stay inside the documented sh
   }
 });
 
+test('a hostile body or request is a closed code, never a caller exception or its message', () => {
+  const set = questionSet();
+  // A Proxy trap that throws must not carry the caller's own message out of either entry point.
+  const hostile = new Proxy(wire({}), { ownKeys() { throw new Error(`planted ${PLANTED}`); } });
+  assert.throws(() => parseSystemOneResponse(hostile, set), (error) =>
+    error.message === 'MALFORMED_RESPONSE' && !error.message.includes(PLANTED));
+  const hostileAnswers = new Proxy({}, { ownKeys() { throw new Error(`planted ${PLANTED}`); } });
+  assert.throws(() => parseSystemOneResponse(wire(hostileAnswers), set), (error) =>
+    error.message === 'MALFORMED_RESPONSE' && !error.message.includes(PLANTED));
+  // Brand refusal happens before any read, so a look-alike set or request is a request defect.
+  const hostileSet = new Proxy(set, { getPrototypeOf() { throw new Error(`planted ${PLANTED}`); } });
+  assert.throws(() => parseSystemOneResponse(wire({}), hostileSet), (error) => error.message === 'INVALID_REQUEST');
+  const hostileRequest = new Proxy(request(), { getPrototypeOf() { throw new Error(`planted ${PLANTED}`); } });
+  assert.throws(() => buildSystemOneBody(hostileRequest, set, 'jev-1.13.0'), (error) =>
+    error.message === 'INVALID_REQUEST' && !error.message.includes(PLANTED));
+  // Data that is not JSON is still refused per answer with a closed code, not an executed hook.
+  let invoked = 0;
+  const withToJson = { is_person: { type: 'noul', noul: 0.9,
+    toJSON() { invoked += 1; return { type: 'noul', noul: 0.9 }; } } };
+  const parsed = parseSystemOneResponse(wire(withToJson), set);
+  assert.deepEqual([...parsed.problems], ['UNEXPECTED_FIELD']);
+  assert.equal(invoked, 0, 'a response field is data, never a callback to run');
+  assert.equal(Object.keys(parsed.payload.answers).length, 0);
+});
+
 test('documented provider statuses map to distinct closed shadow reasons', () => {
   const expected = { 401: 'PROVIDER_UNAUTHORIZED', 422: 'PROVIDER_REJECTED', 429: 'PROVIDER_RATE_LIMITED',
     529: 'PROVIDER_OVERLOADED' };

@@ -23,6 +23,10 @@
  * Every outcome is an explicit conservative record. A missing, malformed, abstained, refused,
  * timed-out or cancelled judgment is recorded as such, never as "no problem", and a failure can
  * only add reasons: it never returns a treatment, grants release, or lowers a deterministic floor.
+ * `runShadowJudgment` never throws and neither of the two promises it returns ever rejects, because
+ * a caller that observes only `settlement` -- the documented way to watch late work -- would
+ * otherwise leave a rejection unhandled and lose the process to Node's default behavior. It reads
+ * the caller's input exactly once, through the same validating snapshot that builds the request.
  *
  * The judge answers a provider-independent canonical shape. A documented provider wire shape is
  * translated by a separate narrow adapter; see docs/contracts/semantic-judge-shadow.md.
@@ -43,6 +47,27 @@ export const SHADOW_MAX_CONTEXT_ENTRIES = 8;
 export const SHADOW_MIN_DEADLINE_MS = 1;
 export const SHADOW_MAX_DEADLINE_MS = 30_000;
 export const SHADOW_MAX_SCRIPT_LATENCY_MS = 60_000;
+/**
+ * A local script may answer at most the whole question set. The parser allows a surplus of
+ * `expected.size + SHADOW_MAX_QUESTIONS` keys and the script adds one documented padding key, so a
+ * module-issued judge can never outrun the parser and turn an ordinary run into a refusal.
+ */
+export const SHADOW_MAX_SCRIPT_ANSWER_KEYS = SHADOW_MAX_QUESTIONS;
+/**
+ * Copy ceilings for anything a caller hands this module. A script and a provider body are DATA:
+ * they are copied into inert JSON values (own enumerable data descriptors only, no getter,
+ * `toJSON`, custom prototype, function, symbol, cycle, hole or non-finite number) before they are
+ * validated, measured, parsed or recorded.
+ */
+export const SHADOW_MAX_JSON_DEPTH = 12;
+export const SHADOW_MAX_JSON_KEYS = 4096;
+/**
+ * Deliberately above `SHADOW_MAX_RESPONSE_BYTES`: an oversized response must still be refused by
+ * the documented size check, not by the copy that protects the check. The request and response
+ * serializers stop at four and eight times their own limits for the same reason.
+ */
+export const SHADOW_MAX_RESPONSE_COPY_BYTES = SHADOW_MAX_RESPONSE_BYTES * 2;
+export const SHADOW_MAX_JSON_STRING = SHADOW_MAX_RESPONSE_COPY_BYTES;
 /** Documented System One limits: at most 255 Choice options, and 2 to 10 Score levels. */
 export const SHADOW_MAX_CHOICE_OPTIONS = 255;
 export const SHADOW_MIN_SCORE_LEVELS = 2;
@@ -343,9 +368,9 @@ function fields(value: unknown, required: readonly string[], optional: readonly 
   for (const name of required) if (!Object.hasOwn(result, name)) fail(code);
   return result;
 }
-function label(value: unknown, limit = 128): string {
+function label(value: unknown, limit = 128, code: ShadowReasonCode = 'INVALID_REQUEST'): string {
   if (typeof value !== 'string' || value.length < 1 || value.length > limit || value.trim() !== value ||
-    CONTROL.test(value)) fail('INVALID_REQUEST');
+    CONTROL.test(value)) fail(code);
   return value;
 }
 function token(value: unknown, limit = 64): string {
@@ -382,8 +407,151 @@ function boundedCount(value: unknown, min: number, max: number, code: ShadowReas
 function codes(values: Iterable<ShadowReasonCode>): readonly ShadowReasonCode[] {
   return Object.freeze([...new Set(values)].sort());
 }
-function encode(value: unknown): Uint8Array {
-  return new TextEncoder().encode(JSON.stringify(value) ?? '');
+/** Exact UTF-8 length without allocating, so a copy budget and a byte ceiling stay exact. */
+function utf8Length(text: string): number {
+  let length = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    if (unit < 0x80) length += 1;
+    else if (unit < 0x800) length += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < text.length &&
+      text.charCodeAt(index + 1) >= 0xdc00 && text.charCodeAt(index + 1) <= 0xdfff) {
+      length += 4; index += 1;
+    } else length += 3;
+  }
+  return length;
+}
+
+/* ----------------------------------------------------------------- bounded, data-only JSON */
+
+interface JsonBudget { keys: number; bytes: number; }
+function jsonBudget(): JsonBudget {
+  return { keys: SHADOW_MAX_JSON_KEYS, bytes: SHADOW_MAX_RESPONSE_COPY_BYTES };
+}
+/**
+ * Copy one JSON value through own enumerable DATA descriptors, with a depth, key, string and byte
+ * budget.
+ *
+ * This is the data-only boundary. `JSON.stringify` would consult `toJSON`, read accessors through
+ * [[Get]] and walk a prototype chain; none of that happens here, so a caller-supplied getter,
+ * function, symbol, cycle, hole or non-finite number is refused instead of executed. A `Proxy`'s
+ * traps are the one thing JavaScript still runs before they can be contained, and any trap that
+ * throws is reported as this context's closed code by the callers below.
+ */
+function copyJsonData(value: unknown, budget: JsonBudget, code: ShadowReasonCode,
+  depth = 0): unknown {
+  if (depth > SHADOW_MAX_JSON_DEPTH) fail(code);
+  if (value === null) return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) fail(code);
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (value.length > SHADOW_MAX_JSON_STRING) fail(code);
+    budget.bytes -= utf8Length(value);
+    if (budget.bytes < 0) fail(code);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const result: unknown[] = [];
+    for (const item of arrayOf(value, SHADOW_MAX_JSON_KEYS, code, 0)) {
+      budget.keys -= 1;
+      if (budget.keys < 0) fail(code);
+      result.push(copyJsonData(item, budget, code, depth + 1));
+    }
+    return Object.freeze(result);
+  }
+  if (value === null || typeof value !== 'object' ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail(code);
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > SHADOW_MAX_JSON_KEYS || keys.some((key) => typeof key !== 'string')) fail(code);
+  // A null-prototype target, so a `__proto__` key stays inert data instead of a prototype write.
+  const result: Fields = Object.create(null) as Fields;
+  for (const key of keys as string[]) {
+    budget.keys -= 1;
+    if (budget.keys < 0) fail(code);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !('value' in descriptor)) fail(code);
+    result[key] = copyJsonData(descriptor.value, budget, code, depth + 1);
+  }
+  return Object.freeze(result);
+}
+
+interface SerializeState { parts: string[]; bytes: number; ceiling: number; code: ShadowReasonCode; }
+function emit(state: SerializeState, text: string): void {
+  state.bytes += utf8Length(text);
+  if (state.bytes > state.ceiling) fail(state.code);
+  state.parts.push(text);
+}
+function jsonString(text: string, state: SerializeState): void {
+  let out = '"';
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    if (unit === 0x22) out += '\\"';
+    else if (unit === 0x5c) out += '\\\\';
+    else if (unit === 0x08) out += '\\b';
+    else if (unit === 0x09) out += '\\t';
+    else if (unit === 0x0a) out += '\\n';
+    else if (unit === 0x0c) out += '\\f';
+    else if (unit === 0x0d) out += '\\r';
+    else if (unit < 0x20) out += `\\u${unit.toString(16).padStart(4, '0')}`;
+    else if (unit >= 0xd800 && unit <= 0xdfff) {
+      const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0;
+      if (unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) { out += text[index]! + text[index + 1]!; index += 1; }
+      // A lone surrogate escapes, as well-formed JSON does, so the encoding stays reversible.
+      else out += `\\u${unit.toString(16).padStart(4, '0')}`;
+    } else out += text[index]!;
+  }
+  emit(state, `${out}"`);
+}
+function serializeJson(value: unknown, state: SerializeState, depth = 0): void {
+  if (depth > SHADOW_MAX_JSON_DEPTH) fail(state.code);
+  if (value === null) { emit(state, 'null'); return; }
+  if (typeof value === 'boolean') { emit(state, value ? 'true' : 'false'); return; }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) fail(state.code);
+    emit(state, String(value)); return;
+  }
+  if (typeof value === 'string') { jsonString(value, state); return; }
+  if (Array.isArray(value)) {
+    const items = arrayOf(value, SHADOW_MAX_JSON_KEYS, state.code, 0);
+    emit(state, '[');
+    for (let index = 0; index < items.length; index += 1) {
+      if (index > 0) emit(state, ',');
+      serializeJson(items[index], state, depth + 1);
+    }
+    emit(state, ']');
+    return;
+  }
+  if (value === null || typeof value !== 'object' ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail(state.code);
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key !== 'string')) fail(state.code);
+  emit(state, '{');
+  let first = true;
+  for (const key of keys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !('value' in descriptor)) fail(state.code);
+    if (!first) emit(state, ',');
+    first = false;
+    jsonString(key, state);
+    emit(state, ':');
+    serializeJson(descriptor.value, state, depth + 1);
+  }
+  emit(state, '}');
+}
+/**
+ * Bounded, data-only JSON serialization with a byte ceiling.
+ *
+ * The ceiling is always a multiple of the documented limit the caller is about to check, so hitting
+ * it means the value is already over that limit: the caller's own closed over-limit code is the
+ * right answer, and the work stays linear in the ceiling rather than in an oversized input.
+ */
+function jsonBytes(value: unknown, ceiling: number, code: ShadowReasonCode): Uint8Array {
+  const state: SerializeState = { parts: [], bytes: 0, ceiling, code };
+  serializeJson(value, state, 0);
+  return new TextEncoder().encode(state.parts.join(''));
 }
 function sha256(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
@@ -399,6 +567,14 @@ function now(): number {
  * cannot know whether an instruction embeds protected text, and it never writes raw text into one.
  */
 export function defineShadowQuestionSet(spec: unknown): ShadowQuestionSet {
+  try {
+    return readShadowQuestionSet(spec);
+  } catch (error) {
+    // A caller's own Proxy exception is not a Hylja reason code, so it never leaves this module.
+    throw error instanceof Invalid ? error : new Invalid('INVALID_REQUEST');
+  }
+}
+function readShadowQuestionSet(spec: unknown): ShadowQuestionSet {
   const v = fields(spec, ['id', 'version', 'questions']);
   const questions: ShadowQuestion[] = [];
   const seen = new Set<string>();
@@ -478,22 +654,36 @@ function scoreLevels(value: unknown): readonly string[] {
 /** A proposal may name a semantic class only. Sensitivity, reversibility and scope are excluded. */
 function proposal(value: unknown, choices: readonly string[]): ShadowProposal {
   const v = fields(value, [], ['semanticType', 'byLabel']);
-  if (v.semanticType !== undefined) member(v.semanticType, SEMANTIC_CLASSES);
-  if (v.byLabel !== undefined) {
-    if (v.byLabel === null || typeof v.byLabel !== 'object' || Array.isArray(v.byLabel) ||
-      ![Object.prototype, null].includes(Object.getPrototypeOf(v.byLabel))) fail('INVALID_REQUEST');
-    const byLabel: Record<string, SemanticClass | 'NONE'> = Object.create(null) as
-      Record<string, SemanticClass | 'NONE'>;
-    for (const [key, mapped] of Object.entries(v.byLabel as Record<string, unknown>)) {
-      if (!choices.includes(key)) fail('UNKNOWN_CHOICE_LABEL');
-      if (mapped !== 'NONE') member(mapped, SEMANTIC_CLASSES);
-      byLabel[key] = mapped as SemanticClass | 'NONE';
-    }
-    return Object.freeze({ ...(v.semanticType === undefined ? {} : { semanticType: v.semanticType as SemanticClass }),
-      byLabel: Object.freeze(byLabel) });
+  if (choices.length > 0) {
+    // A labelled question maps each option or level to a class. A bare `semanticType` beside it
+    // would be silently ignored and the question would abstain forever, so it is refused instead
+    // of being trusted as configuration that does nothing.
+    if (v.semanticType !== undefined || v.byLabel === undefined) fail('INVALID_REQUEST');
+    return Object.freeze({ byLabel: frozenByLabel(v.byLabel, choices) });
   }
-  if (v.semanticType === undefined) fail('INVALID_REQUEST');
+  if (v.semanticType === undefined || v.byLabel !== undefined) fail('INVALID_REQUEST');
+  member(v.semanticType, SEMANTIC_CLASSES);
   return Object.freeze({ semanticType: v.semanticType as SemanticClass });
+}
+function frozenByLabel(value: unknown, choices: readonly string[]): Readonly<Record<string,
+  SemanticClass | 'NONE'>> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail('INVALID_REQUEST');
+  const byLabel: Record<string, SemanticClass | 'NONE'> = Object.create(null) as
+    Record<string, SemanticClass | 'NONE'>;
+  // Own data descriptors only, as for every other object this module reads: an accessor here would
+  // run caller code during trusted configuration.
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key !== 'string')) fail('INVALID_REQUEST');
+  for (const key of keys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !('value' in descriptor)) fail('INVALID_REQUEST');
+    if (!choices.includes(key)) fail('UNKNOWN_CHOICE_LABEL');
+    const mapped = descriptor.value;
+    if (mapped !== 'NONE') member(mapped, SEMANTIC_CLASSES);
+    byLabel[key] = mapped as SemanticClass | 'NONE';
+  }
+  return Object.freeze(byLabel);
 }
 
 /* ---------------------------------------------------------------------------------- request build */
@@ -526,13 +716,33 @@ function neighborKinds(value: unknown): readonly ShadowCandidateKind[] {
 function placeholder(prefix: string, index: number): string {
   return `${prefix}-${String(index + 1).padStart(2, '0')}`;
 }
-/** Local minimization. Raw candidate and neighbouring text never reach the returned request. */
-export function minimizeShadowRequest(interactionRef: unknown, tenantRef: unknown, set: unknown,
-  judge: unknown, input: unknown): MinimizedShadowRequest {
+interface PreparedShadowRequest {
+  readonly request: MinimizedShadowRequest;
+  readonly requestBytes: Uint8Array;
+  /** Attribution taken from the same validated snapshot, never from a second read. */
+  readonly candidateRef: string;
+}
+/**
+ * Local minimization, and the single validated read of the caller's input.
+ *
+ * The candidate, its neighbours and its context are each read once, through `fields()`, and the
+ * values that survive validation are the only ones used. A caller object that answers differently
+ * on a second read therefore cannot substitute a value that was never validated.
+ */
+function prepareShadowRequest(interactionRef: unknown, tenantRef: unknown, set: unknown,
+  judge: unknown, input: unknown): PreparedShadowRequest {
+  try {
+    return readShadowRequest(interactionRef, tenantRef, set, judge, input);
+  } catch (error) {
+    throw error instanceof Invalid ? error : new Invalid('INVALID_REQUEST');
+  }
+}
+function readShadowRequest(interactionRef: unknown, tenantRef: unknown, set: unknown, judge: unknown,
+  input: unknown): PreparedShadowRequest {
   if (SHADOW_BRANDS.get(set as object) !== 'set') fail('INVALID_REQUEST');
   if (SHADOW_BRANDS.get(judge as object) !== 'judge') fail('INVALID_REQUEST');
-  const candidate = fields(fields(input, ['candidate'], ['neighbors', 'context']).candidate,
-    ['ref', 'kind', 'raw']);
+  const top = fields(input, ['candidate'], ['neighbors', 'context']);
+  const candidate = fields(top.candidate, ['ref', 'kind', 'raw']);
   const ref = label(candidate.ref, 256);
   const kind = member(candidate.kind, SHADOW_CANDIDATE_KINDS);
   // Read for validation only. The value is dropped here and is never stored or returned.
@@ -548,10 +758,10 @@ export function minimizeShadowRequest(interactionRef: unknown, tenantRef: unknow
     model: Object.freeze({ requested: 'local-synthetic' }),
     state: Object.freeze({
       candidate: Object.freeze({ placeholder: placeholder('cand', 0), kind }),
-      neighbors: Object.freeze(neighborKinds((input as ShadowCandidateInput).neighbors)
+      neighbors: Object.freeze(neighborKinds(top.neighbors)
         .map((neighborKind, index) => Object.freeze({ placeholder: placeholder('nbr', index),
           kind: neighborKind }))),
-      context: contextEntries((input as ShadowCandidateInput).context),
+      context: contextEntries(top.context),
     }),
     questions: Object.freeze(setValue.questions.map((question) => Object.freeze({
       id: question.id, kind: question.kind, purpose: question.purpose,
@@ -559,12 +769,19 @@ export function minimizeShadowRequest(interactionRef: unknown, tenantRef: unknow
       ...(question.criteria === undefined ? {} : { criteria: question.criteria }),
     }))),
   };
-  if (encode(request).length > SHADOW_MAX_REQUEST_BYTES) fail('REQUEST_TOO_LARGE');
+  // The ceiling is a multiple of the documented limit, so passing it still reports REQUEST_TOO_LARGE.
+  const requestBytes = jsonBytes(request, SHADOW_MAX_REQUEST_BYTES * 4, 'REQUEST_TOO_LARGE');
+  if (requestBytes.length > SHADOW_MAX_REQUEST_BYTES) fail('REQUEST_TOO_LARGE');
   const frozen = Object.freeze(request);
   // A minimized request is branded. A provider adapter may only translate a request this seam
   // issued, so a hand-built object cannot smuggle raw text into an outbound judge state.
   requestBrands.add(frozen);
-  return frozen;
+  return Object.freeze({ request: frozen, requestBytes, candidateRef: ref });
+}
+/** Local minimization. Raw candidate and neighbouring text never reach the returned request. */
+export function minimizeShadowRequest(interactionRef: unknown, tenantRef: unknown, set: unknown,
+  judge: unknown, input: unknown): MinimizedShadowRequest {
+  return prepareShadowRequest(interactionRef, tenantRef, set, judge, input).request;
 }
 
 /* -------------------------------------------------------------------------------- canonical parse */
@@ -579,10 +796,19 @@ export interface ParsedShadowPayload {
 }
 /** Strict validation of the canonical payload against the question set. Throws only closed codes. */
 export function parseShadowJudgePayload(payload: unknown, set: unknown): ParsedShadowPayload {
+  try {
+    return readShadowJudgePayload(payload, set);
+  } catch (error) {
+    // A caller's own Proxy exception is not a Hylja reason code: a provider body that cannot even be
+    // read is one malformed response.
+    throw error instanceof Invalid ? error : new Invalid('MALFORMED_RESPONSE');
+  }
+}
+function readShadowJudgePayload(payload: unknown, set: unknown): ParsedShadowPayload {
   if (SHADOW_BRANDS.get(set as object) !== 'set') fail('INVALID_REQUEST');
   const setValue = set as ShadowQuestionSet;
   const v = fields(payload, ['servedModel', 'answers'], ['usage'], 'MALFORMED_RESPONSE');
-  const servedModel = label(v.servedModel, 128);
+  const servedModel = label(v.servedModel, 128, 'MALFORMED_RESPONSE');
   let usage: { inputTokens: number; outputTokens: number } | null = null;
   if (Object.hasOwn(v, 'usage')) {
     const u = fields(v.usage, ['inputTokens', 'outputTokens'], [], 'MALFORMED_RESPONSE');
@@ -597,6 +823,8 @@ export function parseShadowJudgePayload(payload: unknown, set: unknown): ParsedS
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw) ||
     ![Object.prototype, null].includes(Object.getPrototypeOf(raw))) fail('MALFORMED_RESPONSE');
   const ids = Reflect.ownKeys(raw);
+  // A module-issued local judge answers at most the whole set plus one documented padding key, so
+  // this bound can only be reached by an externally supplied body, which is refused as malformed.
   if (ids.length > expected.size + SHADOW_MAX_QUESTIONS) fail('MALFORMED_RESPONSE');
   const problems = new Set<ShadowReasonCode>();
   // This version runs local doubles only, so a hosted served-model label is a closed problem here
@@ -682,6 +910,14 @@ function probabilityMap(raw: unknown, keys: readonly string[]): Readonly<Record<
  * a local double can never be mistaken for a hosted judgment in an evaluation record.
  */
 export function createLocalShadowJudge(script: unknown): ShadowJudge {
+  try {
+    return readLocalShadowJudge(script);
+  } catch (error) {
+    // A caller's own Proxy exception is not a Hylja reason code, so it never leaves this module.
+    throw error instanceof Invalid ? error : new Invalid('INVALID_REQUEST');
+  }
+}
+function readLocalShadowJudge(script: unknown): ShadowJudge {
   const v = fields(script, ['id', 'version', 'servedModel', 'latencyMs', 'mode'],
     ['answers', 'responsePadBytes']);
   const servedModel = label(v.servedModel, 128);
@@ -692,23 +928,35 @@ export function createLocalShadowJudge(script: unknown): ShadowJudge {
     mode: member(v.mode, ['ANSWER', 'REFUSE']),
     ...(v.answers === undefined ? {} : { answers: answerMap(v.answers) }),
     ...(v.responsePadBytes === undefined ? {} :
-      { responsePadBytes: boundedCount(v.responsePadBytes, 0, SHADOW_MAX_RESPONSE_BYTES * 4,
+      { responsePadBytes: boundedCount(v.responsePadBytes, 0, SHADOW_MAX_RESPONSE_COPY_BYTES,
         'INVALID_REQUEST') }),
   });
   SHADOW_BRANDS.set(judge, 'judge');
   return judge;
 }
+/**
+ * Copy the script's answers into inert, frozen JSON data.
+ *
+ * The seam accepts data, never behavior: an accessor, a function, a `toJSON` method, a symbol, a
+ * cycle, a hole, a non-finite number, a custom prototype or anything over the copy bounds is
+ * refused HERE, so nothing a caller supplied can be executed later by parsing, measuring or
+ * recording. One budget covers the whole map, so total work stays bounded.
+ */
 function answerMap(value: unknown): Readonly<Record<string, unknown>> {
   if (value === null || typeof value !== 'object' || Array.isArray(value) ||
     ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail('INVALID_REQUEST');
   const keys = Reflect.ownKeys(value);
-  if (keys.length > 64 || keys.some((key) => typeof key !== 'string')) fail('INVALID_REQUEST');
+  if (keys.length > SHADOW_MAX_SCRIPT_ANSWER_KEYS || keys.some((key) => typeof key !== 'string')) {
+    fail('INVALID_REQUEST');
+  }
+  const budget = jsonBudget();
   const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const key of keys as string[]) {
+    budget.keys -= 1;
     if (key.length > 32) fail('INVALID_REQUEST');
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor?.enumerable || !('value' in descriptor)) fail('INVALID_REQUEST');
-    result[key] = descriptor.value;
+    result[key] = copyJsonData(descriptor.value, budget, 'INVALID_REQUEST', 0);
   }
   return Object.freeze(result);
 }
@@ -736,7 +984,9 @@ function stopped(controller: AbortController): Promise<'stopped'> {
   });
 }
 function blankRecord(outcome: ShadowOutcome, reasons: readonly ShadowReasonCode[],
-  deadlineMs: number, latencyMs: number): ShadowJudgmentRecord {
+  deadlineMs: number, latencyMs: number,
+  floor: { sensitivity: Sensitivity | 'UNKNOWN'; source: 'INTEGRATION' | 'NONE' } =
+  { sensitivity: 'UNKNOWN', source: 'NONE' }): ShadowJudgmentRecord {
   return Object.freeze({
     version: 1, outcome, reasons: codes(reasons),
     interactionRef: 'unbound', tenantRef: 'unbound', candidateRef: 'unbound',
@@ -745,7 +995,8 @@ function blankRecord(outcome: ShadowOutcome, reasons: readonly ShadowReasonCode[
     model: Object.freeze({ requested: 'local-synthetic', served: 'NONE' }),
     request: Object.freeze({ digest: sha256(new Uint8Array(0)), bytes: 0 }),
     answers: Object.freeze([]), evidence: Object.freeze([]),
-    deterministicFloor: Object.freeze({ sensitivity: 'UNKNOWN', source: 'NONE' }),
+    // Identity is a fixed, safe, unbound placeholder here; the floor is echoed once it was read.
+    deterministicFloor: Object.freeze({ ...floor }),
     authority: 'NONE',
     advisory: Object.freeze({ suggestedTreatment: 'NONE', effect: 'IGNORED_NO_AUTHORITY' }),
     metadata: Object.freeze({ latencyMs: Math.max(0, Math.round(latencyMs)), responseBytes: 0,
@@ -792,8 +1043,22 @@ export interface ShadowRun {
  * Every outcome, including a timeout, an outage, a malformed body, an abstention or an unapproved
  * context, is an explicit conservative record. There is no code path here that selects a treatment,
  * grants release, relaxes protected egress or lowers deterministic credential evidence.
+ *
+ * Nothing throws out of this function and neither promise it returns ever rejects: a caller that
+ * observes only `settlement` -- the documented way to watch late work -- cannot leave an unhandled
+ * rejection behind, and a caller that observes `record` always gets a typed, conservative result.
  */
 export function runShadowJudgment(set: unknown, judge: unknown, interactionRef: unknown, tenantRef: unknown,
+  input: unknown, options: unknown): ShadowRun {
+  try {
+    return startShadowRun(set, judge, interactionRef, tenantRef, input, options);
+  } catch {
+    // Defense in depth: a caller-controlled object that no closed code describes is an invalid
+    // request, never an exception the caller must handle.
+    return settled(blankRecord('REFUSED', ['INVALID_REQUEST'], 0, 0), false);
+  }
+}
+function startShadowRun(set: unknown, judge: unknown, interactionRef: unknown, tenantRef: unknown,
   input: unknown, options: unknown): ShadowRun {
   const started = now();
   if (SHADOW_BRANDS.get(set as object) !== 'set' || SHADOW_BRANDS.get(judge as object) !== 'judge') {
@@ -815,9 +1080,13 @@ export function runShadowJudgment(set: unknown, judge: unknown, interactionRef: 
     deadlineMs = boundedCount(v.deadlineMs, SHADOW_MIN_DEADLINE_MS, SHADOW_MAX_DEADLINE_MS,
       'INVALID_REQUEST');
     if (Object.hasOwn(v, 'signal')) {
+      // The abort API is required up front: a signal-shaped object without it is a refusal, not a
+      // TypeError raised from inside this function.
       if (v.signal === null || typeof v.signal !== 'object' ||
-        typeof (v.signal as { aborted?: unknown }).aborted !== 'boolean') {
-        return settled(blankRecord('REFUSED', ['INVALID_REQUEST'], deadlineMs, 0), false);
+        typeof (v.signal as { aborted?: unknown }).aborted !== 'boolean' ||
+        typeof (v.signal as { addEventListener?: unknown }).addEventListener !== 'function' ||
+        typeof (v.signal as { removeEventListener?: unknown }).removeEventListener !== 'function') {
+        return settled(blankRecord('REFUSED', ['INVALID_REQUEST'], deadlineMs, 0, floor), false);
       }
       signal = v.signal as AbortSignal;
     }
@@ -828,18 +1097,18 @@ export function runShadowJudgment(set: unknown, judge: unknown, interactionRef: 
     }
   } catch (error) {
     return settled(blankRecord('REFUSED', [error instanceof Invalid ? error.code : 'INVALID_REQUEST'],
-      deadlineMs, 0), false);
+      deadlineMs, 0, floor), false);
   }
-  let request: MinimizedShadowRequest;
+  let prepared: PreparedShadowRequest;
   try {
-    request = minimizeShadowRequest(interactionRef, tenantRef, set, judge, input);
+    // One validated read of the caller's input. `candidateRef`, the request and its bytes all come
+    // from this single snapshot, so no caller object is read again after it was validated.
+    prepared = prepareShadowRequest(interactionRef, tenantRef, set, judge, input);
   } catch (error) {
     return settled(blankRecord('REFUSED', [error instanceof Invalid ? error.code : 'INVALID_REQUEST'],
-      deadlineMs, 0), false);
+      deadlineMs, 0, floor), false);
   }
-  const requestBytes = encode(request);
-  const candidateRef = label(fields(fields(input, ['candidate'], ['neighbors', 'context']).candidate,
-    ['ref', 'kind', 'raw']).ref, 256);
+  const { request, requestBytes, candidateRef } = prepared;
   const state = { final: false, late: false, failed: false };
   // Two independent controls, deliberately: caller cancellation aborts the judge's own work, while
   // the seam's deadline only stops WAITING. That is what makes a genuinely late result observable --
@@ -858,7 +1127,9 @@ export function runShadowJudgment(set: unknown, judge: unknown, interactionRef: 
   const judged = delay(judgeValue.latencyMs, caller.signal).then(() => {
     const late = state.final;
     if (late) state.late = true;
-    return Object.freeze({ late, payload: late ? null : judgePayload(judgeValue) });
+    let payload: ShadowCanonicalPayload | null = null;
+    try { payload = late ? null : judgePayload(judgeValue); } catch { state.failed = true; }
+    return Object.freeze({ late, payload });
   }, () => {
     state.failed = true;
     return Object.freeze({ late: state.final, payload: null });
@@ -868,33 +1139,42 @@ export function runShadowJudgment(set: unknown, judge: unknown, interactionRef: 
     judged.then((result) => ({ type: 'judged' as const, result })),
     stopped(waiting).then(() => ({ type: 'stopped' as const })),
   ]).then((outcome) => {
-    clearTimeout(timer);
-    detach();
+    // The record is final from this point, whether or not what follows succeeds.
     state.final = true;
-    if (outcome.type === 'judged') {
-      if (outcome.result.payload !== null) {
-        return buildRecord(request, setValue, judgeValue, candidateRef, requestBytes, floor, deadlineMs,
-          started, outcome.result.payload);
+    try {
+      clearTimeout(timer);
+      detach();
+      if (outcome.type === 'judged') {
+        if (outcome.result.payload !== null) {
+          return buildRecord(request, setValue, judgeValue, candidateRef, requestBytes, floor, deadlineMs,
+            started, outcome.result.payload);
+        }
+        // Order matters and must not depend on which promise settles first: a cancelled caller wins
+        // over a transport failure, and a transport failure wins over a plain refusal.
+        if (signal?.aborted === true) {
+          return idleRecord('CANCELLED', ['CANCELLED'], floor, deadlineMs, now() - started, request,
+            setValue, judgeValue, candidateRef, requestBytes);
+        }
+        return idleRecord('REFUSED', [state.failed ? 'ADAPTER_THREW' : 'ADAPTER_REFUSED'], floor, deadlineMs,
+          now() - started, request, setValue, judgeValue, candidateRef, requestBytes);
       }
-      // Order matters and must not depend on which promise settles first: a cancelled caller wins
-      // over a transport failure, and a transport failure wins over a plain refusal.
-      if (signal?.aborted === true) {
-        return idleRecord('CANCELLED', ['CANCELLED'], floor, deadlineMs, now() - started, request,
-          setValue, judgeValue, candidateRef, requestBytes);
-      }
-      return idleRecord('REFUSED', [state.failed ? 'ADAPTER_THREW' : 'ADAPTER_REFUSED'], floor, deadlineMs,
-        now() - started, request, setValue, judgeValue, candidateRef, requestBytes);
+      return idleRecord(signal?.aborted === true ? 'CANCELLED' : 'TIMEOUT',
+        [signal?.aborted === true ? 'CANCELLED' : 'TIMED_OUT'], floor, deadlineMs, now() - started, request,
+        setValue, judgeValue, candidateRef, requestBytes);
+    } catch (error) {
+      // An answer this module did not build could still fail to be interpreted. That is an explicit
+      // conservative record, never a rejected promise a caller has to remember to handle.
+      return idleRecord('REFUSED', [error instanceof Invalid ? error.code : 'INVALID_REQUEST'], floor,
+        deadlineMs, now() - started, request, setValue, judgeValue, candidateRef, requestBytes);
     }
-    return idleRecord(signal?.aborted === true ? 'CANCELLED' : 'TIMEOUT',
-      [signal?.aborted === true ? 'CANCELLED' : 'TIMED_OUT'], floor, deadlineMs, now() - started, request,
-      setValue, judgeValue, candidateRef, requestBytes);
   });
 
-  // `settlement` waits for the judge's own work even after the record is final.
+  // `settlement` waits for the judge's own work even after the record is final, and resolves even
+  // when the record path failed, so no caller of either promise can end up with an unhandled one.
   const settlement = judged.then((result) => {
     clearTimeout(timer);
     return Object.freeze({ late: result.late || state.late });
-  });
+  }, () => Object.freeze({ late: state.late }));
   return { record: work, settlement };
 }
 
@@ -906,13 +1186,23 @@ function buildRecord(request: MinimizedShadowRequest, set: ShadowQuestionSet, ju
   deadlineMs: number, started: number, payload: ShadowCanonicalPayload | null): ShadowJudgmentRecord {
   const reasons = new Set<ShadowReasonCode>();
   // Size first, parse second: an oversized body is never interpreted, so no part of it can reach a
-  // record, a proposal or an evidence entry.
-  const responseBytes = payload === null ? 0 : encode(payload).length;
-  if (payload !== null && responseBytes > SHADOW_MAX_RESPONSE_BYTES) {
-    return idleRecord('REFUSED', ['RESPONSE_TOO_LARGE'], floor, deadlineMs, now() - started, request, set,
-      judge, candidateRef, requestBytes);
+  // record, a proposal or an evidence entry. Both steps are inside one guard, because a payload this
+  // module did not build may still be uninterpretable, and a record promise that rejects would take
+  // the process down with it under Node's default unhandled-rejection behavior.
+  let parsed: ParsedShadowPayload | null = null;
+  let responseBytes = 0;
+  try {
+    responseBytes = payload === null ? 0 :
+      jsonBytes(payload, SHADOW_MAX_RESPONSE_BYTES * 8, 'RESPONSE_TOO_LARGE').length;
+    if (payload !== null && responseBytes > SHADOW_MAX_RESPONSE_BYTES) {
+      return idleRecord('REFUSED', ['RESPONSE_TOO_LARGE'], floor, deadlineMs, now() - started, request, set,
+        judge, candidateRef, requestBytes);
+    }
+    parsed = payload === null ? null : parseShadowJudgePayload(payload, set);
+  } catch (error) {
+    return idleRecord('REFUSED', [error instanceof Invalid ? error.code : 'MALFORMED_RESPONSE'], floor,
+      deadlineMs, now() - started, request, set, judge, candidateRef, requestBytes);
   }
-  const parsed = payload === null ? null : parseShadowJudgePayload(payload, set);
   if (parsed === null) reasons.add('ADAPTER_REFUSED');
   else {
     for (const problem of parsed.problems) reasons.add(problem);
