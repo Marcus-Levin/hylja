@@ -8,6 +8,8 @@ Send an outside application specialist only the [20–30 minute brief](issue-65-
 
 This longer packet is for the coordinator and any person accepting the subsequent formal independent-review role. Give the formal reviewer a fixed summary of decisions, sources and changes rather than asking them to reconstruct the project from a moving PR.
 
+Use the [2026-10-01 fixed review snapshot](issue-65-66-review-snapshot-2026-10-01.md) for that summary. It pins the existing proposals to `522430ea68d28777fcff4cdf2f49d3fd2826eb31`, preserves the prior discussion preferences, and asks for separate verdicts on eight concrete findings. The pinned drafts remain the artifacts under review; the snapshot is a cross-checked summary of them, not a replacement. Include the snapshot's exact revision or bytes in the private record; it is a review aid, not approval.
+
 ## What the formal reviewer is being asked to decide
 
 The [#65 taxonomy issue](https://github.com/Marcus-Levin/hylja/issues/65) asks **what kind of information a value is**. The [#66 information-model issue](https://github.com/Marcus-Levin/hylja/issues/66) asks where contextual privacy, disclosure sensitivity, source influence, task needs and policy treatment belong. A label such as `NETWORK_IDENTIFIER / PORT` does not decide whether a value may go to a model. Task usefulness does not grant permission to send it.
