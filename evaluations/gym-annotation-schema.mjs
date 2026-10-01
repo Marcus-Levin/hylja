@@ -376,9 +376,12 @@ function parse(raw) {
   const retentionClass = retention ? member(retention.class, GYM_RETENTION_CLASSES) : undefined;
   const deletionState = retention ? member(retention.deletionState, GYM_DELETION_STATES) : undefined;
   const expiresAtMs = retention ? instant(retention.expiresAt) : undefined;
-  if (!retention || !retentionClass || !deletionState || expiresAtMs === undefined) {
-    fail(retention ? 'RETENTION_TIMESTAMP_INVALID' : 'RETENTION_INVALID');
-  } else if ((level === 'TENANT') !== (retentionClass === 'TENANT_RESTRICTED')) {
+  // Each retention defect reports its own cause: a missing record, an unknown enum member and an
+  // unreadable instant are different authoring mistakes and must not share a code.
+  if (!retention) fail('RETENTION_INVALID');
+  else if (!retentionClass || !deletionState) fail('BAD_ENUM');
+  else if (expiresAtMs === undefined) fail('RETENTION_TIMESTAMP_INVALID');
+  else if ((level === 'TENANT') !== (retentionClass === 'TENANT_RESTRICTED')) {
     fail('RETENTION_SCOPE_CONFLICT');
   } else if (deletionState === 'ACTIVE') {
     if (retention.tombstonedAt !== null) fail('TOMBSTONE_CONFLICT');

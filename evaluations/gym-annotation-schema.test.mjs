@@ -680,6 +680,26 @@ test('degenerate field and source records fail closed', () => {
 });
 
 test('retention, deletion and tombstoning are explicit', () => {
+  // Each retention defect reports its own cause rather than a shared code, so an authoring mistake is
+  // identifiable from the reason alone.
+  for (const [label, apply, code] of [
+    ['missing retention record', (a) => { delete a.retention; }, 'ARTIFACT_INVALID_SHAPE'],
+    ['missing expiresAt', (a) => { delete a.retention.expiresAt; }, 'RETENTION_INVALID'],
+    ['unknown retention class', (a) => { a.retention.class = 'BOGUS'; }, 'BAD_ENUM'],
+    ['unknown deletion state', (a) => { a.retention.deletionState = 'DELETED'; }, 'BAD_ENUM'],
+    ['imaginary expiresAt', (a) => { a.retention.expiresAt = '2026-02-30T00:00:00Z'; }, 'RETENTION_TIMESTAMP_INVALID'],
+    ['retention class mismatched with scope', (a) => { a.retention.class = 'DERIVED_SYNTHETIC'; }, 'RETENTION_SCOPE_CONFLICT'],
+    ['tombstone timestamp while active', (a) => { a.retention.tombstonedAt = '2026-02-01T00:00:00Z'; }, 'TOMBSTONE_CONFLICT'],
+    ['tombstoned without a timestamp', (a) => { a.retention.deletionState = 'TOMBSTONED'; }, 'TOMBSTONE_CONFLICT'],
+    ['imaginary tombstone timestamp', (a) => {
+      a.retention.deletionState = 'TOMBSTONED';
+      a.retention.tombstonedAt = '2026-13-01T00:00:00Z';
+    }, 'TOMBSTONE_CONFLICT'],
+  ]) {
+    const target = artifact();
+    apply(target);
+    assert.ok(reasons(target).includes(code), `${label} must be reported as ${code}`);
+  }
   const inconsistent = artifact();
   inconsistent.retention.deletionState = 'ACTIVE';
   inconsistent.retention.tombstonedAt = '2026-02-01T00:00:00Z';

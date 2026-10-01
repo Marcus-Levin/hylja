@@ -502,7 +502,13 @@ Known limits, stated rather than implied:
 - it reports one generic `FIELD_INVALID` code rather than a per-field reason, and it does not detect duplicate JSON
   keys (that needs a raw-byte pre-parse, as the D05 projector does). A missing or duplicated producer list also
   fails the per-occurrence containment checks, so such an artifact reports several codes at once; the artifact is
-  invalid either way.
+  invalid either way. Within a single record each defect keeps its own code, so a bad `retention.class`
+  (`BAD_ENUM`) is never reported as an unreadable date (`RETENTION_TIMESTAMP_INVALID`);
+- **cost is bounded but not free at the maximum.** A single maximal legal artifact (64 sources, 512 fields, 4096
+  occurrences with 64 label entries each, 64 contracts with 256 requirements) parses in roughly 2 s per entry
+  point, and `gymEffectiveLabel` is the most expensive of them because order-independent agreement compares the
+  newest assertion against every earlier one. That is a development-aid cost, not a service budget; the 20 behavior
+  groups run in about 0.2 s in total, and no threshold was raised or added.
 
 ## 14. Integration with #5/#39 evaluation and later #27 promotion
 
@@ -542,7 +548,7 @@ These are decisions, not questions to be answered later by an implementer. Each 
 | G5 | Retention periods, deletion SLA and the restricted-store design | the `expiresAt` default and any importer | concrete numbers, key scope, destruction evidence |
 | G6 | Promotion approver and the minimum cell size for aggregate statistics | any tenant-to-global artifact | approver role, threshold, audit requirement |
 | G7 | Inter-annotator agreement method and threshold, and whether two annotators are required at all | any "agreed" claim used as a quality gate | method choice (see §17) and a minimum-agreement bar per class |
-| G8 | Whether `SOLE_ENTRY` may be used as evaluation ground truth, or only `AGREED`/`ADJUDICATED` | the local eligibility predicate | reviewer ruling; with order-independent agreement (section 6) an occurrence now needs either a matching second assertion or an explicit adjudication, so this gate also decides whether a single annotator can ground-truth anything |
+| G8 | Whether `SOLE_ENTRY` may be used as evaluation ground truth, or only `AGREED`/`ADJUDICATED` | the local eligibility predicate | reviewer ruling. This gate is now consequential: because agreement requires a matching second assertion or an explicit adjudication (section 6), ruling out `SOLE_ENTRY` needs one further blocker in the local predicate, which as written still admits a single uncorroborated assertion. |
 | G9 | Whether a deterministic sensitivity **floor** may ever be raised by tenant annotations, and how over-hiding is bounded | any "Gym improves recall" claim | policy review plus an over-hiding metric |
 | G10 | #39 protocol freeze ordering: whether any Gym artifact may be admitted to a development family after the pre-tuning lock | scored comparisons | the protocol steward, under independent review |
 
