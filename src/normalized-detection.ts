@@ -16,9 +16,15 @@
  *   covered that text, so a value with no credential-like key in its path gains no duplicate candidate;
  * - #7's `highRisk` flag is reported as metadata, but a field flagged only by a non-ASCII key or a sibling
  *   whose value #8 does not recognize still yields no candidate here; that gap needs an agreed #8 vocabulary;
- * - one #7 parse runs per view, chosen by content-type hint or by the caller's `formats` for the root, so
- *   encoded YAML/TOML/connection strings stay unparsed and a hint that does not hold is reported as opaque;
- * - field values composed per request are capped, and the remainder is opaque rather than silently dropped.
+ * - every view is parsed by its own content-type hint, and the root additionally runs the caller's trusted
+ *   `formats`. That list is *added* to the hinted format, never substituted for it, so a wrong or hostile
+ *   assertion can add a parse but can never suppress the parse the hint named. Encoded YAML/TOML/connection
+ *   strings still stay unparsed unless their decoded view itself sniffs as a supported structure, and a
+ *   requested format that does not hold is reported as opaque;
+ * - field values composed per request are capped. The view that exhausts the budget, and every later view
+ *   that would have been parsed, are recorded as uninspected rather than silently skipped;
+ * - repeated protected text inside one decoded view is reported once per occurrence, each with its own
+ *   in-view span and evidence id. Only a repeat of the very same occurrence is suppressed.
  */
 import { createHash } from 'node:crypto';
 import { generateContactCandidates, type CandidateScope, type NameDictionary } from './contact-candidates.js';
@@ -128,15 +134,21 @@ export interface NormalizedDetectionResult {
 }
 export interface NormalizedDetectionRequest {
   readonly input: unknown;
-  /** Privacy-safe opaque reference, never a value or raw source path. */
+  /**
+   * Privacy-safe opaque reference, never a value or raw source path. The #7 field path digests are bound to
+   * it, so a trusted integration must pass a fresh value per request: that is what keeps key paths from
+   * being correlated across requests.
+   */
   readonly inputRef: string;
   readonly scope: CandidateScope;
   readonly names?: NameDictionary;
   /**
    * Trusted #7 formats the integration asserts for the input it passes, for formats no content hint reaches
-   * (YAML, TOML, CONNECTION_STRING). Decoded views are new text and are parsed by their own content-type
-   * hint, so encoded YAML/TOML stays unparsed unless its decoded view itself sniffs as a supported structure.
-   * This selects parsers only; it grants nothing and authorizes no release.
+   * (YAML, TOML, CONNECTION_STRING). The root is parsed by the union of this list and the format its own
+   * content hint names, so a format asserted here never suppresses the hinted parse. Decoded views are new
+   * text and are parsed by their own content-type hint, so encoded YAML/TOML stays unparsed unless its
+   * decoded view itself sniffs as a supported structure. This selects parsers only; it grants nothing and
+   * authorizes no release.
    */
   readonly formats?: readonly Format[];
   /** Optional trusted tenant key for #8 candidate fingerprints. */
@@ -254,7 +266,11 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
   const reasons = new Set<string>(normalized.reasons.map((reason) => `NORMALIZATION_${reason}`));
   const candidates: NormalizedCandidate[] = [];
   const encodedOrigins = new Map<number, OriginalLocation>();
-  /** One entry per distinct piece of evidence, so two parsers over one view cannot double-report it. */
+  /**
+   * One entry per distinct piece of evidence. Identity is per occurrence, never per envelope: every
+   * occurrence inside one decoded view shares the same `ENCODED_RUNS` envelope, so the in-view span, the
+   * #7 format and the field span are what keep two occurrences of the same protected text apart.
+   */
   const seen = new Set<string>();
   const uninspected: OpaqueLocation[] = normalized.uninspected.map((item) => {
     const view = normalized.views[item.viewId]!;
@@ -282,7 +298,8 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
     for (const item of items) {
       const at = place(item.start, item.end);
       const identity = `${at.view.viewId}|${at.view.representation}|${source}|${item.subtype ?? ''}|${item.rule ?? ''}|` +
-        `${originalKey(at.original)}|${at.field?.pathRef ?? ''}`;
+        `${at.view.span.start}-${at.view.span.end}|${originalKey(at.original)}|` +
+        `${at.field ? `${at.field.format}|${at.field.span.start}-${at.field.span.end}|${at.field.pathRef}` : ''}`;
       if (seen.has(identity)) continue;
       if (counts[source] >= MAX_PER_SOURCE) { markOpaque(`${source}_CANDIDATE_LIMIT`, view); break; }
       seen.add(identity);
@@ -299,8 +316,12 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
 
   /**
    * Privacy-safe path digest, bound to this request: key names are payload content, and a digest that could
-   * be compared across requests would still leak "these two messages share a key here". Equal paths inside one
-   * result share a digest, so a consumer can correlate fields without any key ever being emitted.
+   * be compared across requests would still leak "these two messages share a key here". The unlinkability is
+   * exactly as strong as the trusted integration's `inputRef` discipline, which this seam does not and cannot
+   * enforce: two requests with distinct `inputRef`s produce digests that cannot be correlated, while a caller
+   * that reuses one `inputRef` across messages would let key paths be correlated within its own traffic.
+   * Equal paths inside one result share a digest, so a consumer can correlate fields without any key ever
+   * being emitted.
    */
   const pathRefOf = (segments: readonly string[]): string =>
     createHash('sha256').update(`field-path.v1\u0000${inputDigest}\u0000${JSON.stringify(segments)}`).digest('hex').slice(0, 16);
@@ -334,11 +355,30 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
     const hint = view.id === 0 ? normalized.contentType : sniffContentType(view.text);
     return hint === 'UNKNOWN' ? NO_FORMATS : HINTED_FORMATS[hint];
   };
+  /**
+   * The #7 formats parsed for one view. Every view is parsed by its own content hint, and the root
+   * additionally runs the caller's trusted list as a union: a caller assertion is a second opinion about
+   * the root payload, not a replacement for the parse the hint named, so a wrong or hostile list cannot
+   * suppress the hinted parse. The asserted formats run first, so a caller's own reading still leads the
+   * candidate order. Bounded by construction: at most `MAX_REQUESTED_FORMATS` already-validated,
+   * de-duplicated formats plus the one hinted format.
+   */
+  const formatsFor = (view: NormalizedView): readonly Format[] => {
+    const hinted = hintedFormats(view);
+    if (view.id !== 0 || !requestedFormats) return hinted;
+    const union: Format[] = [...requestedFormats];
+    for (const format of hinted) if (!union.includes(format)) union.push(format);
+    return Object.freeze(union);
+  };
   const scanFields = (view: NormalizedView): void => {
-    if (fieldLimitReached) return;
-    // Caller formats are an assertion about the payload the integration handed over, so they apply to the
-    // root. A decoded view is new text whose format is unknown, so it is parsed by its own content hint.
-    const list = requestedFormats && view.id === 0 ? requestedFormats : hintedFormats(view);
+    const list = formatsFor(view);
+    if (list.length === 0) return;
+    if (fieldLimitReached) {
+      // The request-wide field budget is spent, so this view's fields are never parsed. That is an
+      // inspection gap like any other: the whole view is marked opaque instead of being silently skipped.
+      markOpaque('PARSED_FIELD_SCAN_LIMIT', view);
+      return;
+    }
     for (const format of list) {
       let parsed: ReturnType<typeof parseStructured>;
       try {
@@ -349,6 +389,14 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
         // An opaque, malformed, unsupported or over-budget parse is an inspection gap, not "nothing there".
         reasons.add(`PARSER_${format}_${parsed.status}`);
         for (const at of parsed.opaque) markOpaque(`PARSER_${format}_${at.reason}`, view, span(at.start, at.end));
+      }
+      // A #7 reason is never dropped, not even on a COMPLETE parse: a duplicate key is a structural
+      // ambiguity that #13's rewriter refuses, and a caller deciding what to transform cannot see it from
+      // the candidates alone. Only COMMENTS is exempt, because comment text is still inside the view text
+      // this seam scans in full, so it is an inspection gap nowhere.
+      for (const reason of parsed.reasons) {
+        if (reason === 'COMMENTS') continue;
+        reasons.add(`PARSER_${format}_${reason}`);
       }
       // #7 key paths indexed once per parse, so a `name`/`key` sibling can supply a field's key hint. The sibling
       // key is compared case-insensitively, as #7 does; a repeated path keeps the last parsed value.

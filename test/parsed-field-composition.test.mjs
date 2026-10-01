@@ -8,6 +8,7 @@ import { detectNormalizedCandidates } from '../dist/normalized-detection.js';
 const scope = Object.freeze({ tenantRef: 'tenant-a', projectRef: 'project-a' });
 const run = (input, rest = {}) => detectNormalizedCandidates({ input, inputRef: 'synthetic-field-case', scope, ...rest });
 const b64 = (value) => Buffer.from(value, 'utf8').toString('base64');
+const hex = (value) => Buffer.from(value, 'utf8').toString('hex');
 const fieldCandidates = (result, source) => result.candidates.filter((item) => item.field && (!source || item.source === source));
 const secretFields = (result) => fieldCandidates(result, 'SECRET').filter((item) => item.subtype === 'PASSWORD');
 const keyHints = (result, source) => fieldCandidates(result, source).filter((item) => item.rule === 'context.field-key');
@@ -159,6 +160,98 @@ test('repeated identical credential fields each keep their own evidence and span
   assert.equal(hinted.every((item) => input.slice(item.original.span.start, item.original.span.end) === 'synthetic-pass.invalid'), true);
 });
 
+test('repeated evidence inside one decoded view keeps one candidate per occurrence', () => {
+  // Every occurrence inside a decoded view shares one ENCODED_RUNS envelope, so a dedup keyed on the
+  // envelope would silently drop all but the first occurrence of each protected value.
+  const cases = [
+    ['alpha@corp.example.invalid beta@corp.example.invalid', {}, 'CONTACT', 'EMAIL', 2],
+    ['password=one.invalid\npassword=two.invalid\npassword=three.invalid', {}, 'SECRET', 'PASSWORD', 3],
+    ['a.example.invalid b.example.invalid c.example.invalid', {}, 'INFRASTRUCTURE', 'HOST_OR_SERVICE', 3],
+    ['{"password":"syn\\u0074hetic-a.invalid","password":"syn\\u0074hetic-b.invalid"}', {}, 'SECRET', 'PASSWORD', 2],
+  ];
+  for (const [document, rest, source, subtype, expected] of cases) {
+    const encoded = b64(document);
+    const input = `payload=${encoded}`;
+    const result = run(input, rest);
+    const hits = result.candidates.filter((item) => item.view.viewId === 1 && item.source === source &&
+      item.subtype === subtype);
+    const byOccurrence = new Map();
+    for (const candidate of hits) {
+      // The view scan and the attributed field scan each report the occurrence once; that pair is expected,
+      // a second pair over the same span and rule is not.
+      const at = `${candidate.view.span.start}-${candidate.view.span.end}|${candidate.rule}|` +
+        `${candidate.field ? candidate.field.format : ''}`;
+      assert.equal(byOccurrence.has(at), false, `${source} duplicate occurrence ${at} in ${document}`);
+      byOccurrence.set(at, candidate);
+    }
+    const occurrences = new Set([...byOccurrence.keys()].map((key) => key.split('|')[0]));
+    assert.equal(occurrences.size, expected, `${source} ${document}`);
+    assert.equal(new Set([...byOccurrence.values()].map((item) => item.evidence.id)).size, byOccurrence.size);
+    for (const candidate of byOccurrence.values()) {
+      // The envelope stays honest: the decoded occurrence never claims an offset in the original text.
+      assert.equal(candidate.original.kind, 'ENCODED_RUNS');
+      assert.deepEqual(candidate.original.spans.map((span) => input.slice(span.start, span.end)), [encoded]);
+      assert.ok(candidate.view.span.end > candidate.view.span.start);
+    }
+    assert.equal(JSON.stringify(result).includes(document), false);
+  }
+  // The same for a repeated configured name, and it stays inside its own tenant and project.
+  const names = createNameDictionary(scope, ['Synthetic Visitor']);
+  const document = 'Synthetic Visitor\nSynthetic Visitor\nSynthetic Visitor\nSynthetic Visitor\nSynthetic Visitor';
+  const own = run(`payload=${b64(document)}`, { names });
+  const ownHits = own.candidates.filter((item) => item.source === 'CONTACT' && item.subtype === 'NAME');
+  assert.equal(new Set(ownHits.map((item) => `${item.view.span.start}-${item.view.span.end}`)).size, 5);
+  const crossed = run(`payload=${b64(document)}`, { names, scope: { tenantRef: 'tenant-b', projectRef: 'project-a' } });
+  assert.equal(crossed.status, 'PARTIAL');
+  assert.ok(reasonSet(crossed).has('CONTACT_NAME_DICTIONARY_SCOPE_MISMATCH'));
+  assert.equal(crossed.candidates.some((item) => item.subtype === 'NAME'), false);
+  assert.equal(JSON.stringify(crossed).includes('Synthetic Visitor'), false);
+});
+
+test('one scan unit still reports each occurrence once after the decoded-view fix', () => {
+  // The dedup key is now per occurrence; it must not degenerate into "never suppress a repeat".
+  const input = `payload=${b64('password=one.invalid\npassword=two.invalid\npassword=three.invalid')}`;
+  const result = run(input);
+  const seen = new Set();
+  for (const candidate of result.candidates) {
+    const key = [candidate.view.viewId, candidate.view.representation, candidate.source, candidate.subtype,
+      candidate.rule, `${candidate.view.span.start}-${candidate.view.span.end}`,
+      candidate.field ? `${candidate.field.format}|${candidate.field.pathRef}` : ''].join('|');
+    assert.equal(seen.has(key), false, `duplicate evidence ${key}`);
+    seen.add(key);
+  }
+  // Two scans of the same occurrence (the view scan and the attributed field scan) are still both present.
+  const attributed = secretFields(result).filter((item) => item.view.viewId === 1);
+  assert.equal(attributed.length, 3);
+  assert.equal(new Set(attributed.map((item) => `${item.view.span.start}-${item.view.span.end}`)).size, 3);
+});
+
+test('property: repeated protected values in a decoded view are all reported or the result is not complete', () => {
+  const encoders = [b64, hex, (value) => [...Buffer.from(value, 'utf8')]
+    .map((byte) => `%${byte.toString(16).padStart(2, '0')}`).join('')];
+  for (let index = 0; index < 30; index++) {
+    const values = Array.from({ length: 2 + (index % 4) }, (_, at) => `repeated-${index}-${at}.invalid`);
+    const cases = [
+      { document: values.map((value) => `${value}@corp.example.invalid`).join(' '), source: 'CONTACT', subtype: 'EMAIL' },
+      { document: values.map((value) => `password=${value}`).join('\n'), source: 'SECRET', subtype: 'PASSWORD' },
+      { document: `{"password":"${values[0]}","password":"syn\\u0074hetic-${values[1]}"}`, source: 'SECRET',
+        subtype: 'PASSWORD', occurrences: 2 },
+    ];
+    const chosen = cases[index % cases.length];
+    const occurrences = chosen.occurrences ?? values.length;
+    const encoded = encoders[index % encoders.length](chosen.document);
+    const input = `payload=${encoded}`;
+    const result = run(input);
+    const distinct = new Set(result.candidates.filter((item) => item.view.viewId === 1 &&
+      item.source === chosen.source && item.subtype === chosen.subtype)
+      .map((item) => `${item.view.span.start}-${item.view.span.end}`));
+    // Every planted occurrence is either reported with its own span, or the result is not a clean COMPLETE.
+    assert.ok(distinct.size >= occurrences || result.status !== 'COMPLETE',
+      `${index} ${distinct.size}/${occurrences}`);
+    assert.equal(JSON.stringify(result).includes(chosen.document), false, `${index}`);
+  }
+});
+
 test('overlapping credential and format evidence inside one field is both retained', () => {
   const jwt = ['eyJ' + 'A'.repeat(20), 'eyJ' + 'B'.repeat(20), 'C'.repeat(20)].join('.');
   const input = JSON.stringify({ token: `rotated ${jwt} today` });
@@ -263,6 +356,32 @@ test('two requested formats over the same text do not duplicate identical eviden
   assert.equal(both.candidates.length, single.candidates.length);
 });
 
+test('a caller format list can add a parse but never suppress the content-hint parse of the root', () => {
+  // The escaped token is invisible in the raw view text and is only reachable after the #7 JSON decode.
+  const document = '{"data":"ghp_AAAAAAAAAAAAAAAAAA\\u0041BBBBBBBBBBBBBBBBBB"}';
+  const control = run(document);
+  assert.equal(control.status, 'COMPLETE');
+  const planted = control.candidates.filter((item) => item.rule === 'format.github-token');
+  assert.equal(planted.length, 1);
+  assert.equal(document.includes('ghp_AAAAAAAABBBBBBBBBBBBBBBBBB'), false);
+  for (const format of ['JSON', 'LOG', 'INI', 'XML', 'YAML', 'TOML', 'DOTENV', 'URL', 'CONNECTION_STRING']) {
+    const result = run(document, { formats: [format] });
+    const found = result.candidates.filter((item) => item.rule === 'format.github-token').length;
+    // A wrong or hostile assertion may cost utility, never evidence: a `COMPLETE` result that reports fewer
+    // protected findings than the hint-driven parse would claim full inspection it did not perform.
+    assert.ok(found >= planted.length, `${format} reported ${found} of ${planted.length}`);
+    if (found < planted.length) assert.notEqual(result.status, 'COMPLETE', format);
+    assert.equal(JSON.stringify(result).includes('ghp_'), false, format);
+  }
+  // The same holds for a document the hint names a format for, and for combinations with a correct hint.
+  const hinted = run('[database]\npassword = synthetic-pass.invalid\n', { formats: ['INI'] });
+  assert.equal(hinted.status, 'COMPLETE');
+  const wrong = run('[database]\npassword = synthetic-pass.invalid\n', { formats: ['LOG'] });
+  assert.ok(secretFields(wrong).length >= secretFields(hinted).length);
+  const combined = run('[database]\npassword = synthetic-pass.invalid\n', { formats: ['LOG', 'YAML'] });
+  assert.ok(secretFields(combined).length >= secretFields(hinted).length);
+});
+
 test('configured name evidence stays tenant and project scoped at view and field level', () => {
   const names = createNameDictionary(scope, ['Synthetic Visitor']);
   // The escaped field only yields a name candidate when the parsed value is scanned, so this proves the
@@ -304,6 +423,49 @@ test('the field-scan budget stays PARTIAL instead of reporting a partial scan as
   assert.equal(limit.viewSpan.end, input.length);
   assert.ok(input.slice(limit.viewSpan.start, limit.viewSpan.end).includes('synthetic-t1024.invalid'));
   assert.equal(input.slice(0, limit.viewSpan.start).includes('synthetic-t1023.invalid'), true);
+});
+
+test('an exhausted field budget marks every later view it skips as uninspected', () => {
+  const document = '{"password":"syn\\u0074hetic-decoded.invalid"}';
+  const encoded = b64(document);
+  const prefix = `blob=${encoded}\n`;
+  const control = run(`${prefix}k0=v0`, { formats: ['DOTENV'] });
+  const controlFields = control.candidates.filter((item) => item.field && item.view.viewId === 1);
+  assert.ok(controlFields.length > 0);
+  assert.equal(control.status, 'COMPLETE');
+  // The root exhausts the budget, so the decoded view after it is never parsed: that gap is recorded
+  // against the decoded view itself, and the encoded region it came from is inside its opaque envelope.
+  const limited = run(`${prefix}${Array.from({ length: 1100 }, (_, index) => `k${index}=v${index}`).join('\n')}`,
+    { formats: ['DOTENV'] });
+  assert.equal(limited.status, 'PARTIAL');
+  assert.ok(reasonSet(limited).has('PARSED_FIELD_SCAN_LIMIT'));
+  assert.equal(limited.candidates.some((item) => item.field && item.view.viewId === 1), false);
+  const gap = limited.uninspected.find((item) => item.reason === 'PARSED_FIELD_SCAN_LIMIT' && item.viewId === 1);
+  assert.ok(gap);
+  assert.equal(gap.viewSpan.start, 0);
+  assert.equal(gap.viewSpan.end, document.length);
+  assert.equal(gap.original.kind, 'ENCODED_RUNS');
+  assert.deepEqual(gap.original.spans.map((span) => `${span.start}-${span.end}`),
+    [`${'blob='.length}-${'blob='.length + encoded.length}`]);
+  // The encoded region that produced the unscanned view is covered by that opaque location.
+  assert.ok(limited.uninspected.some((item) => item.original.kind === 'ENCODED_RUNS' &&
+    item.original.spans.some((span) => span.end - span.start === encoded.length)));
+});
+
+test('a duplicate-key parse is never reported as a complete unambiguous document', () => {
+  // #13's rewriter refuses an ambiguous source, so the seam must not present one as fully inspected.
+  const input = '{"password":"synthetic-p11.invalid","password":"synthetic-p12.invalid"}';
+  const result = run(input);
+  assert.equal(result.status, 'PARTIAL');
+  assert.ok(reasonSet(result).has('PARSER_JSON_DUPLICATE_KEY'));
+  // Both values are still reported; the reason is added to the state, never replacing evidence.
+  assert.equal(secretFields(result).filter((item) => item.rule === 'context.field-key').length, 2);
+  assert.equal(JSON.stringify(result).includes('synthetic-p1'), false);
+  // A parse with comments is not a gap: comment text is inside the view text this seam scans in full.
+  const commented = run('API_TOKEN="synthetic-token.invalid"\n# synthetic note\n', { formats: ['DOTENV'] });
+  assert.equal(commented.status, 'COMPLETE');
+  assert.deepEqual(opaqueReasons(commented), []);
+  assert.deepEqual([...reasonSet(commented)].filter((reason) => reason.startsWith('PARSER_')), []);
 });
 
 test('a parser budget failure stays visible instead of looking like a document without fields', () => {
