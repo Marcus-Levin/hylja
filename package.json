@@ -14,7 +14,9 @@
     "test:coverage": "npm run check:fixtures && npm run build && node --test --experimental-test-coverage test/*.test.mjs evaluations/candidates/reference.test.mjs evaluations/preparation-integrity.test.mjs",
     "check:fixtures": "node scripts/check-fixtures.mjs",
     "audit:deps": "npm audit --audit-level=high",
-    "sbom": "npm sbom --sbom-format cyclonedx"
+    "sbom": "npm sbom --sbom-format cyclonedx",
+    "check:sbom": "node scripts/check-sbom.mjs",
+    "check:release": "node scripts/synthetic-release-demo.mjs"
   },
   "devDependencies": {
     "typescript": "5.9.3"
