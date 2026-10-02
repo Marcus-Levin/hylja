@@ -4,7 +4,9 @@
 Three things happen for each artifact, in this order:
 
 1. the local bytes are read once, in bounded chunks, to compute size and
-   SHA-256 -- nothing is unpacked yet;
+   SHA-256 -- nothing is unpacked yet, and an entry that is not an ordinary
+   regular file is refused before a single byte is read, because opening one
+   can wait for a writer that never arrives;
 2. the digest and size are compared against an **independently fetched**
    published record. A missing or mismatched pin is refused here, *before* any
    candidate archive is opened;
@@ -25,6 +27,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import urllib.parse
 import urllib.request
@@ -39,6 +42,13 @@ MAX_METADATA_BYTES = 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
 METADATA_FIELD_LIMIT = 64
 READ_CHUNK = 1024 * 1024
+
+# How local artifact bytes are first touched. O_NONBLOCK is the whole point:
+# opening a FIFO read-only otherwise waits for a writer, so a download entry
+# that is not a regular file can park this screen forever instead of raising,
+# and nothing here bounds that wait. O_CLOEXEC keeps the descriptor out of any
+# child process. Neither flag is a tunable bound.
+LOCAL_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
 
 USER_AGENT = "hylja-46-prescreen-research/1.0"
 
@@ -68,8 +78,46 @@ def outcome_record(outcome, **fields):
     return record
 
 
+def is_ordinary_regular_file(path):
+    """True when `path` is a regular file that can be read without waiting.
+
+    This is a cheap *type* question, not a byte check: it opens the entry
+    without blocking, asks the opened descriptor -- not the pathname, which a
+    symlink or a replacement would misreport -- whether it is a regular file,
+    and closes the descriptor again on every path. It reads no byte, keeps no
+    descriptor and has no loop to poll, so it cannot itself hang, consume the
+    artifact or run the process out of descriptors.
+
+    A symlink is judged by its target. An entry that cannot be opened at all
+    (no permission, gone, or a path that is not openable such as a socket)
+    raises OSError inside and is reported as "not an ordinary regular file",
+    which is the same refusal the caller already gave a failed stat.
+
+    What this does not do is bind the later read to this descriptor: the digest
+    is still read by reopening the path, and the archive is still opened by
+    path again, so a trusted download directory that replaced the entry in
+    between is a pre-existing research limit, not a property claimed here.
+    """
+    try:
+        descriptor = os.open(path, LOCAL_READ_FLAGS)
+    except OSError:
+        return False
+    try:
+        return stat.S_ISREG(os.fstat(descriptor).st_mode)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
 def digest_and_size(path):
-    """Bounded, streaming digest of local bytes. Returns (sha256, size) or (None, None)."""
+    """Bounded, streaming digest of local bytes. Returns (sha256, size) or (None, None).
+
+    Raises OSError if the path cannot be opened or read after it was stat'ed
+    and its entry was accepted as a regular file; the caller turns that into a
+    fixed code so the pathname-bearing exception never escapes into a report
+    or a console.
+    """
     digest = hashlib.sha256()
     size = 0
     with open(path, "rb") as handle:
@@ -116,7 +164,27 @@ def screen_local_artifact(path, expected_sha256, expected_size):
     if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
         return outcome_record("EXPECTED_DIGEST_MALFORMED")
 
-    observed_sha256, observed_size = digest_and_size(path)
+    # A download entry that is not an ordinary regular file -- a FIFO with no
+    # writer, a directory, a device, an entry this process may not open -- is
+    # refused here, before any byte is read. Opening such an entry can block
+    # indefinitely rather than raise: a FIFO opened read-only waits for a
+    # writer that may never come, and no timeout in this helper bounds that
+    # wait. The refusal is the existing fixed code and nothing more: no path,
+    # exception or message, no digest or size, no archive opened and no
+    # advisory query.
+    if not is_ordinary_regular_file(path):
+        return outcome_record("ARTIFACT_UNREADABLE")
+
+    try:
+        observed_sha256, observed_size = digest_and_size(path)
+    except OSError:
+        # The path stat'ed but its bytes could not be opened or read: a
+        # directory entry, a file this process may not read, or a read error
+        # part way through. That is the same refusal as a failed stat, and it
+        # is a refusal and nothing more -- the partial digest and size are
+        # dropped, no path, exception or message is recorded, and no archive is
+        # opened or member parsed for bytes that were never fully read.
+        return outcome_record("ARTIFACT_UNREADABLE")
     if observed_sha256 is None:
         return outcome_record("ARTIFACT_TOO_LARGE")
     if observed_sha256 != expected_sha256:
