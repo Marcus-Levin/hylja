@@ -803,3 +803,493 @@ test('composition and rewriting stay bounded in time and memory on a wide struct
   assert.deepEqual(result.repeat.reasons, ['ORIGINAL_SPAN_STILL_PRESENT']);
   assert.equal(result.repeat.rewritten, 0);
 });
+
+/* ---------- #114 XML rewrite path: element text, attributes, entities, Unicode, refusals ---------- */
+/*
+ * The committed XML evidence above is one CDATA `OPAQUE_LOCATION_OVERLAP` refusal. Everything below is the
+ * other side of that: the source-location-to-rewrite path #7 already supports for XML, exercised end to end
+ * through the real #6 findings, the real #7 parse and rewrite, and the independent #19 final-byte check.
+ * Every case is built from `detect()`, `parseStructured()` and the draft's own public functions, so nothing
+ * here asserts behaviour a caller cannot reach; nothing here wires the draft into anything.
+ */
+
+test('an XML element text and an XML attribute each rewrite from their own #6/#7 source location', () => {
+  // One case per XML value syntax #7 reports: element text (`XML_TEXT`) and a double-quoted attribute
+  // (`XML_DOUBLE_QUOTED`). Each region must resolve to exactly that field's own parsed value span.
+  const cases = [
+    { input: `<svc><password>${PASSWORD}</password></svc>`, syntax: 'XML_TEXT', path: 'svc.password',
+      rewritten: `<svc><password>${MASK}</password></svc>` },
+    { input: `<svc token="${PASSWORD}"/>`, syntax: 'XML_DOUBLE_QUOTED', path: 'svc.@token',
+      rewritten: `<svc token="${MASK}"/>` },
+  ];
+  for (const { input, syntax, path, rewritten } of cases) {
+    // 1. Source location: the #7 parse that will be rewritten is a real, single, complete value.
+    const parsed = parseStructured(input, 'XML');
+    assert.equal(parsed.status, 'COMPLETE');
+    assert.equal(parsed.coverage, 'FULL');
+    assert.deepEqual(parsed.opaque, []);
+    assert.equal(parsed.fields.length, 1);
+    const [field] = parsed.fields;
+    assert.equal(field.path.join('.'), path);
+    assert.equal(field.syntax, syntax);
+    assert.equal(field.highRisk, true);
+    assert.equal(field.value, PASSWORD);
+    assert.equal(input.slice(field.valueStart, field.valueEnd), PASSWORD);
+
+    // 2. Detection: the same value is found twice, once scanning the view and once through the trusted
+    //    #7 key-path hint, and the field-bound candidate carries that field's own source location.
+    const detection = detect(input);
+    assert.equal(detection.status, 'COMPLETE', detection.reasons.join());
+    const bound = detection.candidates.filter((item) => item.field);
+    assert.equal(bound.length, 1);
+    assert.equal(bound[0].field.format, 'XML');
+    assert.equal(bound[0].field.verbatim, true);
+    assert.equal(bound[0].field.hintSource, 'PATH');
+    assert.deepEqual(bound[0].field.span, { start: field.valueStart, end: field.valueEnd });
+    assert.equal(bound[0].evidence.claim.sensitivity, 'SECRET');
+
+    // 3. Composition: nothing lost, one region, the credential floor intact.
+    const composition = compose(detection.candidates);
+    assert.equal(composition.retention.received, detection.candidates.length);
+    assert.equal(composition.retention.retained, detection.candidates.length);
+    assert.equal(composition.retention.rejected, 0);
+    assert.equal(composition.retention.uncomposed, 0);
+    assert.equal(composition.regions.length, 1);
+    const [region] = composition.regions;
+    assert.deepEqual(region.span, { start: field.valueStart, end: field.valueEnd });
+    assert.deepEqual(region.original, { kind: 'ORIGINAL_EXACT', span: region.span });
+    assert.equal(region.obligations.nonReversibleFloor, true);
+    assert.equal(region.obligations.highestSensitivity, 'SECRET');
+    assert.equal(region.composed.sensitivity, 'SECRET');
+    assert.equal(region.composed.reversible, false);
+
+    // 4. Rewrite: the planned span is the parsed value span, not one the draft invented.
+    const plan = planOverlapRewrite({ composition, source: input, format: 'XML', replacement: MASK });
+    assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+    assert.deepEqual(reasonsOf(plan), []);
+    assert.deepEqual(plan.regions.map((item) => item.fieldSpan),
+      [{ start: field.valueStart, end: field.valueEnd }]);
+    const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'XML' });
+    assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? applied.reasons.join() : '');
+
+    // 5. Exact serialized bytes, an independent reparse, and no planted original in either.
+    assert.equal(applied.text, rewritten);
+    assert.equal(applied.text.includes(PASSWORD), false);
+    const after = parseStructured(applied.text, 'XML');
+    assert.equal(after.status, 'COMPLETE');
+    assert.deepEqual(after.fields.map((item) => item.path.join('.')), [path]);
+    assert.deepEqual(after.fields.map((item) => item.value), [MASK]);
+    assert.equal(applied.provenance.rewrittenFields, 1);
+    assert.equal(applied.provenance.format, 'XML');
+    assert.equal(applied.provenance.sourceDigest, createHash('sha256').update(input).digest('hex'));
+    assert.match(plan.regions[0].fieldRef, /^[0-9a-f]{16}$/u);
+    // The field reference is a source-bound digest, not the key path: the same path in another document
+    // gets another one, and the plain path string never appears in the plan.
+    const sibling = input.replace(PASSWORD, TOKEN);
+    const siblingPlan = planOverlapRewrite({ composition: compose(detect(sibling).candidates), source: sibling,
+      format: 'XML', replacement: MASK });
+    assert.equal(siblingPlan.status, 'PLANNED', reasonsOf(siblingPlan).join());
+    assert.notEqual(siblingPlan.regions[0].fieldRef, plan.regions[0].fieldRef);
+    // The element name is payload content too: it never reaches the plan either.
+    assert.equal(JSON.stringify(plan).includes(`"${path.split('.')[0]}"`), false);
+
+    // 6. Final bytes: #19 is the independent backstop. It blocks the untransformed source and releases the
+    //    rewritten bytes it was actually given, so the release belongs to the rewrite, not to a merge.
+    const finalBytes = sentinel(applied.text);
+    assert.deepEqual([finalBytes.decision, finalBytes.reasons], ['ALLOW', []]);
+    assert.equal(Buffer.from(finalBytes.release).equals(Buffer.from(enc(applied.text))), true);
+    assert.equal(sentinel(input).decision, 'BLOCK');
+  }
+});
+
+test('the XML rewriter re-encodes the constant for the attribute and element syntaxes it parsed', () => {
+  // A constant that needs escaping is only safe if it is re-encoded for the syntax #7 found and comes back
+  // as the same value on reparse. The draft passes the constant through unchanged, so the encoding is #7's.
+  // A single quote is literal inside a double-quoted attribute and an escape inside a single-quoted one: the
+  // encoding follows the syntax #7 found, never a preference.
+  const cases = [
+    { input: `<svc token="${PASSWORD}"/>`, constant: 'a&b"c', rewritten: '<svc token="a&amp;b&quot;c"/>' },
+    { input: `<svc><password>${PASSWORD}</password></svc>`, constant: 'a&b<c', rewritten: '<svc><password>a&amp;b&lt;c</password></svc>' },
+    { input: `<svc token="${PASSWORD}"/>`, constant: "a'b", rewritten: '<svc token="a\'b"/>' },
+    { input: `<svc token='${PASSWORD}'/>`, constant: "a'b\"c", rewritten: '<svc token=\'a&apos;b"c\'/>' },
+    { input: `<svc><password>${PASSWORD}</password></svc>`, constant: 'a>b', rewritten: '<svc><password>a&gt;b</password></svc>' },
+  ];
+  for (const { input, constant, rewritten } of cases) {
+    const composition = compose(detect(input).candidates);
+    const plan = planOverlapRewrite({ composition, source: input, format: 'XML', replacement: constant });
+    assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+    const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'XML' });
+    assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? applied.reasons.join() : '');
+    assert.equal(applied.text, rewritten);
+    assert.equal(applied.text.includes(PASSWORD), false);
+    // The reparsed value is the constant, so the escaped bytes carry no second meaning.
+    const after = parseStructured(applied.text, 'XML');
+    assert.equal(after.status, 'COMPLETE');
+    assert.deepEqual(after.fields.map((item) => item.value), [constant]);
+    assert.deepEqual([sentinel(applied.text).decision, sentinel(applied.text).reasons], ['ALLOW', []]);
+  }
+});
+
+test('an entity-decoded XML value keeps a covering source location and still rewrites', () => {
+  // The source holds a spelling the decoded value does not: a decimal or hex entity where the detector
+  // matched the decoded text. The candidate may therefore only claim a covering span, and the plan may only
+  // rewrite the field that span belongs to.
+  const cases = [
+    { label: 'decimal entity in an attribute', input: `<svc token="syn&#45;pass&#45;4f2b9c7e1d.invalid"/>`,
+      rewritten: `<svc token="${MASK}"/>`, span: { start: 12, end: 47 } },
+    { label: 'hex entity in element text', input: `<svc><password>syn&#x2D;pass&#x2D;4f2b9c7e1d.invalid</password></svc>`,
+      rewritten: `<svc><password>${MASK}</password></svc>`, span: { start: 15, end: 52 } },
+    { label: 'named entity before the value', input: `<svc token="a&amp;b-${PASSWORD}"/>`,
+      rewritten: `<svc token="${MASK}"/>`, span: { start: 12, end: 47 } },
+  ];
+  for (const { label, input, rewritten, span } of cases) {
+    const parsed = parseStructured(input, 'XML');
+    assert.equal(parsed.status, 'COMPLETE', label);
+    const [field] = parsed.fields;
+    // The decoded value is the planted secret; the source slice is a different, longer spelling of it.
+    assert.equal(field.value.includes(PASSWORD), true, label);
+    assert.notEqual(input.slice(field.valueStart, field.valueEnd), field.value, label);
+    assert.deepEqual({ start: field.valueStart, end: field.valueEnd }, span, label);
+
+    const detection = detect(input);
+    assert.equal(detection.status, 'COMPLETE', label);
+    const bound = detection.candidates.filter((item) => item.field);
+    assert.ok(bound.length >= 1, label);
+    assert.equal(bound.every((item) => item.field.verbatim === false), true, label);
+    assert.equal(bound.every((item) => item.original.kind === 'ORIGINAL_COVER'), true, label);
+    // No candidate claims the decoded value at an offset the source does not hold.
+    for (const item of detection.candidates) {
+      assert.ok(item.original.span.start >= 0 && item.original.span.end <= input.length, label);
+    }
+
+    const composition = compose(detection.candidates);
+    assert.equal(composition.retention.uncomposed, 0, label);
+    const [region] = composition.regions;
+    assert.deepEqual(region.span, span, label);
+    // The union of an exact view match and a covering decoded-field match is a covering region.
+    assert.equal(region.original.kind, 'ORIGINAL_COVER', label);
+    assert.ok(region.relations.includes('CONTAINING'), label);
+    assert.ok(region.relations.includes('IDENTICAL'), label);
+    assert.equal(region.obligations.nonReversibleFloor, true, label);
+    assert.equal(region.composed.sensitivity, 'SECRET', label);
+    assert.equal(region.composed.reversible, false, label);
+
+    const plan = planOverlapRewrite({ composition, source: input, format: 'XML', replacement: MASK });
+    assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+    const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'XML' });
+    assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? applied.reasons.join() : '');
+    assert.equal(applied.text, rewritten, label);
+    assert.equal(applied.text.includes(PASSWORD), false, label);
+    assert.deepEqual([sentinel(applied.text).decision, sentinel(applied.text).reasons], ['ALLOW', []], label);
+  }
+});
+
+test('XML source locations are UTF-16 offsets that survive non-BMP, folded and combining input', () => {
+  // Offsets are UTF-16 code units, so a non-BMP character counts as two and a decomposed letter as two.
+  const astralPrefix = `<svc><password>\u{1f600}${PASSWORD}</password></svc>`;
+  const astralSuffix = `<svc><password>${PASSWORD}é你\u{1f600}</password></svc>`;
+  for (const [input, start, end] of [[astralPrefix, 15, 15 + 2 + PASSWORD.length],
+    [astralSuffix, 15, 15 + PASSWORD.length + 1 + 1 + 2]]) {
+    const parsed = parseStructured(input, 'XML');
+    assert.equal(parsed.status, 'COMPLETE');
+    assert.deepEqual([parsed.fields[0].valueStart, parsed.fields[0].valueEnd], [start, end]);
+    const bound = detect(input).candidates.find((item) => item.field);
+    assert.equal(bound.field.verbatim, true);
+    assert.deepEqual(bound.field.valueSpan, { start: 0, end: end - start });
+    assert.deepEqual(bound.field.span, { start, end });
+    const [region] = compose(detect(input).candidates).regions;
+    assert.deepEqual(region.span, { start, end });
+    assert.equal(region.original.kind, 'ORIGINAL_EXACT');
+    assert.equal(region.composed.sensitivity, 'SECRET');
+    const composition = compose(detect(input).candidates);
+    const plan = planOverlapRewrite({ composition, source: input, format: 'XML', replacement: MASK });
+    assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+    const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'XML' });
+    assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? applied.reasons.join() : '');
+    assert.equal(applied.text, `<svc><password>${MASK}</password></svc>`);
+    assert.equal(applied.text.includes(PASSWORD), false);
+    assert.deepEqual([sentinel(applied.text).decision, sentinel(applied.text).reasons], ['ALLOW', []]);
+  }
+
+  // Folded input: the compatibility fold finds the value in a spelling the source does not hold, so the
+  // region reports a covering original and both representations instead of an invented exact span.
+  for (const [label, input] of [
+    ['decomposed', `<svc><password>syn-pa\u0308ss-4f2b9c7e1d.invalid</password></svc>`],
+    ['zero width', `<svc><password>syn-p\u200bass-4f2b9c7e1d.invalid</password></svc>`],
+  ]) {
+    const detection = detect(input);
+    assert.equal(detection.status, 'COMPLETE', label);
+    assert.ok(detection.candidates.some((item) => item.view.representation === 'FOLDED'), label);
+    for (const item of detection.candidates) {
+      if (item.view.representation === 'FOLDED') assert.equal(item.original.kind, 'ORIGINAL_COVER', label);
+      assert.ok(item.original.span.start >= 0 && item.original.span.end <= input.length, label);
+    }
+    const composition = compose(detection.candidates);
+    const [region] = composition.regions;
+    assert.deepEqual([...region.representations].sort(), ['FOLDED', 'RAW'], label);
+    assert.equal(region.original.kind, 'ORIGINAL_COVER', label);
+    assert.equal(region.obligations.nonReversibleFloor, true, label);
+    assert.equal(region.composed.sensitivity, 'SECRET', label);
+    assert.equal(region.composed.reversible, false, label);
+    // The composition carries spans and references only, so it echoes no character of the folded spelling.
+    // `JSON.stringify` emits the real character rather than an escape spelling, so this checks the character
+    // that is actually in the input, not a string that can never appear.
+    const folded = new Set(input.match(/[\u0300-\u036f\u200b-\u200f]/gu) ?? []);
+    assert.ok(folded.size > 0, `the ${label} input really carries a combining or invisible character`);
+    for (const char of folded) {
+      assert.equal(JSON.stringify(composition).includes(char), false, `${label} U+${char.codePointAt(0).toString(16)}`);
+    }
+    const plan = planOverlapRewrite({ composition, source: input, format: 'XML', replacement: MASK });
+    assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+    const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'XML' });
+    assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? applied.reasons.join() : '');
+    assert.equal(applied.text, `<svc><password>${MASK}</password></svc>`, label);
+    assert.equal(applied.text.includes('\u0308'), false, label);
+    assert.equal(applied.text.includes('\u200b'), false, label);
+    assert.deepEqual([sentinel(applied.text).decision, sentinel(applied.text).reasons], ['ALLOW', []], label);
+  }
+});
+
+test('repeated and overlapping XML findings keep one region per occurrence and one edit per field', () => {
+  // One value in two element texts: two occurrences, so two regions with their own field spans and their
+  // own source-bound path digests, and two edits. They are not duplicates of each other.
+  const repeated = `<svc><password>${PASSWORD}</password><secret>${PASSWORD}</secret></svc>`;
+  const detection = detect(repeated);
+  const composition = compose(detection.candidates);
+  assert.equal(composition.regions.length, 2);
+  assert.equal(composition.retention.duplicateEvidence, 0);
+  assert.equal(composition.retention.uncomposed, 0);
+  assert.equal(composition.regions.every((region) => region.obligations.nonReversibleFloor), true);
+  const pathRefs = composition.regions.map((region) => region.members.find((member) => member.field).field.pathRef);
+  assert.equal(new Set(pathRefs).size, 2);
+  const plan = planOverlapRewrite({ composition, source: repeated, format: 'XML', replacement: MASK });
+  assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+  const spans = plan.regions.map((item) => `${item.fieldSpan.start}-${item.fieldSpan.end}`);
+  assert.equal(new Set(spans).size, 2);
+  const applied = applyOverlapRewrite({ plan, composition, source: repeated, format: 'XML' });
+  assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? applied.reasons.join() : '');
+  assert.equal(applied.text, `<svc><password>${MASK}</password><secret>${MASK}</secret></svc>`);
+  assert.equal(applied.provenance.rewrittenFields, 2);
+  assert.equal(applied.text.includes(PASSWORD), false);
+  assert.deepEqual([sentinel(applied.text).decision, sentinel(applied.text).reasons], ['ALLOW', []]);
+
+  // Two non-overlapping regions inside ONE element text: both are covered by that single #7 field, so the
+  // plan names the same field twice and the apply makes one edit. Both regions keep their own evidence.
+  const shared = `<svc><note>${PASSWORD} and ${TOKEN}</note></svc>`;
+  const sharedParsed = parseStructured(shared, 'XML');
+  assert.equal(sharedParsed.fields.length, 1);
+  const sharedComposition = compose(detect(shared).candidates);
+  assert.equal(sharedComposition.regions.length, 2);
+  const sharedPlan = planOverlapRewrite({ composition: sharedComposition, source: shared, format: 'XML', replacement: MASK });
+  assert.equal(sharedPlan.status, 'PLANNED', reasonsOf(sharedPlan).join());
+  const sharedField = { start: sharedParsed.fields[0].valueStart, end: sharedParsed.fields[0].valueEnd };
+  assert.deepEqual(sharedPlan.regions.map((item) => item.fieldSpan), [sharedField, sharedField]);
+  const sharedApplied = applyOverlapRewrite({ plan: sharedPlan, composition: sharedComposition, source: shared, format: 'XML' });
+  assert.equal(sharedApplied.status, 'REWRITTEN', sharedApplied.status === 'REFUSED' ? sharedApplied.reasons.join() : '');
+  assert.equal(sharedApplied.text, `<svc><note>${MASK}</note></svc>`);
+  assert.equal(sharedApplied.provenance.rewrittenFields, 1);
+  assert.equal(sharedApplied.provenance.regions.length, 2);
+  assert.equal(new Set(sharedApplied.provenance.regions.map((item) => item.fieldRef)).size, 1);
+  const carried = sharedApplied.provenance.regions.flatMap((item) => item.evidenceRefs);
+  assert.equal(new Set(carried).size, carried.length);
+  for (const region of sharedComposition.regions) {
+    for (const member of region.members) assert.ok(carried.includes(member.evidenceRef), member.evidenceRef);
+  }
+  assert.equal(sharedApplied.text.includes(PASSWORD), false);
+  assert.equal(sharedApplied.text.includes(TOKEN), false);
+  assert.deepEqual([sentinel(sharedApplied.text).decision, sentinel(sharedApplied.text).reasons], ['ALLOW', []]);
+
+  // A nested SECRET inside a wider URL in an attribute: the wider claim never displaces the credential, and
+  // one attribute edit satisfies both, because the attribute is the field that covers the whole region.
+  const nested = `<svc url="https://user:${PASSWORD}@svc.example.invalid/v1"/>`;
+  const nestedComposition = compose(detect(nested).candidates);
+  assert.equal(nestedComposition.regions.length, 1);
+  const [nestedRegion] = nestedComposition.regions;
+  assert.deepEqual([...new Set(nestedRegion.obligations.semanticTypes)].sort(),
+    ['CREDENTIAL_OR_SECRET', 'HOST_OR_SERVICE', 'NETWORK_IDENTIFIER', 'PERSON']);
+  assert.ok(nestedRegion.relations.includes('CONTAINING') && nestedRegion.relations.includes('IDENTICAL'));
+  assert.equal(nestedRegion.obligations.nonReversibleFloor, true);
+  assert.equal(nestedRegion.composed.sensitivity, 'SECRET');
+  assert.equal(nestedRegion.composed.reversible, false);
+  const nestedPlan = planOverlapRewrite({ composition: nestedComposition, source: nested, format: 'XML', replacement: MASK });
+  assert.equal(nestedPlan.status, 'PLANNED', reasonsOf(nestedPlan).join());
+  const nestedApplied = applyOverlapRewrite({ plan: nestedPlan, composition: nestedComposition, source: nested, format: 'XML' });
+  assert.equal(nestedApplied.status, 'REWRITTEN', nestedApplied.status === 'REFUSED' ? nestedApplied.reasons.join() : '');
+  assert.equal(nestedApplied.text, `<svc url="${MASK}"/>`);
+  assert.equal(nestedApplied.provenance.rewrittenFields, 1);
+  assert.equal(nestedApplied.provenance.regions[0].evidenceRefs.length, nestedRegion.members.length);
+  assert.deepEqual([sentinel(nestedApplied.text).decision, sentinel(nestedApplied.text).reasons], ['ALLOW', []]);
+});
+
+test('score and arrival order cannot weaken the XML region obligations', () => {
+  // The same two-region XML document under every arrival order of its real #6 findings, and with every
+  // finding given a score it never had. Region refs, member order, obligations and the credential floor are
+  // functions of the finding set alone.
+  const input = `<svc token="${TOKEN}"><password>${PASSWORD}</password></svc>`;
+  const detection = detect(input);
+  assert.equal(detection.status, 'COMPLETE');
+  const baseline = compose(detection.candidates);
+  assert.equal(baseline.regions.length, 2);
+  for (const region of baseline.regions) {
+    assert.equal(region.obligations.nonReversibleFloor, true);
+    assert.equal(region.obligations.highestSensitivity, 'SECRET');
+    assert.equal(region.composed.sensitivity, 'SECRET');
+    assert.equal(region.composed.reversible, false);
+    assert.ok(region.members.some((member) => member.semanticType === 'CREDENTIAL_OR_SECRET'));
+  }
+  for (const order of permutations(detection.candidates)) assert.deepEqual(compose(order), baseline);
+  assert.deepEqual(compose([...detection.candidates].reverse()), baseline);
+  assert.deepEqual(compose(detection.candidates.map((item) => ({ ...item, score: 0.99 }))), baseline);
+  const serialized = JSON.stringify(baseline);
+  assert.equal(serialized.includes('score'), false);
+  assert.equal(serialized.includes('0.99'), false);
+  assert.equal(serialized.includes(TOKEN), false);
+  assert.equal(serialized.includes(PASSWORD), false);
+});
+
+test('XML refusals stay restrictive, name themselves and return no bytes', () => {
+  // CDATA is markup #7 declines, so the whole input is opaque and the region inside it is never read as
+  // inspected-and-clean. This is the committed refusal case, carried through the plan and the apply.
+  const cdata = `<svc><password><![CDATA[${PASSWORD}]]></password></svc>`;
+  const cdataDetection = detect(cdata);
+  assert.equal(cdataDetection.status, 'PARTIAL');
+  assert.ok(cdataDetection.uninspected.length > 0);
+  const cdataComposition = compose(cdataDetection.candidates, { uninspected: cdataDetection.uninspected });
+  assert.deepEqual([...new Set(cdataComposition.refusals.map((item) => item.reason))], ['OPAQUE_LOCATION_OVERLAP']);
+  const cdataPlan = planOverlapRewrite({ composition: cdataComposition, source: cdata, format: 'XML', replacement: MASK });
+  assert.equal(cdataPlan.status, 'REFUSED');
+  assert.deepEqual(reasonsOf(cdataPlan), ['SOURCE_NOT_COMPLETE']);
+  assert.ok(cdataPlan.regions.every((item) => item.decision === 'REFUSED'));
+  assert.deepEqual(applyOverlapRewrite({ plan: cdataPlan, composition: cdataComposition, source: cdata, format: 'XML' }),
+    { status: 'REFUSED', reasons: ['REFUSED_PLAN'] });
+  // The block that follows is #19's alone: the draft refused, so no merge or rewrite is credited with it.
+  const cdataBytes = sentinel(cdata);
+  assert.deepEqual([cdataBytes.decision, cdataBytes.reasons], ['BLOCK', ['KNOWN_ORIGINAL_DETECTED']]);
+  assert.deepEqual(cdataBytes.findings.map((item) => item.rule), ['planted.secret.1']);
+
+  // A comment carrying the same value: #7 reports comments, and the accepted rewriter refuses commented
+  // sources rather than silently rewriting around comment text.
+  const commented = `<svc><!-- ${PASSWORD} --><name>x</name></svc>`;
+  const commentedComposition = compose(detect(commented).candidates);
+  const commentedPlan = planOverlapRewrite({ composition: commentedComposition, source: commented, format: 'XML', replacement: MASK });
+  assert.equal(commentedPlan.status, 'REFUSED');
+  assert.deepEqual(reasonsOf(commentedPlan), ['SOURCE_HAS_COMMENTS']);
+  assert.deepEqual(applyOverlapRewrite({ plan: commentedPlan, composition: commentedComposition, source: commented, format: 'XML' }),
+    { status: 'REFUSED', reasons: ['REFUSED_PLAN'] });
+
+  // Binding failures on an otherwise clean XML source.
+  const source = `<svc><password>${PASSWORD}</password></svc>`;
+  const composition = compose(detect(source).candidates);
+  const plan = planOverlapRewrite({ composition, source, format: 'XML', replacement: MASK });
+  assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+  assert.deepEqual(applyOverlapRewrite({ plan, composition, source: `<svc><password>${TOKEN}</password></svc>`, format: 'XML' }),
+    { status: 'REFUSED', reasons: ['STALE_SOURCE_BINDING'] });
+  assert.deepEqual(applyOverlapRewrite({ plan, composition, source, format: 'JSON' }),
+    { status: 'REFUSED', reasons: ['FORMAT_MISMATCH'] });
+  const echoed = PASSWORD.slice(0, 8);
+  const tampered = { ...plan, replacement: echoed, replacementDigest: createHash('sha256').update(echoed).digest('hex') };
+  const tamperedResult = applyOverlapRewrite({ plan: tampered, composition, source, format: 'XML' });
+  assert.deepEqual(tamperedResult, { status: 'REFUSED', reasons: ['REPLACEMENT_ECHOES_ORIGINAL'] });
+  assert.equal(tamperedResult.text, undefined);
+
+  // A plan that names a different XML field than the one its region resolves to.
+  const pair = `<svc token="${PASSWORD}"><password>${PASSWORD}</password></svc>`;
+  const pairComposition = compose(detect(pair).candidates);
+  const pairPlan = planOverlapRewrite({ composition: pairComposition, source: pair, format: 'XML', replacement: MASK });
+  assert.equal(pairPlan.status, 'PLANNED', reasonsOf(pairPlan).join());
+  assert.equal(new Set(pairPlan.regions.map((item) => `${item.fieldSpan.start}-${item.fieldSpan.end}`)).size, 2);
+  const attribute = parseStructured(pair, 'XML').fields[0];
+  const forged = { ...pairPlan, regions: [{ regionRef: 'region-0', decision: 'REPLACE_FIELD_VALUE',
+    fieldSpan: { start: attribute.valueStart, end: attribute.valueEnd }, fieldRef: 'a'.repeat(16),
+    evidenceRefs: ['syn.forged.1'] }] };
+  assert.deepEqual(applyOverlapRewrite({ plan: forged, composition: pairComposition, source: pair, format: 'XML' }),
+    { status: 'REFUSED', reasons: ['PLAN_BINDING_MISMATCH'] });
+  // The honest plan still rewrites both fields, so the refusal above is a binding failure, not a format gap.
+  const honest = applyOverlapRewrite({ plan: pairPlan, composition: pairComposition, source: pair, format: 'XML' });
+  assert.equal(honest.status, 'REWRITTEN');
+  assert.equal(honest.text, `<svc token="${MASK}"><password>${MASK}</password></svc>`);
+
+  // A #6 source this draft has not been reviewed against: counted, named, and the rewrite refuses.
+  const detection = detect(source);
+  const future = { ...detection.candidates[0], source: 'FUTURE_SOURCE' };
+  const futureComposition = compose([future, ...detection.candidates.slice(1)]);
+  assert.equal(futureComposition.retention.rejected, 1);
+  assert.equal(futureComposition.retention.uncomposed, 1);
+  assert.deepEqual(reasonsOf(futureComposition), ['REGION_UNRESOLVED', 'UNKNOWN_FINDING_SOURCE']);
+  const futurePlan = planOverlapRewrite({ composition: futureComposition, source, format: 'XML', replacement: MASK });
+  assert.equal(futurePlan.status, 'REFUSED');
+  assert.deepEqual(reasonsOf(futurePlan), ['INCOMPLETE_CANDIDATE_SET']);
+
+  // A finding set that missed a surviving copy of part of a covered original: the bytes decide, not the
+  // candidate list. The covered XML field is wider than the protected value, so a whole-value comparison
+  // would see nothing left and an 8+ unit window of the covered original is still there.
+  const mirror = `<svc><password>Bearer ${PASSWORD}</password><note>mirror ${PASSWORD}</note></svc>`;
+  const noteAt = mirror.indexOf('<note>');
+  const partial = compose(detect(mirror).candidates.filter((item) => item.view.span.start < noteAt));
+  assert.equal(partial.regions.length, 1);
+  assert.equal(mirror.slice(partial.regions[0].span.start, partial.regions[0].span.end), `Bearer ${PASSWORD}`);
+  const partialPlan = planOverlapRewrite({ composition: partial, source: mirror, format: 'XML', replacement: MASK });
+  assert.equal(partialPlan.status, 'PLANNED', reasonsOf(partialPlan).join());
+  const partialApplied = applyOverlapRewrite({ plan: partialPlan, composition: partial, source: mirror, format: 'XML' });
+  assert.deepEqual(partialApplied, { status: 'REFUSED', reasons: ['ORIGINAL_SPAN_STILL_PRESENT'] });
+  assert.equal(partialApplied.text, undefined);
+  // With every #6 finding composed, both element texts are rewritten and the release is clean.
+  const whole = compose(detect(mirror).candidates);
+  assert.equal(whole.regions.length, 2);
+  const wholePlan = planOverlapRewrite({ composition: whole, source: mirror, format: 'XML', replacement: MASK });
+  const wholeApplied = applyOverlapRewrite({ plan: wholePlan, composition: whole, source: mirror, format: 'XML' });
+  assert.equal(wholeApplied.status, 'REWRITTEN', wholeApplied.status === 'REFUSED' ? wholeApplied.reasons.join() : '');
+  assert.equal(wholeApplied.text, `<svc><password>${MASK}</password><note>${MASK}</note></svc>`);
+  assert.deepEqual([sentinel(wholeApplied.text).decision, sentinel(wholeApplied.text).reasons], ['ALLOW', []]);
+});
+
+test('a case-and-separator variant no XML detector reports is an independent sentinel catch', () => {
+  // `SYN PASS 4F2B9C7E1D INVALID` is the same value with other case and separators. No #6 candidate source
+  // reports it and it shares no literal window with the covered original, so the draft's post-condition cannot
+  // see it: the rewrite legitimately succeeds. Only #19, on the exact serialized bytes, refuses the release,
+  // and that catch is the sentinel's alone.
+  const input = `<svc><password>${PASSWORD}</password><note>SYN PASS 4F2B9C7E1D INVALID</note></svc>`;
+  const composition = compose(detect(input).candidates);
+  assert.equal(composition.regions.length, 1);
+  const plan = planOverlapRewrite({ composition, source: input, format: 'XML', replacement: MASK });
+  assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+  const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'XML' });
+  assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? applied.reasons.join() : '');
+  assert.equal(applied.text, `<svc><password>${MASK}</password><note>SYN PASS 4F2B9C7E1D INVALID</note></svc>`);
+  assert.equal(applied.text.includes(PASSWORD), false);
+  assert.equal(applied.provenance.rewrittenFields, 1);
+  // Composition and transformation outcomes are reported separately from the final-byte one: no candidate
+  // survives in the rewritten bytes, and the note element was never a region in the first place.
+  assert.deepEqual(detect(applied.text).candidates.filter((item) => item.source === 'SECRET'), []);
+  const finalBytes = sentinel(applied.text);
+  assert.deepEqual([finalBytes.decision, finalBytes.reasons], ['BLOCK', ['KNOWN_ORIGINAL_DETECTED']]);
+  assert.deepEqual(finalBytes.findings.map((item) => item.rule), ['planted.secret.1']);
+  // The same source without the rewritten region still blocks for the same independent reason.
+  assert.deepEqual(sentinel(input).reasons, ['KNOWN_ORIGINAL_DETECTED']);
+});
+
+test('XML rewrite records carry references, spans and digests only', () => {
+  const input = `<svc token="${TOKEN}"><password>${PASSWORD}</password><owner>${PERSON}</owner></svc>`;
+  const detection = detect(input);
+  const composition = compose(detection.candidates);
+  const plan = planOverlapRewrite({ composition, source: input, format: 'XML', replacement: MASK });
+  const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'XML' });
+  assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? applied.reasons.join() : '');
+  const serialized = [JSON.stringify(composition), JSON.stringify(plan), JSON.stringify(applied.provenance)].join('');
+  for (const planted of [PERSON, PASSWORD, TOKEN, CANARY]) assert.equal(serialized.includes(planted), false, planted);
+  // Key, element and attribute names are payload content and never reach a record; the field reference is a
+  // source-bound digest instead. A detector rule name does reach an evidence reference, which is why
+  // `password` is not in this list and the surrounding paths are asserted individually above.
+  for (const name of ['accessToken', '@token', 'owner']) assert.equal(serialized.includes(name), false, name);
+  assert.ok(serialized.includes('hylja.secret-detectors.password'));
+  for (const word of ['KEEP', 'MASK', 'TOKENIZE', 'SYNTHETIC', 'GENERALIZE', 'REMOVE', 'BLOCK', 'REQUIRE_REVIEW']) {
+    assert.equal(serialized.includes(word), false, word);
+  }
+  assert.equal(plan.regions.every((item) => /^[0-9a-f]{16}$/u.test(item.fieldRef)), true);
+  assert.equal(new Set(plan.regions.map((item) => item.fieldRef)).size, plan.regions.length);
+  assert.equal(applied.provenance.regions.length, plan.regions.length);
+  assert.equal(applied.text.includes(PERSON), false);
+  assert.equal(applied.text.includes(PASSWORD), false);
+  assert.equal(applied.text.includes(TOKEN), false);
+  assert.deepEqual([sentinel(applied.text).decision, sentinel(applied.text).reasons], ['ALLOW', []]);
+});
