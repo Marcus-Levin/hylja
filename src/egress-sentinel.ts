@@ -271,6 +271,8 @@ function urlPassword(text: string): boolean {
 // other bare words are flagged, since unquoted passwords look the same as identifiers.
 const CREDENTIAL_ASSIGNMENT = /(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*(?:(["'`])([^"'`\r\n]{4,})\2|([^\s"'`,;)]{4,}))/giu;
 const REFERENCE = /^(?:\$\{[^}]*\}|\{\{[^}]*\}\}|<[\w -]{1,40}>|\*{3,}|\[hylja:protected:[A-Z0-9_]+\])$/u;
+/** The shortest literal the single-line credential pattern accepts, and the floor a block-scalar body must clear. */
+const MIN_ASSIGNED_VALUE = 4;
 const NOT_A_VALUE = /^(?:[$<*{[]|(?:string|number|boolean|bigint|object|any|unknown|undefined|null|none|true|false|nil|str|int|bool|bytes)$|[A-Za-z_$][\w$]*(?:(?:\.|\?\.)[A-Za-z_$][\w$]*|\[[^\]]*\])+$)/iu;
 function credentialAssignment(text: string): boolean {
   for (const match of text.matchAll(CREDENTIAL_ASSIGNMENT)) {
@@ -288,6 +290,55 @@ function credentialAssignment(text: string): boolean {
     const sameName = unquoted !== undefined && unquoted.replace(/[_-]/gu, '').toLowerCase() === match[1]!.replace(/[_-]/gu, '').toLowerCase();
     if (match[4] !== undefined ? unquoted!.length >= 4 && !NOT_A_VALUE.test(unquoted!) && !sameName : !REFERENCE.test(match[3]!)) return true;
   }
+  return blockScalarCredential(text);
+}
+/**
+ * A YAML block scalar (`password: |`, `secret: >-2`) is a credential-shaped assignment whose value is on the
+ * following indented lines, so the single-line pattern above cannot see it. A block scalar body is always a
+ * literal, exactly like a quoted value: it is a value unless it is a whole reference or mask, a key-echo
+ * shorthand, or a `PWD` path. The indicator itself (`|`, `>`) is never a value and never exempts the body.
+ *
+ * The header is found anywhere a key may appear, like the single-line pattern, so a YAML document carried inside
+ * a JSON string is read once the escape round has produced its line breaks. Each header is read forward from its
+ * own end, so a line is visited once per header and the work stays linear in the text. A line that is not more
+ * indented than the header's own line ends the block and starts a new mapping entry. The per-block line and byte
+ * bounds are this module's other per-field bounds: a longer block is read up to the bound and reading resumes at
+ * the next line, so a bound can never hide a later key.
+ */
+const BLOCK_SCALAR_ASSIGNMENT = /(?<![A-Za-z0-9_-])(?:"|')?(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)(?:"|')?[ \t]*:[ \t]*[|>](?:[+-][1-9]?|[1-9][+-]?)?[ \t]*(?:#[^\r\n]*)?\r?(?=\n|$)/giu;
+const MAX_BLOCK_LINES = 64;
+const MAX_BLOCK_BYTES = 4096;
+const LEADING_SPACE = /^[ \t]*/u;
+const BLOCK_COMMENT = /^[ \t]*#/u;
+function blockScalarCredential(text: string): boolean {
+  for (const match of text.matchAll(BLOCK_SCALAR_ASSIGNMENT)) {
+    const indent = LEADING_SPACE.exec(text.slice(text.lastIndexOf('\n', match.index) + 1, match.index))![0].length;
+    let at = match.index + match[0].length;
+    if (text[at] === '\n') at += 1;
+    else if (text[at] === '\r' && text[at + 1] === '\n') at += 2;
+    const body: string[] = [];
+    let bytes = 0;
+    while (at < text.length && body.length < MAX_BLOCK_LINES && bytes < MAX_BLOCK_BYTES) {
+      let end = text.indexOf('\n', at);
+      if (end < 0) end = text.length;
+      const line = text.slice(at, end);
+      bytes += line.length + 1;
+      at = end + 1;
+      // A blank line belongs to the block only after the block has started.
+      if (line.trim() === '') { if (body.length) body.push(''); continue; }
+      const width = LEADING_SPACE.exec(line)![0].length;
+      if (width <= indent) break;
+      const content = line.slice(width).trim();
+      // A comment line inside the block is a comment, and a document marker ends the document.
+      if (!BLOCK_COMMENT.test(line) && content !== '---' && content !== '...') body.push(content);
+    }
+    const value = body.join('\n').trim();
+    if (value.length < MIN_ASSIGNED_VALUE) continue;
+    if (/^pwd$/iu.test(match[1]!) && /^[/~]/u.test(value)) continue;
+    if (REFERENCE.test(value)) continue;
+    if (value.replace(/[_-]/gu, '').toLowerCase() === match[1]!.replace(/[_-]/gu, '').toLowerCase()) continue;
+    return true;
+  }
   return false;
 }
 const ENCODED_RUN = /(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{16,65536}={0,2})(?![A-Za-z0-9+/=_-])/gu;
@@ -302,6 +353,50 @@ const MAX_SHORT_RUNS = 8192;
  * inspected (decision 007). Decompression still runs first so a planted original yields a precise reason.
  */
 const OPAQUE_BYTES = 32;
+/**
+ * Bounds on the interior read of a run the opaque count does not count (a run shorter than `OPAQUE_BYTES` that is
+ * not a recognized digest, id or public key, a run whose exact byte length is a digest length, and a run inside a
+ * DER-shaped public PEM body). Brotli and raw deflate carry no signature to scan for, so every starting offset of
+ * such a run is tried, and the read is split into two ceilings because the two kinds are not the same claim.
+ *
+ * `MAX_INTERIOR_BYTES` bounds the runs **nothing declared**: their exemption is a coincidence of length, so they are
+ * read in full or the message is uninspectable (`SENTINEL_BUDGET`). Without that refusal a bounded read that ran out
+ * released whatever it never reached, and adding harmless lines *before* a hidden payload disabled detection of it,
+ * which is a bypass rather than a completeness gap.
+ *
+ * `MAX_OPTIONAL_WINDOWS` bounds every **other** exempt run: a short run that is not a recognized digest, id or
+ * public key, a declared reconstruction, a digest the message named under an algorithm context (`sha256-`, `h1:`,
+ * `Content-MD5:`, `ETag:`), and a run inside a DER-shaped public PEM body. Those keep the exemptions this module
+ * has always published; they are read when the window ceiling allows, and exhausting it is never a reason to
+ * refuse, because refusing them would refuse ordinary `go.sum` and certificate traffic, which is what the
+ * exemption is for.
+ *
+ * `MAX_INTERIOR_OUTPUT` bounds one speculative decode and `MAX_INTERIOR_TEXT` bounds what those decodes may add to
+ * the message's views. Every window is charged whether it decoded, decoded nothing or failed; a window is the unit
+ * of work and tries `INTERIOR_SWEEP + 1` starting offsets against both signature-less formats.
+ */
+const MAX_INTERIOR_BYTES = 32 << 10;
+const MAX_OPTIONAL_WINDOWS = 64;
+/**
+ * Starting offsets after the first that one interior window sweeps. The width is a measured trade, not a guess:
+ * each offset costs one brotli and one raw-deflate attempt (fewer for deflate, whose reserved block-type bit rules
+ * three of every four offsets out), and each attempt holds up to `DECODE_CHUNK` bytes of native memory until the
+ * runtime can run again, so a wider window buys coverage with a higher high-water mark for a synchronous batch. The
+ * ceiling that
+ * decides coverage is `MAX_INTERIOR_BYTES`; this only decides how many attempts reach it.
+ */
+const INTERIOR_SWEEP = 15;
+/** Shorter runs cannot hold a deflate or brotli stream that decodes to a value, so they are never read inside. */
+const MIN_INTERIOR_RUN = 16;
+const MAX_INTERIOR_OUTPUT = 1 << 10;
+const MAX_INTERIOR_TEXT = 1 << 16;
+/**
+ * Total decompressed output the interior read itself may produce. It is separate from the message's own 4 MiB
+ * because these decodes are speculative and a long list of compressible digests decodes by chance at many offsets;
+ * sharing one ceiling refused messages this module has always read and released for finding nothing. Measured on
+ * this host, reading the module's own 900-line digest-list control produces about 12 MiB of it.
+ */
+const MAX_INTERIOR_INFLATED = 16 << 20;
 /** Total decompressed output per message across all attempts and rounds; exceeding it blocks (bomb or flood). */
 const MAX_INFLATE_TOTAL = 4 << 20;
 // Container and compression formats the sentinel does not decode: opaque at any length.
@@ -405,33 +500,92 @@ function isIdentifier(value: string): boolean {
 // JSON/YAML arrays of pairs (`["4f","72",…]`) and padded columns decode too.
 const HEX_PAIRS = /(?<![0-9A-Fa-f])(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:(?:[ \t\r\n,;:|.&"'[\]]|\\[nrt"\\]|-(?=[ \t0-9A-Fa-f])){1,24}(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?![0-9A-Fa-f])){7,4096}/gu;
 /**
- * Hex dump lines (`od`, `xxd`, `xxd -g1`, `hexdump -C` with offsets): an offset, byte pairs or two-byte groups, then an optional ASCII column after `  |`
- * or two or more spaces. The offset and ASCII column are dropped, so hex-looking text in the ASCII column (`|.Ee.`)
- * cannot corrupt the bytes. Consecutive dump lines (real or JSON-escaped line breaks) form one decode-only run.
+ * One dump row, as its structure rather than as a string: the cells it spells, the width they are written at, how
+ * many of them are cells at all, how many there are before its ASCII column, and the byte offset it declares. The
+ * offset column is what makes the row width knowable without trusting the column separator, which matters because a
+ * sender chooses both the whitespace inside the hex field and the content of the column.
  */
+interface DumpRow { cells: string[]; width: number; count: number; gap: number; offset: number }
 // Lines with an offset column; the line may carry a prefix (a JSON body's first line: `"content":"00000000  78 9c …`).
 // Dumps without offsets (`od -An`) are plain byte-pair runs.
-const DUMP_OFFSET = /(?:^|[^0-9A-Fa-f])[0-9A-Fa-f]{4,8}:?[ \t]+/u;
-function dumpLineHex(line: string): string | null {
+const DUMP_OFFSET = /(?:^|[^0-9A-Fa-f])([0-9A-Fa-f]{4,8}):?[ \t]+/u;
+/**
+ * Cells examined in one dump row, counting the ASCII column. This is a parsing bound on one line the caller has
+ * already capped at 400 characters, not a work, view, depth or output budget, and it guards no reconstruction: the
+ * reconstruction is bounded by the row width the row's own offsets declare, and the line by that 400-character
+ * ceiling. What it decides is only whether a line is read as a dump row at all, and that is not a neutral choice,
+ * because a rejected row falls back to the byte-pair reader, which reads the column's pairs as data and interleaves
+ * them into the reconstruction. Measured: with this bound at 32 -- below a 32-byte `xxd -c 32` row plus its column,
+ * or any `xxd -g1` row whose column spells more than 16 cells -- a dump carrying an unmarked column of
+ * two-character hex cells, or of either cell width written as word-like groups, released a planted original and
+ * canary with `release` bytes even with the offset-derived row width in place. 64 covers every standard dump row up
+ * to `xxd -c 64` plus its column; a row wider than that is still reconstructed by the byte-pair reader and blocks,
+ * which is measured rather than assumed.
+ */
+const MAX_DUMP_CELLS = 64;
+function dumpLineRow(line: string): DumpRow | null {
   const ascii = line.indexOf('  |');
   const body = ascii >= 0 ? line.slice(0, ascii) : line;
   const offset = DUMP_OFFSET.exec(body);
   if (!offset) return null;
-  const field = body.slice(offset.index + offset[0].length);
-  // hexdump -C puts two spaces between halves but marks its ASCII column with `|`. xxd pads with two or
-  // more spaces before an unmarked ASCII column. Split the latter only after the offset has been removed.
-  const hexField = ascii >= 0 ? field : field.split(/[ \t]{2,}/u, 1)[0]!;
-  const groups = hexField.trim().split(/[ \t]+/u);
-  const width = groups[0]?.length;
-  if ((width !== 2 && width !== 4) || groups.length > 32 || groups.some((group, index) =>
-    !/^[0-9A-Fa-f]+$/u.test(group) || group.length !== width && !(width === 4 && index === groups.length - 1 && group.length === 2))) return null;
-  return groups.join('');
+  const tail = body.slice(offset.index + offset[0].length);
+  const cells = tail.trim().split(/[ \t]+/u);
+  const width = cells[0]?.length;
+  if (cells.length > MAX_DUMP_CELLS || (width !== 2 && width !== 4)) return null;
+  // The cells the row spells before anything that is not a cell: every cell is hex of the row's own width, except
+  // a default `xxd` row's final odd byte, which is one cell shorter.
+  const shortCell = width === 4 ? cells.length - 1 : -1;
+  let count = 0;
+  while (count < cells.length &&
+    (cells[count]!.length === width || (count === shortCell && cells[count]!.length === 2))) count++;
+  if (!count) return null;
+  // Cells before the ASCII column: every cell up to the first run of two or more spaces. Only an unmarked column
+  // can be mistaken for cells, so only an unmarked row has one.
+  const gap = ascii < 0 ? /[ \t]{2,}/u.exec(tail) : null;
+  return { cells, width, count, offset: parseInt(offset[1]!, 16),
+    gap: gap ? tail.slice(0, gap.index).trim().split(/[ \t]+/u).length : count };
+}
+/**
+ * The cell count a block's rows agree on, from their own offsets. A short final row has no successor to compare
+ * against, and a row that spells more cells than the agreed width is not a full row, so it falls back to the cells
+ * before its column; that fallback is safe because a doubled separator inside a full row leaves the row's own
+ * offsets and cell count untouched, and the row cut at the gap is read as well. `xxd`, `hexdump -C` and `od` all advance the offset
+ * by one row, so the difference between two consecutive offsets is that row's byte count. This is the whole answer to
+ * "where does the hex field end": a doubled space or tab *inside* the field adds no cell, so the row's own offsets
+ * are unchanged by it and the complete reading still spans the field; while an unmarked ASCII column adds cells, and
+ * cells past the row's declared width are the column, not bytes. Reading past them interleaves the column into the
+ * reconstruction, destroys the stream it carries and released the payload outright. A block whose offsets do not
+ * advance uniformly (a partial or hand-written listing) has no agreed width, and is read as before.
+ */
+function dumpRowWidth(rows: readonly DumpRow[]): number | null {
+  let width: number | null = null;
+  for (let index = 0; index + 1 < rows.length; index++) {
+    const bytes = rows[index + 1]!.offset - rows[index]!.offset;
+    const cells = rows[index]!.width === 2 ? bytes : bytes / 2;
+    if (!(cells >= 1 && cells <= 32) || !Number.isInteger(cells)) return null;
+    if (width === null) width = cells;
+    else if (width !== cells) return null;
+  }
+  return width;
 }
 function* dumpRuns(text: string): Generator<EncodedRun> {
-  let block: { start: number; end: number; hex: string[]; lines: number } | null = null;
+  // One block per reading, kept side by side so a complete reading is never displaced by a shorter one.
+  let block: { start: number; end: number; rows: DumpRow[]; hex: string[][]; lines: number } | null = null;
   const flush = function* (): Generator<EncodedRun> {
-    if (block && block.lines >= 2 && block.hex.join('').length >= 32) {
-      yield { start: block.start, end: block.end, value: block.hex.join(''), prefixed: false, countable: false, separated: true };
+    if (block) {
+      const width = dumpRowWidth(block.rows);
+      for (const [index, hex] of block.hex.entries()) {
+        if (block.lines < 2 || hex.join('').length < 32) continue;
+        // Reading 0 is the whole row, bounded by the width the offsets declare so a hex-looking unmarked ASCII column
+        // is never read as bytes. Reading 1 is the row cut at the first multi-space run, which is what a doubled
+        // separator inside the hex field must not be allowed to truncate.
+        // A row that spells no more cells than the agreed width holds exactly those cells — its own hex field,
+        // whatever separator a sender put inside it. A row that spells more spells its column too, and there the
+        // cells before the column are the field. Either way the column's cells are left out.
+        const value = index === 0 && width !== null ? block.rows.map((row) =>
+          row.cells.slice(0, row.count > width ? row.gap : row.count).join('')).join('') : hex.join('');
+        if (value.length >= 32) yield { start: block.start, end: block.end, value, prefixed: false, countable: false, separated: true };
+      }
     }
     block = null;
   };
@@ -440,12 +594,16 @@ function* dumpRuns(text: string): Generator<EncodedRun> {
   for (let found = breaks.exec(text); ; found = breaks.exec(text)) {
     const end = found ? found.index : text.length;
     if (end - start <= 400) {
-      const pairs = dumpLineHex(text.slice(start, end));
-      if (pairs !== null) {
-        block ??= { start, end, hex: [], lines: 0 };
-        block.hex.push(pairs);
-        block.end = end;
+      const row = dumpLineRow(text.slice(start, end));
+      if (row) {
+        block ??= { start, end, rows: [], hex: [], lines: 0 };
         block.lines++;
+        block.rows.push(row);
+        for (const [index, upTo] of [row.count, row.gap].entries()) {
+          const hex = row.cells.slice(0, upTo).join('');
+          if (hex && hex !== block.hex[index]?.at(-1)) (block.hex[index] ??= []).push(hex);
+        }
+        block.end = end;
       } else yield* flush();
     } else yield* flush();
     if (!found) break;
@@ -1144,14 +1302,42 @@ function* escapedByteRuns(text: string): Generator<EncodedRun> {
  * when the message's decompression budget is exhausted.
  */
 const SYNC_FLUSH = 2;
+/**
+ * Output chunk every decode attempt asks Node's zlib for. A synchronous zlib call allocates one output buffer per
+ * call at Node's default `chunkSize` of 16 KiB, and a call that *fails* keeps that buffer until the runtime can run
+ * again: measured on this host, a synchronous batch of 24,000 failed calls raises `arrayBuffers` by 16,148 bytes per
+ * call at the default, by 4,037 at 4,096 and by 1,049 at 1,024, independent of `windowBits`. That is the high-water
+ * mark of one synchronous batch, not a per-process retention: after two event-loop turns and a forced GC,
+ * `arrayBuffers` and `external` return to within 0.1 MiB of their baseline, while RSS does not come back. So this
+ * constant bounds how much a wrong-offset or decoy-signature scan can hold *while it runs*; it costs nothing
+ * measurable on successful decodes (median of five, 1 MiB gunzip: 1.92 ms at 1 KiB against 1.49 ms at the default).
+ */
+const DECODE_CHUNK = 1024;
 interface Inflated { out: Uint8Array; signed: boolean; consumed: number }
-type Engine = (buffer: Uint8Array, options: { maxOutputLength: number; finishFlush: number; info: true }) => { buffer: Uint8Array; engine: { bytesWritten: number } };
-function inflate(bytes: Uint8Array, budget: { inflated: number }): Inflated | null | 'BUDGET' {
+type Engine = (buffer: Uint8Array, options: { maxOutputLength: number; finishFlush: number; info: true; chunkSize: number }) => { buffer: Uint8Array; engine: { bytesWritten: number } };
+/**
+ * `sweep` is how many starting offsets after the first a raw-deflate attempt may try. A signed stream carries a
+ * signature, so those sixteen attempts are already bounded; an unsigned one does not, so the interior read asks
+ * for a bounded number of starting offsets per call rather than one, and steps its window on by the same amount,
+ * so every offset is tried once. A sweep is matching evidence only: it never lowers or raises the opaque authority
+ * of what it decodes.
+ */
+/**
+ * `budget.total` is the message-wide decompression ceiling for the reads that share it. The interior read charges
+ * its own, because its decodes are speculative: a long list of compressible digests decodes by chance at many
+ * offsets, and charging those against the message's own 4 MiB would refuse messages the module has always inspected
+ * and released for reading nothing. Both ceilings fail closed when they are reached.
+ */
+interface DecodeBudget { inflated: number; total: number }
+function inflate(bytes: Uint8Array, budget: DecodeBudget, cap = budget.total, sweep = 0): Inflated | null | 'BUDGET' {
   const attempt = (engine: Engine, input: Uint8Array, start: number, signed: boolean, trailer = 0): Inflated | null | 'BUDGET' => {
-    const remaining = MAX_INFLATE_TOTAL - budget.inflated;
+    const remaining = budget.total - budget.inflated;
     if (remaining <= 0) return 'BUDGET';
+    // A per-attempt cap (`cap`) bounds one speculative decode; running out of *that* is a failed attempt, while
+    // running out of the message budget still fails closed.
+    const limit = Math.min(remaining, cap);
     try {
-      const { buffer: out, engine: state } = engine(input, { maxOutputLength: remaining, finishFlush: SYNC_FLUSH, info: true });
+      const { buffer: out, engine: state } = engine(input, { maxOutputLength: limit, finishFlush: SYNC_FLUSH, info: true, chunkSize: DECODE_CHUNK });
       budget.inflated += out.length;
       const consumed = Math.min(bytes.length, start + (state.bytesWritten || input.length) + trailer);
       // A gzip/zlib stream that decoded is a stream even when its output is tiny or empty, so a chain continues.
@@ -1159,7 +1345,7 @@ function inflate(bytes: Uint8Array, budget: { inflated: number }): Inflated | nu
       if (out.length < 4) return null;
       return { out, signed, consumed };
     } catch (error) {
-      return (error as { code?: string }).code === 'ERR_BUFFER_TOO_LARGE' ? 'BUDGET' : null;
+      return (error as { code?: string }).code === 'ERR_BUFFER_TOO_LARGE' && limit >= remaining ? 'BUDGET' : null;
     }
   };
   for (let offset = 0; offset < Math.min(16, bytes.length - 1); offset++) {
@@ -1183,9 +1369,25 @@ function inflate(bytes: Uint8Array, budget: { inflated: number }): Inflated | nu
       if (result) return result;
     }
   }
-  const brotli = attempt(brotliDecompressSync as unknown as Engine, bytes, 0, false);
-  if (brotli) return brotli;
-  return attempt(inflateRawSync as unknown as Engine, bytes, 0, false);
+  if (!sweep) {
+    const brotli = attempt(brotliDecompressSync as unknown as Engine, bytes, 0, false);
+    return brotli ?? attempt(inflateRawSync as unknown as Engine, bytes, 0, false);
+  }
+  // A sweep reads several starting offsets for the formats whose header cannot be scanned for. RFC 1951 reserves
+  // one block type, so three of every four offsets cannot start a deflate stream and are not tried; brotli has no
+  // such bit, so its own decoder is asked at each offset. A speculative interior read adds text and nothing else,
+  // so a binary decode from a wrong offset is not evidence and must not displace the real stream behind it; among
+  // the text decodes, the longest wins.
+  let best: Inflated | null = null;
+  for (let offset = 0; offset < Math.min(sweep + 1, bytes.length - 1); offset++) {
+    for (const engine of [brotliDecompressSync, inflateRawSync]) {
+      if (engine === inflateRawSync && ((bytes[offset]! >> 1) & 3) === 3) continue;
+      const result = attempt(engine as unknown as Engine, bytes.subarray(offset), offset, false);
+      if (result === 'BUDGET') return 'BUDGET';
+      if (result && isText(result.out) && (!best || result.out.length > best.out.length)) best = result;
+    }
+  }
+  return best;
 }
 /** Offset of the deflate body after a gzip member header (RFC 1952), or -1. */
 function gzipBody(view: Uint8Array): number {
@@ -1234,22 +1436,29 @@ function startsStream(bytes: Uint8Array): boolean {
   }
   return false;
 }
-function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, depth = 0, chain = 0): Expanded | null | 'CONTAINER' | 'BUDGET' {
-  const inflated = inflate(bytes, budget);
+/**
+ * `speculative` marks a read whose printable and junk layers are discarded (an interior offset scan), so only the
+ * text a decode produces is built: garbage that is dropped must not cost a string.
+ */
+function expand(bytes: Uint8Array, budget: DecodeBudget, sink: Sink, depth = 0, chain = 0,
+  cap = budget.total, speculative = false, sweep = 0): Expanded | null | 'CONTAINER' | 'BUDGET' {
+  const inflated = inflate(bytes, budget, cap, sweep);
   if (inflated === 'BUDGET' || inflated === null) return inflated;
   const { out, signed, consumed } = inflated;
   const decoded = out;
   // Every layer is matched: as text when it is text, and as printable bytes and UTF-16 otherwise.
-  const matchBinary = (): void => { sink.printables.push(printable(decoded), utf16Printable(out)); };
+  const matchBinary = (): void => { if (!speculative) sink.printables.push(printable(decoded), utf16Printable(out)); };
   // Brotli/raw deflate has no reliable signature. Even plausible printable output from ordinary decimal text
   // is only tentative: inspect it and its nested layers, but never use it to lower or raise opaque authority.
   if (!signed) {
-    sink.junk.push(printable(decoded), utf16Printable(out));
+    if (!speculative) sink.junk.push(printable(decoded), utf16Printable(out));
     if (isText(decoded)) sink.uncertain.push(utf8Lenient.decode(out));
-    if (depth + 1 < MAX_INFLATE_DEPTH) {
+    // A speculative read does not recurse: its sweep already tries every starting offset of the whole run, so a
+    // layer inside this output is reached by the next window rather than by a second pass over the same bytes.
+    if (!speculative && depth + 1 < MAX_INFLATE_DEPTH) {
       const inner: Sink = { texts: [], uncertain: [], printables: [], junk: [] };
       for (const part of consumed < bytes.length ? [out, bytes.subarray(consumed)] : [out]) {
-        const result = expand(part, budget, inner, depth + 1);
+        const result = expand(part, budget, inner, depth + 1, 0, cap);
         // Only a successfully decoded signed gzip/zlib layer can return CONTAINER. Preserve that restrictive
         // finding even when the layer was reached through tentative raw deflate or brotli output.
         if (result === 'CONTAINER' || result === 'BUDGET') return result;
@@ -1264,15 +1473,17 @@ function expand(bytes: Uint8Array, budget: { inflated: number }, sink: Sink, dep
   let trailing = 0;
   if (consumed < bytes.length) {
     const tail = bytes.subarray(consumed);
-    const next = chain + 1 < MAX_STREAM_CHAIN ? expand(tail, budget, sink, depth, chain + 1) : null;
+    // A speculative read does not follow the chain: its sweep already tries every starting offset of the run, so a
+    // stream after this one's end is read by the next window rather than by a second pass over the same bytes.
+    const next = chain + 1 < MAX_STREAM_CHAIN && !speculative ? expand(tail, budget, sink, depth, chain + 1, cap, speculative) : null;
     if (next === 'CONTAINER' || next === 'BUDGET') return next;
     if (next && !next.keep) trailing = next.opaque;
     else if (isText(tail)) sink.texts.push(utf8Lenient.decode(tail));
-    else { trailing = tail.length; sink.printables.push(printable(tail), utf16Printable(tail)); }
+    else { trailing = tail.length; if (!speculative) sink.printables.push(printable(tail), utf16Printable(tail)); }
   }
   if (isText(decoded)) { sink.texts.push(utf8Lenient.decode(out)); return { opaque: trailing, consumed: bytes.length, keep: false }; }
   matchBinary();
-  const nested = depth + 1 < MAX_INFLATE_DEPTH ? expand(out, budget, sink, depth + 1) : null;
+  const nested = depth + 1 < MAX_INFLATE_DEPTH ? expand(out, budget, sink, depth + 1, 0, cap) : null;
   if (nested === 'CONTAINER' || nested === 'BUDGET') return nested;
   if (nested && !nested.keep) return { opaque: nested.opaque + trailing, consumed: bytes.length, keep: false };
   return { opaque: out.length + trailing, consumed: bytes.length, keep: false };
@@ -1356,12 +1567,17 @@ const INVALID_BYTE_OCTAL = /\\[4-7][0-7]{2}/u;
  */
 function canonicalViews(root: string): { views: View[]; opaque: boolean } | { reason: string } {
   const views: View[] = [];
-  const budget = { inflated: 0 };
+  const budget: DecodeBudget = { inflated: 0, total: MAX_INFLATE_TOTAL };
+  // The interior read's own decompression ceiling, charged across every window and every round.
+  const interiorBudget: DecodeBudget = { inflated: 0, total: MAX_INTERIOR_INFLATED };
   /** Declared reconstructions are budgeted per message, across every view and round. */
   const declaredBudget: DeclaredBudget = { seen: new Set<string>(), runs: 0, units: 0, work: 0 };
   const countedValues = new Set<string>();
   const countedBytes: string[] = [];
   let opaqueTotal = 0;
+  let interiorWindows = 0;
+  let interiorBytes = 0;
+  let interiorText = 0;
   let queue: View[] = [{ name: 'ROOT', text: root }];
   let units = 0;
   for (let round = 0; queue.length && round <= MAX_ROUNDS; round++) {
@@ -1396,6 +1612,10 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
       const declaredRun: boolean[] = [];
       const runCounts: number[] = [];
       const runIdentified: boolean[] = [];
+      const runPublicBlock: boolean[] = [];
+      const runDeclared: boolean[] = [];
+      const runDigest: boolean[] = [];
+      const runValue: string[] = [];
       const publicBlocks = [...view.text.matchAll(PUBLIC_PEM)].filter((block) => derShaped(block[0]))
         .map((block) => ({ start: block.index, end: block.index + block[0].length }));
       for (const run of encodedRuns(view.text, declaredBudget)) {
@@ -1440,6 +1660,15 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         if (counted) { countedValues.add(run.value); countedValues.add(run.value.slice(1)); countedBytes.push(byteKey); }
         runCounts.push(counted);
         runIdentified.push(identified);
+        // A DER-shaped public PEM body is exempt from the opaque count by its shape, so a stream inside one is
+        // never found by counting; the interior read below is the only thing that can find it.
+        runPublicBlock.push(publicBlocks.some((block) => block.start <= run.start && run.end <= block.end));
+        // What the message itself declares about this run: a digest under a named algorithm, or a certificate body
+        // whose DER length header matches. Everything else the opaque count ignores, it ignores by coincidence.
+        runDeclared.push(digestContext !== null ||
+          publicBlocks.some((block) => block.start <= run.start && run.end <= block.end));
+        runDigest.push(digest);
+        runValue.push(run.value);
         countable += counted;
         const text = printable(decoded);
         if (text.trim()) printables.push(text);
@@ -1518,6 +1747,66 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
             if (result && !result.keep) { streams++; at += result.consumed - 1; }
           }
         }
+        // A run the opaque count does not count contributes nothing to that count, so a stream inside it is only
+        // ever found here: a run shorter than OPAQUE_BYTES that is not a recognized digest, id or public key, a run
+        // whose exact byte length is a digest length, and a run inside a DER-shaped public PEM body. Brotli and raw
+        // deflate carry no signature to scan for, so every starting offset of such a run is tried. Must-read runs
+        // are read first and in full; declared ones after them, within their own window budget.
+        // Distinct values only: a list repeats its entries, and reading the same bytes again is work nobody can
+        // bill for twice. A run's bytes are its encoded value, so this cannot merge two different reads.
+        const seenRuns = new Set<string>();
+        const exempt = binary.map((_, index) => index).filter((index) => !covered.has(index) &&
+          binary[index]!.length >= MIN_INTERIOR_RUN &&
+          (runPublicBlock[index]! || binary[index]!.length < OPAQUE_BYTES || runDigest[index]!) &&
+          !seenRuns.has(runValue[index]!) && seenRuns.add(runValue[index]!));
+        // Only the shape coincidence obliges this module: a run whose exact byte length is a digest length that
+        // nothing declared. The other exempt runs are decode-only by design (declared reconstructions, chunk joins,
+        // byte-pair lists) or positively identified, and their residual is a published limit, not a hidden payload.
+        const mustRead = exempt.filter((index) => runDigest[index]! && !runDeclared[index]! && !runPublicBlock[index]!);
+        /**
+         * One run's starting offsets, as bounded matching evidence: the text these attempts decode goes only to the
+         * uncertain layers, which are matched but never counted, because a wrong-offset decode is garbage and
+         * garbage must not become evidence of its own. `obliged` selects which ceiling applies; an `EXHAUSTED`
+         * result is a refusal for a run the opaque count excuses on a length coincidence and a stop for the rest.
+         */
+        const readInterior = (index: number, obliged: boolean): 'EXHAUSTED' | 'BUDGET' | 'CONTAINER' | null => {
+          const bytes = binary[index]!;
+          if (obliged) {
+            if (interiorBytes + bytes.length > MAX_INTERIOR_BYTES) return 'EXHAUSTED';
+            interiorBytes += bytes.length;
+          } else if (interiorWindows >= MAX_OPTIONAL_WINDOWS) return 'EXHAUSTED';
+          for (let at = 1; at + 1 < bytes.length && (obliged || interiorWindows < MAX_OPTIONAL_WINDOWS); at += INTERIOR_SWEEP + 1) {
+            interiorWindows++;
+            const interior: Sink = { texts: [], uncertain: [], printables: [], junk: [] };
+            // Speculative: no layer below it is followed and no chain is continued, so one window costs one signed
+            // scan and one sweep of the two formats that have no signature.
+            const result = expand(bytes.subarray(at), interiorBudget, interior, MAX_INFLATE_DEPTH - 1, 0, MAX_INTERIOR_OUTPUT,
+              true, INTERIOR_SWEEP);
+            if (result === 'BUDGET') return 'BUDGET';
+            if (result === 'CONTAINER') return 'CONTAINER';
+            if (!result) continue;
+            for (const text of [...interior.texts, ...interior.uncertain]) {
+              if (interiorText >= MAX_INTERIOR_TEXT) break;
+              sink.uncertain.push(text.slice(0, MAX_INTERIOR_TEXT - interiorText));
+              interiorText += text.length;
+            }
+          }
+          return null;
+        };
+        for (const index of mustRead) {
+          const status = readInterior(index, true);
+          if (status === 'BUDGET') return { reason: 'SENTINEL_BUDGET' };
+          if (status === 'CONTAINER') return { reason: 'OPAQUE_EMBEDDED' };
+          // Content the opaque count ignores and nothing declared, which this read cannot afford: uninspectable.
+          if (status === 'EXHAUSTED') return { reason: 'SENTINEL_BUDGET' };
+        }
+        // Every other exempt run — a short run, a declared reconstruction, a digest the message named, a public
+        // certificate body — is read when the window ceiling allows and is never a reason to refuse.
+        for (const index of exempt) if (!mustRead.includes(index)) {
+          const status = readInterior(index, false);
+          if (status === 'BUDGET') return { reason: 'SENTINEL_BUDGET' };
+          if (status === 'CONTAINER') return { reason: 'OPAQUE_EMBEDDED' };
+        }
         if (sink.texts.length) next.push({ name: `${view.name}>INFLATED`, text: sink.texts.join('\n'), derived: view.derived === true });
         // Binary layers are matched but not decoded further: signed binary output already counts as opaque in full.
         if (sink.printables.length) next.push({ name: `${view.name}>INFLATED_BINARY`, text: sink.printables.join('\n'), derived: true, matchOnly: true });
@@ -1563,7 +1852,7 @@ function shortKnownMatches(known: Known, views: readonly View[], budget: { verif
   Map<number, string> | { reason: string } {
   const hits = new Map<number, string>();
   const seen = new Set<string>();
-  const inflateBudget = { inflated: 0 };
+  const inflateBudget: DecodeBudget = { inflated: 0, total: MAX_INFLATE_TOTAL };
   for (const view of views) {
     for (const run of view.text.matchAll(SHORT_ENCODED_RUN)) {
       if (seen.has(run[0])) continue;

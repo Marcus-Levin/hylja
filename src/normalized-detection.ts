@@ -44,7 +44,8 @@ import { detectConfigured, type CandidateConfigHandle } from './configured-candi
 import { generateContactCandidates, type CandidateScope, type NameDictionary } from './contact-candidates.js';
 import { detectInfrastructure, type InfraFidelity } from './infrastructure-identifiers.js';
 import { DEFAULT_BUDGET, foldForDetection, mapFoldedSpan, normalizeInput, sniffContentType,
-  type ContentType, type Encoding, type NormalizedView } from './normalization.js';
+  type ContentType, type DetectionFold, type Encoding, type NormalizedView,
+  type NormalizationResult } from './normalization.js';
 import { DEFAULT_PARSE_BUDGET, FORMATS, isParseHost, parseStructured, type Format, type ParsedField } from './structured-parsers.js';
 import { detectSecrets, subtypeForKey } from './secret-detectors.js';
 import type { ClassificationClaim, EvidenceProvenance } from './classification.js';
@@ -196,7 +197,27 @@ interface Detected {
   fidelity?: Readonly<InfraFidelity>;
   fingerprint?: string;
 }
-interface Placed { view: ViewLocation; original: OriginalLocation; field?: ParsedFieldLocation }
+/** A view span and the original-source location #6 provenance derives for it. */
+export interface Placed { view: ViewLocation; original: OriginalLocation; field?: ParsedFieldLocation }
+/**
+ * The bounded text unit an outside detector was handed. `source` records what the trusted caller
+ * passed to #6: `BYTES` yields `UTF8_TEXT`, which this repository documents as offsets into decoded
+ * UTF-8 text and never as byte-source offsets.
+ */
+export type ExternalSpanTarget = Readonly<{
+  kind: 'VIEW';
+  viewId: number;
+  representation: 'RAW' | 'FOLDED';
+  unit: Span;
+  source: 'STRING' | 'BYTES';
+}> | Readonly<{
+  kind: 'FIELD';
+  viewId: number;
+  format: Format;
+  fieldIndex: number;
+  unit: Span;
+  source: 'STRING' | 'BYTES';
+}>;
 
 function label(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max && value.trim() === value &&
@@ -247,6 +268,95 @@ function originalKey(location: OriginalLocation): string {
 function failure(reason: string): NormalizedDetectionResult {
   return Object.freeze({ status: 'FAILURE', reasons: Object.freeze([reason]), contentType: 'UNKNOWN',
     candidates: Object.freeze([]), uninspected: Object.freeze([]) });
+}
+/** The one place a view span becomes a #6 `Placed`, shared by this seam and `placeExternalSpan`. */
+function placeSpan(views: readonly NormalizedView[], view: NormalizedView, at: Span,
+  representation: 'RAW' | 'FOLDED', field: ParsedFieldLocation | undefined, exact: boolean,
+  sourceIsString: boolean, encodedOrigins: Map<number, OriginalLocation>): Placed {
+  return Object.freeze({
+    view: Object.freeze({ viewId: view.id, span: at, representation, form: view.form,
+      encodingPath: path(views, view) }),
+    original: originalOf(views, view, at, representation, encodedOrigins, sourceIsString, exact),
+    ...(field ? { field } : {}),
+  });
+}
+/**
+ * A FIELD placement has no caller-supplied #7 key path and therefore no path digest of its own. The
+ * placeholder is derived from the view and field index alone, so it names no payload content, but it
+ * is also **not** comparable with the `pathRef` values `detectNormalizedCandidates` emits.
+ */
+function pathRefPlaceholder(viewId: number, fieldIndex: number): string {
+  return `external-field-${viewId}-${fieldIndex}`;
+}
+
+/**
+ * Place a span an OUTSIDE detector produced against a view it was given, using the same #6/#7
+ * provenance this seam derives for its own candidates.
+ *
+ * A candidate source that is not this module (a bounded local worker, for example) reports offsets
+ * in a text unit *it* was handed, never in the original source. Two units are supported, and each
+ * is re-derived here rather than believed:
+ *
+ * - `VIEW`: the worker received exactly `view.text`, or exactly `foldForDetection(view.text).text`
+ *   when `representation` is `FOLDED`. A folded span is mapped back through the fold and can only
+ *   ever claim a covering span, because the folded spelling is not the source spelling.
+ * - `FIELD`: the worker received exactly the decoded value of #7 field `fieldIndex` of `format` in
+ *   that view. The parse is repeated here, so a caller cannot name a field the worker did not see.
+ *   A value written verbatim in the view keeps exact offsets; an escaped, percent- or entity-decoded
+ *   value claims its field's covering span, never an invented original offset.
+ *
+ * The caller must bind the text it actually sent with a digest; this function returns the `original`
+ * envelope and the `view`/`field` provenance to keep with the outside candidate. It never rewrites
+ * input, transforms a value, grants trust or selects any effect. Returns `null` for anything outside
+ * the bounded, parseable surface rather than inventing a location.
+ */
+export function placeExternalSpan(normalized: NormalizationResult, target: ExternalSpanTarget): Placed | null {
+  try {
+    if (normalized === null || typeof normalized !== 'object' || normalized.status === 'FAILURE') return null;
+    const views = normalized.views;
+    if (!Array.isArray(views) || views.length === 0 || views.length > MAX_SCANNED_VIEWS) return null;
+    const view = views[target.viewId];
+    if (!view || view.id !== target.viewId || typeof view.text !== 'string' ||
+      typeof view.form !== 'string') return null;
+    const unit: Span = target.unit;
+    if (!Number.isSafeInteger(unit.start) || !Number.isSafeInteger(unit.end) ||
+      unit.start < 0 || unit.end <= unit.start) return null;
+    const sourceIsString = target.source === 'STRING';
+    const origins = new Map<number, OriginalLocation>();
+    if (target.kind === 'VIEW') {
+      if (target.representation === 'FOLDED') {
+        let folded: DetectionFold;
+        try { folded = foldForDetection(view.text); } catch { return null; }
+        if (unit.end > folded.text.length) return null;
+        let mapped: { start: number; end: number };
+        try { mapped = mapFoldedSpan(folded, unit.start, unit.end); } catch { return null; }
+        // A folded spelling is not the source spelling, so this can only ever be a covering span.
+        return placeSpan(views, view, span(mapped.start, mapped.end), 'FOLDED', undefined, false,
+          sourceIsString, origins);
+      }
+      if (target.representation !== 'RAW' || unit.end > view.text.length) return null;
+      return placeSpan(views, view, unit, 'RAW', undefined, true, sourceIsString, origins);
+    }
+    if (target.kind !== 'FIELD' || typeof target.format !== 'string' || !isFormat(target.format) ||
+      !Number.isSafeInteger(target.fieldIndex) || target.fieldIndex < 0 || target.fieldIndex > 1 << 16) {
+      return null;
+    }
+    let parsed: ReturnType<typeof parseStructured>;
+    try {
+      // #7 is asked for exactly this view's size, so a large view is parsed rather than rejected.
+      parsed = parseStructured(view.text, target.format,
+        { ...DEFAULT_PARSE_BUDGET, maxInputUnits: view.text.length || 1 });
+    } catch { return null; }
+    const parsedField = parsed.fields[target.fieldIndex];
+    if (!parsedField || !parsedField.value || unit.end > parsedField.value.length) return null;
+    const fieldSpan = span(parsedField.valueStart, parsedField.valueEnd);
+    const verbatim = view.text.slice(fieldSpan.start, fieldSpan.end) === parsedField.value;
+    const field = Object.freeze({ format: target.format, pathRef: pathRefPlaceholder(view.id, target.fieldIndex),
+      hintSource: 'NONE' as const, hintDepth: -1, highRisk: parsedField.highRisk, span: fieldSpan,
+      valueSpan: span(unit.start, unit.end), verbatim });
+    const at = verbatim ? span(fieldSpan.start + unit.start, fieldSpan.start + unit.end) : fieldSpan;
+    return placeSpan(views, view, at, 'RAW', field, verbatim, sourceIsString, origins);
+  } catch { return null; }
 }
 
 /**
@@ -329,11 +439,8 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
   const counts = { SECRET: 0, INFRASTRUCTURE: 0, CONTACT: 0, CONFIGURED: 0 };
   const inputDigest = createHash('sha256').update(inputRef).digest('hex').slice(0, 32);
   const locate = (view: NormalizedView, at: Span, representation: 'RAW' | 'FOLDED',
-    exact: boolean): Placed => ({
-    view: Object.freeze({ viewId: view.id, span: at, representation, form: view.form,
-      encodingPath: path(normalized.views, view) }),
-    original: originalOf(normalized.views, view, at, representation, encodedOrigins, sourceIsString, exact),
-  });
+    exact: boolean): Placed => placeSpan(normalized.views, view, at, representation, undefined, exact,
+      sourceIsString, encodedOrigins);
   const accept = (view: NormalizedView, source: NormalizedCandidate['source'], items: readonly Detected[],
     place: (start: number, end: number) => Placed): void => {
     for (const item of items) {

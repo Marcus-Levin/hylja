@@ -1331,3 +1331,500 @@ test('residual encoded views: declared recognition limits are explicit, not comp
   for (const payload of [splitEvery(note.toString('base64'), 8).map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n'),
     `[${[...note].join(',')}]`]) blocksWithOriginal(payload);
 });
+
+/* ---------- Issue #88 residual R2: a credential-shaped block scalar, and a stream behind other bytes ---------- */
+
+/**
+ * Every case in these groups is a public-interface decision and reason code over generated, obviously synthetic
+ * values. The credential cases register **no** known original, so a block blocks on its own shape: a sentinel that
+ * needed the registry would fail all of them.
+ */
+const credentialOnly = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+const blocksAsCredential = (payload, at) => {
+  const result = credentialOnly(payload);
+  assert.equal(result.decision, 'BLOCK', at ?? payload.slice(0, 60));
+  assert.ok(result.reasons.includes('HIGH_RISK_PATTERN'), `${payload.slice(0, 60)}: ${result.reasons.join()}`);
+  assert.ok(result.findings.some((finding) => finding.rule === 'pattern.credential-assignment'),
+    `${payload.slice(0, 60)}: ${result.findings.map((finding) => finding.rule).join()}`);
+  assert.equal(result.release, undefined);
+  return result;
+};
+
+test('issue 88 R2: a credential-shaped block scalar blocks with no known original registered', () => {
+  const bodies = ['synthetic-block-scalar-value', 'correct synthetic horse battery staple'];
+  for (const body of bodies) {
+    for (const indicator of ['|', '|-', '|+', '>2', '|4', '|-2', '>4-']) {
+      // Literal, folded, chomping and explicit-indentation spellings, in and out of a document, CRLF, and with a
+      // comment after the header. The credential-shaped assignment is read from the block, not from the indicator.
+      blocksAsCredential(`password: ${indicator}\n  ${body}\n`);
+      blocksAsCredential(`password: ${indicator}\r\n  ${body}\r\n`);
+      blocksAsCredential(`password: ${indicator} # synthetic note\n  ${body}\n`);
+      blocksAsCredential(`  api_key: ${indicator}\n    ${body}\n`);
+      blocksAsCredential(`'secret': ${indicator}\n  ${body}\n`);
+      blocksAsCredential(`"auth_token": ${indicator}\n  ${body}\n`);
+      blocksAsCredential(JSON.stringify({ config: `password: ${indicator}\n  ${body}\n` }));
+      blocksAsCredential(`database:\n  password: ${indicator}\n    ${body}\n  port: 5432\n`);
+      blocksAsCredential(`items:\n  - name: synthetic-one\n    secret: ${indicator}\n      ${body}\n`);
+    }
+  }
+  // A multi-line literal and a folded paragraph are one value; the same literal on a single line already blocks.
+  blocksAsCredential('password: |\n  first synthetic line\n  second synthetic line\n  third synthetic line\n');
+  blocksAsCredential('password: >\n  first synthetic line\n  second synthetic line\n');
+  // The value may sit under the key with a blank line and deeper indentation, and the block may end at a sibling key.
+  blocksAsCredential('password: |\n\n      synthetic-block-scalar-value\nreplicas: 3\n');
+  // Nesting an encoded assignment inside the literal is a literal, and is still a credential-shaped assignment.
+  blocksAsCredential('password: |\n  Authorization: Bearer synthetic-bearer-value\n');
+});
+
+test('issue 88 R2: block-scalar credential controls, placeholders and ordinary YAML stay allowed', () => {
+  for (const payload of [
+    // Whole-value placeholders and masks are references, exactly as in the single-line forms.
+    'password: |\n  <your-password-here>\n', 'api_key: >\n  ${API_KEY}\n', 'secret: |-\n  {{ secret }}\n',
+    'password: |\n  ***\n', 'password: |\n  ${password}\n',
+    'password: "<your-password-here>"\n',
+    // A type name, a key-echo shorthand and a `PWD` path are the same non-values they are on one line.
+    'password: |\n  password\n', 'pwd: |\n  /srv/synthetic/app\n', 'pwd: >\n  ~/synthetic\n',
+    // An empty or comment-only block carries no value; a scalar under a key that is not credential-like is ordinary.
+    'password: |\n', 'password: | # note\n  # only a comment\nreplicas: 3\n', 'password: |\n  \nnext: value\n',
+    'description: |\n  A long synthetic description of the service\n', 'notes: >\n  a folded note\n',
+    // Pipes and angle brackets that are prose, tables, regexes or shell, not block-scalar headers after a key.
+    '| password | value |\n| --- | --- |\n', 'the flag is | and the arrow is >\n', 'cat <<EOF\nhello\nEOF\n',
+    'password: |0\n  out-of-range indentation indicator\n', 'secret: |\tvalue on the same line\n',
+    // Indentation indicator 0 is not a header at all, and `password` inside a longer key is a different key.
+    'user_password_hint: |\n  not this key\n', 'myapikey: |\n  not this key either\n',
+    // A Kubernetes reference and a JSON body are ordinary configuration.
+    'env:\n  - name: PASSWORD\n    valueFrom:\n      secretKeyRef:\n        name: synthetic-secret\n',
+    JSON.stringify({ password: '${PASSWORD}', api_key: '<api-key>', secret: null, replicas: 3 }),
+  ]) assert.equal(credentialOnly(payload).decision, 'ALLOW', `${payload.slice(0, 40)}: ${credentialOnly(payload).reasons.join()}`);
+  // The single-line forms this rule mirrors are unchanged: still blocking, still allowed, same reasons.
+  assert.equal(credentialOnly('password: |\n  x\n').decision, 'ALLOW');
+  blocksAsCredential('password: synthetic-plain-value\n');
+  // A bare `$NAME` body is flagged, which is exactly what the quoted form it mirrors already does. A multi-line
+  // body is one value, so two placeholders on two lines are not one whole reference either.
+  assert.equal(credentialOnly('password: "$ACCESS_TOKEN"\n').decision, 'BLOCK');
+  blocksAsCredential('access_token: |\n  $ACCESS_TOKEN\n');
+  blocksAsCredential('password: |\n  ${API_KEY}\n  ${DB_PASSWORD}\n');
+  // A block body is a literal, exactly like the quoted form, so a body that reads as a type name is still a value
+  // while the *unquoted* plain scalar `password: string` stays a type name. That difference is deliberate.
+  blocksAsCredential('password: |\n  string\n');
+  assert.equal(credentialOnly('password: string\n').decision, 'ALLOW');
+  assert.equal(credentialOnly('password: "string"\n').decision, 'BLOCK', 'the quoted form this body mirrors');
+  assert.equal(credentialOnly('secret: required\n').decision, 'BLOCK', 'a bare identifier value on one line is unchanged');
+});
+
+test('issue 88 R2: block-scalar reading is bounded, linear and fails closed like every other bound', () => {
+  // One credential block far larger than the per-block bound is still read, and stays within a work bound.
+  const huge = `password: |\n${'  synthetic line of configuration text\n'.repeat(4000)}`;
+  const started = process.hrtime.bigint();
+  blocksAsCredential(huge);
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
+  // Many credential blocks in one message: read every one of them, linearly, without exceeding the work bound.
+  const many = Array.from({ length: 2000 }, (_, index) =>
+    `service-${index}:\n  password: |\n    synthetic-block-scalar-value-${index}\n`).join('\n');
+  const flood = process.hrtime.bigint();
+  const flooded = credentialOnly(many);
+  assert.equal(flooded.decision, 'BLOCK');
+  assert.ok(flooded.reasons.includes('HIGH_RISK_PATTERN'), flooded.reasons.join());
+  assert.ok(Number(process.hrtime.bigint() - flood) / 1e6 < 5000);
+  // Blocks nested inside other blocks are content, not mapping keys: a single pass reads the outer one and stops.
+  assert.equal(credentialOnly('password: |\n  password: |\n    inner-synthetic-value\n').decision, 'BLOCK');
+  // The declared-reconstruction budget still fails closed above its own bound, unchanged by this rule: a cheap
+  // 17,000-part distinct join is refused, and a 1,024-part one is reconstructed and inspected instead.
+  const join = (count) => Array.from({ length: count }, (_, index) => `part${index}: ${(index + 1).toString(36)}abcdefgh`).join(' + ');
+  const overBudget = credentialOnly(join(17000));
+  assert.equal(overBudget.decision, 'BLOCK');
+  assert.deepEqual(overBudget.reasons, ['SENTINEL_BUDGET']);
+  assert.equal(overBudget.release, undefined);
+  assert.deepEqual(overBudget.findings, []);
+  assert.deepEqual(credentialOnly(join(1024)).reasons, []);
+});
+
+test('issue 88 R2: a compressed stream behind other bytes is found inside a run the opaque count does not count', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const blocksWith = (payload, at) => {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', `${at ?? payload.slice(0, 40)}: ${result.reasons.join()}`);
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), `${at ?? payload.slice(0, 40)}: ${result.reasons.join()}`);
+    assert.equal(result.release, undefined);
+  };
+  const short = Buffer.from(PLANTED);
+  const full = Buffer.from(SECRET_NOTE);
+  for (const compress of [zlib.deflateRawSync, zlib.brotliCompressSync]) {
+    // A run shorter than the opaque threshold, carrying only the planted original: Base64 and hex, whole and
+    // chunked, and inside a JSON string. A prefix byte puts the stream where the run's own start is not.
+    const shortStream = compress(short);
+    for (const prefix of ['x', 'ok', 'note:', 'junkjunk']) {
+      const body = Buffer.concat([Buffer.from(prefix), shortStream]);
+      for (const payload of [body.toString('base64'), body.toString('hex'), splitEvery(body.toString('base64'), 8).join(' '),
+        splitEvery(body.toString('hex'), 16).join('\n'), JSON.stringify({ attachment: body.toString('base64') }),
+        JSON.stringify({ attachment: body.toString('hex') })]) blocksWith(payload, `${prefix}/${payload.slice(0, 20)}`);
+    }
+    // The same stream inside a DER-shaped public PEM body, which the opaque count exempts by its shape alone.
+    const der = Buffer.concat([Buffer.from([0x30, shortStream.length + 2]), shortStream]);
+    blocksWith(`-----BEGIN CERTIFICATE-----\n${der.toString('base64').replace(/(.{40})/gu, '$1\n')}\n-----END CERTIFICATE-----\n`);
+    // A run whose exact byte length is a digest length, so the opaque count exempts it, hiding the full note.
+    const fullStream = compress(full);
+    for (const size of [16, 20, 32, 48, 64]) {
+      const pad = size - fullStream.length;
+      if (pad < 1) continue;
+      blocksWithOriginal(Buffer.concat([syntheticBytes(pad), fullStream]).toString('hex'));
+    }
+  }
+});
+
+test('issue 88 R2: digests, ids, public keys and ordinary text keep their exemptions with the interior read', () => {
+  // Every shape the interior read must not disturb, at volume, with a work bound.
+  const digests = Array.from({ length: 2000 }, (_, index) =>
+    `sha256-${createHash('sha256').update(`synthetic-digest-${index}`).digest('base64')}`).join('\n');
+  const hexDigests = Array.from({ length: 1000 }, (_, index) =>
+    createHash('sha256').update(`synthetic-hex-digest-${index}`).digest('hex')).join('\n');
+  const ids = Array.from({ length: 2000 }, () => syntheticUUID()).join('\n');
+  const keys = Array.from({ length: 200 }, () => `ssh-ed25519 ${sshEd25519Public()}`).join('\n');
+  const der = Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]), syntheticBytes(596)]);
+  const certificates = ['-----BEGIN CERTIFICATE-----', ...der.toString('base64').match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
+  const goSum = Array.from({ length: 200 }, (_, index) =>
+    `example.invalid/module${index} v1.0.${index} h1:${syntheticBytes(32).toString('base64')}`).join('\n');
+  const source = Array.from({ length: 300 }, (_, index) =>
+    `const synthRecordHandler${index}Value = convertUtf8ToBase64String(input${index});`).join('\n');
+  for (const payload of [digests, hexDigests, ids, keys, certificates, goSum, source]) {
+    const started = process.hrtime.bigint();
+    const result = credentialOnly(payload);
+    assert.equal(result.decision, 'ALLOW', `${payload.slice(0, 40)}: ${result.reasons.join()}`);
+    assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000, payload.slice(0, 40));
+  }
+  // Ordinary compressed text still inflates to its own text and stays allowed, and a container still blocks.
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  for (const payload of ['build log ok, all good', 'attachment ok', 'contact the synthetic team about the build']) {
+    const compressed = zlib.gzipSync(Buffer.from(payload));
+    for (const prefix of ['', 'x', 'note:', 'junkjunk', 'attachment:']) {
+      // Correctly aligned bytes: a character glued to the front of Base64 text shifts the encoding by six bits,
+      // which is a different (and opaque) case, so the prefix belongs inside the encoded bytes here.
+      const dressed = Buffer.concat([Buffer.from(prefix), compressed]).toString('base64');
+      assert.equal(credentialOnly(dressed).decision, 'ALLOW', `${dressed.slice(0, 40)}: ${credentialOnly(dressed).reasons.join()}`);
+    }
+  }
+  const zip = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), syntheticBytes(64)]);
+  assert.equal(credentialOnly(splitEvery(zip.toString('hex'), 16).map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n')).decision, 'BLOCK');
+  // A pre-existing catch is not weakened: a value glued to a single-line assignment is still refused.
+  blocksAsCredential('const re = /password: |hunter2/;\n');
+});
+
+test('issue 88 R2: the remaining declared limits are measured and pinned, not claimed closed', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // 1. Uncompressed random data in ordinary-looking shapes is not counted opaque. A fingerprint list, a hex list
+  //    and a `:;|.&`-joined byte list are indistinguishable from data this module must let through, so they pass.
+  const random = syntheticBytes(400);
+  for (const payload of [splitEvery(random.toString('hex'), 2).join('\n'),
+    splitEvery(random.toString('hex'), 2).join(':;|.&'), splitEvery(random.toString('base64'), 4).join(' '),
+    splitEvery(random.toString('base64'), 6).join(', ')]) {
+    assert.equal(unknown(payload).decision, 'ALLOW', payload.slice(0, 40));
+  }
+  // 2. The same bytes under a signed gzip block, however the hex is chunked and separated.
+  for (const payload of [splitEvery(zlib.gzipSync(random).toString('base64'), 4).join(' '),
+    splitEvery(zlib.gzipSync(random).toString('hex'), 2).join(':;|.&')]) {
+    assert.ok(unknown(payload).reasons.includes('OPAQUE_EMBEDDED'), payload.slice(0, 40));
+  }
+  //    A tentative (unsigned) stream in the same shape is matched but cannot raise the opaque count, so the run
+  //    itself still passes: this is the declared tentative-output limit, not a new finding.
+  // 3. Binary that is exactly a digest length in hex is exempt from the opaque count by its shape alone.
+  for (const size of [8, 12, 16, 20, 28, 32, 48, 64]) assert.equal(unknown(syntheticBytes(size).toString('hex')).decision, 'ALLOW', `${size}`);
+  // 4. A credential assignment whose value is a bare identifier is flagged on purpose, and a `PWD` path is not.
+  assert.equal(unknown('secret: required\n').decision, 'BLOCK');
+  assert.equal(unknown('Password: pass\n').decision, 'BLOCK');
+  assert.equal(unknown('pwd: /srv/synthetic/app\n').decision, 'ALLOW');
+  // 5. A list of short digit-heavy camelCase names counts as opaque binary: the price of the identifier exemption.
+  //    Measured here: three names are allowed and four block, while eleven lowercase camelCase names are allowed.
+  const camel = ['UTF8ToUTF16LE', 'UTF16LEToUTF8', 'UTF8ToUTF32LE', 'UTF32LEToUTF8', 'UTF8ToUTF16BE', 'UTF16BEToUTF8',
+    'UTF8ToUTF32BE', 'UTF32BEToUTF8', 'UTF8ToUTF32', 'UTF32ToUTF8', 'UTF8ToUTF16', 'UTF16ToUTF8', 'UTF16LEToUTF32LE',
+    'UTF32LEToUTF16LE', 'UTF16BEToUTF32BE', 'UTF32BEToUTF16BE', 'UTF8ToUTF16LE', 'UTF16LEToUTF8', 'UTF8ToUTF32LE',
+    'UTF32LEToUTF8'];
+  assert.equal(unknown(camel.slice(0, 3).join(', ')).decision, 'ALLOW');
+  assert.ok(unknown(camel.join(', ')).reasons.includes('OPAQUE_EMBEDDED'));
+  assert.equal(unknown(Array.from({ length: 11 }, (_, index) => `convertUtf8ToBase64String${index}`).join(', ')).decision, 'ALLOW');
+  // 6. A single short default-`xxd` row is not rebuilt, and a truncated prefix of a longer stream is released.
+  const gz = zlib.gzipSync(Buffer.from(SECRET_NOTE));
+  const row = (bytes) => {
+    const hex = Buffer.from(bytes).toString('hex');
+    return `00000000: ${splitEvery(hex, 4).join(' ')}  |${[...bytes].map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : '.')).join('')}|`;
+  };
+  assert.equal(unknown(row(gz.subarray(0, 16))).decision, 'ALLOW');
+  assert.equal(unknown(row(gz.subarray(0, 16)) + '\n' + row(gz.subarray(16, 32))).decision, 'ALLOW');
+  const dump = Array.from({ length: Math.ceil(gz.length / 16) }, (_, index) => row(gz.subarray(index * 16, index * 16 + 16))).join('\n');
+  blocksWithOriginal(dump);
+  // 7. A legitimate list of concatenated hex digests exhausts #6's decode budget, which the sentinel refuses.
+  //    This is #6's bound, measured here: 1,000 lines are allowed and 1,100 are uninspectable.
+  const digestList = (count) => Array.from({ length: count }, (_, index) =>
+    createHash('sha256').update(`synthetic-list-${index}`).digest('hex')).join('\n');
+  assert.equal(unknown(digestList(1000)).decision, 'ALLOW');
+  assert.deepEqual(unknown(digestList(1100)).reasons, ['UNINSPECTED_CONTENT']);
+});
+
+/**
+ * Core-audit blocker B1, red at the reviewed head: one extra space or tab inside a dump row's hex field made
+ * `dumpLineHex` split at it, so the reconstructed bytes were truncated to the first group. The truncated reading
+ * still spanned the whole block, so it displaced the complete one, the gzip stream never inflated, and a message
+ * carrying a planted original and a canary was ALLOWed with `release` bytes. Every probe here is in-process and
+ * every value is synthetic.
+ */
+const dumpRows = (bytes, { group = 1, marker = false, midGap = false, at = -1, sep = ' ', column = null } = {}) => {
+  const printable = (line) => column ? column(line)
+    : [...line].map((byte) => (byte >= 0x20 && byte < 0x7f ? String.fromCharCode(byte) : '.')).join('');
+  const rows = [];
+  for (let index = 0; index < bytes.length; index += 16) {
+    const line = bytes.subarray(index, index + 16);
+    let cells = [...line].map((byte) => byte.toString(16).padStart(2, '0'));
+    if (group === 2) cells = cells.join('').match(/.{1,4}/gu);
+    // `hexdump -C` splits each row into two halves with two spaces between them.
+    if (midGap) cells = [cells.slice(0, cells.length / 2).join(' '), cells.slice(cells.length / 2).join(' ')];
+    if (index === at) cells = [cells[0] + sep, ...cells.slice(1)];
+    rows.push(`${(index >>> 0).toString(16).padStart(8, '0')}:  ${cells.join(' ')}  ` +
+      `${marker ? '|' : ''}${printable(line)}${marker ? '|' : ''}`);
+  }
+  return `synthetic hex dump\n${rows.join('\n')}\nend\n`;
+};
+
+test('core audit B1: one extra separator or a missing ASCII marker inside a dump row never releases a block', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const payload = zlib.gzipSync(Buffer.from(SECRET_NOTE + 'synthetic padding text '.repeat(6)));
+  // `xxd -g1` byte pairs, default `xxd` two-byte groups and `hexdump -C`'s two halves, each with an unmarked
+  // ASCII column, plus the marked spelling. Whitespace inside the hex field is sender-controlled: one extra
+  // space or tab at any row must not change the outcome.
+  for (const shape of [{ group: 1 }, { group: 1, marker: true }, { group: 2 }, { group: 2, marker: true },
+    { group: 1, midGap: true }, { group: 1, midGap: true, marker: true }]) {
+    const label = JSON.stringify(shape);
+    blocksWithOriginal(dumpRows(payload, shape), true);
+    for (const at of [0, 16, 32, 48]) blocksWithOriginal(dumpRows(payload, { ...shape, at }), true);
+    blocksWithOriginal(dumpRows(payload, { ...shape, at: 0, sep: '\t' }), true);
+    // The same dump inside a JSON body, where the line breaks are escapes and the first row carries a prefix.
+    const body = JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content: dumpRows(payload, shape) }] });
+    blocksWithOriginal(body, true);
+    blocksWithOriginal(JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content: dumpRows(payload, { ...shape, at: 16 }) }] }), true);
+  }
+  // A `|`-marked row keeps its ASCII column out of the bytes; an unmarked one reads the row, never the column.
+  assert.equal(credentialOnly(dumpRows(Buffer.from('ordinary prose about the synthetic build'), { column: () => 'deadbeef cafe f00d 0000' })).decision, 'ALLOW');
+  assert.equal(credentialOnly(dumpRows(zlib.gzipSync(Buffer.from('ordinary build log, nothing secret')), { column: () => 'deadbeef cafe f00d 0000' })).decision, 'ALLOW');
+  assert.equal(credentialOnly(dumpRows(zlib.gzipSync(Buffer.from('ordinary build log, nothing secret')), { midGap: true, column: () => 'deadbeef cafe f00d 0000' })).decision, 'ALLOW');
+  // A planted value written literally in the ASCII column is plain text and is still caught, not read as bytes.
+  const withLiteral = dumpRows(zlib.gzipSync(Buffer.from('ordinary build log')), { column: () => PLANTED });
+  assert.ok(check(withLiteral).reasons.includes('KNOWN_ORIGINAL_DETECTED'), withLiteral);
+  // Ordinary text with offsets and words is not a dump at all.
+  for (const ordinary of ['2024-01-02: build step 3 of 9 finished in 4211ms\n2024-01-02: build step 4 of 9 finished',
+    'deadbeef cafe f00d 0000 1111 2222 3333 4444\n5555 6666 7777 8888 9999 aaaa bbbb cccc',
+    'a line, another line, ordinary log output with 1024 rows and 4096 columns']) {
+    assert.equal(credentialOnly(ordinary).decision, 'ALLOW', ordinary.slice(0, 40));
+  }
+});
+
+test('core audit: the interior read covers every exempt run it can afford, and its work stays bounded', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // A run whose exact byte length is a digest length is exempt from the opaque count by its shape alone, so a
+  // compressed note inside one is found only by the interior read. One window now reads sixteen starting offsets
+  // instead of one, and the budget is spent across every such run in the message instead of being skipped whole.
+  for (const compress of [zlib.deflateRawSync, zlib.brotliCompressSync]) {
+    // A note short enough that its compressed form still fits a 64-byte run, which is the longest run whose hex
+    // length is also a digest length, so the opaque count exempts it by shape alone.
+    const stream = compress(Buffer.from(`${PLANTED} ${CANARY}`));
+    assert.ok(stream.length < 64, `${stream.length}`);
+    const hidden = Buffer.concat([syntheticBytes(64 - stream.length), stream]).toString('hex');
+    assert.equal(hidden.length, 128);
+    // Decoys of the same exempt shape, then the hidden run last: one beyond the old run gate, and eight beyond it.
+    for (const decoys of [0, 1, 3]) {
+      const payload = [...Array.from({ length: decoys }, () => syntheticBytes(64).toString('hex')), hidden].join('\n');
+      const started = process.hrtime.bigint();
+      blocksWithOriginal(payload, true);
+      assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000, `${decoys} decoys`);
+    }
+    // The same run written in Base64, whole and inside a JSON body, and the raw bytes as one hex run. A signed stream
+    // is found by the signature scan that reads every run; an unsigned one inside a Base64 run is not exempt from
+    // the opaque count by shape, so it is the hex digest-length spelling above that needs the interior read.
+    const gz = zlib.gzipSync(Buffer.from(`${PLANTED} ${CANARY}`));
+    const signed = Buffer.concat([syntheticBytes(64 - gz.length), gz]);
+    assert.ok(gz.length < 64, `${gz.length}`);
+    blocksWithOriginal(JSON.stringify({ attachment: signed.toString('base64') }), true);
+    blocksWithOriginal(signed.toString('hex'), true);
+    blocksWithOriginal(`sha256=${signed.toString('hex')}`, true);
+  }
+  // The ceiling is explicit rather than silent: the read spends its windows in span order across every exempt
+  // run, so a message whose exempt runs need more starting offsets than the budget holds has a declared gap and
+  // no claim of completeness (docs/plan.md #19 known limits, measured at 1,024 starting offsets per message).
+  // Nothing here claims such a message is clean, and the controls below stay allowed.
+  const many = Array.from({ length: 400 }, () => syntheticBytes(64).toString('hex')).join('\n');
+  const started = process.hrtime.bigint();
+  assert.equal(credentialOnly(many).decision, 'ALLOW');
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
+  const goSum = Array.from({ length: 300 }, (_, index) =>
+    `example.invalid/module${index} v1.0.${index} h1:${syntheticBytes(32).toString('base64')}`).join('\n');
+  const certificates = ['-----BEGIN CERTIFICATE-----', ...Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]),
+    syntheticBytes(596)]).toString('base64').match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
+  for (const payload of [goSum, certificates]) {
+    const at = process.hrtime.bigint();
+    assert.equal(credentialOnly(payload).decision, 'ALLOW', payload.slice(0, 40));
+    assert.ok(Number(process.hrtime.bigint() - at) / 1e6 < 5000, payload.slice(0, 40));
+  }
+});
+
+/**
+ * Independent review blocking finding B2 at `e2ad93b`: the interior read spent its ceiling in text order and then
+ * skipped every later exempt run, so a handful of ordinary digest lines *before* a hidden payload turned BLOCK into
+ * a clean ALLOW with `release` bytes. The trigger was a few lines, the effect was non-monotonic, and nothing
+ * distinguished "read and clean" from "never read".
+ *
+ * Every value below is invented and the decoys are fixed digests, so the results are deterministic rather than
+ * seeded: the test must fail or pass identically on every run.
+ */
+const deterministicHex = (seed, algorithm = 'sha256') => createHash(algorithm).update(seed).digest('hex');
+
+test('core audit B2: exhausting the interior read refuses the message instead of releasing what it never read', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // Short enough that its compressed form still fits a 64-byte run, the longest run whose hex length is also a
+  // digest length, so the opaque count excuses it on a length coincidence and nothing declares what it is.
+  const note = Buffer.from(`${PLANTED} ${CANARY}`);
+  const hiddenRun = (stream) => Buffer.concat([syntheticBytes(64 - stream.length), stream]).toString('hex');
+  // Decoys of the shape the opaque count excuses on a length coincidence, then the hidden run last: one beyond the
+  // old run gate, far beyond its window ceiling, and past the byte ceiling that now refuses instead of releasing.
+  for (const compress of [zlib.deflateRawSync, zlib.brotliCompressSync]) {
+    const carried = compress(note);
+    const hidden = hiddenRun(carried);
+    assert.equal(hidden.length, 128);
+    for (const decoys of [0, 1, 4, 8, 32]) {
+      for (const [label, algorithm] of [['sha256', 'sha256'], ['sha512', 'sha512']]) {
+        const payload = [...Array.from({ length: decoys }, (_, index) => deterministicHex(`decoy-${label}-${index}`, algorithm)), hidden].join('\n');
+        blocksWithOriginal(payload, true);
+      }
+    }
+    // Decoy-heavy beyond any read this module can afford is refused, never released: a reason, no `release` bytes.
+    for (const decoys of [200, 600]) {
+      const payload = [...Array.from({ length: decoys }, (_, index) => deterministicHex(`heavy-${index}`)), hidden].join('\n');
+      const refused = check(payload);
+      assert.equal(refused.decision, 'BLOCK', `${decoys} decoys`);
+      assert.ok(refused.reasons.length > 0, `${decoys} decoys`);
+      assert.equal(refused.release, undefined, `${decoys} decoys`);
+    }
+    // A declared context is not a licence to starve the read: `go.sum`-shaped decoys leave the hidden run first.
+    for (const decoys of [0, 8, 200]) {
+      const lines = Array.from({ length: decoys }, (_, index) =>
+        `example.invalid/module${index} v1.0.${index} h1:${Buffer.from(syntheticBytes(32)).toString('base64')}`);
+      blocksWithOriginal([...lines, hidden].join('\n'), true);
+    }
+    // Past the byte ceiling with no payload in it, the message is uninspectable, not clean, and releases nothing.
+    const over = Array.from({ length: 1400 }, (_, index) => deterministicHex(`over-${index}`)).join('\n');
+    const exhausted = credentialOnly(over);
+    assert.equal(exhausted.decision, 'BLOCK');
+    assert.ok(['SENTINEL_BUDGET', 'UNINSPECTED_CONTENT'].includes(exhausted.reasons.join()), exhausted.reasons.join());
+    assert.equal(exhausted.release, undefined);
+    assert.deepEqual(exhausted.findings, []);
+  }
+  // The exemptions the module publishes for ordinary traffic are unchanged by the refusal, with their work bounds.
+  const certificate = ['-----BEGIN CERTIFICATE-----', ...Buffer.concat([Buffer.from([0x30, 0x82, 0x02, 0x54]),
+    syntheticBytes(596)]).toString('base64').match(/.{1,64}/gu), '-----END CERTIFICATE-----'].join('\n');
+  for (const [label, payload] of [
+    ['1000 bare hex digests', Array.from({ length: 1000 }, (_, index) => deterministicHex(`synthetic-hex-digest-${index}`)).join('\n')],
+    ['2000 sha256- digests', Array.from({ length: 2000 }, (_, index) => `sha256-${Buffer.from(syntheticBytes(32)).toString('base64')}`).join('\n')],
+    ['300 go.sum lines', Array.from({ length: 300 }, (_, index) =>
+      `example.invalid/module${index} v1.0.${index} h1:${Buffer.from(syntheticBytes(32)).toString('base64')}`).join('\n')],
+    ['200 trace ids', Array.from({ length: 200 }, () => `trace=${deterministicHex(`trace-${syntheticCounter++}`).slice(0, 32)}`).join('\n')],
+    ['certificate', certificate],
+  ]) {
+    const started = process.hrtime.bigint();
+    const result = credentialOnly(payload);
+    assert.equal(result.decision, 'ALLOW', `${label}: ${result.reasons.join()}`);
+    assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000, `${label} exceeded its work bound`);
+  }
+});
+
+test("core audit: every decode attempt sizes its own codec window, bounding a synchronous scan's high-water mark", () => {
+  // Node's synchronous zlib helper allocates an output buffer per call at its default 16 KiB chunk size, and a call
+  // that decodes nothing holds that buffer until the runtime can run again. Measured on this host: a synchronous
+  // batch of 24,000 failed calls grows `arrayBuffers` by about 16 KiB per call at that default and about 1 KiB at a
+  // 1 KiB chunk, and after two event-loop turns and a forced GC `arrayBuffers` and `external` return to within
+  // 0.1 MiB of their baseline while RSS does not. So this is the high-water mark of one synchronous batch: a work
+  // bound, not a retention claim and not a lifetime claim, and deliberately not a test of process-lifetime memory.
+  // Every decode attempt in the module names its own chunk, so a decoy-signature or wrong-offset scan's high-water
+  // mark is its chunk times its attempts rather than Node's default: about 20 MiB without that, about 1 MiB with it.
+  const pieces = [];
+  let index = 0;
+  while (pieces.join('').length < 60000) pieces.push(deterministicHex(`piece-${index++}`).slice(0, 6), '1f8b08', deterministicHex(`x${index}`).slice(0, 10));
+  const payload = pieces.join('');
+  const before = process.memoryUsage();
+  const started = process.hrtime.bigint();
+  const result = credentialOnly(payload);
+  const highWater = process.memoryUsage().arrayBuffers - before.arrayBuffers;
+  assert.equal(result.decision, 'BLOCK');
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
+  assert.ok(highWater < 8 * 1024 * 1024, `synchronous high-water mark ${Math.round(highWater / 1048576)} MiB`);
+});
+
+test('core audit: a speculative interior window reads every offset of its run without following a chain', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // Two unsigned streams in one digest-shaped run, so the second is only reachable by a window that reads on past
+  // the first: a read that stopped at its own stream's end, or continued a chain instead of sweeping, would miss it.
+  const stream = zlib.brotliCompressSync(Buffer.from(PLANTED));
+  const second = zlib.deflateRawSync(Buffer.from(CANARY));
+  const body = Buffer.concat([syntheticBytes(2), stream, syntheticBytes(2), second]);
+  assert.ok(body.length < 64, `${body.length}`);
+  const padded = Buffer.concat([syntheticBytes(64 - body.length), body]);
+  assert.equal(padded.length, 64);
+  const both = blocksWithOriginal(padded.toString('hex'), false);
+  assert.ok(both.reasons.includes('CANARY_DETECTED'), both.reasons.join());
+  // One stream alone in the same shape, so the second is not found by any other route.
+  const single = Buffer.concat([syntheticBytes(64 - stream.length), stream]);
+  blocksWithOriginal(single.toString('hex'), false);
+});
+
+test('core audit: an unmarked ASCII column is never read as cells, at any column width', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const printable = (line) => [...line].map((byte) => (byte >= 32 && byte < 127 ? String.fromCharCode(byte) : '.')).join('');
+  const dump = (bytes, column, marker) => `synthetic dump\n${Array.from({ length: Math.ceil(bytes.length / 16) }, (_, row) => {
+    const line = bytes.subarray(row * 16, row * 16 + 16);
+    const cells = [...line].map((byte) => byte.toString(16).padStart(2, '0')).join(' ');
+    return `${(row * 16 >>> 0).toString(16).padStart(8, '0')}:  ${cells}  ${marker ? '|' : ''}${typeof column === 'function' ? column(line) : column}${marker ? '|' : ''}`;
+  }).join('\n')}\nend\n`;
+  // A dump row carries its own offset, so the row width is knowable without trusting where the column separator is:
+  // consecutive offsets say how many bytes the row holds. That is what separates the hex field from an unmarked
+  // ASCII column, which is the point here -- a doubled space or tab *inside* the field adds no cell and leaves the
+  // row's offsets untouched, so the complete reading still spans the field, while the column's cells never are read.
+  // Without it, an unmarked column whose cells are hex of the row's own width was absorbed, the interleaving
+  // destroyed the stream it carried, and a planted original and canary were released with `release` bytes.
+  const columns = {
+    'four-character hex cells': 'deadbeef cafe f00d 0000 1111 2222 3333 4444 5555 6666 7777 8888 9999 aaaa bbbb cccc',
+    'two-character hex cells': 'dead beef cafe f00d 0000 1111 2222 3333 4444 5555 6666 7777 8888 9999 aaaa bbbb cccc dddd eeee ffff 0001',
+    'four-character words': 'dead beef cafe food 1111 2222 3333 4444 5555 6666 7777 8888 9999 aaaa bbbb cccc dddd',
+    'two-character words': 'de ad be ef ca fe f0 0d 00 00 11 11 22 22 33 33 44 44 55 55 66 66 77 77 88 88 99 99 aa aa bb bb cc cc',
+    'dots': '................................',
+  };
+  const long = zlib.gzipSync(Buffer.from(`contact ${PLANTED} re ${CANARY} and some more synthetic padding text to move the row count`));
+  assert.equal(long.length, 108, `${long.length}`);
+  const ordinary = zlib.gzipSync(Buffer.from(`ordinary build log about the synthetic service.${'x'.repeat(8)}`));
+  assert.equal(ordinary.length, 69, `${ordinary.length}`);
+  const short = zlib.gzipSync(Buffer.from(`note for ${PLANTED} ${CANARY}`));
+  // Every column width, marked and unmarked, on ordinary and planted payloads: the column is dropped either way.
+  for (const [name, column] of Object.entries(columns)) {
+    for (const marker of [false, true]) {
+      blocksWithOriginal(dump(long, column, marker), true);
+      blocksWithOriginal(dump(short, column, marker), true);
+      assert.equal(credentialOnly(dump(ordinary, column, marker)).decision, 'ALLOW', `${name}/${marker}`);
+    }
+  }
+  for (const marker of [false, true]) {
+    blocksWithOriginal(dump(long, printable, marker), true);
+    assert.equal(credentialOnly(dump(ordinary, printable, marker)).decision, 'ALLOW', `printable/${marker}`);
+  }
+  // A planted value written literally in the column is plain text and is still caught, marked or unmarked.
+  const literal = zlib.gzipSync(Buffer.from('ordinary build log'));
+  const withLiteral = dump(literal, PLANTED, false);
+  assert.ok(check(withLiteral).reasons.includes('KNOWN_ORIGINAL_DETECTED'), withLiteral);
+  // A row the dump reader declines to parse is not a release path: the row's own byte pairs are still reconstructed
+  // by the byte-pair reader. Rows of 64, 80 and 128 cells all exceed the dump reader's parsing bound or the
+  // 400-character line ceiling, and all three still block precisely.
+  for (const perRow of [64, 80, 128]) {
+    const wide = Array.from({ length: Math.ceil(long.length / perRow) }, (_, row) => {
+      const line = long.subarray(row * perRow, (row + 1) * perRow);
+      const column = [...line].map((byte) => (byte >= 32 && byte < 127 ? String.fromCharCode(byte) : '.')).join('').replace(/(.{4})/gu, '$1 ');
+      return `${(row * perRow >>> 0).toString(16).padStart(8, '0')}:  ${[...line].map((byte) => byte.toString(16).padStart(2, '0')).join(' ')}  ${column}`;
+    }).join('\n');
+    blocksWithOriginal(`synthetic dump\n${wide}\nend\n`, true);
+  }
+  // Ordinary text with offsets and words is not a dump, whatever its column looks like.
+  assert.equal(credentialOnly('2024-01-02: build step 3 of 9 finished in 4211ms\n2024-01-02: build step 4 of 9 finished').decision, 'ALLOW');
+});
