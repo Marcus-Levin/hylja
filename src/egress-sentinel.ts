@@ -492,6 +492,13 @@ function chunkLikeLoose(token: string): boolean {
  */
 const MAX_DECLARED_RUNS = 16384;
 const MAX_DECLARED_UNITS = 8 << 20;
+/**
+ * Characters every declared join costs, counted whether or not the joined value is a new reconstruction: a join
+ * that is dropped as a duplicate or as too short still spent the work. It is a ceiling on how far the readers may
+ * fan out rather than a threshold tuned to observed traffic: no message within the 1 MiB input limit was found to
+ * reach it (docs/plan.md records the measured maximum), and exceeding it is uninspectable, never clean.
+ */
+const MAX_DECLARED_WORK = 8 << 20;
 const MAX_DECLARED_VALUE = 1 << 16;
 /** Group bounds: a wider group is split and read in parts, and a truncated part still inflates its own head. */
 const MAX_DECLARED_FIELDS = 512;
@@ -501,8 +508,15 @@ const MIN_DECLARED_VALUES = 2;
 /** Filler between two labelled fields (whitespace, punctuation, list markers, prose) is never data itself. */
 const MAX_DECLARED_GAP = 256;
 /** Per-message reconstruction work: distinct joined values already read, how many, and their total length. */
-interface DeclaredBudget { seen: Set<string>; runs: number; units: number }
-interface DeclaredEntry { label: string; value: string }
+interface DeclaredBudget { seen: Set<string>; runs: number; units: number; work: number }
+interface DeclaredEntry {
+  label: string;
+  value: string;
+  /** A label drawn from the hex alphabet (`face:`, `deadbeef1:`) is a value the sender wrote before a colon
+   * (a dump offset column) rather than a key, so it joins no reading until its own numbers make it a declared
+   * series: see `completeHexSeries`. */
+  hexLabel: boolean;
+}
 /** One candidate reading of a group: its values in reading order, and how many of them it requires. */
 interface DeclaredReading {
   entries: readonly DeclaredEntry[];
@@ -519,19 +533,24 @@ function declaredValue(token: string): string {
  * was already read for this message. Exceeding the budget is uninspectable, not clean.
  */
 function charge(value: string, budget: DeclaredBudget): boolean {
+  // Every join is charged, including one this budget will drop as too short, too long or already read: the
+  // characters were copied either way, and an uncharged join is work nobody can bound.
+  budget.work += value.length;
+  if (budget.work > MAX_DECLARED_WORK || budget.runs > MAX_DECLARED_RUNS || budget.units > MAX_DECLARED_UNITS) throw new BudgetExceeded();
   if (value.length < MIN_DECLARED_UNITS || value.length > MAX_DECLARED_VALUE || budget.seen.has(value)) return false;
   budget.seen.add(value);
   budget.runs++;
   budget.units += value.length;
-  if (budget.runs > MAX_DECLARED_RUNS || budget.units > MAX_DECLARED_UNITS) throw new BudgetExceeded();
   return true;
 }
+/** A declared numeric label: one name followed by a number (`part1`, `p2`, `part-3`, `chunk_07`). */
+const NUMERIC_LABEL = /^(.*?)(\d{1,4})$/u;
 /** Labels that are one numbered series (`part1`, `part2`, …) in another order than the text carries them. */
 function numericOrder(entries: readonly DeclaredEntry[]): DeclaredEntry[] | null {
   const ranks: number[] = [];
   let base: string | null = null;
   for (const entry of entries) {
-    const label = /^(.*?)(\d{1,4})$/u.exec(entry.label);
+    const label = NUMERIC_LABEL.exec(entry.label);
     if (label === null) return null;
     const name = label[1]!.toLowerCase();
     if (base === null) base = name;
@@ -577,22 +596,136 @@ function labelledGap(gap: string): boolean {
   return gap.length <= MAX_DECLARED_GAP && !/[A-Za-z0-9+/_-]{16,}/u.test(gap);
 }
 /**
+ * One declared label series of a group: the fields that share a label name, whether the name carries a number
+ * (`part1 … partN`, `p1=…`) or not (`data`, `value`, `note` — the keys an array of labelled objects uses).
+ * A label repeated inside one group keeps every occurrence, so the series partition the group's fields by name.
+ *
+ * This is a per-name reading, never a search over subsets: a group of n labelled fields yields at most n/2 series,
+ * and each series reading costs its own size, so the work stays linear in the group.
+ */
+interface DeclaredSeries { numeric: boolean; entries: DeclaredEntry[] }
+function labelledSeries(entries: readonly DeclaredEntry[]): DeclaredSeries[] {
+  const series = new Map<string, DeclaredEntry[]>();
+  for (const entry of entries) {
+    const numbered = NUMERIC_LABEL.exec(entry.label);
+    const name = (numbered ? numbered[1]! : entry.label).toLowerCase();
+    const found = series.get(name);
+    if (found) found.push(entry);
+    else series.set(name, [entry]);
+  }
+  // Largest first, so the metadata beside the dominant series is well defined and stable for equal sizes.
+  return [...series.values()]
+    .map((members) => ({ numeric: members.every((entry) => NUMERIC_LABEL.test(entry.label)), entries: members }))
+    .sort((left, right) => right.entries.length - left.entries.length);
+}
+/** The rank part of a declared numeric label, which is its label number and nothing else. */
+function labelRank(entry: DeclaredEntry): string {
+  return NUMERIC_LABEL.exec(entry.label)?.[2] ?? entry.label;
+}
+/**
+ * The hex-labelled fields of a group that declare one coherent numbered series under one label name
+ * (`face1 … faceN`, `dead1 … deadN`, or the same counted from 0): every member carries a number, the numbers are
+ * distinct, and together they cover a complete run with no gap. A dump offset column is one value written before
+ * a colon (`face: 1f8b0800`, `d0: 0000…`) and never repeats into that shape, so a series is a declaration the
+ * sender made, exactly like `part1 … partN`, and dropping every hex-alphabet label instead made the same payload
+ * readable or not depending on which letters the sender happened to pick.
+ *
+ * The test is over each name's own members, once per field, so it stays linear in the group and is not a search
+ * over subsets. A hex-labelled field that fails it joins no reading at all, so a dump offset column still reads
+ * as it always did.
+ */
+function completeHexSeries(entries: readonly DeclaredEntry[]): DeclaredEntry[][] {
+  const byName = new Map<string, DeclaredEntry[]>();
+  for (const entry of entries) {
+    if (!entry.hexLabel) continue;
+    const name = NUMERIC_LABEL.exec(entry.label)?.[1]?.toLowerCase();
+    if (name === undefined) continue;
+    const members = byName.get(name);
+    if (members) members.push(entry);
+    else byName.set(name, [entry]);
+  }
+  const complete: DeclaredEntry[][] = [];
+  for (const members of byName.values()) {
+    if (members.length < MIN_DECLARED_VALUES) continue;
+    // Every member here carries a number (the grouping above), so this is its rank and nothing else.
+    const ranks = members.map((entry) => Number(labelRank(entry))).sort((left, right) => left - right);
+    const start = ranks[0]!;
+    if (start !== 0 && start !== 1) continue;
+    // A repeated or skipped rank leaves a gap, so the series is not the complete one it claims to be.
+    if (ranks.some((rank, index) => rank !== start + index)) continue;
+    complete.push(members);
+  }
+  return complete;
+}
+/**
+ * One reading of a numbered series whose label numbers repeat: a record with a duplicate key reads first-wins or
+ * last-wins, and the sentinel does not know which parser produced the text, so it reads both. The series keeps its
+ * text order, so a duplicate key does not move a payload part.
+ */
+function duplicateKeyReadings(members: readonly DeclaredEntry[]): DeclaredEntry[][] {
+  const first = new Map<string, number>(), last = new Map<string, number>();
+  members.forEach((entry, index) => {
+    const rank = labelRank(entry);
+    if (!first.has(rank)) first.set(rank, index);
+    last.set(rank, index);
+  });
+  return [members.filter((_, index) => first.get(labelRank(members[index]!)) === index),
+    members.filter((_, index) => last.get(labelRank(members[index]!)) === index)];
+}
+/**
  * Readings of one labelled group: every field value in text order, only the clearly-encoded values, the values
  * that are not bare decimal numbers, and each of those in ascending numeric-label order. A JSON array of
  * objects carries its order indexes beside the payload (`{"part":1,"data":"…"}`), and a chunk of a short split
  * is not always chunk-like on its own, so the numeric values must be droppable without dropping the chunks.
+ *
+ * One declared label series per reading as well, read on its own in text and numeric order. Unrelated metadata
+ * written between the members of a series (`part1: …`, `trace: 1a2b3c4d`, `part2: …`) is not part of that
+ * declaration, and joining it into the value leaves every reading junk, so the series is read without it; the
+ * metadata beside the dominant series is then read as its own group, so no field is dropped from inspection.
+ * Every earlier reading of the group is kept, so nothing that used to be read stops being read.
  */
 function labelledReadings(entries: readonly DeclaredEntry[]): DeclaredReading[] {
-  const sets: DeclaredEntry[][] = [entries as DeclaredEntry[]];
-  const encoded = entries.filter((entry) => chunkLikeLoose(entry.value));
-  const payload = entries.filter((entry) => !DECIMAL_VALUE.test(entry.value));
-  if (encoded.length !== entries.length) sets.push(encoded);
-  if (payload.length !== entries.length && payload.length !== encoded.length) sets.push(payload);
+  // Fields whose label comes from the hex alphabet carry no declaration of their own (`face: 1f8b…` is a value
+  // before a colon, as in a dump offset), so they are in no reading of the group below: a hex dump keeps reading
+  // as it did, and an unrelated hex-looking field beside labelled parts does not join or split them.
+  const fields = entries.filter((entry) => !entry.hexLabel);
+  const sets: DeclaredEntry[][] = [fields as DeclaredEntry[]];
+  const encoded = fields.filter((entry) => chunkLikeLoose(entry.value));
+  const payload = fields.filter((entry) => !DECIMAL_VALUE.test(entry.value));
+  if (encoded.length !== fields.length) sets.push(encoded);
+  if (payload.length !== fields.length && payload.length !== encoded.length) sets.push(payload);
   const readings: DeclaredReading[] = [];
   for (const set of sets) {
     readings.push({ entries: set, minimum: MIN_DECLARED_VALUES });
     const numbered = numericOrder(set);
     if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES });
+  }
+  // A series whose values are all bare decimals is an order index (`{"part":1,"data":"…"}`, `- part: 1`), which
+  // the readings above already handle by dropping the numbers; reading the numbers alone would only spend budget.
+  const series = labelledSeries(fields)
+    .filter((candidate) => candidate.entries.length >= MIN_DECLARED_VALUES &&
+      !candidate.entries.every((entry) => DECIMAL_VALUE.test(entry.value)));
+  for (const candidate of series) {
+    readings.push({ entries: candidate.entries, minimum: MIN_DECLARED_VALUES });
+    const numbered = numericOrder(candidate.entries);
+    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES });
+    if (candidate.numeric && candidate.entries.length !== new Set(candidate.entries.map(labelRank)).size) {
+      readings.push(...duplicateKeyReadings(candidate.entries)
+        .map((reading): DeclaredReading => ({ entries: reading, minimum: MIN_DECLARED_VALUES })));
+    }
+  }
+  // A hex-labelled field is read when its own numbers declare one complete series, in text order and in
+  // numeric-label order. These readings are additional: every reading above is exactly the one it was, so no
+  // field that used to be read stops being read and no other view is displaced.
+  for (const members of completeHexSeries(entries)) {
+    readings.push({ entries: members, minimum: MIN_DECLARED_VALUES });
+    const numbered = numericOrder(members);
+    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES });
+  }
+  if (series.length) {
+    const declared = new Set(series[0]!.entries);
+    const metadata = fields.filter((entry) => !declared.has(entry));
+    if (metadata.length >= MIN_DECLARED_VALUES) readings.push({ entries: metadata, minimum: MIN_DECLARED_VALUES });
   }
   return readings;
 }
@@ -612,14 +745,11 @@ function* labelledChunkRuns(text: string, budget: DeclaredBudget): Generator<Enc
     const gap = previous ? text.slice(previous.at + previous.length, at) : '';
     if (previous && (!labelledGap(gap) || group.length >= MAX_DECLARED_FIELDS)) yield* flush();
     if (group.length === 0) start = at;
-    // A word that is all hex (`face:`) is a value, not a label: it breaks the group rather than being dropped.
-    if (!/[g-zG-Z]/u.test(field[1]!)) {
-      yield* flush();
-      previous = { at, length: field[0].length };
-      continue;
-    }
     const value = field[2] ?? field[3] ?? field[4];
-    if (value !== undefined) group.push({ label: field[1]!, value });
+    // A word that is all hex (`face:`) is a value, not a label: it joins no reading unless it declares a
+    // numbered series of its own, and it does not end the group, so an unrelated hex-looking field between
+    // labelled parts cannot split the declaration in two.
+    if (value !== undefined) group.push({ label: field[1]!, value, hexLabel: !/[g-zG-Z]/u.test(field[1]!) });
     end = at + field[0].length;
     previous = { at, length: field[0].length };
   }
@@ -672,7 +802,7 @@ function* separatorChunkRuns(text: string, budget: DeclaredBudget): Generator<En
   let previousEnd = 0;
   /** One reading: the joined value, judged against the chunks exactly as they were written. */
   const reading = (value: string, evidence: readonly DeclaredEntry[]): DeclaredReading =>
-    ({ entries: [{ label: '', value }], minimum: 1, evidence });
+    ({ entries: [{ label: '', value, hexLabel: false }], minimum: 1, evidence });
   /**
    * The same chunks with one separator character removed from a consistent edge of the chunks it was written
    * against (`X +Y`, `X+ Y`). Both the interior boundaries and the outer edges are offered, since the first or
@@ -696,7 +826,7 @@ function* separatorChunkRuns(text: string, budget: DeclaredBudget): Generator<En
   const flush = function* (): Generator<EncodedRun> {
     if (!group.length) { group = []; plus = true; return; }
     const chunks = group.map(({ start, end }) => text.slice(start, end));
-    const asWritten: DeclaredEntry[] = chunks.map((value) => ({ label: '', value }));
+    const asWritten: DeclaredEntry[] = chunks.map((value) => ({ label: '', value, hexLabel: false }));
     const start = group[0]!.start, end = group[group.length - 1]!.end;
     const joined = chunks.join('');
     // `>` is in no encoding alphabet, so dropping it is exact. `+` and `/` are Base64 characters: dropping
@@ -1228,7 +1358,7 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
   const views: View[] = [];
   const budget = { inflated: 0 };
   /** Declared reconstructions are budgeted per message, across every view and round. */
-  const declaredBudget: DeclaredBudget = { seen: new Set<string>(), runs: 0, units: 0 };
+  const declaredBudget: DeclaredBudget = { seen: new Set<string>(), runs: 0, units: 0, work: 0 };
   const countedValues = new Set<string>();
   const countedBytes: string[] = [];
   let opaqueTotal = 0;
