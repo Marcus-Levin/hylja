@@ -455,7 +455,7 @@ function* dumpRuns(text: string): Generator<EncodedRun> {
 }
 const SEPARATED_HEX = /^[0-9A-Fa-f]{2,}(?:[-_/][0-9A-Fa-f]{2,})+$/u;
 const UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u;
-interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean; joined?: boolean; escaped?: boolean }
+interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean; joined?: boolean; escaped?: boolean; declared?: boolean }
 // Chunks of any length: a fixed-width split ends in a short remainder (`…Ghs2 M=`), and short words between chunks
 // are dropped by the word-free variant.
 const CHUNK = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{1,1024}={0,2}(?![A-Za-z0-9+/=_-])/gu;
@@ -463,12 +463,464 @@ const CHUNK = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{1,1024}={0,2}(?![A-Za-z0-9+/=
 function chunkLike(token: string): boolean {
   return /\d/u.test(token) && /[A-Za-z]/u.test(token) || /^[0-9A-Fa-f]{8,}$/u.test(token) || /=$/u.test(token);
 }
+/** A short hex group of a chunked hex value (`6f6e`, `7461`): data, but never a whole digest. */
+const HEX_GROUP = /^[0-9A-Fa-f]{4,}$/u;
 /**
  * Also possibly encoded: `+`/`/`, a lower-to-upper case switch (digit-free Base64 chunks) or short hex groups
  * (hex of text is mostly digits: `6f6e 7461 6374`).
  */
 function chunkLikeLoose(token: string): boolean {
   return chunkLike(token) || /[+/]/u.test(token) || /[a-z][A-Z]/u.test(token) || /^[0-9A-Fa-f]{4,}$/u.test(token);
+}
+/* ---------- Declared reconstructions (labelled chunks, declared separators, decimal byte arrays) ---------- */
+
+/**
+ * Reconstructions that the representation itself declares: chunks labelled with a key (`part1: …`, `p1=…`,
+ * arrays of labelled JSON objects), chunks joined by a declared separator (` + `, ` / `, ` > ` and their
+ * percent-escaped forms), and decimal byte arrays including Node `Buffer` JSON (`{"type":"Buffer","data":[…]}`).
+ *
+ * They are **decode-only**, like the hex byte-pair lists above: the joined bytes are read as text when they are
+ * text, decompressed, container-checked and matched, but they add no opaque bytes, so no ordinary engineering
+ * numeric array or labelled configuration list gains opaque authority from its shape. Compressed opaque data
+ * still blocks, because a decoded stream's own opaque output is counted, and so does a container signature.
+ * Unknown *uncompressed* binary inside these forms can still pass. That is a declared limit, not a completeness
+ * claim (docs/plan.md #19 known limits).
+ *
+ * Work is bounded per message and shared by every view and round: each distinct joined value is read once, and a
+ * message demanding more reconstructions than the budget allows is uninspectable rather than clean, because
+ * stopping early would let a sender hide a payload behind padding.
+ */
+const MAX_DECLARED_RUNS = 16384;
+const MAX_DECLARED_UNITS = 8 << 20;
+/**
+ * Characters every declared join costs, counted whether or not the joined value is a new reconstruction: a join
+ * that is dropped as a duplicate or as too short still spent the work. It is a ceiling on how far the readers may
+ * fan out rather than a threshold tuned to observed traffic: no message within the 1 MiB input limit was found to
+ * reach it (docs/plan.md records the measured maximum), and exceeding it is uninspectable, never clean.
+ */
+const MAX_DECLARED_WORK = 8 << 20;
+const MAX_DECLARED_VALUE = 1 << 16;
+/** Group bounds: a wider group is split and read in parts, and a truncated part still inflates its own head. */
+const MAX_DECLARED_FIELDS = 512;
+const MAX_DECLARED_CHUNKS = 256;
+const MIN_DECLARED_UNITS = 16;
+const MIN_DECLARED_VALUES = 2;
+/** Filler between two labelled fields (whitespace, punctuation, list markers, prose) is never data itself. */
+const MAX_DECLARED_GAP = 256;
+/** Per-message reconstruction work: distinct joined values already read, how many, and their total length. */
+interface DeclaredBudget { seen: Set<string>; runs: number; units: number; work: number }
+interface DeclaredEntry {
+  label: string;
+  value: string;
+  /** A label drawn from the hex alphabet (`face:`, `deadbeef1:`) is a value the sender wrote before a colon
+   * (a dump offset column) rather than a key, so it joins no reading until its own numbers make it a declared
+   * series: see `completeHexSeries`. */
+  hexLabel: boolean;
+}
+/** One candidate reading of a group: its values in reading order, and how many of them it requires. */
+interface DeclaredReading {
+  entries: readonly DeclaredEntry[];
+  minimum: number;
+  /** Values the encoded-data evidence is judged on, when the join itself differs (`/` glued into a chunk). */
+  evidence?: readonly DeclaredEntry[];
+}
+/** Strip a chunk's own padding and hex `0x` prefix, as the chunk join does before concatenating. */
+function declaredValue(token: string): string {
+  return token.replace(/=+$/u, '').replace(/^0[xX](?=[0-9A-Fa-f]+$)/u, '');
+}
+/**
+ * Charge one reconstructed value to the per-message budget, or return false when it is too short, too long or
+ * was already read for this message. Exceeding the budget is uninspectable, not clean.
+ */
+function charge(value: string, budget: DeclaredBudget): boolean {
+  // Every join is charged, including one this budget will drop as too short, too long or already read: the
+  // characters were copied either way, and an uncharged join is work nobody can bound.
+  budget.work += value.length;
+  if (budget.work > MAX_DECLARED_WORK || budget.runs > MAX_DECLARED_RUNS || budget.units > MAX_DECLARED_UNITS) throw new BudgetExceeded();
+  if (value.length < MIN_DECLARED_UNITS || value.length > MAX_DECLARED_VALUE || budget.seen.has(value)) return false;
+  budget.seen.add(value);
+  budget.runs++;
+  budget.units += value.length;
+  return true;
+}
+/** A declared numeric label: one name followed by a number (`part1`, `p2`, `part-3`, `chunk_07`). */
+const NUMERIC_LABEL = /^(.*?)(\d{1,4})$/u;
+/** Labels that are one numbered series (`part1`, `part2`, …) in another order than the text carries them. */
+function numericOrder(entries: readonly DeclaredEntry[]): DeclaredEntry[] | null {
+  const ranks: number[] = [];
+  let base: string | null = null;
+  for (const entry of entries) {
+    const label = NUMERIC_LABEL.exec(entry.label);
+    if (label === null) return null;
+    const name = label[1]!.toLowerCase();
+    if (base === null) base = name;
+    else if (name !== base) return null;
+    ranks.push(Number(label[2]!));
+  }
+  if (base === null) return null;
+  const order: number[] = entries.map((_, index) => index);
+  order.sort((left, right) => ranks[left]! - ranks[right]!);
+  const sorted = order.map((index) => entries[index]!);
+  return sorted.some((entry, index) => entry !== entries[index]) ? sorted : null;
+}
+/**
+ * The joined runs of one group, one per candidate reading. Evidence is judged **per value**, as for a plain
+ * chunk sequence: at least half of them must look encoded and at least one must look clearly encoded, so a
+ * labelled list of ordinary words, a numeric list and a sentence of prose are not reconstructed at all.
+ */
+function* declaredRuns(start: number, end: number, readings: readonly DeclaredReading[],
+  budget: DeclaredBudget): Generator<EncodedRun> {
+  for (const reading of readings) {
+    const entries = reading.entries;
+    if (entries.length < reading.minimum) continue;
+    const evidence = reading.evidence ?? entries;
+    if (evidence.filter((entry) => chunkLikeLoose(entry.value)).length < evidence.length * 0.5) continue;
+    if (!evidence.some((entry) => chunkLike(entry.value) || HEX_GROUP.test(entry.value))) continue;
+    const value = entries.map((entry) => declaredValue(entry.value)).join('');
+    if (!charge(value, budget)) continue;
+    yield { start, end, value, prefixed: false, countable: false, separated: true, joined: true, declared: true };
+  }
+}
+/**
+ * A labelled field: `part1: <chunk>`, `p1=<chunk>`, `"part1":"<chunk>"` (a JSON closing quote may sit between
+ * the label and the colon) and `part: 1`. The label is bounded and word-initial; the value is one bounded
+ * chunk, quoted or bare.
+ */
+const LABELLED_FIELD = /(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{0,23})"?[ \t]{0,4}[:=][ \t]{0,4}(?:"([A-Za-z0-9+/_-]{1,1024}={0,2})"|'([A-Za-z0-9+/_-]{1,1024}={0,2})'|([A-Za-z0-9+/_-]{1,1024}={0,2}))(?![A-Za-z0-9+/_=-])/gu;
+/**
+ * Between two labelled fields: whitespace, JSON punctuation, list markers and prose. A gap may be long, since a
+ * document may introduce each part in words, but it is never a run of 16+ alphabet characters: that is data, so
+ * it ends the group instead of joining across it.
+ */
+function labelledGap(gap: string): boolean {
+  return gap.length <= MAX_DECLARED_GAP && !/[A-Za-z0-9+/_-]{16,}/u.test(gap);
+}
+/**
+ * One declared label series of a group: the fields that share a label name, whether the name carries a number
+ * (`part1 … partN`, `p1=…`) or not (`data`, `value`, `note` — the keys an array of labelled objects uses).
+ * A label repeated inside one group keeps every occurrence, so the series partition the group's fields by name.
+ *
+ * This is a per-name reading, never a search over subsets: a group of n labelled fields yields at most n/2 series,
+ * and each series reading costs its own size, so the work stays linear in the group.
+ */
+interface DeclaredSeries { numeric: boolean; entries: DeclaredEntry[] }
+function labelledSeries(entries: readonly DeclaredEntry[]): DeclaredSeries[] {
+  const series = new Map<string, DeclaredEntry[]>();
+  for (const entry of entries) {
+    const numbered = NUMERIC_LABEL.exec(entry.label);
+    const name = (numbered ? numbered[1]! : entry.label).toLowerCase();
+    const found = series.get(name);
+    if (found) found.push(entry);
+    else series.set(name, [entry]);
+  }
+  // Largest first, so the metadata beside the dominant series is well defined and stable for equal sizes.
+  return [...series.values()]
+    .map((members) => ({ numeric: members.every((entry) => NUMERIC_LABEL.test(entry.label)), entries: members }))
+    .sort((left, right) => right.entries.length - left.entries.length);
+}
+/** The rank part of a declared numeric label, which is its label number and nothing else. */
+function labelRank(entry: DeclaredEntry): string {
+  return NUMERIC_LABEL.exec(entry.label)?.[2] ?? entry.label;
+}
+/**
+ * The hex-labelled fields of a group that declare one coherent numbered series under one label name
+ * (`face1 … faceN`, `dead1 … deadN`, or the same counted from 0): every member carries a number, the numbers are
+ * distinct, and together they cover a complete run with no gap. A dump offset column is one value written before
+ * a colon (`face: 1f8b0800`, `d0: 0000…`) and never repeats into that shape, so a series is a declaration the
+ * sender made, exactly like `part1 … partN`, and dropping every hex-alphabet label instead made the same payload
+ * readable or not depending on which letters the sender happened to pick.
+ *
+ * The test is over each name's own members, once per field, so it stays linear in the group and is not a search
+ * over subsets. A hex-labelled field that fails it joins no reading at all, so a dump offset column still reads
+ * as it always did.
+ */
+function completeHexSeries(entries: readonly DeclaredEntry[]): DeclaredEntry[][] {
+  const byName = new Map<string, DeclaredEntry[]>();
+  for (const entry of entries) {
+    if (!entry.hexLabel) continue;
+    const name = NUMERIC_LABEL.exec(entry.label)?.[1]?.toLowerCase();
+    if (name === undefined) continue;
+    const members = byName.get(name);
+    if (members) members.push(entry);
+    else byName.set(name, [entry]);
+  }
+  const complete: DeclaredEntry[][] = [];
+  for (const members of byName.values()) {
+    if (members.length < MIN_DECLARED_VALUES) continue;
+    // Every member here carries a number (the grouping above), so this is its rank and nothing else.
+    const ranks = members.map((entry) => Number(labelRank(entry))).sort((left, right) => left - right);
+    const start = ranks[0]!;
+    if (start !== 0 && start !== 1) continue;
+    // A repeated or skipped rank leaves a gap, so the series is not the complete one it claims to be.
+    if (ranks.some((rank, index) => rank !== start + index)) continue;
+    complete.push(members);
+  }
+  return complete;
+}
+/**
+ * One reading of a numbered series whose label numbers repeat: a record with a duplicate key reads first-wins or
+ * last-wins, and the sentinel does not know which parser produced the text, so it reads both. The series keeps its
+ * text order, so a duplicate key does not move a payload part.
+ */
+function duplicateKeyReadings(members: readonly DeclaredEntry[]): DeclaredEntry[][] {
+  const first = new Map<string, number>(), last = new Map<string, number>();
+  members.forEach((entry, index) => {
+    const rank = labelRank(entry);
+    if (!first.has(rank)) first.set(rank, index);
+    last.set(rank, index);
+  });
+  return [members.filter((_, index) => first.get(labelRank(members[index]!)) === index),
+    members.filter((_, index) => last.get(labelRank(members[index]!)) === index)];
+}
+/**
+ * Readings of one labelled group: every field value in text order, only the clearly-encoded values, the values
+ * that are not bare decimal numbers, and each of those in ascending numeric-label order. A JSON array of
+ * objects carries its order indexes beside the payload (`{"part":1,"data":"…"}`), and a chunk of a short split
+ * is not always chunk-like on its own, so the numeric values must be droppable without dropping the chunks.
+ *
+ * One declared label series per reading as well, read on its own in text and numeric order. Unrelated metadata
+ * written between the members of a series (`part1: …`, `trace: 1a2b3c4d`, `part2: …`) is not part of that
+ * declaration, and joining it into the value leaves every reading junk, so the series is read without it; the
+ * metadata beside the dominant series is then read as its own group, so no field is dropped from inspection.
+ * Every earlier reading of the group is kept, so nothing that used to be read stops being read.
+ */
+function labelledReadings(entries: readonly DeclaredEntry[]): DeclaredReading[] {
+  // Fields whose label comes from the hex alphabet carry no declaration of their own (`face: 1f8b…` is a value
+  // before a colon, as in a dump offset), so they are in no reading of the group below: a hex dump keeps reading
+  // as it did, and an unrelated hex-looking field beside labelled parts does not join or split them.
+  const fields = entries.filter((entry) => !entry.hexLabel);
+  const sets: DeclaredEntry[][] = [fields as DeclaredEntry[]];
+  const encoded = fields.filter((entry) => chunkLikeLoose(entry.value));
+  const payload = fields.filter((entry) => !DECIMAL_VALUE.test(entry.value));
+  if (encoded.length !== fields.length) sets.push(encoded);
+  if (payload.length !== fields.length && payload.length !== encoded.length) sets.push(payload);
+  const readings: DeclaredReading[] = [];
+  for (const set of sets) {
+    readings.push({ entries: set, minimum: MIN_DECLARED_VALUES });
+    const numbered = numericOrder(set);
+    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES });
+  }
+  // A series whose values are all bare decimals is an order index (`{"part":1,"data":"…"}`, `- part: 1`), which
+  // the readings above already handle by dropping the numbers; reading the numbers alone would only spend budget.
+  const series = labelledSeries(fields)
+    .filter((candidate) => candidate.entries.length >= MIN_DECLARED_VALUES &&
+      !candidate.entries.every((entry) => DECIMAL_VALUE.test(entry.value)));
+  for (const candidate of series) {
+    readings.push({ entries: candidate.entries, minimum: MIN_DECLARED_VALUES });
+    const numbered = numericOrder(candidate.entries);
+    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES });
+    if (candidate.numeric && candidate.entries.length !== new Set(candidate.entries.map(labelRank)).size) {
+      readings.push(...duplicateKeyReadings(candidate.entries)
+        .map((reading): DeclaredReading => ({ entries: reading, minimum: MIN_DECLARED_VALUES })));
+    }
+  }
+  // A hex-labelled field is read when its own numbers declare one complete series, in text order and in
+  // numeric-label order. These readings are additional: every reading above is exactly the one it was, so no
+  // field that used to be read stops being read and no other view is displaced.
+  for (const members of completeHexSeries(entries)) {
+    readings.push({ entries: members, minimum: MIN_DECLARED_VALUES });
+    const numbered = numericOrder(members);
+    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES });
+  }
+  if (series.length) {
+    const declared = new Set(series[0]!.entries);
+    const metadata = fields.filter((entry) => !declared.has(entry));
+    if (metadata.length >= MIN_DECLARED_VALUES) readings.push({ entries: metadata, minimum: MIN_DECLARED_VALUES });
+  }
+  return readings;
+}
+const DECIMAL_VALUE = /^\d{1,16}$/u;
+function* labelledChunkRuns(text: string, budget: DeclaredBudget): Generator<EncodedRun> {
+  if (!HAS_LABEL.test(text)) return;
+  let group: DeclaredEntry[] = [];
+  let start = 0, end = 0;
+  let previous: { at: number; length: number } | null = null;
+  const flush = function* (): Generator<EncodedRun> {
+    if (group.length) yield* declaredRuns(start, end, labelledReadings(group), budget);
+    group = [];
+    previous = null;
+  };
+  for (const field of text.matchAll(LABELLED_FIELD)) {
+    const at = field.index!;
+    const gap = previous ? text.slice(previous.at + previous.length, at) : '';
+    if (previous && (!labelledGap(gap) || group.length >= MAX_DECLARED_FIELDS)) yield* flush();
+    if (group.length === 0) start = at;
+    const value = field[2] ?? field[3] ?? field[4];
+    // A word that is all hex (`face:`) is a value, not a label: it joins no reading unless it declares a
+    // numbered series of its own, and it does not end the group, so an unrelated hex-looking field between
+    // labelled parts cannot split the declaration in two.
+    if (value !== undefined) group.push({ label: field[1]!, value, hexLabel: !/[g-zG-Z]/u.test(field[1]!) });
+    end = at + field[0].length;
+    previous = { at, length: field[0].length };
+  }
+  yield* flush();
+}
+/** Declared separators between encoded chunks: `+` concatenation, `/` grouping, `>` pipeline output. */
+const MIN_JOIN_CHUNKS = 3;
+const MIN_JOIN_CHUNK = 2;
+const MAX_JOIN_CHUNK = 1024;
+/** Base64url characters, plus the separator characters that can be glued inside a chunk (`+`, `/`, `>`). */
+function joinChunkChar(code: number): boolean {
+  return (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a) ||
+    code === 0x2d || code === 0x5f || code === 0x2b || code === 0x2f || code === 0x3e;
+}
+/** A chunk needs Base64url characters of its own: a lone `+`, `/` or `>` is separator punctuation. */
+function joinChunkCore(code: number): boolean {
+  return joinChunkChar(code) && code !== 0x2b && code !== 0x2f && code !== 0x3e;
+}
+/**
+ * The same two sets as a table, for scanning a whole message: bit 1 is a Base64url character, bit 2 is one of its
+ * own. Every join this reader reconstructs needs a separator or its percent-escaped spelling somewhere, so a
+ * message without one has nothing for it to read and is skipped in a single scan.
+ */
+const JOIN_CHAR = ((): Uint8Array => {
+  const table = new Uint8Array(128);
+  for (let code = 0; code < 128; code++) table[code] = joinChunkChar(code) ? (joinChunkCore(code) ? 3 : 1) : 0;
+  return table;
+})();
+const HAS_JOIN_SEPARATOR = /[/+>]|%2[BbFf]|%3[Ee]/u;
+const HAS_LABEL = /[:=]/u;
+const GLUED_SEPARATOR = /[/+>]/u;
+/**
+ * Whitespace-padded single separator between two chunks: ` + `, ` / `, ` > `, their asymmetric and line-broken
+ * forms, and the percent-escaped spelling of the same separator (`%2B`, `%2f`, `%3e`).
+ */
+const DECLARED_GAP = /^[ \t\r\n]{0,8}([/+>]|%2[BbFf]|%3[Ee])[ \t\r\n]{0,8}$/u;
+const PERCENT_ESCAPE = /^%[0-9A-Fa-f]{2}/u;
+/**
+ * Chunks joined by declared separators, scanned once. A chunk is a run of Base64url characters that may carry a
+ * glued separator character, so several readings of one group are decoded: the text as written, the text with
+ * every separator character removed, and the text with a separator character glued to the same side of every
+ * chunk removed (`X +Y` and `X+ Y`). Evidence is judged on the chunks as written, so a hex join split by `/`
+ * (`1f8b/0800/…`) is read as hex and a Base64 join as Base64. `/` and `>` are ordinary punctuation, so a group
+ * using them needs three or more chunks; `+` alone is an explicit concatenation operator and two are enough.
+ */
+function* separatorChunkRuns(text: string, budget: DeclaredBudget): Generator<EncodedRun> {
+  if (!HAS_JOIN_SEPARATOR.test(text)) return;
+  let group: { start: number; end: number }[] = [];
+  let plus = true;
+  let previousEnd = 0;
+  /** One reading: the joined value, judged against the chunks exactly as they were written. */
+  const reading = (value: string, evidence: readonly DeclaredEntry[]): DeclaredReading =>
+    ({ entries: [{ label: '', value, hexLabel: false }], minimum: 1, evidence });
+  /**
+   * The same chunks with one separator character removed from a consistent edge of the chunks it was written
+   * against (`X +Y`, `X+ Y`). Both the interior boundaries and the outer edges are offered, since the first or
+   * last chunk may or may not have been written with the same glue.
+   */
+  const glued = (chunks: readonly string[], side: 'leading' | 'trailing'): string[] => {
+    const edge = (value: string): string => (side === 'leading' ? value[0] ?? '' : value[value.length - 1] ?? '');
+    const interior = side === 'leading' ? chunks.slice(1) : chunks.slice(0, -1);
+    if (chunks.length < 2 || !interior.every((value) => GLUED_SEPARATOR.test(edge(value)))) return [];
+    const separator = edge(interior[0]!);
+    const trim = (value: string): string => (side === 'leading' ? value.slice(1) : value.slice(0, -1));
+    const values = [chunks.map((value, index) => {
+      const interiorEdge = side === 'leading' ? index > 0 : index < chunks.length - 1;
+      return interiorEdge ? trim(value) : value;
+    }).join('')];
+    // The uniform spelling: the outer chunks were glued the same way as the interior boundaries.
+    const outer = edge(side === 'leading' ? chunks[0]! : chunks[chunks.length - 1]!);
+    if (outer === separator) values.push(chunks.map((value) => (edge(value) === separator ? trim(value) : value)).join(''));
+    return values;
+  };
+  const flush = function* (): Generator<EncodedRun> {
+    if (!group.length) { group = []; plus = true; return; }
+    const chunks = group.map(({ start, end }) => text.slice(start, end));
+    const asWritten: DeclaredEntry[] = chunks.map((value) => ({ label: '', value, hexLabel: false }));
+    const start = group[0]!.start, end = group[group.length - 1]!.end;
+    const joined = chunks.join('');
+    // `>` is in no encoding alphabet, so dropping it is exact. `+` and `/` are Base64 characters: dropping
+    // every one of them is a guess that only wins when the sender used them as the separator rather than data.
+    const readings = [reading(joined, asWritten), reading(joined.replace(/>/gu, ''), asWritten),
+      reading(joined.replace(/[/+>]/gu, ''), asWritten)];
+    for (const side of ['leading', 'trailing'] as const) {
+      for (const value of glued(chunks, side)) readings.push(reading(value, asWritten));
+    }
+    if (chunks.length >= (plus ? MIN_DECLARED_VALUES : MIN_JOIN_CHUNKS)) yield* declaredRuns(start, end, readings, budget);
+    // Too few chunks for a declared join, but they may still be one written without spaces around the separator.
+    else yield* declaredRuns(start, end, readings.slice(1), budget);
+    group = [];
+    plus = true;
+  };
+  let at = 0;
+  while (at < text.length) {
+    // A percent escape is separator spelling, not a chunk: its two hex digits must not become one.
+    if (text[at] === '%' && PERCENT_ESCAPE.test(text.slice(at, at + 3))) { at += 3; continue; }
+    const start = at;
+    let core = 0;
+    while (at < text.length && (JOIN_CHAR[text.charCodeAt(at)] ?? 0) !== 0) {
+      if ((JOIN_CHAR[text.charCodeAt(at)] ?? 0) === 3) core++;
+      at++;
+    }
+    if (at === start) { at++; continue; }
+    if (core < MIN_JOIN_CHUNK) {
+      // A lone `+`, `/` or `>` is separator punctuation, not a chunk: leave the gap open so a later chunk can
+      // still be read as joined to the previous one.
+      continue;
+    }
+    if (at - start > MAX_JOIN_CHUNK) {
+      // A run wider than the chunk bound is not one; the whole-run reader already has it on its own.
+      yield* flush();
+      previousEnd = at;
+      continue;
+    }
+    if (group.length) {
+      const gapText = text.slice(previousEnd, start);
+      const separator = DECLARED_GAP.exec(gapText)?.[1];
+      // A separator written against the chunk it touches (`X +Y`, `X+ Y`) has whitespace-only around it and the
+      // separator character itself at the edge of a chunk; the glued readings above join it correctly.
+      const against = /^[ \t\r\n]{1,8}$/u.test(gapText) ? GLUED_SEPARATOR.test(text[start] ?? '') ?
+        text[start]! : GLUED_SEPARATOR.test(text[at - 1] ?? '') ? text[at - 1]! : '' : '';
+      // Anything else is ordinary text between two chunks.
+      if (separator === undefined && !against) yield* flush();
+      else if (!/^(?:[+/])$/u.test(separator ?? against)) plus = false;
+    }
+    group.push({ start, end: at });
+    previousEnd = at;
+    if (group.length >= MAX_DECLARED_CHUNKS) yield* flush();
+  }
+  yield* flush();
+}
+/**
+ * Decimal byte arrays and Node `Buffer` JSON: `[63, 111, 110]`, `["63","111"]` and `{"type":"Buffer","data":[…]}`.
+ * Eight or more decimal bytes below 256 inside one bracket, with or without a trailing comma, read as bytes for
+ * matching, decompression and the container check only. A value above 255, a non-integer or any other content
+ * ends the array, so timestamps, versions, port lists and float vectors are not reinterpreted as bytes.
+ */
+const MIN_DECIMAL_ARRAY = 8;
+/** As many bytes as one reconstructed value can hold, so a byte array is never read past its own value cap. */
+const MAX_DECIMAL_ARRAY = MAX_DECLARED_VALUE >> 1;
+const SPACE = /[ \t\r\n]/u;
+/** Whitespace and at most one quote: numbers in a byte array may be written as strings. */
+function decimalSpace(text: string, at: number): number {
+  while (SPACE.test(text[at] ?? '')) at++;
+  if (text[at] === '"' || text[at] === "'") { at++; while (SPACE.test(text[at] ?? '')) at++; }
+  return at;
+}
+function* decimalByteRuns(text: string, budget: DeclaredBudget): Generator<EncodedRun> {
+  if (!text.includes('[')) return;
+  for (let at = 0; at < text.length; at++) {
+    if (text[at] !== '[') continue;
+    let cursor = decimalSpace(text, at + 1), closed = false;
+    const bytes: number[] = [];
+    for (; cursor < text.length && bytes.length < MAX_DECIMAL_ARRAY;) {
+      const start = cursor;
+      while (cursor - start < 3 && (text[cursor] ?? '') >= '0' && (text[cursor] ?? '') <= '9') cursor++;
+      if (cursor === start) break;
+      const value = Number(text.slice(start, cursor));
+      if (value > 255) break;
+      bytes.push(value);
+      cursor = decimalSpace(text, cursor);
+      // A trailing comma before the bracket is valid in the array literals this form comes from.
+      if (text[cursor] === ',') { cursor = decimalSpace(text, cursor + 1); if (text[cursor] !== ']') continue; }
+      closed = text[cursor] === ']';
+      break;
+    }
+    if (!closed || bytes.length < MIN_DECIMAL_ARRAY) continue;
+    const value = bytes.map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    if (!charge(value, budget)) continue;
+    yield { start: at, end: cursor + 1, value, prefixed: false, countable: false, separated: true, joined: true, declared: true };
+  }
 }
 /**
  * Encoded runs: every run of 16+ alphabet characters (a `shaNNN-`/`shaNNN:`/`h1:` prefix stripped), plus
@@ -478,7 +930,7 @@ function chunkLikeLoose(token: string): boolean {
  * tokens are clearly encoded; other sequences (digit-free Base64 chunks, but also JSON ids, IPv6 addresses and
  * regex classes) are decoded and decompressed, never counted.
  */
-function* encodedRuns(text: string): Generator<EncodedRun> {
+function* encodedRuns(text: string, budget: DeclaredBudget): Generator<EncodedRun> {
   for (const run of text.matchAll(ENCODED_RUN)) {
     // A digest prefix, `0x` before hex (`0x0000A1B2C3D4E5F6`), or the letter of a JSON escape before the run
     // (`\nQUJD…`) is not part of the value.
@@ -506,6 +958,10 @@ function* encodedRuns(text: string): Generator<EncodedRun> {
   yield* escapedByteRuns(text);
   yield* chunkSequences(text, /^(?:[\s,"'[\]]|\\[nrt]){1,64}$/u, false);
   yield* chunkSequences(text, /^(?:[\s,"'[\]:;|.&]|\\[nrt]){1,64}$/u, true);
+  // Representations that declare their own reconstruction, decode-only and budgeted per message.
+  yield* labelledChunkRuns(text, budget);
+  yield* separatorChunkRuns(text, budget);
+  yield* decimalByteRuns(text, budget);
 }
 /**
  * Joined chunk sequences. The strict pass (whitespace, commas, quotes, brackets) may count; the weak pass also
@@ -901,6 +1357,8 @@ const INVALID_BYTE_OCTAL = /\\[4-7][0-7]{2}/u;
 function canonicalViews(root: string): { views: View[]; opaque: boolean } | { reason: string } {
   const views: View[] = [];
   const budget = { inflated: 0 };
+  /** Declared reconstructions are budgeted per message, across every view and round. */
+  const declaredBudget: DeclaredBudget = { seen: new Set<string>(), runs: 0, units: 0, work: 0 };
   const countedValues = new Set<string>();
   const countedBytes: string[] = [];
   let opaqueTotal = 0;
@@ -935,11 +1393,12 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
       let countable = 0;
       const spans: [number, number][] = [];
       const chunkJoin: boolean[] = [];
+      const declaredRun: boolean[] = [];
       const runCounts: number[] = [];
       const runIdentified: boolean[] = [];
       const publicBlocks = [...view.text.matchAll(PUBLIC_PEM)].filter((block) => derShaped(block[0]))
         .map((block) => ({ start: block.index, end: block.index + block[0].length }));
-      for (const run of encodedRuns(view.text)) {
+      for (const run of encodedRuns(view.text, declaredBudget)) {
         if (textSpans.some((span) => span.start <= run.start && run.end <= span.end)) continue;
         const decoded = decodeRun(run.value);
         if (!decoded) continue;
@@ -970,6 +1429,7 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         binary.push(bytes);
         spans.push([run.start, run.end]);
         chunkJoin.push(run.joined === true);
+        declaredRun.push(run.declared === true);
         // Each distinct run counts once per message. An escape view repeats its parent's runs, sometimes with one
         // more or one fewer leading character (`\nQUJD…` becomes a newline and `QUJD…`).
         // A run whose bytes are part of an already counted run (the same token split by an escape) counts once too.
@@ -998,7 +1458,11 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         for (const index of whole) if (spans[index]![0] >= reach) { taken.push(index); reach = spans[index]![1]; }
         const takenOverlaps = spanIndex(taken.map((index) => spans[index]!));
         reach = -1;
-        for (const index of binary.map((_, i) => i).filter((i) => chunkJoin[i]).sort(bySpan)) {
+        // A declared reconstruction is one complete value, so it is appended after the chunk joins it overlaps:
+        // a labelled or joined group must never take the concatenation slot of a chunk sequence that still needs
+        // another run to complete its stream.
+        const byJoin = (a: number, b: number): number => Number(declaredRun[a]) - Number(declaredRun[b]) || bySpan(a, b);
+        for (const index of binary.map((_, i) => i).filter((i) => chunkJoin[i]).sort(byJoin)) {
           if (taken.length >= 4096 || spans[index]![0] < reach || takenOverlaps(spans[index]!)) continue;
           taken.push(index);
           reach = spans[index]![1];
