@@ -18,13 +18,13 @@ and remains subject to [#4](https://github.com/Marcus-Levin/hylja/issues/4) poli
 
 1. A semantic judgment is evidence. It may propose a semantic class with a bounded confidence, and
    nothing else. It never names a sensitivity, subtype, scope, reversibility, trust, purpose or
-   treatment (decisions [002](../decisions/002-sensitivity-and-trust-are-separate),
-   [003](../decisions/003-semantic-judgment-does-not-own-effects),
-   [009](../decisions/009-secrets-are-not-synthetic-identities)).
+   treatment (decisions [002](../decisions/002-sensitivity-and-trust-are-separate.md),
+   [003](../decisions/003-semantic-judgment-does-not-own-effects.md),
+   [009](../decisions/009-secrets-are-not-synthetic-identities.md)).
 2. Every record carries `authority: 'NONE'` and `advisory: { suggestedTreatment: 'NONE', effect:
    'IGNORED_NO_AUTHORITY' }`. No code path in the module can select a treatment, grant release,
    authorize a sink or lower deterministic evidence. Semantic failure cannot relax protected egress
-   (decision [007](../decisions/007-fail-closed-for-protected-egress)).
+   (decision [007](../decisions/007-fail-closed-for-protected-egress.md)).
 3. Shadow means no policy authority, **not** permission to transmit. A hosted judge is its own
    external sink (see below).
 4. A judge cannot be a candidate source. PERSON/EMAIL/PHONE and customer/project candidates come from

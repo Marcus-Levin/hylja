@@ -8,12 +8,12 @@ This contract answers one question at a release boundary: **do the exact bytes o
 
 | Piece | File | Role |
 |---|---|---|
-| Bounded canonical JSON | [`src/canonical-json.ts`](../src/canonical-json.ts) | Deterministic serialization, duplicate-key rejection, SHA-256 over exact bytes. |
-| Strict byte encodings | [`src/byte-encoding.ts`](../src/byte-encoding.ts) | Canonical base64 and lowercase-hex checks. |
-| Dependency evidence | [`src/dependency-evidence.ts`](../src/dependency-evidence.ts) | Locked dependency set, CycloneDX SBOM set, and their comparison. |
-| Adapter conformance | [`src/adapter-conformance.ts`](../src/adapter-conformance.ts) | Synthetic harness that observes what an adapter actually released, using the in-tree #19 final-byte check. |
-| Promotion gate | [`src/release-integrity.ts`](../src/release-integrity.ts) | `verifyReleaseEvidence`: strict failure on missing, mismatched or critical evidence. |
-| Release gate CLI | [`src/release-gate-cli.ts`](../src/release-gate-cli.ts) | The exact release-boundary invocation. |
+| Bounded canonical JSON | [`src/canonical-json.ts`](../../src/canonical-json.ts) | Deterministic serialization, duplicate-key rejection, SHA-256 over exact bytes. |
+| Strict byte encodings | [`src/byte-encoding.ts`](../../src/byte-encoding.ts) | Canonical base64 and lowercase-hex checks. |
+| Dependency evidence | [`src/dependency-evidence.ts`](../../src/dependency-evidence.ts) | Locked dependency set, CycloneDX SBOM set, and their comparison. |
+| Adapter conformance | [`src/adapter-conformance.ts`](../../src/adapter-conformance.ts) | Synthetic harness that observes what an adapter actually released, using the in-tree #19 final-byte check. |
+| Promotion gate | [`src/release-integrity.ts`](../../src/release-integrity.ts) | `verifyReleaseEvidence`: strict failure on missing, mismatched or critical evidence. |
+| Release gate CLI | [`src/release-gate-cli.ts`](../../src/release-gate-cli.ts) | The exact release-boundary invocation. |
 | Offline substrate | `scripts/synthetic-release-substrate.mjs`, `scripts/synthetic-release-demo.mjs` | Synthetic, in-memory, ephemeral-key evidence and a 13-case demonstration. |
 | Ephemeral SBOM check | `scripts/check-sbom.mjs` | Semantic SBOM/lockfile cross-check, replacing a parse-only check. |
 
