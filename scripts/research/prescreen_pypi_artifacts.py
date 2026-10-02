@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Host-side prescreen of downloaded PyPI wheels, for the #46 research screen.
 
-Three things happen for each artifact, in this order:
+Four things happen for each artifact, in this order:
 
 1. the local bytes are read once, in bounded chunks, to compute size and
    SHA-256 -- nothing is unpacked yet, and an entry that is not an ordinary
@@ -11,7 +11,19 @@ Three things happen for each artifact, in this order:
    published record. A missing or mismatched pin is refused here, *before* any
    candidate archive is opened;
 3. only then is the archive inspected, under fixed member-count, per-member
-   size and metadata-expansion bounds.
+   size and metadata-expansion bounds, and its distribution identity is read
+   from **exactly one** root ``<distribution>-<version>.dist-info/METADATA``
+   member. A vendored copy of another distribution's metadata lives *below* the
+   outer package directory and describes that other distribution, so it can
+   neither stand in for nor replace the outer one; a wheel with two root
+   metadata members has two candidate identities and is refused rather than
+   resolved by member order;
+4. that declared identity is bound to the identity the **published record**
+   publishes for the same version before anything is asked of an advisory
+   service. The record, not the archive, says which distribution a file is; an
+   archive member name is only ever a cross-check on what the metadata
+   declares, never the source of a reported identity, and a file name
+   contributes no identity to any record at all.
 
 Every failure is a fixed code. No file name, archive member name, request URL or
 response body is echoed, because those are artifact-controlled text.
@@ -58,6 +70,17 @@ NAME_GRAMMAR = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 VERSION_GRAMMAR = re.compile(r"^[A-Za-z0-9.+!_-]{1,32}$")
 LICENSE_GRAMMAR = re.compile(r"^[A-Za-z0-9 .(),;+*-]{1,128}$")
 PYTHON_GRAMMAR = re.compile(r"^[A-Za-z0-9 .<>=!~,;]{1,64}$")
+
+# A distribution's own metadata is one member at the *root* of the wheel, named
+# ``{distribution}-{version}.dist-info/METADATA``. Vendored copies of another
+# distribution's metadata sit below the outer package directory, so the
+# directory prefix is part of the identity's spelling and not decoration.
+DIST_INFO_METADATA_SUFFIX = ".dist-info/METADATA"
+DIST_INFO_SUFFIX = ".dist-info"
+
+# PEP 503's separator run, folded to one hyphen. Applied only to compare two
+# names that were each grammar-checked first.
+NAME_SEPARATORS = re.compile(r"[-_.]+")
 
 UNPARSEABLE = "UNPARSEABLE"
 
@@ -132,26 +155,103 @@ def digest_and_size(path):
     return digest.hexdigest(), size
 
 
-def _field(head, key):
+def _field_values(head, key):
     lowered = key.lower() + ":"
+    values = []
     for line in head.splitlines():
         if not line.strip():
             break
         if line.lower().startswith(lowered):
-            value = line.split(":", 1)[1].strip()
-            return value or None
-    return None
+            values.append(line.split(":", 1)[1].strip())
+    return values
+
+
+def _field(head, key):
+    values = _field_values(head, key)
+    return (values[0] or None) if values else None
 
 
 def _grammar(value, pattern):
     return value if value is not None and pattern.match(value) else None
 
 
-def screen_local_artifact(path, expected_sha256, expected_size):
-    """Screen one downloaded wheel against an independently fetched pin.
+def normalize_distribution_name(name):
+    """The PEP 503 normalized form of a distribution name, stdlib only.
 
-    ``expected_sha256``/``expected_size`` come from the index record, never from
-    the artifact. The archive is opened only after both agree.
+    Deliberate and minimal, because this screen has no dependency to delegate
+    it to: every run of ``-``, ``_`` and ``.`` collapses to one ``-`` and the
+    name is lowercased, which is exactly what makes the escaped root directory
+    name, an artifact's declared ``Name:`` and the index's project key one
+    name. Nothing else is applied -- no version parsing, no further case folding
+    -- and it is only ever used to *compare* two grammar-checked names, never to
+    rewrite one into the record.
+    """
+    return NAME_SEPARATORS.sub("-", name).lower()
+
+
+def root_dist_info_stem(member_name):
+    """One member's root ``.dist-info`` directory name, or None.
+
+    Only the root spelling is a candidate, and only that spelling is the outer
+    distribution's own: ``a/b-1.0.dist-info/METADATA`` is a vendored copy
+    belonging to whatever ``a`` bundles, and a member without a single directory
+    level is not a wheel's own metadata whatever it is called.
+    """
+    if member_name.count("/") != 1 or not member_name.endswith(DIST_INFO_METADATA_SUFFIX):
+        return None
+    directory = member_name[:-len("/METADATA")]
+    return directory[:-len(DIST_INFO_SUFFIX)] if directory.endswith(DIST_INFO_SUFFIX) else None
+
+
+def dist_info_stem_identity(stem):
+    """``(escaped name, version)`` from a ``{name}-{version}`` stem, or None.
+
+    The stem is the archive's own spelling of the outer identity, and it is
+    checked for agreement with the metadata rather than believed: a stem with no
+    version cannot name a published version at all, so it yields None and the
+    caller refuses rather than filling the gap from anywhere else.
+    """
+    name, separator, version = stem.rpartition("-")
+    if not separator:
+        return None
+    escaped_name = _grammar(name, NAME_GRAMMAR)
+    parsed_version = _grammar(version, VERSION_GRAMMAR)
+    if escaped_name is None or parsed_version is None:
+        return None
+    return escaped_name, parsed_version
+
+
+def declared_identity(head):
+    """The one declared ``Name``/``Version`` pair in a metadata header, or None.
+
+    A repeated field is not resolved by taking the first or the last: two
+    ``Name:`` lines are an ambiguous declaration rather than a value, and an
+    absent, repeated or out-of-grammar field yields None so the caller refuses.
+    It is never completed from the file name or from any archive member name.
+    """
+    names = _field_values(head, "name")
+    versions = _field_values(head, "version")
+    if len(names) != 1 or len(versions) != 1:
+        return None
+    name = _grammar(names[0], NAME_GRAMMAR)
+    version = _grammar(versions[0], VERSION_GRAMMAR)
+    if name is None or version is None:
+        return None
+    return name, version
+
+
+def screen_local_artifact(path, expected_sha256, expected_size, expected_name, expected_version):
+    """Screen one downloaded wheel against an independently fetched record.
+
+    ``expected_sha256``/``expected_size``/``expected_name``/``expected_version``
+    all come from the published record, never from the artifact. The archive is
+    opened only after the digest and size agree, and the artifact is only
+    reported ``OK`` when its own declared identity agrees with both its root
+    ``.dist-info`` directory and the published identity -- so an ``OK`` names a
+    distribution that two independent sources agree on, not one an archive
+    member claimed. All four are required: without a published identity there is
+    nothing to bind to, and a screen that can succeed without one would report
+    whatever the artifact itself said.
     """
     try:
         if os.path.getsize(path) > MAX_ARTIFACT_BYTES:
@@ -209,15 +309,26 @@ def screen_local_artifact(path, expected_sha256, expected_size):
         if any(info.file_size > MAX_MEMBER_BYTES for info in infos):
             return outcome_record("MEMBER_TOO_LARGE")
 
-        metadata_info = None
+        # The candidate identity carriers, by shape and never by position: a
+        # vendored ``.dist-info`` below a package directory is skipped, and a
+        # second root candidate is ambiguous rather than a preference.
+        roots = []
         native = False
         for info in infos:
-            if info.filename.endswith(".dist-info/METADATA"):
-                metadata_info = info
+            stem = root_dist_info_stem(info.filename)
+            if stem is not None:
+                roots.append((info, stem))
             if info.filename.endswith((".so", ".pyd")):
                 native = True
-        if metadata_info is None:
+        if not roots:
             return outcome_record("METADATA_ABSENT")
+        if len(roots) > 1:
+            return outcome_record("DIST_INFO_METADATA_AMBIGUOUS")
+        metadata_info, stem = roots[0]
+        stem_identity = dist_info_stem_identity(stem)
+        if stem_identity is None:
+            return outcome_record("DISTRIBUTION_IDENTITY_INVALID")
+
         if metadata_info.file_size > MAX_METADATA_BYTES:
             return outcome_record("METADATA_TOO_LARGE")
         if metadata_info.compress_size > 0 and \
@@ -233,6 +344,27 @@ def screen_local_artifact(path, expected_sha256, expected_size):
 
     head = raw.decode("utf-8", "replace").splitlines()[:METADATA_FIELD_LIMIT]
     head_text = "\n".join(head)
+    identity = declared_identity(head_text)
+    if identity is None:
+        return outcome_record("DISTRIBUTION_IDENTITY_INVALID")
+    name, version = identity
+
+    # The archive's own spelling of the outer identity, checked against the
+    # declared one: agreement is required, and the stem is never substituted for
+    # it, so a metadata record claiming some other distribution is refused here.
+    if (normalize_distribution_name(stem_identity[0]) != normalize_distribution_name(name)
+            or stem_identity[1] != version):
+        return outcome_record("DISTRIBUTION_IDENTITY_MISMATCH")
+
+    # The independent binding. Without it this artifact is not screened as a
+    # distribution, so it must not be reported as one and must never reach an
+    # advisory query: the caller sees an unverified outcome, not a fallback name.
+    if (_grammar(expected_name, NAME_GRAMMAR) is None
+            or _grammar(expected_version, VERSION_GRAMMAR) is None
+            or normalize_distribution_name(name) != normalize_distribution_name(expected_name)
+            or version != expected_version):
+        return outcome_record("DISTRIBUTION_IDENTITY_UNVERIFIED")
+
     return outcome_record(
         "OK",
         observed_sha256=observed_sha256,
@@ -240,8 +372,8 @@ def screen_local_artifact(path, expected_sha256, expected_size):
         zip_members=len(infos),
         zip_entries=len(archive.infolist()),
         has_native_code=bool(native),
-        package_name=_grammar(_field(head_text, "name"), NAME_GRAMMAR),
-        version=_grammar(_field(head_text, "version"), VERSION_GRAMMAR),
+        package_name=name,
+        version=version,
         license_expression=_grammar(_field(head_text, "license-expression"), LICENSE_GRAMMAR),
         license_field=_grammar(_field(head_text, "license"), LICENSE_GRAMMAR),
         requires_python=_grammar(_field(head_text, "requires-python"), PYTHON_GRAMMAR),
@@ -249,7 +381,20 @@ def screen_local_artifact(path, expected_sha256, expected_size):
 
 
 def fetch_published_record(pkg, version, filename):
-    """Fetch the index's own record for one exact file. Returns None on failure."""
+    """Fetch the index's own record for one exact file.
+
+    Returns ``{"file": entry, "name": ..., "version": ..., "sha256": ..., "size": ...}``
+    -- the exact file's entry plus the distribution identity the **index**
+    publishes for that version and the pin to compare against -- or None on any
+    failure. None covers a document that does not carry a usable published
+    identity, that names no entry for this exact file, or whose byte count is
+    not a byte count: the screen *compares* against the identity, the digest
+    and the size, so a record that cannot supply them in the shapes it compares
+    is not a record this helper can screen with. A digest that is not a string
+    is not a refusal of the record but of the artifact, and becomes the absent
+    pin the screen already has a fixed code for; an absent identity is never
+    filled in from the download's own file name.
+    """
     url = "https://pypi.org/pypi/%s/%s/json" % (urllib.parse.quote(pkg), urllib.parse.quote(version))
     try:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -261,12 +406,26 @@ def fetch_published_record(pkg, version, filename):
         return None
     try:
         document = json.loads(body)
-        for entry in document.get("urls", []):
-            if entry.get("filename") == filename:
-                return entry
+        identity = document.get("info") or {}
+        published_name = _grammar(identity.get("name"), NAME_GRAMMAR)
+        published_version = _grammar(identity.get("version"), VERSION_GRAMMAR)
+        entry = None
+        for candidate in document.get("urls", []):
+            if isinstance(candidate, dict) and candidate.get("filename") == filename:
+                entry = candidate
+        digests = entry.get("digests") if isinstance(entry.get("digests"), dict) else {}
+        digest = digests.get("sha256")
+        if not isinstance(digest, str):
+            digest = None
+        size = entry.get("size")
+        if size is not None and type(size) is not int:  # noqa: E721 -- bool is not a byte count
+            return None
     except Exception:  # noqa: BLE001
         return None
-    return None
+    if entry is None or published_name is None or published_version is None:
+        return None
+    return {"file": entry, "name": published_name, "version": published_version,
+            "sha256": digest, "size": size}
 
 
 def query_osv(pkg, version):
@@ -296,7 +455,12 @@ def query_osv(pkg, version):
 
 
 def split_filename(filename):
-    """Return (package, version) parsed from a wheel file name, or (None, None)."""
+    """Return (package, version) parsed from a wheel file name, or (None, None).
+
+    Only used to ask the index for a record. The spelling is the wheel's own
+    (escaped, per the wheel format) and is normalized by the caller; neither
+    half ever becomes a reported identity.
+    """
     match = re.match(r"^([A-Za-z0-9._-]+?)-([^-]+)-[^-]+-[^-]+-[^-]+\.whl$", filename)
     if not match:
         return None, None
@@ -309,25 +473,29 @@ def main(download_dir, output_path):
         if not filename.endswith(".whl"):
             continue
         path = os.path.join(download_dir, filename)
-        package, version = split_filename(filename)
-        if package is None:
+        file_name, file_version = split_filename(filename)
+        if file_name is None:
             records.append(outcome_record("FILENAME_UNPARSEABLE"))
             continue
-        published = fetch_published_record(package.replace("_", "-"), version, filename)
+        # The file name says which index record to ask for -- normalized once,
+        # deliberately -- and nothing more. It is not a recorded identity and is
+        # never a fallback for one: an artifact whose own identity cannot be
+        # read or verified reports no identity at all.
+        requested_name = normalize_distribution_name(file_name)
+        published = fetch_published_record(requested_name, file_version, filename)
         if published is None:
-            records.append(outcome_record("PUBLISHED_RECORD_UNAVAILABLE",
-                                          package_name=_grammar(package, NAME_GRAMMAR),
-                                          version=_grammar(version, VERSION_GRAMMAR)))
+            records.append(outcome_record("PUBLISHED_RECORD_UNAVAILABLE"))
             continue
-        record = screen_local_artifact(path,
-                                      published.get("digests", {}).get("sha256"),
-                                      published.get("size"))
-        record["package_name"] = record["package_name"] or _grammar(package, NAME_GRAMMAR)
-        record["version"] = record["version"] or _grammar(version, VERSION_GRAMMAR)
-        record["upload_time"] = _grammar(published.get("upload_time_iso_8601"),
+        record = screen_local_artifact(path, published["sha256"], published["size"],
+                                       published["name"], published["version"])
+        record["upload_time"] = _grammar(published["file"].get("upload_time_iso_8601"),
                                          re.compile(r"^[0-9TZ:.\-]{10,40}$"))
-        record["yanked"] = bool(published.get("yanked"))
-        record["advisories"] = query_osv(record["package_name"], record["version"]) \
+        record["yanked"] = bool(published["file"].get("yanked"))
+        # The one request this helper makes that asks about something, and it
+        # asks about the **published** identity, which the screen has already
+        # bound the artifact to. A refused artifact is not put to it at all.
+        record["advisories"] = query_osv(normalize_distribution_name(published["name"]),
+                                         published["version"]) \
             if record["outcome"] == "OK" else "SKIPPED_UNVERIFIED_ARTIFACT"
         records.append(record)
     with open(output_path, "w", encoding="utf-8") as handle:
