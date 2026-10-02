@@ -132,7 +132,7 @@ The columns above are only the five candidates whose **source text was read at a
 | CloakPipe | source-inspected (column above) | `source-inspected` | none | — |
 | LiteLLM + Presidio | source-inspected (column above) | `source-inspected` | none | — |
 | PromptCape | **not assessed — register-only identity facts** | `claim/docs` | none | No public source repository, immutable version, release provenance or binary hash is established ([register](issue-38-46-candidate-register-v0.1.md)); there is nothing to pin and read. Defer execution. |
-| InCountry AgentCloak | **not assessed — register-only identity facts** | `claim/docs` | none | Commercial service with no public build or tested tier; no source text to pin. No vendor contact is authorised here. |
+| InCountry AgentCloak | **not assessed — register-only identity facts** | `claim/docs` | none | Commercial **server** service with no public build or tested tier; no server source text to pin, and no server artifact, tier or trial right is established. Client-artifact and commercial-term facts are in the [#47 public commercial-terms record](issue-47-commercial-public-terms-2026-10-02.md); no vendor contact is authorised here. |
 | MCP Conceal | **not assessed — register-only identity facts** | `claim/docs` | none | Register records tag `v0.1.0` identity, licence and a published asset digest, plus an unresolved maintenance concern (last repository push 2025-07-24). Its source was **not** read in this pass, so no `src:` statement may be attributed to it. |
 | Hoop Cloak | **not assessed — register-only identity facts** | `claim/docs` | none | No release/version or public binary/source identity established; the plugin page still labels Credential Cloak "coming soon". A design reference, not a verified boundary. |
 | Hylja's own proposed adapter contract | **not assessed — design baseline, not a candidate** | — | none | This is the [#48](https://github.com/Marcus-Levin/hylja/issues/48) *target requirements baseline*, not a shipped component. Per [#43](https://github.com/Marcus-Levin/hylja/issues/43) it is **predicted/untested** and must never be scored as an arm; per [#45](https://github.com/Marcus-Levin/hylja/issues/45) an adapter label is not coverage. Its existence does not create an `enforced` cell. |
@@ -207,8 +207,8 @@ Each entry states the desk result, the **blocker**, and the **smallest defensibl
 
 ### [#47](https://github.com/Marcus-Levin/hylja/issues/47) — commercial platforms
 
-* **Desk result.** `claim/docs` only (register). No public build, tier, artefact, trial right or pricing has been established for AgentCloak, Skyflow or Protecto, and this desk pass procured nothing.
-* **Blocker.** No authorised account, tier, contract, region, residency or retention term. No vendor traffic of any kind.
+* **Desk result.** `claim/docs` only (register). Public commercial terms and access evidence for all three candidates are now recorded, with exact page URLs and retrieval dates, in the [#47 public commercial-terms record](issue-47-commercial-public-terms-2026-10-02.md). No public **server-side** artifact, selected tier, evaluation right or evaluated commercial tier has been established for any of the three, and this desk pass procured nothing.
+* **Blocker.** No authorised account, tier, contract, region, residency or retention term, and no vendor traffic of any kind. Per the cited record, publishing scored results is a contracting question for both quote-only candidates before it is an engineering one.
 * **Smallest defensible proof.** Matched, frozen #39 scenarios and pinned tiers for whatever is later authorised, on synthetic data only, with deployment/tenancy/key-management/residency assumptions stated and claims kept separate from observed outcomes.
 * **Status.** `claim/docs` provenance, **no observed outcome**, decision **unknown/defer**. No buy/integrate conclusion is drawn, and none is authorised here.
 
