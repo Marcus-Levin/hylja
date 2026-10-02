@@ -25,8 +25,19 @@
  *   that would have been parsed, are recorded as uninspected rather than silently skipped;
  * - repeated protected text inside one decoded view is reported once per occurrence, each with its own
  *   in-view span and evidence id. Only a repeat of the very same occurrence is suppressed.
+ *
+ * #10 configured sources run here too. When the integration supplies a trusted configuration handle, its term
+ * dictionaries, engineering templates and #7 key-path field hints join the same per-occurrence candidates under
+ * the same tenant and project, so a configured claim keeps exactly the provenance every other source gets here:
+ * an exact span for text written verbatim in a string root, a covering span for folded, escaped or decoded
+ * text, and the encoded envelope for a decoded view. Without a handle nothing from #10 runs and no reason is
+ * added, because the integration simply configured no configured source. A forged or foreign handle is PARTIAL
+ * with its own opaque location and no configured claim; only #10's tenant-independent engineering-key rule
+ * still runs. A #7 field whose value is verbatim in its view is read here for its trusted key-path hint only,
+ * exactly like the #8 key hint above, because the view scan already covered that text.
  */
 import { createHash } from 'node:crypto';
+import { detectConfigured, type CandidateConfigHandle } from './configured-candidates.js';
 import { generateContactCandidates, type CandidateScope, type NameDictionary } from './contact-candidates.js';
 import { detectInfrastructure, type InfraFidelity } from './infrastructure-identifiers.js';
 import { DEFAULT_BUDGET, foldForDetection, mapFoldedSpan, normalizeInput, sniffContentType,
@@ -106,7 +117,7 @@ export interface ParsedFieldLocation {
   readonly verbatim: boolean;
 }
 export interface NormalizedCandidate {
-  readonly source: 'SECRET' | 'INFRASTRUCTURE' | 'CONTACT';
+  readonly source: 'SECRET' | 'INFRASTRUCTURE' | 'CONTACT' | 'CONFIGURED';
   readonly subtype?: string;
   readonly rule?: string;
   readonly basis: string;
@@ -142,6 +153,14 @@ export interface NormalizedDetectionRequest {
   readonly inputRef: string;
   readonly scope: CandidateScope;
   readonly names?: NameDictionary;
+  /**
+   * Trusted #10 configuration handle, already bound by its own constructor to exactly the tenant and project
+   * in `scope`. It selects what this request treats as configured evidence (customer, project, business and
+   * engineering terms, templates and #7 field hints); it grants nothing and authorizes no release. A handle
+   * from another tenant or project, or a forged object, never matches here: the result is PARTIAL with an
+   * opaque location. Omitting it means the integration configured no configured source.
+   */
+  readonly configured?: CandidateConfigHandle;
   /**
    * Trusted #7 formats the integration asserts for the input it passes, for formats no content hint reaches
    * (YAML, TOML, CONNECTION_STRING). The root is parsed by the union of this list and the format its own
@@ -228,8 +247,8 @@ function failure(reason: string): NormalizedDetectionResult {
  * candidate and separately enforce policy.
  */
 export function detectNormalizedCandidates(request: NormalizedDetectionRequest): NormalizedDetectionResult {
-  let input: unknown, inputRef: unknown, scope: unknown, names: unknown, fingerprintKey: unknown, budget: unknown, formats: unknown;
-  try { ({ input, inputRef, scope, names, fingerprintKey, budget, formats } = request); }
+  let input: unknown, inputRef: unknown, scope: unknown, names: unknown, fingerprintKey: unknown, budget: unknown, formats: unknown, configured: unknown;
+  try { ({ input, inputRef, scope, names, fingerprintKey, budget, formats, configured } = request); }
   catch { return failure('INVALID_REQUEST'); }
   let tenantRef: unknown, projectRef: unknown;
   try {
@@ -269,7 +288,13 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
   /**
    * One entry per distinct piece of evidence. Identity is per occurrence, never per envelope: every
    * occurrence inside one decoded view shares the same `ENCODED_RUNS` envelope, so the in-view span, the
-   * #7 format and the field span are what keep two occurrences of the same protected text apart.
+   * #7 format, the field span and the **in-value occurrence offsets** are what keep two occurrences of the
+   * same protected text apart. The in-value offsets are not redundant with the view span: a value #7 decoded
+   * (an escape or an entity) reports its whole field span in the view for every match inside it, so without
+   * them two occurrences of the same text in one decoded value would collapse into one candidate and the
+   * second would vanish with no reason and no opaque location. A value that #6 decoded is a different case: it
+   * is verbatim inside its own view, so its matches already differ by in-view span. A repeat of the very same
+   * occurrence still suppresses: same view span *and* same in-value span is the same occurrence read twice.
    */
   const seen = new Set<string>();
   const uninspected: OpaqueLocation[] = normalized.uninspected.map((item) => {
@@ -285,7 +310,7 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
     uninspected.push(Object.freeze({ reason, viewId: view.id, viewSpan,
       original: originalOf(normalized.views, view, viewSpan, 'RAW', encodedOrigins, sourceIsString, true) }));
   };
-  const counts = { SECRET: 0, INFRASTRUCTURE: 0, CONTACT: 0 };
+  const counts = { SECRET: 0, INFRASTRUCTURE: 0, CONTACT: 0, CONFIGURED: 0 };
   const inputDigest = createHash('sha256').update(inputRef).digest('hex').slice(0, 32);
   const locate = (view: NormalizedView, at: Span, representation: 'RAW' | 'FOLDED',
     exact: boolean): Placed => ({
@@ -299,7 +324,8 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
       const at = place(item.start, item.end);
       const identity = `${at.view.viewId}|${at.view.representation}|${source}|${item.subtype ?? ''}|${item.rule ?? ''}|` +
         `${at.view.span.start}-${at.view.span.end}|${originalKey(at.original)}|` +
-        `${at.field ? `${at.field.format}|${at.field.span.start}-${at.field.span.end}|${at.field.pathRef}` : ''}`;
+        `${at.field ? `${at.field.format}|${at.field.span.start}-${at.field.span.end}|${at.field.pathRef}|` +
+          `${at.field.valueSpan.start}-${at.field.valueSpan.end}` : ''}`;
       if (seen.has(identity)) continue;
       if (counts[source] >= MAX_PER_SOURCE) { markOpaque(`${source}_CANDIDATE_LIMIT`, view); break; }
       seen.add(identity);
@@ -310,6 +336,29 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
         ...(item.fingerprint ? { fingerprint: item.fingerprint } : {}), evidence: item.evidence,
         ...at }));
     }
+  };
+
+  /**
+   * #10 over one scanned text unit. `fieldHintsOnly` is set for a #7 field whose value is verbatim in its
+   * view: the view scan already covered that text, so only the trusted key-path hint is new here.
+   */
+  const runConfigured = (view: NormalizedView, text: string, unitRef: string,
+    place: (start: number, end: number) => Placed, fieldPath?: readonly string[], fieldHintsOnly = false): void => {
+    let result: ReturnType<typeof detectConfigured>;
+    try {
+      result = detectConfigured({ text, inputRef: unitRef, scope: { tenantRef, projectRef },
+        ...(configured === undefined ? {} : { config: configured as CandidateConfigHandle }),
+        ...(fieldPath === undefined ? {} : { fieldPath }) });
+    } catch { markOpaque('CONFIGURED_INTERNAL_ERROR', view); return; }
+    if (result.status !== 'COMPLETE') {
+      // An invalid or out-of-scope configuration is an inspection gap like any other, never "nothing there".
+      for (const reason of result.reasons) markOpaque(`CONFIGURED_${reason}`, view);
+    }
+    if (result.status === 'FAILURE') return;
+    const items = (fieldHintsOnly ? result.candidates.filter((item) => item.basis === 'FIELD_HINT') : result.candidates)
+      .map((item) => ({ start: item.start, end: item.end, ...(item.subtype ? { subtype: item.subtype } : {}),
+        rule: item.rule, basis: item.basis, evidence: item.evidence }));
+    accept(view, 'CONFIGURED', items, place);
   };
 
   /* ---------- #7 parsed fields: trusted key hints, decoded values, honest provenance ---------- */
@@ -418,7 +467,6 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
         const verbatim = view.text.slice(field.valueStart, field.valueEnd) === field.value;
         const hint = hintOf(field, siblings);
         const fieldKey = hint.key;
-        if (verbatim && fieldKey === undefined) continue;
         const pathRef = pathRefOf(field.path);
         const fieldSpan = span(field.valueStart, field.valueEnd);
         const unitRef = `n6-${inputDigest}-v${view.id}-${format.toLowerCase()}-f${index}`;
@@ -427,6 +475,11 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
           field: Object.freeze({ format, pathRef, hintSource: hint.source, hintDepth: hint.depth,
             highRisk: field.highRisk, span: fieldSpan, valueSpan: span(start, end), verbatim }),
         });
+        if (configured !== undefined && verbatim) {
+          // The view scan already covered this value's text, so only the trusted #10 key-path hint is new here.
+          runConfigured(view, field.value, unitRef, place, field.path, true);
+        }
+        if (verbatim && fieldKey === undefined) continue;
         try {
           const secret = detectSecrets({ text: field.value, inputRef: unitRef,
             ...(fieldKey === undefined ? {} : { fieldKey }),
@@ -449,6 +502,7 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
           }
           if (contact.status !== 'FAILURE') accept(view, 'CONTACT', contact.candidates, place);
         } catch { markOpaque('CONTACT_INTERNAL_ERROR', view); }
+        if (configured !== undefined) runConfigured(view, field.value, unitRef, place, field.path);
       }
     }
   };
@@ -490,6 +544,7 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
         }
         if (contact.status !== 'FAILURE') accept(view, 'CONTACT', contact.candidates, place);
       } catch { markOpaque('CONTACT_INTERNAL_ERROR', view); }
+      if (configured !== undefined) runConfigured(view, text, unitRef, place);
     }
     scanFields(view);
   }
