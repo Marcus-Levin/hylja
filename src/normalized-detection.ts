@@ -23,6 +23,9 @@
  *   requested format that does not hold is reported as opaque;
  * - field values composed per request are capped. The view that exhausts the budget, and every later view
  *   that would have been parsed, are recorded as uninspected rather than silently skipped;
+ * - #7's own time budget is per parse call, not per request, and its clock is the host-owned `host` reading
+ *   this seam forwards. A time-expired or clock-less parse is `FAILURE` with the whole view opaque, and the
+ *   view text is still scanned in full by the detectors below, so a bounded parse can never hide a value;
  * - repeated protected text inside one decoded view is reported once per occurrence, each with its own
  *   in-view span and evidence id. Only a repeat of the very same occurrence is suppressed.
  *
@@ -42,7 +45,7 @@ import { generateContactCandidates, type CandidateScope, type NameDictionary } f
 import { detectInfrastructure, type InfraFidelity } from './infrastructure-identifiers.js';
 import { DEFAULT_BUDGET, foldForDetection, mapFoldedSpan, normalizeInput, sniffContentType,
   type ContentType, type Encoding, type NormalizedView } from './normalization.js';
-import { DEFAULT_PARSE_BUDGET, FORMATS, parseStructured, type Format, type ParsedField } from './structured-parsers.js';
+import { DEFAULT_PARSE_BUDGET, FORMATS, isParseHost, parseStructured, type Format, type ParsedField } from './structured-parsers.js';
 import { detectSecrets, subtypeForKey } from './secret-detectors.js';
 import type { ClassificationClaim, EvidenceProvenance } from './classification.js';
 
@@ -174,6 +177,12 @@ export interface NormalizedDetectionRequest {
   readonly fingerprintKey?: Uint8Array;
   /** #6 validates this bounded budget; opt-in larger budgets can cost more request time. */
   readonly budget?: unknown;
+  /**
+   * Host-owned capability forwarded to #7: a required `now` returning **milliseconds** on a monotonic
+   * reading, which its time budget is measured against. Payload text never supplies it and it authorizes
+   * nothing; omitting it uses the module default, and anything else is refused as `INVALID_HOST`.
+   */
+  readonly host?: unknown;
 }
 
 /** One detector finding before placement: spans are relative to whatever unit that detector was given. */
@@ -247,8 +256,12 @@ function failure(reason: string): NormalizedDetectionResult {
  * candidate and separately enforce policy.
  */
 export function detectNormalizedCandidates(request: NormalizedDetectionRequest): NormalizedDetectionResult {
-  let input: unknown, inputRef: unknown, scope: unknown, names: unknown, fingerprintKey: unknown, budget: unknown, formats: unknown, configured: unknown;
-  try { ({ input, inputRef, scope, names, fingerprintKey, budget, formats, configured } = request); }
+// #10's `configured` handle and PR111's #7 `host` clock are read exactly once here, together, from the
+  // one snapshot below. Both are optional and independent: neither is required for the other, and neither
+  // authorizes anything.
+  let input: unknown, inputRef: unknown, scope: unknown, names: unknown, fingerprintKey: unknown, budget: unknown, formats: unknown,
+    configured: unknown, host: unknown;
+  try { ({ input, inputRef, scope, names, fingerprintKey, budget, formats, configured, host } = request); }
   catch { return failure('INVALID_REQUEST'); }
   let tenantRef: unknown, projectRef: unknown;
   try {
@@ -278,6 +291,9 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
     }
     requestedFormats = Object.freeze(unique);
   }
+  // #7 owns the definition of a usable host clock, so a host that is not one is refused here with the
+  // same shape check the parser applies: a parse that cannot be time-bounded is not run at all.
+  if (host !== undefined && !isParseHost(host)) return failure('INVALID_HOST');
 
   const normalized = normalizeInput(input, budget);
   if (normalized.status === 'FAILURE') return failure(`NORMALIZATION_${normalized.reasons[0] ?? 'FAILURE'}`);
@@ -432,7 +448,8 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
       let parsed: ReturnType<typeof parseStructured>;
       try {
         // #7 is asked for exactly this view's size, so a large view is parsed rather than rejected on size.
-        parsed = parseStructured(view.text, format, { ...DEFAULT_PARSE_BUDGET, maxInputUnits: view.text.length || 1 });
+        parsed = parseStructured(view.text, format, { ...DEFAULT_PARSE_BUDGET, maxInputUnits: view.text.length || 1 },
+          host);
       } catch { markOpaque(`PARSER_${format}_INTERNAL_ERROR`, view); continue; }
       if (parsed.status !== 'COMPLETE') {
         // An opaque, malformed, unsupported or over-budget parse is an inspection gap, not "nothing there".
