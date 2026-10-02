@@ -1227,6 +1227,41 @@ function escapedByteAt(text: string, at: number, allowQuotedPrintable = true): {
   return null;
 }
 
+/**
+ * One separator character between two byte escapes, and nothing else: whitespace, `,;:|.&`, quotes and brackets,
+ * or the two-character JSON spelling of a line break (`\n`, `\r`, `\t`). Anything wider than one character is
+ * ordinary text, so this is a single character and not a class of separators that grows with the sender's
+ * formatting; `-` is deliberately not one, because a hyphen between two escapes is as likely to be a word.
+ */
+const ESCAPE_SEPARATOR = /^[ \t\r\n,;:|.&"'[\]]$/u;
+const ESCAPE_JSON_SEPARATOR = /\\[nrt]/u;
+/**
+ * The end of the separator between two byte escapes in ordinary text, or -1 when the run ends at `at`. The
+ * separator is skipped only when exactly one character separates two escapes, so `=41 =42` is one two-byte run while
+ * `=41 and =42` and `=41, =42` stay two one-byte runs below the floor.
+ *
+ * This is a rule about the **text between** escapes, so it applies where the text is text and nowhere else. Inside
+ * a quoted string every literal character is a byte of that string (`b'\x1f\x8b \x08'` holds a space), so the
+ * quoted readers below never call this: dropping such a character corrupts the bytes they reconstruct, and a
+ * corrupted stream that decodes to nothing lands under `OPAQUE_BYTES` and would be released.
+ */
+function escapeSeparatorEnd(text: string, at: number): number {
+  const json = ESCAPE_JSON_SEPARATOR.exec(text.slice(at, at + 2))?.[0];
+  const width = json !== undefined ? json.length : ESCAPE_SEPARATOR.test(text[at] ?? '') ? 1 : 0;
+  if (!width || escapedByteAt(text, at + width) === null) return -1;
+  return at + width;
+}
+
+/**
+ * Bytes one escape run reconstructs before the escapes after it are read as the next run. The bound is below #6's
+ * own longest-run ceiling (`MAX_RUN` in src/normalization.ts) on purpose: a run this reader builds is inspected
+ * again as a view, and a decoded text run longer than that ceiling would be a view #6 refuses, so this module
+ * would refuse a message it could otherwise read. The split drops no byte — the separator after the bound is
+ * absorbed into the run's own span, so the next run is adjacent to it and the two concatenate back into the same
+ * bytes — and the message-size and view budgets still bound the total. It bounds the direct reader only; a quoted
+ * string is read whole, as it always was.
+ */
+const MAX_ESCAPED_RUN = 32 << 10;
 function escapedRun(start: number, end: number, bytes: number[], byteSyntax: boolean): EncodedRun {
   return { start, end, value: bytes.map((byte) => byte.toString(16).padStart(2, '0')).join(''),
     // Unicode escapes for ordinary accented prose are ambiguous Latin-1, so inspect them without opaque counting
@@ -1234,21 +1269,69 @@ function escapedRun(start: number, end: number, bytes: number[], byteSyntax: boo
     prefixed: false, countable: byteSyntax || bytes.some((byte) => byte < 32 || byte === 127), separated: true, escaped: true };
 }
 
-/** Direct escape runs plus mixed byte string literals, including Latin-1 JSON and Python/JS strings. */
-function* escapedByteRuns(text: string): Generator<EncodedRun> {
+/**
+ * Escape runs in ordinary text. `separated` decides whether one separator character between two escapes is skipped:
+ * the contiguous reading this reader has always had, or the separated reading added to it. Both are read from the
+ * same text, so a sender cannot lose the contiguous reading by formatting the list, and a character that is a byte
+ * of the payload rather than formatting is still read by the contiguous one. A separated run that skipped no
+ * separator at all is byte-for-byte the contiguous run and is not yielded twice.
+ *
+ * A run ends at the first character that is not an escape (and, when separated, at a separator that is not between
+ * two escapes), or at `MAX_ESCAPED_RUN`, which never drops a byte: the next run starts at the next escape, adjacent
+ * to this one, so consecutive runs concatenate back into the same bytes.
+ */
+function* textEscapeRuns(text: string, separated: boolean): Generator<EncodedRun> {
   for (let at = 0; at < text.length;) {
     const first = escapedByteAt(text, at);
     if (!first) { at++; continue; }
     const start = at;
     const bytes: number[] = [];
-    let byteSyntax = false;
+    let byteSyntax = false, skipped = false;
     for (let token: { byte: number; end: number } | null = first; token; token = escapedByteAt(text, at)) {
       bytes.push(token.byte);
       if (text[at] === '%' || text[at] === '=' || text[at] === '\\' && !/[uU]/u.test(text[at + 1]!)) byteSyntax = true;
       at = token.end;
+      if (separated) {
+        const skip = escapeSeparatorEnd(text, at);
+        if (skip >= 0) { at = skip; skipped = true; }
+      }
+      if (bytes.length >= MAX_ESCAPED_RUN) break;
     }
-    if (bytes.length >= 4) yield escapedRun(start, at, bytes, byteSyntax);
+    // The contiguous reading is always yielded; a separated one only when it actually skipped a separator.
+    if (bytes.length >= 4 && (!separated || skipped)) yield escapedRun(start, at, bytes, byteSyntax);
   }
+}
+
+/**
+ * Direct escape runs plus mixed byte string literals, including Latin-1 JSON and Python/JS strings.
+ *
+ * In ordinary text a run is a list of escapes the same way a hex dump is a list of byte pairs: **one** separator
+ * character may sit between two escapes, so an escape list the sender formatted (`=1F =8B =08 …`, `%1f %8b …`,
+ * `\u001f \u008b …`) is read as the bytes it spells rather than as the formatting around it. Ordinary text is read
+ * twice for that reason, in this order: the contiguous reading this reader has always had, then the separated one,
+ * which is **added** to it and never instead of it — so neither a sender who formats the list nor a sender whose
+ * separator character is a byte of the payload loses a reading. Two or more separator characters, or escapes split
+ * across labels and other punctuation, still end a run; that limit is published in docs/plan.md and pinned in the
+ * sentinel tests rather than claimed closed.
+ *
+ * Inside a quoted string the escapes are read by `quoted()` below, which is unchanged: there every literal
+ * character is a byte of the string, so the separator rule is not applied and no byte is dropped. Both readings
+ * reach the same run list, so a formatted escape list is read even when it sits inside a JSON string or a byte
+ * literal, and a byte of the string itself is never mistaken for formatting.
+ *
+ * The four-byte floor, the supported escape families, this one-character separator and `MAX_ESCAPED_RUN` are the
+ * whole of the direct reader's grammar, and the work all of it does is bounded by the message limit and the
+ * per-view budget it runs inside.
+ */
+function* escapedByteRuns(text: string): Generator<EncodedRun> {
+  yield* textEscapeRuns(text, false);
+  yield* textEscapeRuns(text, true);
+  /**
+   * A quoted string read as bytes: escapes, simple backslash escapes and Latin-1 characters, in the order they are
+   * written. Every literal character is a byte of the string, including a character that sits between two escapes
+   * and belongs to this module's separator class, so no reading here drops one: this is the reader's original
+   * behaviour and the one the direct reader's separated reading is added to, never a replacement for.
+   */
   const quoted = (start: number, prefixed: boolean): { run: EncodedRun | null; end: number } => {
     const quote = text[start]!;
     const bytes: number[] = [];
