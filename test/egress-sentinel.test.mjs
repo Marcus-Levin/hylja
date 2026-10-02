@@ -759,6 +759,428 @@ test('independent review: ordinary decimals cannot gain opaque authority from te
   }
 });
 
+/* ---------- Issue #19 residual encoded views: labelled chunks, declared separators, byte arrays ---------- */
+
+const SECRET_NOTE = `contact ${PLANTED} re ${CANARY} ${syntheticBytes(16).toString('hex')} `;
+const splitEvery = (text, width) => text.match(new RegExp(`.{1,${width}}`, 'gu'));
+/**
+ * Every assertion here is a public-interface decision and reason code, never a planted value. A truncated
+ * prefix carries the planted original but not the canary, so `complete` marks the payloads that hold it all.
+ */
+const blocksWithOriginal = (payload, complete = true) => {
+  const result = check(payload);
+  assert.equal(result.decision, 'BLOCK', payload.slice(0, 40));
+  assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), `${payload.slice(0, 40)}: ${result.reasons.join()}`);
+  if (complete) assert.ok(result.reasons.includes('CANARY_DETECTED'), `${payload.slice(0, 40)}: ${result.reasons.join()}`);
+  assert.equal(result.release, undefined);
+  return result;
+};
+/**
+ * A dress that leaves one Base64 run (`A+B`, or a JSON-escaped separator whose letters fuse with the next chunk)
+ * is already refused as opaque binary by the plain encoded-run reader: a block, without the precise reason.
+ */
+const blocksLeak = (payload) => {
+  const result = check(payload);
+  assert.equal(result.decision, 'BLOCK', payload.slice(0, 40));
+  assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED') || result.reasons.includes('OPAQUE_EMBEDDED'),
+    `${payload.slice(0, 40)}: ${result.reasons.join()}`);
+  assert.equal(result.release, undefined);
+  return result;
+};
+
+test('residual encoded views: labelled chunks are rebuilt, inflated and matched', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const note = Buffer.from(SECRET_NOTE);
+  const compressed = zlib.gzipSync(note);
+  for (const width of [7, 8, 11, 16, 24, 40]) {
+    const text = splitEvery(note.toString('base64'), width);
+    const gzip = splitEvery(compressed.toString('base64'), width);
+    const labelled = (chunks, label, opener, closer) => chunks.map((chunk, index) =>
+      `${opener}${label}${index + 1}${closer}${chunk}`).join('\n');
+    for (const payload of [
+      labelled(text, 'part', '', ': '),
+      labelled(text, 'p', '', '='),
+      labelled(text, 'chunk_', '', ': '),
+      labelled(text, 'PART', '', ': '),
+      labelled(gzip, 'part', '', ': '),
+      labelled(gzip, 'p', '', '='),
+      text.map((chunk, index) => `part${index + 1}: ${chunk}`).join('&'),
+      text.map((chunk, index) => `\tpart${index + 1}\t=\t${chunk}`).join(',\n'),
+      text.map((chunk, index) => `"part${index + 1}":"${chunk}"`).join(','),
+      JSON.stringify(Object.fromEntries(text.map((chunk, index) => [`part${index + 1}`, chunk]))),
+      JSON.stringify(text.map((chunk, index) => ({ part: index + 1, data: chunk }))),
+      JSON.stringify(text.map((chunk, index) => ({ index: index + 1, note: 'ignored', data: chunk })), null, 2),
+      JSON.stringify({ parts: text.map((chunk, index) => ({ id: index + 1, value: chunk })) }, null, 2),
+      `payload ${text.map((chunk, index) => `part${index + 1}: ${chunk}`).join(' note ')}`,
+    ]) blocksWithOriginal(payload);
+    // Declared separators: an explicit concatenation join of the same compressed note. Hex chunks keep an
+    // even width, since an odd-width split shifts every following nibble and cannot be rebuilt at all.
+    const hex = splitEvery(compressed.toString('hex'), width + (width % 2));
+    for (const payload of [hex.join(' + '), hex.join('/'), hex.join(' > '), gzip.join(' + '), gzip.join(' / '),
+      gzip.join(' > '), `data ${hex.join(' + ')} trailing`]) blocksWithOriginal(payload);
+  }
+});
+
+test('residual encoded views: label order, decoys and mixed syntax are reconstructed', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const note = Buffer.from(SECRET_NOTE);
+  const chunks = splitEvery(zlib.gzipSync(note).toString('base64'), 8);
+  assert.ok(chunks.length > 10, 'needs enough chunks for a lexicographic mis-order');
+  const reversed = chunks.map((chunk, index) => `part${chunks.length - index}: ${chunk}`).join('\n');
+  const lexical = [...chunks.keys()].sort((a, b) => `p${a + 1}` < `p${b + 1}` ? -1 : 1)
+    .map((index) => `p${index + 1}: ${chunks[index]}`).join('\n');
+  const singleDigit = chunks.slice(0, 9).map((chunk, index) => `p${index + 1}: ${chunk}`).join('\n');
+  for (const [payload, complete] of [[reversed, true], [lexical, true], [singleDigit, false],
+    [chunks.map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n'), true],
+    [chunks.map((chunk, index) => `part${index + 1}: ${chunk}`).join(' decoy '), true],
+    [chunks.map((chunk, index) => `{"part":${index + 1},"data":"${chunk}"}`).join(',\n'), true]]) {
+    blocksWithOriginal(payload, complete);
+  }
+  // The same bytes as a decimal byte array and as Node `Buffer` JSON.
+  for (const bytes of [zlib.gzipSync(note), [...note], zlib.deflateSync(note)]) {
+    blocksWithOriginal(`[${[...bytes].join(', ')}]`);
+    blocksWithOriginal(`{"type":"Buffer","data":[${[...bytes].join(',')}]}`);
+    blocksWithOriginal(JSON.stringify({ messages: [{ content: `[${[...bytes].map((b) => `0x${b.toString(16).padStart(2, '0')}`).join(', ')}]` }] }));
+  }
+  blocksWithOriginal(JSON.stringify({ content: `{"type":"Buffer","data":[${[...zlib.gzipSync(note)].join(',')}]}` }));
+  // Labelled hex with per-field `0x` prefixes, and the same list nested in an escaped JSON string.
+  const hexChunks = splitEvery(zlib.gzipSync(note).toString('hex'), 8);
+  blocksWithOriginal(hexChunks.map((chunk, index) => `part${index + 1}: 0x${chunk}`).join('\n'));
+  blocksWithOriginal(JSON.stringify({ content: JSON.stringify({ parts: hexChunks.map((chunk, index) => ({ part: index + 1, data: chunk })) }) }));
+  blocksWithOriginal(JSON.stringify({ content: `[${[...zlib.gzipSync(note)].map(String).join('\\u002c')}]`.replaceAll('\\u002c', ',') }));
+});
+
+test('residual encoded views: an interleaved ordinary field no longer defeats a declared label series', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const note = Buffer.from(SECRET_NOTE);
+  const chunks = splitEvery(zlib.gzipSync(note).toString('base64'), 8);
+  const parts = chunks.map((chunk, index) => `part${index + 1}: ${chunk}`);
+  const withField = (field, at) => [...parts.slice(0, at), field, ...parts.slice(at)].join('\n');
+  // A field the group never declared as part of the payload (`trace: 1a2b3c4d`, `note: Zz9Qa1b2`,
+  // `region: 4f2a91b7`) is what an honest trace between labelled parts looks like. It carries no bytes of its own
+  // payload, so the declared series stays readable on its own, before, in the middle and after it.
+  for (const [label, value] of [['trace', '1a2b3c4d'], ['note', 'Zz9Qa1b2'], ['region', '4f2a91b7'],
+    ['x', syntheticBytes(8).toString('hex')], ['region_code', 'c3d4e5f6']]) {
+    for (const at of [0, 1, Math.floor(parts.length / 2), parts.length - 1, parts.length]) {
+      blocksWithOriginal(withField(`${label}: ${value}`, at));
+      blocksWithOriginal(withField(`${label}=${value}`, at));
+      blocksWithOriginal(withField(`"${label}":"${value}"`, at));
+    }
+  }
+  // Several such fields at once, and a field on a line of its own between two parts.
+  for (const at of [0, 2, parts.length - 1, parts.length]) blocksWithOriginal([...parts.slice(0, at),
+    'trace: 1a2b3c4d', 'region: 4f2a91b7', ...parts.slice(at)].join('\n'));
+  blocksWithOriginal(parts.join(' the next part follows here. '));
+  // A field whose own label is entirely hex (`face: 1a2b3c4d`, a dump offset column) joins no reading, and it must
+  // not split the labelled declaration either: the series either side of it is still one declared sequence.
+  for (const label of ['d0', 'cafe', 'deadbeef', 'bad', 'f00d', 'abc123', 'eff']) {
+    for (const at of [1, Math.floor(parts.length / 2)]) blocksWithOriginal(
+      [...parts.slice(0, at), `${label}: 1a2b3c4d`, ...parts.slice(at)].join('\n'));
+  }
+  // JSON bodies, YAML lists, query strings, list markers and an escaped inner body.
+  const object = Object.fromEntries(parts.map((line) => [line.slice(0, line.indexOf(':')), line.slice(line.indexOf(': ') + 2)]));
+  blocksWithOriginal(JSON.stringify({ trace: '1a2b3c4d', ...object }));
+  blocksWithOriginal(JSON.stringify({ ...object, trace: '1a2b3c4d' }));
+  blocksWithOriginal(JSON.stringify({ parts: [{ trace: '1a2b3c4d' },
+    ...chunks.map((chunk, index) => ({ part: index + 1, data: chunk }))] }));
+  blocksWithOriginal(JSON.stringify({ content: [...parts.slice(0, 2), 'trace: 1a2b3c4d', ...parts.slice(2)].join('\n') }));
+  blocksWithOriginal(chunks.flatMap((chunk, index) => index === 1 ? ['  trace: 1a2b3c4d', `  part${index + 1}: ${chunk}`]
+    : [`  part${index + 1}: ${chunk}`]).join('\n'));
+  blocksWithOriginal(parts.map((line) => line.replace(': ', '=')).join('&').replace('part2=', 'trace=1a2b3c4d&part2='));
+  blocksWithOriginal(parts.map((line, index) => index === 1 ? `- trace: 1a2b3c4d\n- ${line}` : `- ${line}`).join('\n'));
+  // Hex chunks, so the series reading is not a Base64 reading.
+  const hex = splitEvery(zlib.gzipSync(note).toString('hex'), 16);
+  for (const at of [0, 1, hex.length]) blocksWithOriginal([...hex.slice(0, at).map((value, index) => `part${index + 1}: ${value}`),
+    'trace: 1a2b3c4d', ...hex.slice(at).map((value, index) => `part${index + at + 1}: ${value}`)].join('\n'));
+  // Compressed opaque bytes behind an interleaved field stay opaque, not merely an allowed message.
+  const opaqueChunks = splitEvery(zlib.gzipSync(syntheticBytes(200)).toString('base64'), 8);
+  for (const at of [0, 2]) {
+    const payload = [...opaqueChunks.slice(0, at).map((chunk, index) => `part${index + 1}: ${chunk}`), 'trace: 1a2b3c4d',
+      ...opaqueChunks.slice(at).map((chunk, index) => `part${index + at + 1}: ${chunk}`)].join('\n');
+    const result = unknown(payload);
+    assert.equal(result.decision, 'BLOCK', payload.slice(0, 40));
+    assert.ok(result.reasons.includes('OPAQUE_EMBEDDED'), result.reasons.join());
+    assert.equal(result.release, undefined);
+  }
+});
+
+test('residual encoded views: duplicate, ambiguous and unrelated labels each keep their own reading', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const chunks = splitEvery(zlib.gzipSync(Buffer.from(SECRET_NOTE)).toString('base64'), 8);
+  const series = (label, values = chunks) => values.map((chunk, index) => `${label}${index + 1}: ${chunk}`);
+  // A repeated field is read once as written.
+  blocksWithOriginal(series('part').flatMap((line, index) => index % 4 === 0 ? [line, line] : [line]).join('\n'));
+  // A duplicate label number carrying a different value is read the way a record with a duplicate key would be:
+  // first occurrence and last occurrence, so neither reading depends on where the duplicate sits.
+  for (const at of [1, Math.floor(series('part').length / 2)]) {
+    const lines = series('part');
+    const duplicate = lines[at].slice(0, lines[at].indexOf(':'));
+    lines.splice(at, 0, `${duplicate}: 1a2b3c4d`);
+    blocksWithOriginal(lines.join('\n'));
+  }
+  // Two declared series in one message: each is readable on its own, in either order, beside or interleaved.
+  const first = series('part'), second = series('chunk');
+  for (const payload of [[...first, ...second], [...second, ...first], first.flatMap((line, index) => [line, second[index]]),
+    [...first, 'region: 4f2a91b7', ...second]]) blocksWithOriginal(payload.join('\n'));
+  // Unrelated metadata carrying the payload beside a numbered decoy series is its own reading, and reading the
+  // metadata never displaces reading the series beside it.
+  const decoy = Array.from({ length: chunks.length }, (_, index) => `part${index + 1}: ${syntheticBytes(4).toString('hex')}`);
+  for (const payload of [[...decoy, ...series('note')], [...series('note'), ...decoy], [...decoy, 'note: 4f2a91b7', ...series('note')]]) {
+    blocksWithOriginal(payload.join('\n'));
+  }
+  blocksWithOriginal([...decoy, ...series('note'), ...series('other')].join('\n'));
+  // Zero-padded, dashed and case-varied spellings of the same declared name are one series.
+  for (const spell of [(index) => `part${String(index + 1).padStart(3, '0')}`, (index) => `part-${index + 1}`,
+    (index) => `${index % 2 ? 'PART' : 'part'}${index + 1}`]) {
+    const lines = chunks.map((chunk, index) => `${spell(index)}: ${chunk}`);
+    lines.splice(1, 0, 'trace: 1a2b3c4d');
+    blocksWithOriginal(lines.join('\n'));
+  }
+  // A numbered label whose values are plain numbers is an index list, not a payload, and stays allowed.
+  for (const payload of [Array.from({ length: 40 }, (_, index) => `ts${index + 1}: ${1695826432 + index}`).join('\n'),
+    Array.from({ length: 24 }, (_, index) => `part${index + 1}: ${(index + 1) * 8}`).join('\n'),
+    '{"part1":1,"part2":2,"part3":3,"part4":4,"part5":5,"part6":6,"part7":7,"part8":8}']) {
+    assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 40)} ${unknown(payload).reasons.join()}`);
+  }
+  // Ordinary labelled values that merely look encoded keep their shape: a declared series adds no opaque bytes.
+  // (A series of *random* Base64 chunks is opaque before this change, through the plain chunk-sequence reader; a
+  // hex series and a word series are the controls for the declared readings themselves.)
+  for (const payload of [Array.from({ length: 40 }, (_, index) => `part${index + 1}: ${syntheticBytes(4).toString('hex')}`).join('\n'),
+    `${Array.from({ length: 40 }, (_, index) => `part${index + 1}: ${syntheticBytes(4).toString('hex')}`).join('\n')}trace: 1a2b3c4d\n`,
+    Array.from({ length: 12 }, (_, index) => `part${index + 1}: alpha${index}`).join('\ntrace: 1a2b3c4d\n'),
+    // Hex-labelled values, and a dump offset column, are ordinary engineering text: no opaque authority.
+    Array.from({ length: 40 }, (_, index) => `face${index}: ${syntheticBytes(4).toString('hex')}`).join('\n'),
+    Array.from({ length: 8 }, (_, index) => `deadbeef${index}: ${syntheticBytes(16).toString('hex')}`).join('\n'),
+    Array.from({ length: 40 }, (_, index) => `bad${index}: worker-${index}`).join('\n'),
+    Array.from({ length: 8 }, (_, index) => `part${index + 1}: alpha${index}`).join('\ndeadbeef: 1f8b0800\n')]) {
+    assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 40)} ${unknown(payload).reasons.join()}`);
+  }
+});
+
+test('residual encoded views: a hex-alphabet label name declares its own numbered series', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const compressed = zlib.gzipSync(Buffer.from(SECRET_NOTE));
+  // A label drawn from the hex alphabet is normally a value the sender wrote before a colon (`face: 1f8b0800`, a
+  // dump offset), not a key. It is still a key when its own numbers declare one complete series under one name,
+  // so the same payload is read whichever letters the sender picked, instead of depending on the label alphabet.
+  const names = ['bad', 'dead', 'face', 'add', 'faded', 'cafe', 'beef', 'cab', 'deed', 'decade', 'facade'];
+  for (const width of [6, 8]) {
+    const chunks = splitEvery(compressed.toString('base64'), width);
+    assert.ok(chunks.length >= 10, 'needs a long enough series to be worth labelling');
+    // The same bytes under an ordinary label name, and with no labels at all, already blocked: what reaches the
+    // hex-named shape is the declared series reading, not some other reader seeing the same payload.
+    blocksWithOriginal(chunks.map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n'));
+    blocksWithOriginal(chunks.join('\n'));
+    for (const name of names) {
+      blocksWithOriginal(chunks.map((chunk, index) => `${name}${index + 1}: ${chunk}`).join('\n'));
+      // Counted from zero, which is the same complete series.
+      blocksWithOriginal(chunks.map((chunk, index) => `${name}${index}: ${chunk}`).join('\n'));
+      // Hex chunks under a hex-labelled name are read as hex, not as Base64.
+      blocksWithOriginal(splitEvery(compressed.toString('hex'), width + (width % 2))
+        .map((chunk, index) => `${name}${index + 1}: ${chunk}`).join('\n'));
+    }
+  }
+  const chunks = splitEvery(compressed.toString('base64'), 8);
+  const parts = chunks.map((chunk, index) => `face${index + 1}: ${chunk}`);
+  const at = (field, position) => [...parts.slice(0, position), field, ...parts.slice(position)].join('\n');
+  // An unrelated field between the parts is what an honest trace looks like, and a dump offset column written
+  // between them neither joins the series nor splits it in two.
+  for (const field of ['trace: 1a2b3c4d', 'deadbeef: 1f8b0800', 'note: Zz9Qa1b2']) {
+    for (const position of [0, 1, Math.floor(parts.length / 2), parts.length]) blocksWithOriginal(at(field, position));
+  }
+  // Syntaxes and label orders the same series is written in.
+  blocksWithOriginal(parts.join('\n') + '\nregion: 4f2a91b7\n');
+  blocksWithOriginal(parts.join(' the next part follows here. '));
+  blocksWithOriginal(parts.join(',\n'));
+  blocksWithOriginal(parts.map((line) => line.replace(': ', '=')).join('&'));
+  blocksWithOriginal(parts.map((line) => `- ${line}`).join('\n'));
+  blocksWithOriginal(parts.map((line) => `  ${line}`).join('\n'));
+  blocksWithOriginal(JSON.stringify(Object.fromEntries(parts.map((line) =>
+    [line.slice(0, line.indexOf(':')), line.slice(line.indexOf(': ') + 2)]))));
+  blocksWithOriginal(JSON.stringify({ trace: '1a2b3c4d', ...Object.fromEntries(parts.map((line) =>
+    [line.slice(0, line.indexOf(':')), line.slice(line.indexOf(': ') + 2)])) }));
+  blocksWithOriginal(JSON.stringify({ content: parts.join('\n') }));
+  blocksWithOriginal(chunks.map((chunk, index) => `${index % 2 ? 'FACE' : 'face'}${index + 1}: ${chunk}`).join('\n'));
+  blocksWithOriginal(parts.map((line, index) => `face${String(index + 1).padStart(3, '0')}: ${chunks[index]}`).join('\n'));
+  blocksWithOriginal(chunks.map((chunk, index) => `face${chunks.length - index}: ${chunk}`).join('\n'));
+  blocksWithOriginal([...chunks.keys()].sort((a, b) => `face${a + 1}` < `face${b + 1}` ? -1 : 1)
+    .map((index) => `face${index + 1}: ${chunks[index]}`).join('\n'));
+  // Two complete series under two hex names in one message are each read on their own.
+  blocksWithOriginal(chunks.flatMap((chunk, index) => [`face${index + 1}: ${chunk}`, `cafe${index + 1}: ${chunk}`]).join('\n'));
+  blocksWithOriginal([...chunks.map((chunk, index) => `face${index + 1}: ${chunk}`), ...chunks.map((chunk, index) => `beef${index + 1}: ${chunk}`)].join('\n'));
+
+  // Ordinary hex-labelled text is not a declaration: a hex dump offset column, hex values, word values and
+  // decimals keep their shape, and none of them gains opaque authority from being read.
+  for (const payload of [
+    Array.from({ length: 40 }, (_, index) => `face${index}: ${syntheticBytes(4).toString('hex')}`).join('\n'),
+    Array.from({ length: 8 }, (_, index) => `deadbeef${index}: ${syntheticBytes(16).toString('hex')}`).join('\n'),
+    Array.from({ length: 40 }, (_, index) => `bad${index}: worker-${index}`).join('\n'),
+    Array.from({ length: 8 }, (_, index) => `fade${index + 1}: ${1695826432 + index}`).join('\n'),
+    '00000000  1f8b 0800 0000 0000 0003 4b4c 4a06  |.....K.LJ.|',
+    '00000000: 1f8b 0800 0000 0000 0003 4b4c 4a06 4a06 4b4c',
+    ['face: 1f8b0800', 'd10: 00000000', 'd20: 4b4c4a06', 'd30: 00000000'].join('\n'),
+    `${Array.from({ length: 8 }, (_, index) => `part${index + 1}: alpha${index}`).join('\n')}\ndeadbeef: 1f8b0800`,
+  ]) assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${unknown(payload).reasons.join()}`);
+
+  // Measured limits, not guarantees: a hex-labelled group whose numbers are not one complete series is not read,
+  // because a dump offset column (`face:`, `d10:`) carries numbers too and only a complete run tells them apart.
+  // With the planted originals registered these release the note at this width; they did before this correction.
+  const ranked = (ranks) => ranks.map((rank, index) => `face${rank}: ${chunks[index]}`).join('\n');
+  const every = (count) => Array.from({ length: count }, (_, index) => index + 1);
+  for (const payload of [
+    ranked([...every(9), 11, 12, 13, 14]),                                      // a gap in the numbering
+    ranked([1, 1, ...every(3)]),                                                 // a repeated label number
+    ranked(every(chunks.length).slice(1)),                                      // no first part
+    chunks.map((chunk) => `face: ${chunk}`).join('\n'),                          // a hex name with no numbers
+    `face1: ${chunks[0]}`,                                                       // one field is not a series
+    chunks.map((chunk, index) => `${index % 2 ? `face${index + 1}` : `part${index + 1}`}: ${chunk}`).join('\n'),
+    chunks.map((chunk, index) => `${index % 2 ? `face${String(index + 1).padStart(3, '0')}` : `part${index + 1}`}: ${chunk}`).join('\n'),
+  ]) assert.equal(check(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${check(payload).reasons.join()}`);
+});
+
+test('residual encoded views: byte arrays that spell a container stay opaque', () => {
+  for (const payload of [`[80, 75, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`,
+    `{"type":"Buffer","data":[66, 90, 104, 57, 0, 1, 2, 3, 4, 5, 6, 7]}`,
+    JSON.stringify({ content: `[${[0x50, 0x4b, 0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 0].join(',')}]` })]) {
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', payload.slice(0, 40));
+    assert.ok(result.reasons.includes('OPAQUE_EMBEDDED'), `${payload.slice(0, 40)}: ${result.reasons.join()}`);
+  }
+});
+
+test('residual encoded views: ordinary engineering numbers, ids and labelled text are allowed', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const digest = createHash('sha256').update('synthetic-buffer-digest').digest();
+  const palette = Array.from({ length: 32 }, (_, index) => index * 8);
+  const matrix = Array.from({ length: 64 }, (_, index) => (index * 37) % 256);
+  for (const payload of [
+    '[1, 2, 3]', '[255, 128, 0]', `rgb = [${palette.join(', ')}]`, `matrix = [${matrix.join(',')}]`,
+    `versions = [1, 0, 0, 0, 0, 0, 0, 0]`, `ports = [80, 443, 8080, 5432]`,
+    `{"timestamps":[1695826432,1695826433,1695826434,1695826435,1695826436,1695826437,1695826438,1695826439]}`,
+    `{"offsets":[0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5]}`,
+    `{"type":"Buffer","data":[${[...digest].join(',')}]}`,
+    `sensor: ${syntheticBytes(8).toString('hex')}\nreading: ${syntheticBytes(8).toString('hex')}\nregion: cafe1234`,
+    'sensor: a1b2c3d4\nreading: b2c3d4e5\nregion: c3d4e5f6',
+    'budget: 1200\nretries: 3\nwindow_ms: 45000\nshard_id: 0007',
+    'alpha + beta > gamma / delta', 'if (count > 5 && retries > 3) reset()', '+86 138 0000 0000',
+    '1 + 1 = 2', 'size + count < limit', 'path/to/resource', 'docs/security/advisories/GHSA-c2qf-rxjj-qqgw',
+    'part1: alpha beta\npart2: gamma delta\npart3: epsilon zeta',
+    '{"part1":"alpha","part2":"beta","part3":"gamma"}',
+    'chunk1: readme\nchunk2: build\nchunk3: deploy',
+  ]) assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${unknown(payload).reasons.join()}`);
+});
+
+test('residual encoded views: reconstruction work is bounded and fails closed on demand', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const chunk = splitEvery(zlib.gzipSync(Buffer.from(SECRET_NOTE)).toString('base64'), 8)[0];
+  const dense = () => Array.from({ length: 40_000 }, (_, index) => `part${index}: ${chunk}${index.toString(16)}`).join(' ')
+    .slice(0, MAX_MESSAGE_BYTES);
+  const decimals = () => Array.from({ length: 60_000 }, (_, index) => `[${Array.from({ length: 12 },
+    (_, byte) => (index * 31 + byte * 7) % 256).join(',')}]`).join(' ').slice(0, MAX_MESSAGE_BYTES);
+  const unterminated = () => `${'['}${'1,2,3,4,5,6,7,8,9,'.repeat(20_000)}`;
+  for (const build of [dense, decimals, unterminated]) {
+    const started = process.hrtime.bigint();
+    const result = check(build());
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(['ALLOW', 'BLOCK'].includes(result.decision));
+    assert.ok(elapsedMs < 5000, `${elapsedMs}ms`);
+  }
+  // A message demanding more distinct reconstructions than the declared budget allows is uninspectable, never
+  // presumed clean: stopping early would let a sender hide one payload behind padding. Every value below is
+  // distinct, so nothing is deduplicated away before the budget is reached.
+  // A filler with a 16-character word ends a labelled group, the way unrelated prose in a document does.
+  const sectionBreak = '\n-- incompatibility --\n';
+  // Values that no other reader treats as an encoded run of its own, so only the declared reconstructions see them.
+  const value = (index) => `Zz${index.toString(36).padStart(4, '0')}Kq9Tp`;
+  const byteRun = (index) => [index & 255, (index >> 8) & 255, (index * 7) & 255, (index * 13) & 255,
+    (index * 29) & 255, (index * 31) & 255, (index * 37) & 255, (index * 53) & 255];
+  const overloads = [
+    Array.from({ length: 17_000 }, (_, index) => `p1: ${value(index)}\np2: ${value(index)}b`).join(sectionBreak),
+    Array.from({ length: 17_000 }, (_, index) => `${value(index)} + ${value(index)}b`).join(' '),
+    Array.from({ length: 17_000 }, (_, index) => `[${byteRun(index).join(',')}]`).join(' '),
+  ];
+  for (const payload of overloads) {
+    assert.ok(payload.length <= MAX_MESSAGE_BYTES, `${payload.length}`);
+    const started = process.hrtime.bigint();
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', payload.slice(0, 32));
+    // Whichever bound trips first is the outcome: the reconstruction budget, or the view budget the decoded
+    // results feed. Both are uninspectable outcomes, never a pass.
+    assert.ok(['SENTINEL_BUDGET', 'UNINSPECTED_CONTENT'].includes(result.reasons[0]), result.reasons.join());
+    assert.equal(result.findings.length, 0);
+    assert.equal(result.release, undefined);
+    assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 20_000);
+  }
+  // Moderate demand from ordinary content stays inside the same budget: it is reconstructed, not refused.
+  const moderate = Array.from({ length: 2_000 }, (_, index) => `part${index}: ${syntheticBytes(4).toString('hex')}`)
+    .join(sectionBreak);
+  const started = process.hrtime.bigint();
+  const result = check(moderate);
+  assert.ok(['ALLOW', 'BLOCK'].includes(result.decision));
+  assert.ok(!result.reasons.includes('SENTINEL_BUDGET'), result.reasons.join());
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
+});
+
+test('residual encoded views: declared series readings are charged like every other reconstruction', () => {
+  // Every declared series reading, its duplicate-key readings and the metadata beside it go through the same
+  // per-message charge as the all-values reading, so a message demanding more distinct reconstructions than the
+  // budget allows is uninspectable rather than clean. Stopping early would let a sender hide one payload behind
+  // padding, and an uncharged reading would be a reading nobody accounts for.
+  const sectionBreak = '\n-- incompatibility --\n';
+  // Values no other reader treats as an encoded run of its own, so only the declared readings see them.
+  const value = (index) => `Zz${index.toString(36).padStart(4, '0')}Kq`;
+  // A group of the widest shape this reader accepts (512 fields) written as 256 distinct declared names, each with
+  // its two label numbers reversed, so every declared name is read both as written and in numeric order: this
+  // message is refused because the series readings alone exceed the budget, not because of any other reader.
+  const overload = Array.from({ length: 32 }, (_, group) => Array.from({ length: 256 }, (_, index) =>
+    `p${index}q1: ${value(group * 512 + index * 2)}\np${index}q0: ${value(group * 512 + index * 2 + 1)}`).join('\n')).join(sectionBreak);
+  for (const payload of [overload,
+    Array.from({ length: 17_000 }, (_, index) => `p1: ${value(index)}\np2: ${value(index)}b`).join(sectionBreak)]) {
+    assert.ok(payload.length <= MAX_MESSAGE_BYTES, `${payload.length}`);
+    const started = process.hrtime.bigint();
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', payload.slice(0, 32));
+    assert.ok(['SENTINEL_BUDGET', 'UNINSPECTED_CONTENT'].includes(result.reasons[0]), result.reasons.join());
+    assert.equal(result.findings.length, 0);
+    assert.equal(result.release, undefined);
+    assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 20_000);
+  }
+  // Demand that stays inside the budget is reconstructed rather than refused: a message that was read in full has
+  // no reason to block, so refusing it would report a limit as a verdict.
+  const withinBudget = Array.from({ length: 8 }, (_, group) => Array.from({ length: 64 }, (_, index) =>
+    `p${index}q1: ${value(group * 128 + index * 2)}\np${index}q0: ${value(group * 128 + index * 2 + 1)}`).join('\n')).join(sectionBreak);
+  const started = process.hrtime.bigint();
+  const within = check(withinBudget);
+  assert.ok(!within.reasons.includes('SENTINEL_BUDGET'), within.reasons.join());
+  assert.ok(!within.reasons.includes('UNINSPECTED_CONTENT'), within.reasons.join());
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
+  // Ordinary labelled content with many distinct names stays inside the same budget and stays allowed.
+  const document = Array.from({ length: 400 }, (_, index) => [
+    `## Section ${index}`, '', `The synthetic deployment writes part${index + 1}: region ${syntheticBytes(2).toString('hex')}.`,
+    `Worker ${index} reports status ${syntheticBytes(2).toString('hex')}.`, '',
+  ].join('\n')).join('\n');
+  const ordinary = check(document);
+  assert.ok(!ordinary.reasons.includes('SENTINEL_BUDGET'), ordinary.reasons.join());
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
+});
+
+test('residual encoded views: results stay privacy-safe and the checked bytes are unchanged', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const compressed = zlib.gzipSync(Buffer.from(SECRET_NOTE));
+  const payload = `part1: ${splitEvery(compressed.toString('base64'), 8).join('\npart2: ')}`;
+  const bytes = enc(payload);
+  const result = check(bytes);
+  assert.equal(result.decision, 'BLOCK');
+  const serialized = JSON.stringify(result);
+  for (const value of ['Orla', 'orla', 'plc-gateway', CANARY, 'Synthetica']) assert.ok(!serialized.includes(value), value);
+  assert.deepEqual(Object.keys(result.regression).sort(), ['reasons', 'rules', 'version', 'views']);
+  bytes.fill(0);
+  assert.equal(result.release, undefined);
+});
+
 test('independent rereview: a signed container inside tentative raw deflate remains opaque', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
   const inner = zlib.gzipSync(Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('Orla')]));
@@ -770,4 +1192,142 @@ test('independent rereview: a signed container inside tentative raw deflate rema
     assert.deepEqual(check(payload).reasons, ['OPAQUE_EMBEDDED']);
   }
   assert.equal(check('0.7231478778415019', { known: null }).decision, 'ALLOW');
+});
+
+test('residual encoded views: generated labelled, joined, decimal and escaped dresses all block', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const note = Buffer.from(SECRET_NOTE);
+  const compressed = zlib.gzipSync(note);
+  // A fixed-seed generator: which payload is dressed is not asserted, only that every dressing of the same
+  // planted note reaches the planted original and the canary through the public interface.
+  let seed = 0x9e3779b9;
+  const next = () => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 8) / 2 ** 24;
+  const pick = (list) => list[Math.floor(next() * list.length) % list.length];
+  const labels = ['part', 'p', 'chunk', 'segment', 'piece', 'blk_'];
+  const gaps = ['\n', ', ', ' & ', ' ', '; ', ',\n  ', '\t', '\n\n', ',', ' &'];
+  const quotes = ['', '', '"', "'"];
+  const seps = [' + ', ' / ', ' > ', ' +', '+ ', ' %2B ', ' \\u002b ', '\n+\n', '\t/\t', ' >'];
+  const encodings = ['base64', 'hex', 'decimal'];
+  let dresses = 0;
+  for (let round = 0; round < 96; round++) {
+    const encoding = pick(encodings);
+    const width = 3 + Math.floor(next() * 30);
+    if (encoding === 'decimal') {
+      const spaced = pick([',', ', ', ',\n  ']);
+      blocksWithOriginal(`[${[...compressed].join(spaced)}]`);
+      blocksWithOriginal(`{"type":"Buffer","data":[${[...compressed].join(',')}]}`);
+      blocksWithOriginal(JSON.stringify({ content: `{"type":"Buffer","data":[${[...compressed].join(',')}]}` }));
+      dresses += 3;
+      continue;
+    }
+    const chunks = splitEvery(compressed.toString(encoding), encoding === 'hex' ? width + (width % 2) : width);
+    if (chunks.length < 2) continue;
+    const label = pick(labels);
+    const gap = pick(gaps);
+    const quote = pick(quotes);
+    const dressed = chunks.map((chunk, index) => `${label}${index + 1}: ${quote}${chunk}${quote}`);
+    blocksWithOriginal(dressed.join(gap));
+    blocksWithOriginal(JSON.stringify(Object.fromEntries(dressed.map((line, index) =>
+      [`${label}${index + 1}`, chunks[index]]))));
+    blocksWithOriginal(JSON.stringify(chunks.map((chunk, index) => ({ part: index + 1, data: chunk }))));
+    blocksLeak(chunks.join(pick(seps)));
+    dresses += 4;
+  }
+  assert.ok(dresses >= 200, `only ${dresses} generated payloads`);
+});
+
+test('residual encoded views: adversarial spellings of each declared form block', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const compressed = zlib.gzipSync(Buffer.from(SECRET_NOTE));
+  const chunks = splitEvery(compressed.toString('base64'), 8);
+  const hexChunks = splitEvery(compressed.toString('hex'), 16);
+  for (const payload of [
+    // Separators written against their chunks, on a line of their own, percent- or JSON-escaped.
+    ...[' + ', ' / ', ' > ', '>', ' +', '+ ', ' %2B ', ' %2f ', ' %3E ', ' \\u002b ', '\n+\n', '\t/\t']
+      .map((separator) => chunks.join(separator)),
+    ...[' + ', ' %2B '].map((separator) => hexChunks.join(separator)),
+    // Labels in lists, in prose and with dashes, zero padding, single quotes and query strings.
+    chunks.map((chunk, index) => `- part${index + 1}: ${chunk}`).join('\n'),
+    chunks.map((chunk, index) => `1. part${index + 1}: ${chunk}`).join('\n'),
+    chunks.map((chunk, index) => `## part${index + 1}: ${chunk}`).join('\n'),
+    chunks.map((chunk, index) => `part-${index + 1}: ${chunk}`).join('\n'),
+    chunks.map((chunk, index) => `part${String(index + 1).padStart(3, '0')}: '${chunk}'`).join('\n'),
+    chunks.map((chunk, index) => `part${index + 1}=${chunk}`).join('&'),
+    chunks.map((chunk, index) => `part${index + 1}: ${chunk}`).join('\nThe next part follows here.\n'),
+    chunks.map((chunk, index) => `- part: ${index + 1}\n  data: ${chunk}`).join('\n'),
+    `chunks: [${chunks.map((chunk) => `"${chunk}"`).join(', ')}]`,
+    // JSON bodies: arrays of labelled objects, nested bodies and an escaped inner body.
+    JSON.stringify({ parts: chunks.map((chunk, index) => ({ id: index + 1, value: chunk })) }, null, 2),
+    JSON.stringify({ content: JSON.stringify({ parts: chunks.map((chunk, index) => ({ part: index + 1, data: chunk })) }) }),
+    // Decimal bytes with a trailing comma, over several lines, and inside an escaped body.
+    `[\n${[...compressed].map((byte) => `  ${byte},`).join('\n')}\n]`,
+    JSON.stringify({ content: `["${[...compressed].join('\\u002c')}]`.replaceAll('\\u002c', ',') }),
+  ]) blocksWithOriginal(payload);
+  for (const separator of ['+', '/']) blocksLeak(chunks.join(separator));
+  // Two independent declared reconstructions in one message, and a labelled payload beside a byte-pair stream:
+  // reading one never stops the other, and neither displaces a neighbouring reconstruction.
+  const pairs = splitEvery(zlib.gzipSync(Buffer.from(SECRET_NOTE)).toString('hex'), 2);
+  const half = Math.floor(pairs.length / 2);
+  const labelled = chunks.map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n');
+  for (const payload of [labelled, labelled.split('\n').map((line, index) => `copy${index + 1}: ${line.split(' ')[1]}`).join('\n'),
+    `${labelled}\n${pairs.slice(0, half).join(' ')}\n${pairs.slice(half).join(' ')}`]) blocksWithOriginal(payload);
+});
+
+test('residual encoded views: ordinary configuration, prose and engineering numbers stay allowed', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // Ordinary text with the punctuation these forms use, and labelled configuration that merely looks structured.
+  for (const payload of ['alpha + beta > gamma / delta', '1 / 2 / 4 / 8 / 16 / 32 / 64',
+    'read/write/exec flags', 'input / output / error', 'step one / step two / step three',
+    'a1b2c3d4 / b2c3d4e5 / c3d4e5f6', 'x = 1 / y = 2', '10.0.0.1 / 10.0.0.2 / 10.0.0.3',
+    'part1: alpha\npart2: beta\npart3: gamma', '{"part1":"alpha","part2":"beta","part3":"gamma"}',
+    'chunk1: readme\nchunk2: build\nchunk3: deploy', '- item: one\n- item: two\n- item: three',
+    'sensor: a1b2c3d4\nreading: b2c3d4e5\nregion: c3d4e5f6',
+    'digest: 3f2a1b9c0d4e5f60718293a4b5c6d7e8a9b0c1d2\nchecksum: a1b2c3d4e5f60718',
+    'ports = [80, 443, 8080, 5432, 3000, 9090, 5672, 15672]',
+    `rgb = [${Array.from({ length: 32 }, (_, index) => index * 8).join(', ')}]`,
+    `matrix = [${Array.from({ length: 64 }, (_, index) => (index * 37) % 256).join(',')}]`,
+    `{"timestamps":[1695826432,1695826433,1695826434,1695826435,1695826436,1695826437,1695826438,1695826439]}`,
+    `{"offsets":[0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5]}`,
+    `{"type":"Buffer","data":[${[...createHash('sha256').update('synthetic-buffer-digest').digest()].join(',')}]}`,
+    '[1, 2, 3]', '[255, 128, 0]', `versions = [1, 0, 0, 0, 0, 0, 0, 0]`,
+    '[[1,2,3],[4,5,6,7,8,9,10,11,12]]', '[80, 443, 8080, 5432, 3000, 9090, 5672, 15672]',
+    'budget: 1200\nretries: 3\nwindow_ms: 45000\nshard_id: 0007',
+    'docs/security/advisories/GHSA-c2qf-rxjj-qqgw', 'https://github.com/example-org/example-repo/actions/runs/36169013008']) {
+    assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 40)} ${unknown(payload).reasons.join()}`);
+  }
+  // Generated ordinary content: labelled fields, short hex ids and prose, the way a real report or log reads.
+  const document = Array.from({ length: 400 }, (_, index) => [
+    `## Section ${index}`, '', `The synthetic deployment writes part${index + 1}: region ${syntheticBytes(2).toString('hex')}.`,
+    '', `Service gateway-worker-${index} serves ${index} requests per minute with retries set to ${index % 5}.`, '',
+  ].join('\n')).join('\n');
+  const started = process.hrtime.bigint();
+  const result = unknown(document);
+  assert.equal(result.decision, 'ALLOW', result.reasons.join());
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 5000);
+  // A compressed blob dressed in each declared form is still opaque, even with no known originals registered.
+  const opaque = zlib.gzipSync(syntheticBytes(200));
+  for (const payload of [splitEvery(opaque.toString('base64'), 8).map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n'),
+    splitEvery(opaque.toString('base64'), 8).join(' + '), `[${[...opaque].join(',')}]`]) {
+    assert.equal(unknown(payload).decision, 'BLOCK', payload.slice(0, 40));
+  }
+});
+
+test('residual encoded views: declared recognition limits are explicit, not completeness claims', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // Unknown uncompressed binary inside a declared form passes: these forms add no opaque bytes of their own,
+  // so ordinary numeric arrays and labelled configuration cannot be blocked by their shape alone.
+  const opaque = syntheticBytes(200);
+  assert.equal(unknown(splitEvery(opaque.toString('base64'), 8).map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n')).decision, 'ALLOW');
+  assert.equal(unknown(splitEvery(opaque.toString('hex'), 16).join(' + ')).decision, 'ALLOW');
+  assert.equal(unknown(`[${[...opaque].join(',')}]`).decision, 'ALLOW');
+  // The same bytes compressed, or a container signature, are still refused, and a known original still matches.
+  assert.ok(unknown(splitEvery(zlib.gzipSync(opaque).toString('base64'), 8).join(' + ')).reasons.includes('OPAQUE_EMBEDDED'));
+  const zip = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), opaque]);
+  assert.ok(unknown(splitEvery(zip.toString('hex'), 16).map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n'))
+    .reasons.includes('OPAQUE_EMBEDDED'));
+  const note = Buffer.from(SECRET_NOTE);
+  for (const payload of [splitEvery(note.toString('base64'), 8).map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n'),
+    `[${[...note].join(',')}]`]) blocksWithOriginal(payload);
 });
