@@ -10,10 +10,21 @@ requires #39's frozen protocol.
 
 ## 1. What was measured, and how
 
-One pinned configuration of `presidio-analyzer==2.2.364`, installed **offline** from the 51 screened
-wheels in `evaluations/presidio-worker/manifest.json` into a disposable virtual environment, and run in
+One pinned configuration of `presidio-analyzer==2.2.364`, installed **offline** from the wheels in
+`evaluations/presidio-worker/manifest.json` into a disposable virtual environment, and run in
 a network-unshared `bwrap` sandbox against public development cases. The #46 host screen reported
-**51/51 `OK`**, 0 yanked, 0 OSV advisories at the pinned versions. The configuration is Presidio's own
+**51/51 `OK`**, 0 yanked, 0 OSV advisories at the pinned versions. **Corrected 2026-10-02 (retrospective,
+from the [#40 matched comparison](issue-40-matched-development-comparison-2026-10-02.md)): that screen is a
+complete **digest** set, not a 51-artifact runtime.** One of its 51 records — `zipp 3.23.0` — carries the
+digest, size and member count of `setuptools 84.0.0`, whose own metadata says so; `zipp 3.23.0` exists on
+this host only as a copy vendored inside that wheel. The screened bytes therefore include a distribution
+that installs an executable startup hook (`distutils-precedence.pth`), and the venv used for the
+measurements in this document ran that hook at every worker start. The manifest carries this as a dated
+`corrections[]` entry and a corrected run executes a **50-artifact, name-and-digest-verified** subset with
+no `pip`, no `setuptools` and no startup hook. **None of the detector measurements below change** — they
+are the same pinned rules and the same configuration — but any reading of this document as evidence about
+a verified *runtime* is superseded, and the manifest's 51-artifact framing is not adopted. The
+configuration is Presidio's own
 `NoOpNlpEngine` with six explicitly registered self-contained recognizers (`EmailRecognizer`,
 `IpRecognizer`, `MacAddressRecognizer`, `PhoneRecognizer`, `UrlRecognizer`, `UsSsnRecognizer`), one
 language (`en`), no country set, no allow list, a no-op context enhancer, and `tldextract` rebound to
@@ -59,9 +70,9 @@ sentinel catch:
 | Bare host | 0 | 1 | No recognizer for a DNS name without a scheme; Hylja's native `#9` covers this. |
 | US_SSN | 0 | 0 | The "very weak" 0.05 patterns were removed by Presidio's own per-entity threshold before the reply. |
 
-The four false positives per case are the URL recognizer matching fragments such as `persona.de` and
-`example.in` inside ordinary text and truncating a real URL at a TLD it recognises. `MAC_ADDRESS` and
-`IP_ADDRESS` behaved correctly.
+**Corrected 2026-10-02 (retrospective, from the [#40 matched comparison](issue-40-matched-development-comparison-2026-10-02.md)).** Two statements here are wrong and are corrected without changing the measured counts. (1) The **false-positive column above is not a false-positive count**: on this eight-control subset at least two of those events are exact-span, exact-label detections of occurrences the independent #39 oracle draft plants and these controls do not name (the backup mailbox in D01 and the repeated host in D02), and the rest are duplicates or values no independent declaration covers. The `Precision` column is an owner-defined ratio against a bounded control subset, **not measured detector precision**. (2) The sentence below names **`persona.de` and `example.in`**, and **no `persona` and no `.de` string exists anywhere in the public fixtures**; that example is withdrawn. What is measured is that four `NETWORK_IDENTIFIER/URL` events per case coincide with no planted control. The recalls, misses, per-subtype table, resource numbers and the recommendation itself are unchanged: the same pinned rules and the same configuration produced them.
+
+The four events per case coincide with no planted control and come from the URL recognizer, which also truncated a real URL at a TLD it recognises. `MAC_ADDRESS` and `IP_ADDRESS` behaved correctly. Which substrings those four events cover is **not** established from a record that carries no span text.
 
 ### Diagnostic disclosure, measured on the real stack
 
