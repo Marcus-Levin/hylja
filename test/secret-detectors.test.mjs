@@ -11,6 +11,10 @@ const T = {
   githubPat: ['github', '_pat_', fill(40, 'Synth_0')].join(''),
   gitlab: ['gl', 'pat-', fill(20, 'Synth-0')].join(''),
   slack: ['xo', 'xb-', fill(24, 'Synth0-')].join(''),
+  slackApp: ['xapp-', '1-', 'A', '0123456789-', '1234567890123-', fill(32, 'Synth0-')].join(''),
+  huggingface: ['hf', '_', fill(34)].join(''),
+  shopify: ['shpat', '_', fill(32, '0f1e2d')].join(''),
+  sendgrid: ['SG', '.', fill(22, 'Syn-th_0'), '.', fill(43, 'Syn-th_0')].join(''),
   stripe: ['sk', '_test_', fill(24)].join(''),
   google: ['AI', 'za', fill(35, 'Synth_-0')].join(''),
   aws: ['AK', 'IA', 'SYNTHETIC0000000'].join(''),
@@ -27,7 +31,9 @@ const values = (text, result) => result.candidates.map((c) => text.slice(c.start
 test('format rules find each synthetic credential with its exact span and subtype', () => {
   for (const [value, subtype, rule] of [
     [T.github, 'ACCESS_TOKEN', 'format.github-token'], [T.githubPat, 'ACCESS_TOKEN', 'format.github-fine-grained-pat'],
-    [T.gitlab, 'ACCESS_TOKEN', 'format.gitlab-pat'], [T.slack, 'ACCESS_TOKEN', 'format.slack-token'],
+    [T.gitlab, 'ACCESS_TOKEN', 'format.gitlab-pat'], [T.slack, 'ACCESS_TOKEN', 'format.slack-token'], [T.slackApp, 'ACCESS_TOKEN', 'format.slack-app-token'],
+    [T.huggingface, 'ACCESS_TOKEN', 'format.huggingface-token'], [T.shopify, 'ACCESS_TOKEN', 'format.shopify-admin-token'],
+    [T.sendgrid, 'API_KEY', 'format.sendgrid-api-key'],
     [T.stripe, 'API_KEY', 'format.stripe-key'], [T.google, 'API_KEY', 'format.google-api-key'],
     [T.aws, 'API_KEY', 'format.aws-access-key-id'], [T.skKey, 'API_KEY', 'format.sk-prefixed-api-key'],
     [T.npm, 'ACCESS_TOKEN', 'format.npm-token'], [T.jwt, 'ACCESS_TOKEN', 'format.jwt'],
