@@ -98,6 +98,33 @@ const FORMAT_RULES: readonly Rule[] = [
   { id: 'format.github-fine-grained-pat', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}github_pat_[A-Za-z0-9_]{22,255}${E}`, 'gu') },
   { id: 'format.gitlab-pat', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}glpat-[A-Za-z0-9_-]{20,255}(?![A-Za-z0-9_-])`, 'gu') },
   { id: 'format.slack-token', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}xox[abposr]-[A-Za-z0-9-]{10,255}(?![A-Za-z0-9-])`, 'gu') },
+  // #141 vendor families. Each prefix below is primary-documented; every body bound is this detector's
+  // *supported shape*, not a vendor guarantee and not a live-token check. A vendor that changes a body length,
+  // alphabet or layout leaves a value undetected until the bound is revisited, and an overlapping match by
+  // another rule (a JWT, a key assignment, #9's dotted-name rule) is never suppressed here.
+  // Slack app-level: "App-level token strings begin with xapp-" and rotating ones "begin with xoxe.xapp-"
+  // (https://docs.slack.dev/authentication/tokens/). Slack describes `-`-separated sections, so the body takes
+  // alphanumerics and `-` across the same 10..255 window the xox* rule already uses; the rotating prefix is
+  // inside the span because it is part of the token.
+  { id: 'format.slack-app-token', subtype: 'ACCESS_TOKEN',
+    pattern: new RegExp(`${B}(?:xoxe\\.)?xapp-[A-Za-z0-9-]{10,255}(?![A-Za-z0-9-])`, 'gu') },
+  // Hugging Face user access tokens are written `hf_...` (https://huggingface.co/docs/hub/security-tokens).
+  // That page documents no body length or alphabet, so 30..64 alphanumerics is a local bound around the body
+  // lengths in common use, not a documented shape.
+  { id: 'format.huggingface-token', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}hf_[A-Za-z0-9]{30,64}${E}`, 'gu') },
+  // Shopify offline and online access tokens "are opaque strings that begin with shpat_"
+  // (https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens). Opaque means the vendor
+  // publishes no charset or length, so 30..64 alphanumerics is a local bound. shpca_ and shppa_ are out of scope.
+  { id: 'format.shopify-admin-token', subtype: 'ACCESS_TOKEN', pattern: new RegExp(`${B}shpat_[A-Za-z0-9]{30,64}${E}`, 'gu') },
+  // SendGrid keys are returned as `SG.` plus two dot-separated segments
+  // (https://docs.sendgrid.com/api-reference/api-keys/create-api-keys) and "are always 69 characters long"
+  // (https://support.sendgrid.com/hc/en-us/articles/44146758703387-Can-I-use-a-reduced-shorter-API-key-size-in-SendGrid).
+  // A window per segment accepts that 69-character total without freezing one era's split; a third segment or a
+  // body outside 8..64 is a near miss, and sentence punctuation after the key stays outside the span. Known
+  // over-cover: a dotted name whose first label is literally `SG` with two 8..64-character labels (`SG.a.b` in
+  // any case) is read as a key. Recall wins here - a false positive fails safe as SECRET, never open.
+  { id: 'format.sendgrid-api-key', subtype: 'API_KEY',
+    pattern: new RegExp(`${B}SG\\.[A-Za-z0-9_-]{8,64}\\.[A-Za-z0-9_-]{8,64}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9_-])`, 'gu') },
   { id: 'format.slack-webhook', subtype: 'API_KEY',
     pattern: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9]{6,32}\/[A-Za-z0-9]{6,32}\/[A-Za-z0-9]{12,64}/gu },
   { id: 'format.stripe-key', subtype: 'API_KEY', pattern: new RegExp(`${B}(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,255}${E}`, 'gu') },
