@@ -1676,12 +1676,11 @@ test('residual encoded views: a hex-alphabet label name declares its own numbere
     chunks.map((chunk, index) => `${index % 2 ? `face${String(index + 1).padStart(3, '0')}` : `part${index + 1}`}: ${chunk}`).join('\n'),
   ]) assert.equal(check(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${check(payload).reasons.join()}`);
 
-  // The same group's **escape** spelling is stricter than the chunk spelling above, and the gap is pinned rather
-  // than implied: a hex-labelled series of byte escapes is excluded from the series reading outright, because a
-  // dump offset column (`face:`, `d10:`) carries numbers too and only a complete run tells the two apart. With the
-  // planted originals registered this releases the note at one escape per field, exactly as the base did, and the
-  // chunk spelling of the same bytes still blocks one line above. Closing it would mean teaching the escape series
-  // reader the complete-hex-series rule, which is a coverage decision and not this slice's claim.
+  // The same group's **escape** spelling now answers to the same complete-run rule as its chunk spelling above
+  // (issue #146). It used to be excluded outright, which released the note at one escape per field; the groups at
+  // the end of this file own that reading now, and the near misses that keep it a declaration rather than a guess
+  // are pinned there. What stays true here is the floor: one or three escapes per field are a declared series, and
+  // four or more are read by the direct escape reader whether or not any label is present.
   const escapedHexSeries = (perField) => {
     const fields = [];
     for (let at = 0; at < compressed.length; at += perField) {
@@ -1690,8 +1689,8 @@ test('residual encoded views: a hex-alphabet label name declares its own numbere
     }
     return fields.map((value, index) => `face${index + 1}: ${value}`).join('\n');
   };
-  assert.equal(check(escapedHexSeries(1)).decision, 'ALLOW', 'published gap: a hex-labelled escape series');
-  assert.equal(check(escapedHexSeries(4)).decision, 'BLOCK', 'the direct reader fires at four escapes per field');
+  blocksWithOriginal(escapedHexSeries(1), true);
+  blocksWithOriginal(escapedHexSeries(4), true);
   blocksWithOriginal(chunks.map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n'), true);
 });
 
@@ -2609,4 +2608,635 @@ test('issue 142: a malformed field before the marker is not read as bytes', () =
     assert.ok(result.findings.some((finding) => finding.rule === 'short.original.1'), result.reasons.join());
     assert.equal(result.release, undefined, `${group}`);
   }
+});
+
+/* ---------- Issue #146: a hex-labelled ordered escape series is a declared series too ---------- */
+
+/**
+ * Issue #146, red at the assigned base `1ab0c29` and reproduced from the public interface with invented values
+ * only. `escapeReadings` excluded **every** field whose label is drawn from the hex alphabet, so a hex-labelled
+ * declared escape series -- `face1: \xHH`, `face2: \xHH`, ... -- joined no escape reading at all, while the
+ * byte-pair, chunk, direct-escape and ordinary-label readings had no such exclusion. Measured on the base build:
+ * a zlib stream spelling a registered `ORIGINAL` and a registered `CANARY`, written one, two or three escapes per
+ * field, was returned `ALLOW` **with `release` bytes** in raw text and in a JSON body whose fields are labelled
+ * object members, for both kinds. The two JSON-string containers blocked opaquely at base, without the
+ * registered value's own finding, so what those shapes could claim was only that nothing was released.
+ *
+ * The exclusion was there for a real reason and is kept: a dump offset column (`face:`, `d10:`) is also written
+ * from the hex alphabet before a colon. What the exclusion lacked is the rule the chunk reader beside it already
+ * has -- `completeHexSeries`, which admits a hex-labelled field only when its own numbers declare one **complete
+ * run** (rank 0 or 1, consecutive, no repeat) under one label name. The fix applies that one rule to the escape
+ * reading and nothing else.
+ *
+ * Nothing else moved: no threshold, no opaque-byte count, no exemption, no budget, no other reader, no policy and
+ * no version. The reading it adds is **decode-only**, exactly like every other declared reconstruction -- it adds
+ * no opaque bytes of its own, so ordinary labelled configuration cannot be blocked by the shape of its values,
+ * and what the series spells is still inflated, container-checked and matched like any other view.
+ */
+const hexEscapeSeries = (bytes, { label = 'face', perField = 1, rank = null } = {}) => {
+  const cells = [];
+  for (let at = 0; at < bytes.length; at += perField) {
+    cells.push([...bytes.subarray(at, at + perField)]
+      .map((byte) => `\\x${byte.toString(16).padStart(2, '0')}`).join(' '));
+  }
+  return cells.map((cell, index) => `${label}${rank ? rank(index, cells.length) : index + 1}: ${cell}`).join('\n');
+};
+/** The containers a labelled escape series is checked in: raw text and two JSON bodies. */
+const escapeSeriesContainers = (series) => [series, JSON.stringify({ content: series }),
+  JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content: series }] })];
+/** A label-object JSON body, the fourth spelling a declared series is written in. */
+const escapeSeriesObject = (series) => JSON.stringify({ parts: series.split('\n').map((line) =>
+  Object.fromEntries([[line.slice(0, line.indexOf(':')), line.slice(line.indexOf(': ') + 2)]])) });
+
+test('issue 146: a hex-labelled ordered escape series is rebuilt, inflated and matched', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const notes = [Buffer.from(ESCAPED_NOTE), Buffer.from(SECRET_NOTE)];
+  // Label names are drawn from the hex alphabet, which is the whole of the point: reading a payload must not
+  // depend on which letters the sender happened to pick for the labels.
+  const labels = ['face', 'dead', 'cafe', 'add', 'beef', 'bad', 'facade', 'effe'];
+  let spellings = 0;
+  for (const compress of [zlib.gzipSync, zlib.deflateSync, zlib.deflateRawSync, zlib.brotliCompressSync]) {
+    for (const note of notes) {
+      const stream = compress(note);
+      assert.ok(stream.length >= 8, `${stream.length}`);
+      for (const label of labels) {
+        for (const perField of [1, 2, 3, 4]) {
+          const series = hexEscapeSeries(stream, { label, perField });
+          for (const payload of [...escapeSeriesContainers(series), escapeSeriesObject(series)]) {
+            blocksWithOriginal(payload, true);
+            spellings++;
+          }
+        }
+      }
+    }
+  }
+  // 4 compressors x 2 notes x 8 hex label names x 4 cells per field x 4 containers = 1024.
+  assert.ok(spellings >= 1000, `${spellings} generated spellings`);
+  // Counting from zero is the same complete run, a repeated name in either case is one series, and a padded rank
+  // is the same rank. Two orderings are distinguished on purpose, because only one of them needs the numeric-label
+  // reading: reversed *ranks* leave the bytes in text order, so the text reading already spells the payload;
+  // reversed *lines* put rank N first, so only the numeric reading recovers it.
+  const zlibStream = zlib.deflateSync(Buffer.from(SECRET_NOTE));
+  const ordered = hexEscapeSeries(zlibStream);
+  for (const variant of [hexEscapeSeries(zlibStream, { label: 'face', rank: (index) => index }),
+    hexEscapeSeries(zlibStream, { label: 'face', rank: (index) => String(index + 1).padStart(3, '0') }),
+    hexEscapeSeries(zlibStream, { label: 'FACE' }),
+    ordered.split('\n').reverse().join('\n'),
+    hexEscapeSeries(zlibStream).split('\n')
+      .map((line, index) => line.replace(/^face(?=\d)/u, index % 2 ? 'FACE' : 'face')).join('\n')]) {
+    for (const payload of [variant, JSON.stringify({ content: variant })]) blocksWithOriginal(payload, true);
+  }
+  // Two complete series under two hex names in one message are each read on their own.
+  const paired = [...zlibStream].flatMap((byte, index) =>
+    [`face${index + 1}: \\x${byte.toString(16).padStart(2, '0')}`, `cafe${index + 1}: \\x${byte.toString(16).padStart(2, '0')}`]).join('\n');
+  for (const payload of [paired, JSON.stringify({ content: paired })]) blocksWithOriginal(payload, true);
+  // An unrelated field between the parts is what an honest trace looks like: it carries no byte of the payload,
+  // so the declared run is read on its own, before, in the middle and after it.
+  const parts = hexEscapeSeries(zlibStream).split('\n');
+  for (const field of ['trace: 1a2b3c4d', 'deadbeef: 1f8b0800', 'note: Zz9Qa1b2', 'region: 4f2a91b7']) {
+    for (const at of [0, 1, Math.floor(parts.length / 2), parts.length]) {
+      blocksWithOriginal([...parts.slice(0, at), field, ...parts.slice(at)].join('\n'), true);
+    }
+  }
+});
+
+test('issue 146: a registered canary alone is reported as a canary, with nothing released', () => {
+  // The canary obligation is independent of the original's: a registry holding only the canary must still refuse
+  // this spelling, and must report it as a canary rather than as a known original or as opaque bytes.
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const canaryOnly = createKnownOriginals(scopeA, new Uint8Array(32).fill(23), [{ kind: 'CANARY', value: CANARY, ref: 'canary.146' }]);
+  const checkCanary = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination,
+    authorized: destination, known: canaryOnly });
+  const stream = zlib.deflateSync(Buffer.from(`note for ${CANARY} and some more synthetic padding text`));
+  for (const perField of [1, 2, 3]) {
+    for (const payload of [...escapeSeriesContainers(hexEscapeSeries(stream, { perField })),
+      escapeSeriesObject(hexEscapeSeries(stream, { perField }))]) {
+      const result = checkCanary(payload);
+      assert.equal(result.decision, 'BLOCK', `${perField}: ${payload.slice(0, 40)}`);
+      assert.ok(result.reasons.includes('CANARY_DETECTED'), `${perField}: ${result.reasons.join()}`);
+      assert.ok(result.findings.some((finding) => finding.kind === 'CANARY' && finding.rule === 'canary.146'),
+        `${perField}: ${result.findings.map((finding) => finding.rule).join()}`);
+      assert.equal(result.release, undefined, `${perField}`);
+    }
+  }
+  // Findings and the regression record carry codes and refs only: no planted byte reaches a result.
+  const serialized = JSON.stringify(checkCanary(hexEscapeSeries(stream, { perField: 1 })));
+  for (const value of ['Orla', 'orla', 'Synthetica', CANARY, 'note']) assert.ok(!serialized.includes(value), value);
+  assert.deepEqual(Object.keys(checkCanary(hexEscapeSeries(stream, { perField: 1 })).regression).sort(),
+    ['reasons', 'rules', 'version', 'views']);
+});
+
+test('issue 146: only a complete numbered run is a declaration, and a near miss reads no partial stream', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const stream = zlib.deflateSync(Buffer.from(SECRET_NOTE));
+  const every = (count) => Array.from({ length: count }, (_, index) => index + 1);
+  // A dump offset column is written from the hex alphabet too, which is why a hex label is not a declaration on
+  // its own: one complete consecutive run under one name is. Each shape below keeps the documented outcome of a
+  // value the sender never finished declaring, and none of them may gain the registered value's finding.
+  const nearMisses = {
+    'a gap in the numbering': hexEscapeSeries(stream, { rank: (index) => (index === 3 ? index + 2 : index + 1) }),
+    'a repeated label number': hexEscapeSeries(stream, { rank: (index) => (index === 2 ? 2 : index + 1) }),
+    'no first part': hexEscapeSeries(stream, { rank: (index) => index + 2 }),
+    'a hex name carrying no numbers': [...stream].map((byte) => `face: \\x${byte.toString(16).padStart(2, '0')}`).join('\n'),
+    'one field is not a series': `face1: ${[...stream.subarray(0, 3)].map((byte) => `\\x${byte.toString(16).padStart(2, '0')}`).join(' ')}`,
+    'two names alternating': [...stream].map((byte, index) =>
+      `${index % 2 ? 'face' : 'dead'}${Math.floor(index / 2) + 1}: \\x${byte.toString(16).padStart(2, '0')}`).join('\n'),
+    // A dump offset column, at both widths a dump writes, is not a run of consecutive ranks.
+    'four-digit dump offsets': [...stream].map((byte, index) =>
+      `${(index * 16).toString(16).padStart(4, '0')}: \\x${byte.toString(16).padStart(2, '0')}`).join('\n'),
+    'eight-digit dump offsets': [...stream].map((byte, index) =>
+      `${(index * 16).toString(16).padStart(8, '0')}: \\x${byte.toString(16).padStart(2, '0')}`).join('\n'),
+    // One part written as a plain hexadecimal chunk: the series reader joins one series and never a subset of it,
+    // so dropping a member from the numbering is not a reading. The chunk reader still owns that one field.
+    'one member written as a chunk': [`face1: ${stream.subarray(0, 1).toString('hex')}`,
+      ...hexEscapeSeries(stream, { rank: (index) => index + 2 }).split('\n')].join('\n'),
+    // A part whose own cell the sender did not finish: the fourth escape of a four-escape member is missing, so
+    // the value is truncated, not removed, and the member is not the whole field its label declares.
+    'one member truncated mid-cell': Array.from({ length: Math.ceil(stream.length / 4) }, (_, at) =>
+      `face${at + 1}: ${[...stream.subarray(at * 4, at * 4 + 4)].map((byte) => `\\x${byte.toString(16).padStart(2, '0')}`).join(' ')}`)
+        .map((line, index) => (index === 1 ? line.replace(/ \\x[0-9A-Fa-f]{2}$/u, '') : line)).join('\n'),
+    // The same member carrying a suffix the reader does not support, which is the review-R1 shape in this family.
+    'one member carrying an unsupported suffix': hexEscapeSeries(stream).split('\n')
+      .map((line, index) => (index === 1 ? `${line} oops` : line)).join('\n'),
+  };
+  for (const [name, payload] of Object.entries(nearMisses)) {
+    for (const container of [payload, JSON.stringify({ content: payload })]) {
+      const result = check(container);
+      assert.ok(!result.reasons.includes('KNOWN_ORIGINAL_DETECTED') && !result.reasons.includes('CANARY_DETECTED'),
+        `${name}: ${result.reasons.join()}`);
+      assert.equal(result.release, result.decision === 'ALLOW' ? result.release : undefined, name);
+    }
+  }
+  // A run whose numbering has a hole is not read, whichever member lost it: what is left names ranks 2..N, or
+  // 1..k-1 and k+1..N, and neither is one complete run. This is the direction the rule is written for -- a
+  // declaration the sender did not finish must not be read as if it had been finished -- and the complete run
+  // below it, and one that has only lost its last member, are both read.
+  const parts = hexEscapeSeries(stream).split('\n');
+  for (const payload of [parts.slice(1).join('\n'), [...parts.slice(0, 1), ...parts.slice(2)].join('\n'),
+    [...parts.slice(0, 2), ...parts.slice(3)].join('\n'),
+    [...parts.slice(0, 3), ...parts.slice(6)].join('\n')]) {
+    const result = check(payload);
+    assert.ok(!result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), `${payload.slice(0, 40)}: ${result.reasons.join()}`);
+  }
+  blocksWithOriginal(parts.slice(0, -1).join('\n'), true);
+});
+
+test('issue 146 order: the membership span follows the numeric ranks, not the text order', () => {
+  // Independently observed at `ad38514`: the veto took its span from the first member in **text** order, and
+  // `completeHexSeries` returns members as the sender wrote them, so reversing the lines moved the span from ranks
+  // 1..N to N..2N. An unrelated `face80: ordinary` then looked like a member of the run and suppressed it, while a
+  // malformed member at rank 1 fell below the span and was read as if it were whole. The span must be the numeric
+  // ranks the candidate actually spans, in whatever order the text is in, and both readings -- the one that follows
+  // the text and the one that follows the numbers -- must survive.
+  //
+  // The values below are invented and registered one at a time so that the readings under test are the only way this
+  // payload can be found: another reader spells the same bytes independently at some stream lengths, and a control
+  // another reader already covers would not measure this veto at all.
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const orderEntries = Object.freeze([
+    Object.freeze({ kind: 'ORIGINAL', value: 'synthetic-order-original.invalid', ref: 'order.original' }),
+    Object.freeze({ kind: 'CANARY', value: 'synthetic-order-canary.invalid', ref: 'order.canary' }),
+  ]);
+  const x = (byte) => `\\x${byte.toString(16).padStart(2, '0')}`;
+  const raw = (rows) => rows.map(([label, value]) => `${label}: ${value}`).join('\n');
+  const object = (rows) => JSON.stringify({ parts: rows.map(([label, value]) => ({ [label]: value })) });
+  for (const entry of orderEntries) {
+    // One handle per check, and one entry in it. The readings under test are then the only way this payload can be
+    // found, so nothing another reader already covers stands in for the veto; and a fresh handle each time also
+    // pins that a reading does not depend on which fingerprint prefilter a handle happens to have been configured
+    // with, which is a property this module owes independently of what is being tested here.
+    const checkOrder = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination,
+      authorized: destination, known: createKnownOriginals(scopeA, new Uint8Array(32).fill(31), [entry]) });
+    const reason = entry.kind === 'CANARY' ? 'CANARY_DETECTED' : 'KNOWN_ORIGINAL_DETECTED';
+    const findingKind = entry.kind === 'CANARY' ? 'CANARY' : 'KNOWN_ORIGINAL';
+    const precise = (payload, at) => {
+      const result = checkOrder(payload);
+      assert.equal(result.decision, 'BLOCK', `${at}: ${result.reasons.join()}`);
+      assert.ok(result.reasons.includes(reason), `${at}: ${result.reasons.join()}`);
+      assert.ok(result.findings.some((finding) => finding.kind === findingKind && finding.rule === entry.ref),
+        `${at}: ${result.findings.map((finding) => finding.rule).join()}`);
+      assert.equal(result.release, undefined, at);
+      // Findings and reasons stay value-free whatever the order was.
+      assert.ok(!JSON.stringify(result).includes(entry.value), at);
+    };
+    const note = [...zlib.deflateSync(Buffer.from(entry.value))];
+    const count = note.length;
+    const rows = note.map((byte, index) => [`face${index + 1}`, x(byte)]);
+    // One unrelated field of the same name, one rank past the run's own span -- the exact distance the text-order
+    // span used to reach. It is a single **row**, and it is added as one: `rows.concat(row)` splices that row's two
+    // strings in as two rows of their own, so the payload ended in `f: a` and `o: r` and the case tested nothing at
+    // all. The shape assertion below is what keeps that mistake from being invisible again.
+    const unrelatedRow = [`face${2 * count}`, 'ordinary'];
+    const reversedRanks = rows.map(([, value], index) => [`face${count - index}`, value]);
+    const shuffled = [...rows.slice(1).filter((_, index) => index % 2 === 0), rows[0],
+      ...rows.slice(1).filter((_, index) => index % 2 === 1)];
+    for (const [shape, render] of [['raw', raw], ['object', object]]) {
+      // Each ordering is checked on its own first, so a run that is found without the unrelated field and lost with
+      // it is measured as what it is rather than as a shape that never reconstructs. The unrelated rank is one
+      // beyond the run's own span, which is exactly the distance the text-order span used to reach.
+      for (const [order, control, data] of [
+        // Ascending: the text reading is the payload.
+        ['forward', rows, [...rows, unrelatedRow]],
+        // Reversed lines: only the numeric reading is the payload, and the unrelated rank is outside its span.
+        ['reversed lines', [...rows].reverse(), [...rows].reverse().concat([unrelatedRow])],
+        // Reversed ranks with the bytes still in text order: only the text reading is the payload, and the span is
+        // still 1..N, so an unrelated rank cannot veto it either.
+        ['reversed ranks', reversedRanks, reversedRanks.concat([unrelatedRow])],
+        // A permutation that is neither ascending nor reversed, so the span cannot come from either end.
+        ['shuffled', shuffled, shuffled.concat([unrelatedRow])],
+      ]) {
+        // The fixture itself, checked before it is checked for behaviour: the payload must carry exactly one more
+        // field than its control, and that field must be the unrelated one and nothing else. An assembly mistake
+        // would otherwise leave a case that passes because the payload never contained what it claimed to.
+        assert.equal(data.length, control.length + 1, `${entry.kind}/${shape}/${order}: one field was added`);
+        assert.deepEqual(data.at(-1), unrelatedRow, `${entry.kind}/${shape}/${order}: the added field`);
+        const rendered = render(data);
+        // The label itself must appear in the payload and must not appear in the control. That is the property a
+        // flattened row destroys -- `f: a` and `o: r` contain neither `face80` nor `ordinary` -- and it holds for
+        // every rendering, raw (`face80: ordinary`) and object (`"face80":"ordinary"`) alike.
+        assert.ok(rendered.includes(unrelatedRow[0]),
+          `${entry.kind}/${shape}/${order}: the payload must carry the unrelated field: ${rendered.slice(-72)}`);
+        assert.ok(rendered.includes(unrelatedRow[1]),
+          `${entry.kind}/${shape}/${order}: the payload must carry the unrelated value: ${rendered.slice(-72)}`);
+        assert.ok(!render(control).includes(unrelatedRow[0]), `${entry.kind}/${shape}/${order}: control carries it`);
+        precise(render(control), `${entry.kind}/${shape}/${order} control`);
+        precise(rendered, `${entry.kind}/${shape}/${order} with an unrelated rank`);
+      }
+    }
+  }
+  // The other direction: a member the sender wrote but this reader cannot reconstruct is a member whatever order the
+  // text is in, so a run that spans it is withheld rather than read. No value is registered here, so only the
+  // container signature can refuse these.
+  const signature = [0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
+  const signed = signature.map((byte, index) => [`face${index + 1}`, x(byte)]);
+  const allows = (payload, at) => {
+    const result = credentialOnly(payload);
+    assert.equal(result.decision, 'ALLOW', `${at}: ${result.reasons.join()}`);
+    assert.deepEqual(result.findings, [], at);
+    assert.ok(result.release instanceof Uint8Array, at);
+  };
+  for (const [shape, render] of [['raw', raw], ['object', object]]) {
+    for (const data of [signed, [...signed].reverse()]) {
+      allows(render(data.map(([label, value]) => [label, label === 'face1' ? `${value}oops` : value])), `${shape}/tail at rank one`);
+      allows(render(data.concat([['FACE01', 'ordinary']])), `${shape}/padded duplicate rank one`);
+    }
+    allows(render([...signature.map((byte, index) => [`face${index}`, x(byte)])].reverse()
+      .concat([['FACE00', 'ordinary']])), `${shape}/padded duplicate rank zero`);
+    allows(render(signed.filter((_, index) => index !== 1)), `${shape}/hole`);
+    allows(render(signed.map(([label, value]) => [label, label === 'face1' ? '50' : value])), `${shape}/plain hex member`);
+    // The whole run beside those same shapes is still read, in both orders, so every control above is about
+    // membership rather than about the reading having been switched off.
+    for (const data of [signed, [...signed].reverse()]) {
+      const result = credentialOnly(render(data));
+      assert.equal(result.decision, 'BLOCK', `${shape}/whole run: ${result.reasons.join()}`);
+      assert.deepEqual(result.reasons, ['OPAQUE_EMBEDDED'], `${shape}/whole run: ${result.reasons.join()}`);
+      assert.equal(result.release, undefined, `${shape}/whole run`);
+    }
+  }
+});
+
+test('issue 146 order: the ordinary-label prefix reading is a separate alternative, not a helper default', () => {
+  // Independently observed at `ad38514`: consuming contiguous escapes in the shared collector replaced the older
+  // ordinary-label reading, which reconstructed the **prefix** of each field. That prefix is a declared
+  // alternative of its own, charged like every other reconstruction, and narrowing it is not this change's to make:
+  // `part1: \xHH\x41` does not spell the payload as two-byte cells, but it does with one escape per field, and
+  // base and the first corrected head both refused it. The whole-cell reading is added beside that one, never
+  // instead of it.
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const x = (byte) => `\\x${byte.toString(16).padStart(2, '0')}`;
+  const raw = (rows) => rows.map(([label, value]) => `${label}: ${value}`).join('\n');
+  const object = (rows) => JSON.stringify({ parts: rows.map(([label, value]) => ({ [label]: value })) });
+  const note = [...zlib.deflateSync(Buffer.from(SECRET_NOTE))];
+  const prefix = note.map((byte, index) => [`part${index + 1}`, `${x(byte)}${x(0x41)}`]);
+  for (const [shape, render] of [['raw', raw], ['object', object]]) {
+    blocksWithOriginal(render(prefix), true);
+    // A field that is one escape and then an unsupported tail is the same alternative: the prefix is the whole value
+    // this reader can see, and it is charged like every other reconstruction.
+    blocksWithOriginal(render(note.map((byte, index) => [`part${index + 1}`, `${x(byte)}oops`])), true);
+  }
+  // The hex-labelled whole-cell reading is the one that needs every field whole, and it is unaffected: the same
+  // bytes under a hex-labelled run are still refused, and a malformed one still is not.
+  const signed = [0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00].map((byte, index) => [`face${index + 1}`, x(byte)]);
+  const pairs = signed.map(([label, value]) => [label, `${value}${x(0x41)}`]);
+  for (const container of [raw(pairs), object(pairs)]) {
+    const whole = credentialOnly(container);
+    assert.equal(whole.decision, 'ALLOW', `hex-labelled pairs are not the signature: ${whole.reasons.join()}`);
+    assert.deepEqual(whole.findings, []);
+  }
+  const whole = credentialOnly(raw(signed));
+  assert.deepEqual(whole.reasons, ['OPAQUE_EMBEDDED'], `hex-labelled whole run: ${whole.reasons.join()}`);
+  assert.equal(whole.release, undefined, 'hex-labelled whole run');
+});
+
+test('issue 146 order: a quoted field needs its closing quote', () => {
+  // Independently observed at `ad38514`, and already present at its parent: a field that opened a quote was read
+  // as whole at end of input, so `face8: "\x00` with no closing quote reconstructed eight bytes the sender never
+  // finished writing. Only the closing quote ends a quoted value; a bare field still ends at end of input, and
+  // trailing whitespace is still formatting.
+  const x = (byte) => `\\x${byte.toString(16).padStart(2, '0')}`;
+  const signature = [0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
+  const closed = signature.map((byte, index) => `face${index + 1}: "${x(byte)}"`).join('\n');
+  for (const [name, payload, expected] of [
+    ['a balanced quoted run is read', closed, 'BLOCK'],
+    ['a quoted field with no closing quote at end of input', closed.slice(0, -1), 'ALLOW'],
+    ['a quoted field with no closing quote before trailing space', `${closed.slice(0, -1)}  `, 'ALLOW'],
+  ]) {
+    const result = credentialOnly(payload);
+    assert.equal(result.decision, expected, `${name}: ${result.reasons.join()}`);
+    assert.deepEqual(result.findings, [], name);
+    if (expected === 'ALLOW') assert.ok(result.release instanceof Uint8Array, name);
+    else assert.equal(result.release, undefined, name);
+  }
+  // The spellings that must not move: the same eight values unquoted, and the quoted ones with the trailing space a
+  // writer leaves at the end of a body, are all whole.
+  for (const payload of [signature.map((byte, index) => `face${index + 1}: ${x(byte)}`).join('\n'),
+    `${closed}\n`, `  ${closed}  `]) {
+    const result = credentialOnly(payload);
+    assert.equal(result.decision, 'BLOCK', `bare control: ${result.reasons.join()}`);
+    assert.deepEqual(result.reasons, ['OPAQUE_EMBEDDED'], `bare control: ${result.reasons.join()}`);
+    assert.equal(result.release, undefined, 'bare control');
+  }
+});
+
+test('issue 146 outcome: an independent group beside a non-escape field is still inspected', () => {
+  // Independently observed at `b3ea8a7`: the whole-field correction vetoed a complete run from anywhere in the
+  // message, so an ordinary `face1: ordinary` field separated from a valid `face1…faceN` escape series by a group
+  // break suppressed that series and released a registered value. A veto must reach the group a field actually
+  // belongs to and nothing else: a break the group rule rejects, or a gap wider than it allows, ends the group,
+  // and the next group is read on its own.
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const note = zlib.deflateSync(Buffer.from(SECRET_NOTE));
+  const series = hexEscapeSeries(note, { perField: 1 });
+  const breaks = {
+    'an explicit group break': '\n-- incompatibility-boundary --\n',
+    // 257 characters: one wider than the module's own group-gap bound, which is a parsing bound and not a threshold.
+    'a gap wider than the group bound': `\n${' '.repeat(257)}\n`,
+  };
+  for (const [name, boundary] of Object.entries(breaks)) {
+    for (const payload of [`face1: ordinary${boundary}${series}`, `${series}${boundary}face1: ordinary`,
+      `face1: ordinary${boundary}${series}${boundary}face1: ordinary`]) {
+      blocksWithOriginal(payload, true);
+      blocksWithOriginal(JSON.stringify({ content: payload }), true);
+    }
+  }
+  // The same field *inside* the group is a different thing and stays a veto, because that is what the group rule
+  // means by a group: prose between two fields is the allowed filler of one declaration, and it holds for an
+  // ordinary sentence exactly as it holds for a line break. Only a break the rule rejects separates the groups.
+  const inside = hexEscapeSeries(zlib.deflateSync(Buffer.from(SECRET_NOTE)), { perField: 1 });
+  for (const filler of ['\n', '\n  ', '\nthe synthetic build finished this section\n', ' ']) {
+    const inside_ = credentialOnly(`face1: ordinary${filler}${inside}`);
+    assert.equal(inside_.decision, 'ALLOW',
+      `a continuing gap keeps the two fields in one group, so it must veto: ${filler}`);
+    assert.deepEqual(inside_.findings, [], filler);
+  }
+  // A rank far outside the run is its own declaration, so it is not a veto and the run beside it is still read.
+  // This is the direction a membership test has to hold: a veto that reached every rank of the name would hide
+  // every payload behind an unrelated field.
+  for (const payload of [`face900: ordinary\n${hexEscapeSeries(note, { perField: 1 })}`,
+    `${hexEscapeSeries(note, { perField: 1 })}\nface900: ordinary`]) blocksWithOriginal(payload, true);
+});
+
+test('issue 146 outcome: no partial field or omitted member ever manufactures a stream', () => {
+  // Independently observed at `b3ea8a7` and at `32811da`, and already ALLOW at the base: seven spellings the
+  // hex-labelled reading turned into the ZIP signature `50 4b 03 04 00 00 00 00` although the sender never wrote a
+  // complete eight-byte value. Every one of them is a field or a membership the module cannot reconstruct whole,
+  // so the honest outcome is that it reconstructs nothing at all.
+  const x = (byte) => `\\x${byte.toString(16).padStart(2, '0')}`;
+  const signature = [0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
+  const rows = signature.map((byte, index) => [`face${index + 1}`, x(byte)]);
+  const raw = (data) => data.map(([label, value]) => `${label}: ${value}`).join('\n');
+  const object = (data) => JSON.stringify({ parts: data.map(([label, value]) => ({ [label]: value })) });
+  const allows = (payload, at) => {
+    const result = credentialOnly(payload);
+    assert.equal(result.decision, 'ALLOW', `${at}: ${result.reasons.join()}`);
+    assert.deepEqual(result.findings, [], at);
+    assert.ok(result.release instanceof Uint8Array, at);
+  };
+  for (const [name, data, shape] of [
+    // A contiguous escape is part of the same value, so a supported pair must not lose its second byte, and an
+    // unsupported tail attached after a contiguous prefix must not be dropped: neither field is whole.
+    ['field/supported contiguous pairs cannot drop a second byte',
+      rows.map(([label, value]) => [label, `${value}${x(0x41)}`]), raw],
+    ['field/an unsupported tail after a contiguous prefix',
+      rows.map(([label, value], index) => [label, index === 0 ? `${value}${x(0x41)}oops` : value]), raw],
+    // Inside a quoted value a line break, a label or a word is still inside the value, not formatting after it.
+    ['field/a quoted newline is still inside the value',
+      rows.map(([label, value], index) => [label, index === 0 ? `${value}\noops` : value]), object],
+    ['field/a quoted label is still inside the value',
+      rows.map(([label, value], index) => [label, index === 0 ? `${value} cafe1: ordinary` : value]), object],
+    // `FACE01` and `face1` are one rank written two ways, so the non-escape member is a duplicate of a member the
+    // run is reading. A rank that the run does not contain is a different declaration and is not a veto.
+    ['membership/a padded-rank duplicate member',
+      [rows[0], ['FACE01', 'ordinary'], ...rows.slice(1)], raw],
+    ['membership/a padded-rank duplicate member in an object body',
+      [rows[0], ['FACE01', 'ordinary'], ...rows.slice(1)], object],
+    // An ordinary field on the next rank of the same name is the member the run is missing.
+    ['membership/a non-escape final rank in the same group', [...rows, ['face9', 'ordinary']], raw],
+    ['membership/a non-escape final rank in an object body', [...rows, ['face9', 'ordinary']], object],
+  ]) {
+    allows(shape(data), name);
+    // The JSON-string wrapper is not a discriminator: the escape round turns the escapes into literal bytes and
+    // the pre-existing quoted-string reader refuses the body in every revision, with or without this reading, so
+    // what is pinned is only that this reading adds no finding and releases nothing.
+    const wrapped = credentialOnly(JSON.stringify({ content: shape(data) }));
+    assert.deepEqual(wrapped.findings, [], name);
+    if (wrapped.decision === 'BLOCK') assert.equal(wrapped.release, undefined, name);
+  }
+  // The eight whole fields are the declaration this grammar admits, so every control above is about validation
+  // rather than about the reading having been switched off.
+  for (const container of [raw(rows), object(rows), JSON.stringify({ content: raw(rows) })]) {
+    const result = credentialOnly(container);
+    assert.equal(result.decision, 'BLOCK', `valid series: ${result.reasons.join()}`);
+    assert.deepEqual(result.reasons, ['OPAQUE_EMBEDDED'], `valid series: ${result.reasons.join()}`);
+    assert.equal(result.release, undefined, 'valid series');
+  }
+  // A rank far outside the run is its own declaration, so it is not a veto and the run beside it is still read.
+  // This is the direction a membership test has to hold: a veto that reached every rank of the name would hide
+  // every payload behind an unrelated field.
+});
+
+test('issue 146 review R1: a malformed field never manufactures a complete hex-labelled declaration', () => {
+  // R1, blocking, found by independent review of `32811da`: the new reading validated a *prefix* rather than a
+  // field. `escapeListAt` stops at the first character it does not support, the field is still pushed with the bytes
+  // read so far, and `labelledGap` then accepts the discarded suffix as the prose between two fields. So
+  // `completeHexSeries` checked the ranks of retained prefixes rather than of the actual members of the
+  // declaration. Measured at `32811da`, and ALLOWed at the base `1ab0c29`, the shapes below invented the ZIP
+  // signature `50 4b 03 04 00 00 00 00` and were refused `OPAQUE_EMBEDDED` on evidence the sender never wrote: a
+  // declared reconstruction must be the whole field, or nothing.
+  const hex = (byte) => `\\x${byte.toString(16).padStart(2, '0')}`;
+  // A container signature in eight single-escape members: the valid spelling, and the positive control for every
+  // shape below. It is a byte count and a container check, never a registered value, so nothing is planted here.
+  const signature = [0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
+  const members = (first) => [`face1: ${first}`, ...signature.slice(1).map((byte, index) => `face${index + 2}: ${hex(byte)}`)];
+  const labelledObject = (lines) => JSON.stringify({ parts: lines.map((line) =>
+    Object.fromEntries([[line.slice(0, line.indexOf(':')), line.slice(line.indexOf(': ') + 2)]])) });
+  for (const [name, lines] of [
+    // Text attached to the first escape, inside and outside a JSON object member. The object form removes any doubt
+    // that the suffix is prose *between* fields: the whole value is one JSON string member.
+    ['text attached after an escape', members(`${hex(0x50)}oops`)],
+    ['an unsupported escape spelling after a valid one', members(`${hex(0x50)}\\xGG`)],
+    // A same-series member that is not an escape field at all. It disappears before the ranks are checked, so the
+    // run looks complete without it, and the rank the sender repeated is what the run would have declared.
+    ['a repeated same-series member that is not an escape field', ['face1: ordinary', ...members(hex(0x50)).slice(1)]],
+    ['a same-series member written as a plain hexadecimal chunk', [`face1: 50`, ...members(hex(0x50)).slice(1)]],
+    // A value the sender began and did not finish: the last escape of the cell is missing, not the whole value.
+    ['a cell truncated after its second escape', members(`${hex(0x50)} ${hex(0x4b)}`)],
+    // The same defect at a later offset, so the rule is about every member and not about the first one.
+    ...[2, 3, 5].map((at) => {
+      const rows = members(hex(0x50));
+      rows[at] = `${rows[at]}oops`;
+      return [`a suffix on member ${at + 1}`, rows];
+    }),
+  ]) {
+    const payload = lines.join('\n');
+    // Raw text and a JSON body of labelled object members: in both, this reading is the only reader that could
+    // reconstruct the bytes, so these two are what discriminate the finding.
+    for (const container of [payload, labelledObject(lines)]) {
+      const result = credentialOnly(container);
+      assert.equal(result.decision, 'ALLOW',
+        `${name}: a malformed field must reconstruct nothing (${result.reasons.join()})`);
+      assert.deepEqual(result.findings, [], name);
+      assert.ok(result.release instanceof Uint8Array, name);
+    }
+    // A JSON *string* wrapper is not a discriminator: the escape round turns the escapes into literal bytes and
+    // the quoted-string reader refuses the result in every revision, with or without this reading. Measured
+    // identically at `1ab0c29` and at this head, so what is pinned here is only that this reading adds no finding
+    // of its own and releases nothing.
+    const wrapped = credentialOnly(JSON.stringify({ content: payload }));
+    assert.deepEqual(wrapped.findings, [], name);
+    if (wrapped.decision === 'BLOCK') assert.equal(wrapped.release, undefined, name);
+  }
+  // The same eight bytes with every field whole are the declaration this grammar does admit, so the controls above
+  // are about validation and not about the reading having been switched off. A truncated *last* member is whole as
+  // far as this grammar is concerned: it spells fewer bytes, and those are the bytes the sender wrote.
+  for (const lines of [members(hex(0x50)), [...members(hex(0x50)).slice(0, -1), `face8: ${hex(0x50)} ${hex(0x4b)}`]]) {
+    for (const container of [lines.join('\n'), labelledObject(lines), JSON.stringify({ content: lines.join('\n') })]) {
+      const result = credentialOnly(container);
+      assert.equal(result.decision, 'BLOCK', `valid series: ${result.reasons.join()}`);
+      assert.deepEqual(result.reasons, ['OPAQUE_EMBEDDED'], `valid series: ${result.reasons.join()}`);
+      assert.equal(result.release, undefined, 'valid series');
+    }
+  }
+  // The ordinary-label spelling of the same values keeps exactly the outcome it has always had, at the base and at
+  // this head: its own prefix rule is the prior path and this correction does not narrow it. Both refusals come from
+  // the bytes that path already reconstructed, not from the new one.
+  for (const first of [hex(0x50), `${hex(0x50)}oops`]) {
+    const lines = members(first).map((line) => line.replace('face', 'part'));
+    for (const container of [lines.join('\n'), labelledObject(lines)]) {
+      assert.deepEqual(credentialOnly(container).reasons, ['OPAQUE_EMBEDDED'], `ordinary label ${first}`);
+    }
+  }
+});
+
+test('issue 146: ordinary text, configuration and below-floor hex-labelled escapes stay allowed', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // A declared reconstruction is decode-only, so its shape alone blocks nothing. Ordinary prose in escapes across
+  // a complete hex-labelled run, control bytes below the reconstruction floor, dump-shaped offset columns and
+  // ordinary engineering text all keep their documented outcome, in raw text and inside a JSON body.
+  const ordinary = 'ordinary build log about the synthetic service, nothing protected here';
+  for (const payload of [
+    hexEscapeSeries(Buffer.from(ordinary), { label: 'face', perField: 4 }),
+    hexEscapeSeries(Buffer.from(ordinary), { label: 'dead', perField: 2 }),
+    'face1: \\x41\nface2: \\x42\nface3: \\x43',
+    'face1: \\x20 \\x09 \\x0a\nface2: \\x20 \\x09 \\x0a\nface3: \\x20 \\x09 \\x0a',
+    '00000000: \\x41\\x42\\x43\\x44\n00000010: \\x45\\x46\\x47\\x48',
+    'face: \\x41\\x42\\x43\\x44\nd10: \\x45\\x46\\x47\\x48\nd20: \\x49\\x4a\\x4b\\x4c',
+    'offset 00000000:  1f8b 08 00  note about the synthetic build finished',
+    'deadbeef cafe f00d 0000 1111 2222 3333 4444\n5555 6666 7777 8888 9999 aaaa bbbb cccc',
+    'sensor: a1b2c3d4\nreading: b2c3d4e5\nregion: c3d4e5f6',
+  ]) {
+    assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${unknown(payload).reasons.join()}`);
+    assert.equal(unknown(JSON.stringify({ content: payload })).decision, 'ALLOW', `json ${payload.slice(0, 44)}`);
+  }
+  // The one row above whose bytes spell a gzip header is read as a container by the escape round inside a JSON
+  // body. That is the container signature check and not this reading, so both outcomes are pinned separately
+  // here and neither can later be attributed to the series reading.
+  assert.equal(unknown('00000000: \\x1f\\x8b\\x08\\x00\n00000010: \\x00\\x03\\x4b\\x4c').decision, 'ALLOW');
+  assert.deepEqual(unknown(JSON.stringify({ content: '00000000: \\x1f\\x8b\\x08\\x00\n00000010: \\x00\\x03\\x4b\\x4c' })).reasons,
+    ['OPAQUE_EMBEDDED']);
+  // Uncompressed unknown binary inside a declared reconstruction is still the published decode-only limit, and it
+  // is unchanged here: only the byte count or a compressed/container reading refuses such a payload, never its shape.
+  const opaque = escapedOpaqueBytes(96);
+  for (const payload of [hexEscapeSeries(opaque, { perField: 2 }), hexEscapeSeries(opaque, { perField: 1 })]) {
+    assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${unknown(payload).reasons.join()}`);
+  }
+  // A compressed blob in the same spelling is still refused, with no known original registered: a declared
+  // reconstruction waives nothing about what the bytes it spells encode.
+  const compressed = zlib.gzipSync(opaque);
+  for (const perField of [1, 2, 3]) {
+    for (const payload of escapeSeriesContainers(hexEscapeSeries(compressed, { perField }))) {
+      const result = unknown(payload);
+      assert.equal(result.decision, 'BLOCK', `${perField}: ${result.reasons.join()}`);
+      assert.ok(result.reasons.includes('OPAQUE_EMBEDDED'), `${perField}: ${result.reasons.join()}`);
+      assert.equal(result.release, undefined, `${perField}`);
+    }
+  }
+  // Ordinary compressed prose in the same spelling is read as ordinary: no new opaque block from the new reading.
+  const ordinaryStream = zlib.deflateSync(Buffer.from(ordinary));
+  for (const perField of [1, 2, 3]) {
+    assert.equal(unknown(hexEscapeSeries(ordinaryStream, { perField })).decision, 'ALLOW',
+      `ordinary ${perField}: ${unknown(hexEscapeSeries(ordinaryStream, { perField })).reasons.join()}`);
+  }
+});
+
+test('issue 146: the new reading is charged, refuses what it cannot inspect, and still reads', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // The reconstruction budget, the view budget, #6's own decode budget and the message limit are this module's
+  // published bounds, and this reading is charged through exactly the same `DeclaredBudget` as every other declared
+  // reconstruction. What is measured here is behaviour under them, not a wall clock on a maximum-size message: which
+  // bound trips first is a property of the message, so every case below asserts the decision, the reason codes, the
+  // findings and the absence of released bytes, never "it decided something".
+  const spell = (byte) => `%${byte.toString(16).padStart(2, '0')}`;
+  // Distinct joined values, all of them printable ASCII: the index rides in the first bytes, so nothing but this
+  // reader can reconstruct them and the opaque count has nothing to count.
+  const cell = (index) => Array.from({ length: 8 }, (_, slot) =>
+    spell(0x41 + ((index >>> (slot * 6)) % 26))).join(' ');
+  const series = (bytes, label) => [...bytes].map((byte, index) => `${label}${index + 1}: ${spell(byte)}`).join('\n');
+  const noise = (count) => Array.from({ length: count }, (_, index) => `dead${index + 1}: ${cell(index)}`).join('\n');
+  const note = zlib.deflateSync(Buffer.from(SECRET_NOTE));
+  // Utility: a complete declared run whose values spell ordinary text stays ordinary. Measured at `1ab0c29` and at
+  // this head, a raw run stays allowed at every size here and a JSON-wrapped one stops being allowed past a few
+  // hundred fields, which is #6's own decode budget and not this reading; both are pinned as measured.
+  for (const payload of [noise(40), noise(200), noise(600), noise(1000)]) {
+    assert.equal(credentialOnly(payload).decision, 'ALLOW',
+      `${payload.slice(0, 40)} ${credentialOnly(payload).reasons.join()}`);
+  }
+  for (const payload of [noise(40), noise(200)]) {
+    assert.equal(credentialOnly(JSON.stringify({ content: payload })).decision, 'ALLOW',
+      `json ${payload.slice(0, 40)} ${credentialOnly(JSON.stringify({ content: payload })).reasons.join()}`);
+  }
+  // Past a few hundred fields the same content wrapped in a JSON string is uninspectable rather than allowed.
+  // Measured identically at `1ab0c29` and at this head, so the bound belongs to #6 and not to this reading.
+  for (const payload of [noise(600), noise(1000)]) {
+    const wrapped = credentialOnly(JSON.stringify({ content: payload }));
+    assert.equal(wrapped.decision, 'BLOCK', `json ${payload.slice(0, 40)}`);
+    assert.deepEqual(wrapped.reasons, ['UNINSPECTED_CONTENT'], `json ${payload.slice(0, 40)}: ${wrapped.reasons.join()}`);
+    assert.equal(wrapped.release, undefined, 'json bound');
+  }
+  // In-budget demand is reconstructed and inspected, not refused: the same noise beside a planted note still reports
+  // both registered values and releases nothing, so a budget refusal is not standing in for a reading.
+  for (const payload of [`${noise(600)}\n${series(note, 'face')}`,
+    `${noise(600)}\n${series(note, 'face')}\n${noise(600)}`]) blocksWithOriginal(payload, true);
+  // Demand past the published bounds is uninspectable rather than clean: a reason, no findings, no released bytes. A
+  // break the group rule rejects restarts each group's ranks, so each group really is one complete run and the
+  // message is asking for more reconstructions than one message may charge. Measured here, #6's decode budget is
+  // the bound that trips on this spelling; the reconstruction budget shares the same uninspectable outcome.
+  const overflow = Array.from({ length: 32 }, (_, group) => Array.from({ length: 512 }, (_, index) =>
+    `face${index + 1}: ${cell(group * 512 + index)}`).join('\n')).join('\n-- incompatibility-boundary --\n');
+  assert.ok(overflow.length <= MAX_MESSAGE_BYTES, `${overflow.length}`);
+  const refused = check(overflow);
+  assert.equal(refused.decision, 'BLOCK', refused.reasons.join());
+  assert.ok(['SENTINEL_BUDGET', 'UNINSPECTED_CONTENT'].includes(refused.reasons[0]), refused.reasons.join());
+  assert.deepEqual(refused.findings, []);
+  assert.equal(refused.release, undefined);
+  // Stopping early is not a reading either way: the payload behind ordinary padding is still found, and so is the
+  // same payload behind two pages of other declared runs.
+  const padding = 'ordinary log line about the synthetic build\n'.repeat(200);
+  blocksWithOriginal(`${padding}${series(note, 'face')}\n${padding}`, true);
+  // The JSON-string wrapper is the one container whose *precise* claim is weaker, exactly as elsewhere in this
+  // file: the escape round turns the escapes into literal bytes and the quoted-string reader refuses the body
+  // opaquely, so what is pinned here is that nothing is released.
+  blocksLeak(JSON.stringify({ content: `${padding}${series(note, 'face')}` }));
+  blocksWithOriginal(`${noise(600)}\n${series(note, 'face')}\n${noise(600)}`, true);
 });

@@ -692,6 +692,52 @@ function chunkLikeLoose(token: string): boolean {
  * Work is bounded per message and shared by every view and round: each distinct joined value is read once, and a
  * message demanding more reconstructions than the budget allows is uninspectable rather than clean, because
  * stopping early would let a sender hide a payload behind padding.
+ *
+ * **Escape-valued declared series, and exactly what is admitted.** A field whose value is a list of byte escapes
+ * (`%XX`, `\xXX`, `\uXXXX`, octal, `\^X`, `&#xXX;`, `&#NN;`, `=XX`) and whose label names the series is joined with
+ * the other members of that series: `part1: \x1f`, `face1: \x1f`. A label drawn from the hex alphabet is admitted
+ * on the same evidence the chunk reader beside it demands (`completeHexSeries`): its own numbers must declare one
+ * complete run under one name (rank 0 or 1, consecutive, no repeat). For that candidate the field must also be
+ * **whole** -- the escapes it spells and nothing else -- which includes the contiguous ones (`\x50\x51` is two bytes
+ * of one field, as it is one run to the direct reader), and every member of the run must be one this reader read in
+ * full. Three things make a field or a member not-whole, and each withholds the run rather than shortening it:
+ * an unsupported suffix after its last escape (`face1: \x50oops`, `face1: \x50\xGG`), anything but the closing
+ * quote after a **quoted** value (`"\x50\noops"`, `"\x50 cafe1: ordinary"` -- inside a string a line break, a
+ * label or a word is still inside the value, and end of input does not close a quote the sender opened), and a
+ * member of the same name whose value is not an escape list at all (`face1: ordinary`), whether that rank is
+ * missing from the run, duplicated inside it (`FACE01` and `face1` are one rank written twice) or one past its end.
+ * That membership test spans the **numeric** ranks the run covers, never the order the text is in, so reversing the
+ * lines cannot move it.
+ *
+ * The ordinary-label reading is a separate alternative of its own and is not narrowed here: it collects what it
+ * always collected from each field, a bounded prefix up to the first contiguous run of escapes, and it is charged and
+ * yielded beside the whole-cell reading rather than instead of it. Both readings exist for one field; whether the
+ * shorter one should remain is a separate decision this change does not make.
+ *
+ * A veto reaches the **bounded group the member belongs to and nothing else**. Groups are the ones this module
+ * already builds (`labelledGap`, `MAX_DECLARED_FIELDS`), so a field on the other side of a break the group rule
+ * rejects, or of a gap wider than it allows, belongs to another declaration: the run beside it is read on its own.
+ * A rank far outside a run is likewise another declaration and never a veto. A veto that reached further released
+ * nothing it was meant to find.
+ *
+ * The ordinary-label reading keeps its own, older prefix behaviour unchanged, because that is the prior path's
+ * decision and not this reading's.
+ *
+ * What is therefore a published limit rather than a claim:
+ *
+ * - a hex-labelled run whose numbering has a gap, a repeat, or no first member; a hex name carrying no numbers;
+ *   one field. These are the shapes a dump offset column (`face:`, `d10:`, `00000010:`) already has.
+ * - a payload spread across two label names, or across two spellings of one series (one member written as a plain
+ *   hexadecimal chunk). The series reader joins one series and never a subset of it, so leaving a member out ends
+ *   the declaration rather than shifting it.
+ * - a value that continues into a labelled assignment with nothing but whitespace after it: `face1: \x41 face2:
+ *   \x42` and `face1: \x41 face2: \x42 oops` are the same text to this reader, and it resolves them as the
+ *   declaration rather than as an unfinished value.
+ * - a JSON **string** wrapper is not a discriminator for any of this: the escape round turns the escapes into
+ *   literal bytes and the quoted-string reader refuses the body, in every revision, with or without this reading.
+ *   The tests pin only that this reading adds no finding and releases nothing there.
+ * - the hex byte-pair list and the chunk join above, which stay decode-only and are never counted opaque. Only a
+ *   compressed stream, a container signature, the opaque byte count or a matched original can refuse them.
  */
 const MAX_DECLARED_RUNS = 16384;
 const MAX_DECLARED_UNITS = 8 << 20;
@@ -993,18 +1039,55 @@ const LABELLED_HEAD = /(?<![A-Za-z0-9_\\])(?:\\[nrtbfunx0-7])?([A-Za-z][A-Za-z0-
  * n/2 series and each costs its own size. A group whose fields are *not* one series is still read, one name at a
  * time; a payload spread across two declared names is not, which is the limit the chunk reader already publishes.
  *
- * Fields whose label comes from the hex alphabet (`face1: \x1f`) are excluded here. That is **stricter** than the
- * chunk reader beside it, which reads the same fields when `completeHexSeries` declares a complete series: a
- * hex-labelled escape series is therefore not reconstructed at one escape per field, which is a published gap and
- * not a parity. It is the same trade the chunk reader makes for a dump offset column, which carries numbers too and
- * is told apart from a declaration only by a complete run.
+ * A hex-alphabet label (`face1: \x1f`, `dead: 1f8b0800`) is not a declaration on its own, because a dump offset
+ * column is written the same way and carries numbers too. The exclusion from the name series above is therefore
+ * replaced, not widened, by the same rule the chunk reader beside it uses: a hex-labelled field joins an escape
+ * series when — and only when — `completeHexSeries` says its own numbers declare one complete run (rank 0 or 1,
+ * consecutive, no repeat) under one label name. Before this rule a zlib stream spelled `face1: \xHH`, `face2: …`
+ * joined no reading at all and a registered original and canary were released with their bytes, while the
+ * ordinary-label and byte-pair spellings of the same bytes were refused. A dump offset column, a hex name with
+ * no numbers, one field, a gap in the numbering and two names alternating are all still not one declaration, and
+ * a part written as a plain hexadecimal chunk still leaves the escape run incomplete rather than joining it: the
+ * series reader joins one series and never a subset of it, which is the limit every declared form already
+ * These readings are **added** to the name series above, so no field that used to be read stops being read, and
+ * they are charged through the same per-message budget.
+ *
+ * A member of a hex-labelled run that this reader could not reconstruct whole — a field with an unsupported
+ * suffix after its last escape, or a field of that name and rank whose value is not an escape list at all — is
+ * still a member the sender wrote, so the run over that name is not complete and no reading is offered for it.
+ * `incomplete` carries those identities from the collector below. The rule is confined to this candidate: the
+ * name-series readings above keep exactly the prefix behaviour they have always had, because changing that is
+ * the prior path's own decision and not this reading's.
  */
-function escapeReadings(entries: readonly DeclaredEntry[]): DeclaredReading[] {
+function escapeReadings(prefix: readonly DeclaredEntry[], whole: readonly DeclaredEntry[],
+  incomplete: readonly HexMember[]): DeclaredReading[] {
   const readings: DeclaredReading[] = [];
-  for (const candidate of labelledSeries(entries.filter((entry) => !entry.hexLabel))) {
+  // The ordinary-name series, over the escapes each field held before this change: a declared alternative of its
+  // own, charged like every other reconstruction, and left exactly as it was.
+  for (const candidate of labelledSeries(prefix.filter((entry) => !entry.hexLabel))) {
     if (candidate.entries.length < MIN_DECLARED_VALUES) continue;
     readings.push({ entries: candidate.entries, minimum: MIN_DECLARED_VALUES, escaped: true });
     const numbered = numericOrder(candidate.entries);
+    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES, escaped: true });
+  }
+  // The hex-labelled candidate, over whole fields. `completeHexSeries` returns its members in the order the sender
+  // wrote them, so the span below is computed from the **numeric ranks** of all of them and never from the first one
+  // in text order: reversing the lines used to move the span from 1..N to N..2N, which both vetoed an unrelated rank
+  // that was nothing to do with the run and read past a member at rank 1 that the run was missing.
+  for (const members of completeHexSeries(whole)) {
+    const first = hexMember(members[0]!.label);
+    let lowest = Number.POSITIVE_INFINITY, highest = Number.NEGATIVE_INFINITY;
+    for (const entry of members) {
+      const rank = hexMember(entry.label);
+      if (rank !== null) { lowest = Math.min(lowest, rank.rank); highest = Math.max(highest, rank.rank); }
+    }
+    // Full membership, over that span: a member of the same name this reader could not reconstruct, at a rank inside
+    // or beside it, is one the sender wrote -- the member the run is missing, or a second spelling of one it has. A
+    // rank far outside is another declaration and is never a veto, so an unrelated field cannot hide a payload.
+    if (first !== null && incomplete.some((entry) => entry.name === first.name
+      && entry.rank >= lowest - 1 && entry.rank <= highest + 1)) continue;
+    readings.push({ entries: members, minimum: MIN_DECLARED_VALUES, escaped: true });
+    const numbered = numericOrder(members);
     if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES, escaped: true });
   }
   return readings;
@@ -1024,27 +1107,70 @@ function escapeReadings(entries: readonly DeclaredEntry[]): DeclaredReading[] {
  */
 function* labelledEscapeRuns(text: string, budget: DeclaredBudget): Generator<EncodedRun> {
   if (!HAS_LABEL.test(text)) return;
-  let group: DeclaredEntry[] = [];
+  /**
+   * The two readings this collector produces from the same fields, side by side and never instead of each other:
+   * `prefix` is the escapes a field holds before a contiguous run of them, which is what this reader has always
+   * collected and what the ordinary-name series is built from, and `whole` is every escape the field holds, which is
+   * what the hex-labelled candidate needs so that a field is reconstructed whole or not at all. Each is charged and
+   * yielded as its own reading.
+   */
+  let prefix: DeclaredEntry[] = [], whole: DeclaredEntry[] = [];
+  /**
+   * Hex-labelled numbered members near this group that were not reconstructed whole, each with where it was
+   * written and whether the text that reaches it continues the group. A member on the other side of a break the
+   * group rule rejects, or of a gap it does not allow, belongs to a different declaration and is dropped with it:
+   * a veto that reached past its own group suppressed valid series beside it and released what it was meant to
+   * find. Cleared with the group.
+   */
+  const incomplete: (HexMember & { at: number; length: number; joins: boolean })[] = [];
   let start = 0, end = 0;
   let previous: { at: number; end: number } | null = null;
   const flush = function* (): Generator<EncodedRun> {
-    if (group.length) yield* declaredRuns(start, end, escapeReadings(group), budget);
-    group = [];
+    if (whole.length) {
+      // A member ahead of this group vetoes it only when the text between them would have continued one.
+      const blocked = incomplete.filter((entry) => entry.joins
+        || entry.at < start && labelledGap(text.slice(entry.at + entry.length, start)));
+      yield* declaredRuns(start, end, escapeReadings(prefix, whole, blocked), budget);
+    }
+    prefix = [];
+    whole = [];
+    incomplete.length = 0;
     previous = null;
   };
   for (const head of text.matchAll(LABELLED_HEAD)) {
     const at = head.index!;
-    const pieces = escapeListPieces(text, at + head[0].length);
+    const label = head[1]!;
+    const member = hexMember(label);
+    const hexLabel = !/[g-zG-Z]/u.test(label);
+    const quote = head[0].endsWith('"') ? '"' : head[0].endsWith("'") ? "'" : '';
+    const valueAt = at + head[0].length;
+    const prefixPieces = escapeListPieces(text, valueAt, false);
+    const wholePieces = escapeListPieces(text, valueAt, true);
     // Not an escape-valued field, so it belongs to no reading here: `LABELLED_FIELD` may still read it as a chunk.
-    if (!pieces.length) continue;
-    const gap = previous ? text.slice(previous.end, at) : '';
-    if (previous && (!labelledGap(gap) || group.length + pieces.length > MAX_DECLARED_FIELDS)) yield* flush();
-    if (group.length === 0) start = at;
-    for (const piece of pieces) {
-      group.push({ label: head[1]!, value: hexBytes(piece.bytes), hexLabel: !/[g-zG-Z]/u.test(head[1]!) });
+    // For a hex-labelled numbered name it is also a member of that declaration, and one this reader cannot
+    // reconstruct must not be counted among the ones it did.
+    if (!prefixPieces.length) {
+      if (member !== null) {
+        incomplete.push({ ...member, at, length: head[0].length,
+          joins: previous !== null && labelledGap(text.slice(previous.end, at)) });
+      }
+      continue;
     }
-    end = pieces.at(-1)!.end;
-    previous = { at, end: pieces.at(-1)!.end };
+    const gap = previous ? text.slice(previous.end, at) : '';
+    if (previous && (!labelledGap(gap) || whole.length + wholePieces.length > MAX_DECLARED_FIELDS)) yield* flush();
+    if (whole.length === 0) start = at;
+    const entries = (pieces: readonly { bytes: number[] }[]) =>
+      pieces.map((piece) => ({ label, value: hexBytes(piece.bytes), hexLabel }));
+    prefix.push(...entries(prefixPieces));
+    whole.push(...entries(wholePieces));
+    end = wholePieces.at(-1)!.end;
+    previous = { at, end };
+    // A field the sender did not finish is still collected for the name-series reading, which has always read the
+    // escapes it can see; only the hex-labelled candidate above needs the whole field, so only it is withheld.
+    // It is inside the group by construction, so it always vetoes it.
+    if (member !== null && !wholeEscapeField(text, end, quote)) {
+      incomplete.push({ ...member, at, length: head[0].length, joins: true });
+    }
   }
   yield* flush();
 }
@@ -1474,12 +1600,21 @@ function* textEscapeRuns(text: string, separated: boolean): Generator<EncodedRun
  * list: a declared series whose every field carries a single escape is one byte stream, not a sequence of
  * one-byte runs below the floor.
  */
-function escapeListAt(text: string, at: number): { bytes: number[]; end: number } | null {
+function escapeListAt(text: string, at: number, contiguous: boolean): { bytes: number[]; end: number } | null {
   const first = escapedByteAt(text, at);
   if (first === null) return null;
   const bytes = [first.byte];
   let end = first.end;
   while (bytes.length < MAX_ESCAPED_RUN) {
+    // `contiguous` is the whole-field candidate's rule, not this helper's: for it a contiguous escape belongs to
+    // the same value as the one before it, because the direct reader treats `\x50\x51` as one run and a field the
+    // reader half-reads is a stream the sender never wrote. It is tried *before* the separator rule below, never
+    // instead of it. The ordinary-name reading keeps that rule on its own, because the prefix it collects is a
+    // declared alternative of its own and narrowing it is a separate decision this change does not make.
+    if (contiguous) {
+      const next = escapedByteAt(text, end);
+      if (next !== null) { bytes.push(next.byte); end = next.end; continue; }
+    }
     const skip = escapeSeparatorEnd(text, end);
     if (skip < 0) break;
     const next = escapedByteAt(text, skip);
@@ -1489,6 +1624,73 @@ function escapeListAt(text: string, at: number): { bytes: number[]; end: number 
   }
   return { bytes, end };
 }
+/** The label grammar `LABELLED_HEAD` uses, anchored so it can only match at one position. */
+const LABELLED_HEAD_AT = new RegExp(LABELLED_HEAD.source, 'uy');
+/**
+ * What a field's own formatting may add after its last escape: the between-escape separator class, plus the
+ * structural closers a JSON body writes around a value and the brackets a line of text may be wrapped in. This is
+ * a rule about the text *after* a value, so it decides where the field's value ends and never contributes a byte
+ * of it. A letter or a digit is not one, which is the whole point: `face1: \x50oops` carries a suffix, not padding.
+ */
+const FIELD_TAIL = /^[ \t\r\n,;:|.&"'[\]{}())\]]$/u;
+/**
+ * Whether the escape list ending at `end` is the **whole** value of its field. `escapeListAt` stops at the first
+ * character it does not support, so on its own it cannot tell a finished value from one the sender began and
+ * abandoned: `face1: \x50oops` and `face1: \x50\xGG` both read as one byte, and `labelledGap` then accepts the
+ * dropped suffix as the prose between two fields. A reconstruction taken from such a prefix invents a stream out
+ * of part of a field the sender never finished writing, which at `32811da` refused the ZIP signature the sender
+ * wrote only one byte of.
+ *
+ * A field is whole when the next character is another escape (the contiguous escapes the direct reader owns, and
+ * which this reader has always collected exactly as far as the list rule reached), or when everything between the
+ * last escape and what follows is a bounded separator run and that run ends the text, ends the line, or is followed
+ * by the next label. A suffix *inside* the field's own line is what this cannot see apart from a value, and it
+ * resolves that in favour of the declaration.
+ */
+function wholeEscapeField(text: string, end: number, quote: string): boolean {
+  // Inside a quoted value only the closing quote ends it, and end of input is not one: a field the sender opened and
+  // never closed is not a field. A line break, a label or a word written between two escapes of a JSON string or a
+  // byte literal is still inside the value, so treating it as formatting after the value dropped it and
+  // reconstructed a stream the sender never wrote.
+  if (quote !== '') {
+    let at = end;
+    while (at < text.length && /[ \t\r\n]/u.test(text[at]!)) at++;
+    return text[at] === quote;
+  }
+  if (end >= text.length) return true;
+  // The next escape continues the same value across a separator run the list rule has not reached.
+  if (escapedByteAt(text, end) !== null) return true;
+  const limit = Math.min(text.length, end + MAX_ESCAPE_SEPARATOR);
+  let after = end, line = false;
+  while (after < limit) {
+    // A character that opens an escape belongs to a value, not to formatting: the value simply continues.
+    if (escapedByteAt(text, after) !== null) break;
+    const json = after + 2 <= limit ? ESCAPE_JSON_SEPARATOR.exec(text.slice(after, after + 2))?.[0] : undefined;
+    if (json !== undefined) { line = line || json === '\\n' || json === '\\r'; after += 2; continue; }
+    const char = text[after]!;
+    if (!FIELD_TAIL.test(char)) break;
+    if (char === '\n' || char === '\r') line = true;
+    after += 1;
+  }
+  // The text ends here, or the field's own line does: whatever follows is another field or another sentence.
+  if (after === text.length || line) return true;
+  if (after === end) return false;
+  LABELLED_HEAD_AT.lastIndex = after;
+  return LABELLED_HEAD_AT.test(text);
+}
+/** One member of a hex-labelled numbered series: the name it shares, and the rank as a number. */
+interface HexMember { name: string; rank: number }
+/**
+ * The member a hex-alphabet label declares, or null when it declares none. A hex label is a value the sender
+ * wrote before a colon unless its own numbers declare a complete run, so the name and the rank together are what
+ * two members of one declaration share. The rank is compared **as a number**: `face1` and `FACE01` are one member
+ * written twice, exactly as `completeHexSeries` already treats them, and a string comparison hid the duplicate.
+ */
+function hexMember(label: string): HexMember | null {
+  if (/[g-zG-Z]/u.test(label)) return null;
+  const rank = NUMERIC_LABEL.exec(label);
+  return rank === null ? null : { name: rank[1]!.toLowerCase(), rank: Number(rank[2]!) };
+}
 /**
  * Every escape list one labelled field holds, as one or more pieces of at most `MAX_ESCAPED_RUN` bytes. A field
  * longer than that bound is split exactly as the direct reader splits a long run, and the split drops no byte:
@@ -1496,11 +1698,11 @@ function escapeListAt(text: string, at: number): { bytes: number[]; end: number 
  * field spells. Without the split a payload straddling the bound would be truncated to its first piece, decode
  * nothing, and — like every declared reconstruction — carry no opaque bytes of its own.
  */
-function escapeListPieces(text: string, at: number): { bytes: number[]; end: number }[] {
+function escapeListPieces(text: string, at: number, contiguous: boolean): { bytes: number[]; end: number }[] {
   const pieces: { bytes: number[]; end: number }[] = [];
   let cursor = at;
   for (;;) {
-    const piece = escapeListAt(text, cursor);
+    const piece = escapeListAt(text, cursor, contiguous);
     if (piece === null) return pieces;
     pieces.push(piece);
     if (piece.bytes.length < MAX_ESCAPED_RUN) return pieces;
