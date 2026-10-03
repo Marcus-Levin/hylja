@@ -738,6 +738,37 @@ function chunkLikeLoose(token: string): boolean {
  *   The tests pin only that this reading adds no finding and releases nothing there.
  * - the hex byte-pair list and the chunk join above, which stay decode-only and are never counted opaque. Only a
  *   compressed stream, a container signature, the opaque byte count or a matched original can refuse them.
+ *
+ * **Hex-labelled byte-pair series.** A field whose whole value is two-digit hex cells separated by formatting --
+ * `face1: 50 4b`, `face2: 03 04` -- is a member of a declared byte-pair series when it shares one hex-alphabet name
+ * with members whose ranks are consecutive, unique and start at 0 or 1 (`completeHexSeries`, the same rule as
+ * above), and the series is read in text order and in numeric-label order. This is what a JSON container needs and
+ * what the byte-pair reader alone cannot do: a JSON member is separated from the next by `"},{"face2":"`, whose
+ * braces are outside both the byte-pair reader's separator class and the labelled chunk reader's value class, so
+ * every member used to be decoded on its own and a compressed registered value written this way was released.
+ *
+ * The grammar, in full. A cell is exactly two hex digits; the formatting between two cells is bounded and **a line
+ * break ends the value**, because the label of the next field is written from letters that are also hex digits and
+ * `face2` would otherwise read as two more cells. A field is whole only when what follows its last cell is the end
+ * of the text, the end of its line, the next label, or -- when the value was quoted -- its closing quote. A field
+ * that is not a byte-pair list, one with a suffix the reader does not support, and one whose member is missing,
+ * duplicated (`FACE01` and `face1`) or out of numbering all withhold the series rather than shortening it, and a
+ * member that is not hex-labelled at all, or a rank past the end, is another declaration and never a veto. There is
+ * no floor on the cells in one member: what makes a declaration is the series and its membership, never the width of
+ * a member.
+ *
+ * Like every other declared reconstruction it is **decode-only**. A list of pairs that decodes to nothing, to
+ * ordinary text, or to unregistered bytes under the opaque count is released exactly as before; what changes is that
+ * the bytes are reachable, so a stream inside them is inflated and matched and a registered value inside them is
+ * found. It is charged through the same per-message `DeclaredBudget`, and it is read in both orderings so neither the
+ * text order nor the numbers is the only way a payload can be seen.
+ *
+ * What makes a field's evidence is how it was **written**, not how its bytes happen to be mixed, so the collector
+ * marks what it validated (`DeclaredEntry.pairList`) and `declaredRuns` does not re-judge those values with the
+ * chunk shape heuristics. Those heuristics are about whether a *token* looks encoded, which is a different question
+ * from whether a field is a byte-pair list: a stored deflate stream of digit-only or letter-only cells is a
+ * perfectly good declaration and used to be dropped for failing a question it was never asked. Nothing else is
+ * admitted with the mark, because only this collector sets it.
  */
 const MAX_DECLARED_RUNS = 16384;
 const MAX_DECLARED_UNITS = 8 << 20;
@@ -766,6 +797,19 @@ interface DeclaredEntry {
    * (a dump offset column) rather than a key, so it joins no reading until its own numbers make it a declared
    * series: see `completeHexSeries`. */
   hexLabel: boolean;
+  /**
+   * Set by a collector that has already validated this field's own **spelling**, so the normalized `value` is
+   * evidence in its own right and `declaredRuns` must not re-guess it from the bytes.
+   *
+   * The byte-pair collector is the case that needs this. It reads a whole field as two-digit hex cells separated by
+   * formatting and stores those cells concatenated, which is what a reconstruction wants and is not what the shape
+   * heuristics read. Judging the normalized value with them asks whether a token *looks* encoded -- usually a digit
+   * next to a hex letter, as in `1f` or `e0` -- so a legitimate digit-only or letter-only cell was not evidence, a
+   * stored deflate stream fell under the half-way mark, and the whole reading was dropped before it produced
+   * anything. The evidence is a fact about how the field was written, so it travels with the entry rather than being
+   * reconstructed from a different representation downstream.
+   */
+  pairList?: true;
 }
 /** One candidate reading of a group: its values in reading order, and how many of them it requires. */
 interface DeclaredReading {
@@ -832,7 +876,11 @@ function* declaredRuns(start: number, end: number, readings: readonly DeclaredRe
     if (entries.length < reading.minimum) continue;
     const evidence = reading.evidence ?? entries;
     // A reading of byte escapes is judged by its spelling, not by the shape of the bytes it spells.
-    if (reading.escaped !== true) {
+    if (reading.escaped !== true
+      && !evidence.every((entry) => entry.pairList === true)) {
+      // A field a collector already validated as a whole byte-pair list carries that evidence with it, so the shape
+      // heuristics below do not apply to it and cannot veto it for how its bytes happen to be mixed. Everything else
+      // is judged exactly as before.
       if (evidence.filter((entry) => chunkLikeLoose(entry.value)).length < evidence.length * 0.5) continue;
       if (!evidence.some((entry) => chunkLike(entry.value) || HEX_GROUP.test(entry.value))) continue;
     }
@@ -1070,27 +1118,110 @@ function escapeReadings(prefix: readonly DeclaredEntry[], whole: readonly Declar
     const numbered = numericOrder(candidate.entries);
     if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES, escaped: true });
   }
-  // The hex-labelled candidate, over whole fields. `completeHexSeries` returns its members in the order the sender
-  // wrote them, so the span below is computed from the **numeric ranks** of all of them and never from the first one
-  // in text order: reversing the lines used to move the span from 1..N to N..2N, which both vetoed an unrelated rank
-  // that was nothing to do with the run and read past a member at rank 1 that the run was missing.
-  for (const members of completeHexSeries(whole)) {
+  readings.push(...hexSeriesReadings(whole, incomplete, true));
+  return readings;
+}
+/**
+ * The hex-labelled complete runs of one group, in text order and in numeric-label order, that `incomplete` does not
+ * veto. Both hex-labelled readers share this so that they cannot drift apart on what a declaration is.
+ *
+ * The span comes from the **numeric ranks** of all the members and never from the first one in text order:
+ * `completeHexSeries` returns members as the sender wrote them, so reversing the lines used to move the span from
+ * 1..N to N..2N, which both vetoed an unrelated rank that was nothing to do with the run and read past a member at
+ * rank 1 that the run was missing. A rank far outside the span is another declaration and is never a veto, so an
+ * unrelated field cannot hide a payload either.
+ */
+function hexSeriesReadings(entries: readonly DeclaredEntry[], incomplete: readonly HexMember[],
+  escaped: boolean): DeclaredReading[] {
+  const readings: DeclaredReading[] = [];
+  for (const members of completeHexSeries(entries)) {
     const first = hexMember(members[0]!.label);
     let lowest = Number.POSITIVE_INFINITY, highest = Number.NEGATIVE_INFINITY;
     for (const entry of members) {
       const rank = hexMember(entry.label);
       if (rank !== null) { lowest = Math.min(lowest, rank.rank); highest = Math.max(highest, rank.rank); }
     }
-    // Full membership, over that span: a member of the same name this reader could not reconstruct, at a rank inside
-    // or beside it, is one the sender wrote -- the member the run is missing, or a second spelling of one it has. A
-    // rank far outside is another declaration and is never a veto, so an unrelated field cannot hide a payload.
     if (first !== null && incomplete.some((entry) => entry.name === first.name
       && entry.rank >= lowest - 1 && entry.rank <= highest + 1)) continue;
-    readings.push({ entries: members, minimum: MIN_DECLARED_VALUES, escaped: true });
+    readings.push({ entries: members, minimum: MIN_DECLARED_VALUES, escaped });
     const numbered = numericOrder(members);
-    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES, escaped: true });
+    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES, escaped });
   }
   return readings;
+}
+/**
+ * Byte-pair lists written as the values of one hex-labelled numbered series — `face1: 50 4b`, `face2: 03 04`, … —
+ * rebuilt as the one byte string that series spells. Before this reading each field was read on its own by the
+ * byte-pair reader, which decodes and never counts; a JSON member is separated from the next by `"},{"face2":"`, whose
+ * braces are outside that reader's separator class and outside the labelled chunk reader's value class, so the
+ * members of a series were never joined and a compressed registered value written this way was released with the
+ * exact input.
+ *
+ * The grammar is the one `completeHexSeries` already uses for a hex-labelled declaration, plus whole fields:
+ * every field is a whole list of two-digit hex cells, every member of the run is one this reader read whole, the run
+ * carries one name and consecutive unique ranks from 0 or 1, and a field that is not a byte-pair list at all, or one
+ * with a suffix the reader does not support, withholds the run rather than being dropped from it. Fields are grouped
+ * by the gap rule every other labelled reader uses, so a field on the other side of a break is another declaration.
+ *
+ * It is **decode-only**, like every other declared reconstruction: it adds no opaque bytes of its own, so a list of
+ * pairs that decodes to nothing, or to ordinary text, is released as before. What it changes is that the bytes are
+ * reachable, so a stream inside them is inflated and matched and a registered value inside them is found. It is
+ * charged through the same per-message `DeclaredBudget` as every other declared reading.
+ */
+function* labelledPairRuns(text: string, budget: DeclaredBudget): Generator<EncodedRun> {
+  if (!HAS_LABEL.test(text)) return;
+  let group: DeclaredEntry[] = [];
+  /**
+   * Hex-labelled numbered members of this group this reader could not read whole, with where each was written and
+   * whether the text that reaches it continues the group, exactly as the escape reader records them.
+   */
+  const incomplete: (HexMember & { at: number; length: number; joins: boolean })[] = [];
+  let start = 0, end = 0;
+  let previous: { at: number; end: number } | null = null;
+  const flush = function* (): Generator<EncodedRun> {
+    if (group.length) {
+      // A member ahead of this group vetoes it only when the text between them would have continued one.
+      const blocked = incomplete.filter((entry) => entry.joins
+        || entry.at < start && labelledGap(text.slice(entry.at + entry.length, start)));
+      yield* declaredRuns(start, end, hexSeriesReadings(group, blocked, false), budget);
+    }
+    group = [];
+    incomplete.length = 0;
+    previous = null;
+  };
+  for (const head of text.matchAll(LABELLED_HEAD)) {
+    const at = head.index!;
+    const label = head[1]!;
+    const member = hexMember(label);
+    const quote = head[0].endsWith('"') ? '"' : head[0].endsWith("'") ? "'" : '';
+    const pieces = pairListPieces(text, at + head[0].length);
+    // Not a byte-pair field, so it belongs to no reading here. For a hex-labelled numbered name it is still a
+    // member of that declaration, and one this reader cannot reconstruct must not be counted among the ones it did.
+    if (!pieces.length) {
+      if (member !== null) {
+        incomplete.push({ ...member, at, length: head[0].length,
+          joins: previous !== null && labelledGap(text.slice(previous.end, at)) });
+      }
+      continue;
+    }
+    const gap = previous ? text.slice(previous.end, at) : '';
+    if (previous && (!labelledGap(gap) || group.length + pieces.length > MAX_DECLARED_FIELDS)) yield* flush();
+    if (group.length === 0) start = at;
+    // A field longer than the per-field bound is split exactly as the escape reader splits a long one, and the split
+    // drops no cell: every piece carries the field's own label, so the series concatenates them back.
+    // `piece.hex` is the field's cells concatenated, which is what a reconstruction wants. The evidence is that the
+    // field was read as a whole list of two-digit hex cells, so it is marked rather than left for a downstream
+    // heuristic to infer from those bytes.
+    for (const piece of pieces) {
+      group.push({ label, value: piece.hex, hexLabel: !/[g-zG-Z]/u.test(label), pairList: true });
+    }
+    end = pieces.at(-1)!.end;
+    previous = { at, end };
+    if (member !== null && !wholePairField(text, end, quote)) {
+      incomplete.push({ ...member, at, length: head[0].length, joins: true });
+    }
+  }
+  yield* flush();
 }
 /**
  * Escapes written as the values of one declared label series — `part1: \x1f`, `part2: \x8b`, … — rebuilt as the
@@ -1379,6 +1510,7 @@ function* encodedRuns(text: string, budget: DeclaredBudget): Generator<EncodedRu
   yield* chunkSequences(text, /^(?:[\s,"'[\]:;|.&]|\\[nrt]){1,64}$/u, true);
   // Representations that declare their own reconstruction, decode-only and budgeted per message.
   yield* labelledChunkRuns(text, budget);
+  yield* labelledPairRuns(text, budget);
   yield* labelledEscapeRuns(text, budget);
   yield* separatorChunkRuns(text, budget);
   yield* decimalByteRuns(text, budget);
@@ -1680,6 +1812,90 @@ function wholeEscapeField(text: string, end: number, quote: string): boolean {
 }
 /** One member of a hex-labelled numbered series: the name it shares, and the rank as a number. */
 interface HexMember { name: string; rank: number }
+/**
+ * Cells one field of a declared byte-pair series may hold before it is split; the split bound is the escape
+ * reader's own byte bound. There is deliberately **no floor** on the cells in one field: what makes a declaration
+ * is the series and its membership, not the width of a member, and this reading's authority is never opacity (it is
+ * decode-only) but the bytes it reconstructs and what they decode to.
+ */
+const MAX_PAIR_CELLS = MAX_ESCAPED_RUN;
+/** The formatting that may sit between two cells of one field, bounded as every separator run here is. */
+const PAIR_GAP = /^[ \t\r\n,;:|.&]$/u;
+const PAIR_CELL = /^[0-9A-Fa-f]{2}$/u;
+function pairCellAt(text: string, at: number): number {
+  return PAIR_CELL.test(text.slice(at, at + 2)) ? 2 : 0;
+}
+/**
+ * The end of the formatting run between two cells, or `at` when there is none. A **line break ends the value**: the
+ * next line is another line of the document, not more of this field's value, and hex labels are written from letters
+ * that are also hex digits, so without this the label of the next field (`face2`) was read as two more cells and the
+ * field ran past the value it declared. Inside a JSON object the members are on one line and are separated by braces
+ * and quotes, which are not this class either, so the same rule holds there.
+ */
+function pairGapEnd(text: string, at: number): number {
+  const limit = Math.min(text.length, at + MAX_ESCAPE_SEPARATOR);
+  let end = at;
+  while (end < limit && PAIR_GAP.test(text[end]!)) {
+    if (text[end] === '\n' || text[end] === '\r') return end;
+    end++;
+  }
+  return end;
+}
+/**
+ * One byte-pair field as a whole, or null when its value is not one. Every cell is exactly two hex digits and every
+ * two cells are separated by formatting, which is what keeps this reader and the labelled **chunk** reader from ever
+ * claiming the same field: a contiguous hexadecimal value belongs to the chunk reader, and a field of pairs does
+ * not. The value is read to its last cell and what follows it is judged by `wholePairField` below, so a value with a
+ * suffix is returned here and refused there rather than silently shortened here.
+ */
+function pairListPieces(text: string, at: number): { hex: string; end: number; cells: number }[] {
+  const pieces: { hex: string; end: number; cells: number }[] = [];
+  let cursor = at;
+  for (;;) {
+    if (pairCellAt(text, cursor) === 0) return pieces.length ? pieces : [];
+    let hex = '', end = cursor, cells = 0;
+    while (cells < MAX_PAIR_CELLS) {
+      if (pairCellAt(text, end) === 0) break;
+      hex += text.slice(end, end + 2);
+      end += 2;
+      cells++;
+      const gap = pairGapEnd(text, end);
+      if (gap === end || pairCellAt(text, gap) === 0) break;
+      end = gap;
+    }
+    pieces.push({ hex, end, cells });
+    if (cells < MAX_PAIR_CELLS) return pieces;
+    const gap = pairGapEnd(text, end);
+    if (gap === end || pairCellAt(text, gap) === 0) return pieces;
+    cursor = gap;
+  }
+}
+/**
+ * Whether the cells ending at `end` are the **whole** value of their field, by the same rule the escape series uses:
+ * a quoted value ends only at its closing quote, and otherwise the value ends at the end of the text, the end of its
+ * own line, or the next label. A suffix the reader does not support is not formatting, so the field is refused
+ * rather than read up to where the suffix begins.
+ */
+function wholePairField(text: string, end: number, quote: string): boolean {
+  if (quote !== '') {
+    let at = end;
+    while (at < text.length && /[ \t\r\n]/u.test(text[at]!)) at++;
+    return text[at] === quote;
+  }
+  if (end >= text.length) return true;
+  const limit = Math.min(text.length, end + MAX_ESCAPE_SEPARATOR);
+  let after = end, line = false;
+  while (after < limit) {
+    const char = text[after]!;
+    if (!FIELD_TAIL.test(char)) break;
+    if (char === '\n' || char === '\r') line = true;
+    after += 1;
+  }
+  if (after === text.length || line) return true;
+  if (after === end) return false;
+  LABELLED_HEAD_AT.lastIndex = after;
+  return LABELLED_HEAD_AT.test(text);
+}
 /**
  * The member a hex-alphabet label declares, or null when it declares none. A hex label is a value the sender
  * wrote before a colon unless its own numbers declare a complete run, so the name and the rank together are what

@@ -3240,3 +3240,262 @@ test('issue 146: the new reading is charged, refuses what it cannot inspect, and
   blocksLeak(JSON.stringify({ content: `${padding}${series(note, 'face')}` }));
   blocksWithOriginal(`${noise(600)}\n${series(note, 'face')}\n${noise(600)}`, true);
 });
+
+/* ---------- Issue #148: a complete hex-labelled byte-pair series, in every container it is written in ---------- */
+
+/**
+ * Issue #148, red at the source base `e28e6f2`, reproduced here from the public interface with invented values only.
+ * A deflated registered value written as space-separated two-digit hex cells, one eight-byte group per hex-labelled
+ * `face1`/`face2`/... object member and serialized as `{parts:[...]}`, returned `ALLOW` **with the exact input
+ * release** and no finding for both an `ORIGINAL` and a `CANARY`, at 188 bytes. The same bytes as raw
+ * newline-delimited `faceN:` fields blocked with the precise registered-value finding, so this is a
+ * representation-dependent miss in a **declared** reconstruction and not the deliberate unknown-binary decode-only
+ * limit, which is about unregistered compressed or opaque bytes and is unchanged here.
+ *
+ * The reason is structural and worth stating: a JSON member is separated from the next by `"},{"face2":"`, whose
+ * braces are outside both the byte-pair reader's separator class and the labelled chunk reader's value class. Each
+ * field is therefore decoded on its own, as eight bytes that decode to nothing, and no reading ever joins the members
+ * of the series. This group is about the **declared byte-pair series**: the fields it is allowed to join, the ones it
+ * must not, and the containers it must behave the same way in.
+ *
+ * The values are registered one at a time so the series under test is the only way each payload can be found, and
+ * each case is checked against its own handle so nothing depends on which fingerprint prefilter a handle has.
+ */
+const ISSUE148_ENTRIES = Object.freeze([
+  Object.freeze({ kind: 'ORIGINAL', value: 'synthetic-author-person.invalid', ref: 'issue148.original' }),
+  Object.freeze({ kind: 'CANARY', value: 'synthetic-author-canary.invalid', ref: 'issue148.canary' }),
+]);
+/** Two-digit lowercase hex cells, the spelling this issue is about. */
+const issue148Hex = (byte) => byte.toString(16).padStart(2, '0');
+/** A deflated registered value as byte-pair groups of `width` bytes, labelled `face1`, `face2`, ... in text order. */
+const issue148Groups = (bytes, width) => {
+  const groups = [];
+  for (let at = 0; at < bytes.length; at += width) {
+    groups.push(`face${groups.length + 1}: ${[...bytes.subarray(at, at + width)].map(issue148Hex).join(' ')}`);
+  }
+  return groups;
+};
+const issue148Raw = (lines) => lines.join('\n');
+const issue148Object = (lines) => JSON.stringify({ parts: lines.map((line) => Object.fromEntries(
+  [[line.slice(0, line.indexOf(':')), line.slice(line.indexOf(': ') + 2)]])) });
+const issue148ReversedLines = (lines) => [...lines].reverse();
+const issue148ReversedRanks = (lines, total) => lines.map((line, index) => `face${total - index}: ${line.slice(line.indexOf(': ') + 2)}`);
+
+test('issue 148: a complete hex-labelled byte-pair series is reconstructed in every container', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  for (const entry of ISSUE148_ENTRIES) {
+    const checkIssue148 = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination,
+      authorized: destination, known: createKnownOriginals(scopeA, new Uint8Array(32).fill(41), [entry]) });
+    const expected = entry.kind === 'CANARY' ? 'CANARY_DETECTED' : 'KNOWN_ORIGINAL_DETECTED';
+    const precise = (payload, at) => {
+      const result = checkIssue148(payload);
+      assert.equal(result.decision, 'BLOCK', `${at}: ${result.reasons.join()}`);
+      assert.ok(result.reasons.includes(expected), `${at}: ${result.reasons.join()}`);
+      assert.equal(result.release, undefined, at);
+      assert.ok(!JSON.stringify(result).includes(entry.value), `${at}: a registered value reached the result`);
+    };
+    const stream = zlib.deflateSync(Buffer.from(entry.value));
+    assert.ok(stream.length >= 8, `${stream.length}`);
+    for (const width of [2, 4, 8, 16]) {
+      const lines = issue148Groups(stream, width);
+      for (const [order, ordered] of [
+        ['text order', lines], ['numeric order', issue148ReversedLines(lines)],
+        ['text order with reversed ranks', issue148ReversedRanks(lines, lines.length)],
+      ]) {
+        const at = `${entry.kind}/${width}/${order}`;
+        // The container is the whole of this issue: the same fields, the same order, three ways of writing them.
+        precise(issue148Object(ordered), `${at}/labelled object`);
+        precise(JSON.stringify({ content: issue148Object(ordered) }), `${at}/wrapped`);
+        precise(JSON.stringify({ messages: [{ role: 'user', content: issue148Object(ordered) }] }), `${at}/message turn`);
+        // Raw fields are the control: they already block, and the fix must not move them.
+        // Raw fields in every order, including the one the source base could not read: the value of a field ends at
+        // its own line, so the next label is no longer mistaken for more cells and the declared series is reachable.
+        precise(issue148Raw(ordered), `${at}/raw`);
+      }
+    }
+  }
+});
+
+test('issue 148: ordinary configuration, decode-only limits and the independent checks are unchanged', () => {
+  // Every expectation in this group was measured at the source base `e28e6f2` and is identical at this head, so it
+  // states what this change must not do rather than what it does. A declared byte-pair series is **decode-only**:
+  // it reaches bytes that were unreachable and nothing else, so a list that decodes to nothing, to ordinary text, or
+  // to unregistered compressed data is released exactly as it was before.
+  const unknownSeries = issue148Groups(syntheticBytes(96), 8);
+  const compressedSeries = issue148Groups(globalThis.process.getBuiltinModule('node:zlib')
+    .gzipSync(syntheticBytes(96)), 8);
+  for (const payload of [
+    // Unregistered bytes the opaque count does not reach, in both containers: still released.
+    issue148Raw(unknownSeries), issue148Object(unknownSeries),
+    // Ordinary text written in cells, an ordinary palette, and a short pair list: all released.
+    issue148Object(issue148Groups(Buffer.from('ordinary build log about the synthetic service'), 8)),
+    issue148Object(issue148Groups(Buffer.from([0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff]), 8)),
+    JSON.stringify({ parts: [{ face1: 'de ad' }, { face2: 'be ef' }] }),
+    // Ordinary prose that happens to carry a few cells is prose.
+    'GET /api 200 trace 50 4b 03 04 done',
+  ]) {
+    assert.equal(credentialOnly(payload).decision, 'ALLOW',
+      `${payload.slice(0, 44)} ${credentialOnly(payload).reasons.join()}`);
+    assert.equal(credentialOnly(JSON.stringify({ content: payload })).decision, 'ALLOW', `json ${payload.slice(0, 44)}`);
+  }
+  // Unregistered **compressed** bytes are still counted by whatever the stream holds, exactly as they are for every
+  // other declared reconstruction: a declared series carries no opacity of its own, and what it decodes to is judged
+  // on its own bytes. Measured at the source base in the raw spelling and at both revisions once the series is read.
+  for (const container of [issue148Raw(compressedSeries), issue148Object(compressedSeries),
+    JSON.stringify({ content: issue148Object(compressedSeries) })]) {
+    const result = credentialOnly(container);
+    assert.equal(result.decision, 'BLOCK', `compressed: ${result.reasons.join()}`);
+    assert.deepEqual(result.reasons, ['OPAQUE_EMBEDDED'], `compressed: ${result.reasons.join()}`);
+    assert.equal(result.release, undefined, 'compressed');
+  }
+  // A registered value in the same shape is found, which is the whole difference this issue makes: the shape alone
+  // decides nothing, the bytes it spells decide everything.
+  const registered = createKnownOriginals(scopeA, new Uint8Array(32).fill(41),
+    [{ kind: 'ORIGINAL', value: 'synthetic-author-person.invalid', ref: 'issue148.utility' }]);
+  const withRegistry = globalThis.process.getBuiltinModule('node:zlib')
+    .deflateSync(Buffer.from('synthetic-author-person.invalid'));
+  for (const payload of [issue148Object(issue148Groups(withRegistry, 8)), issue148Raw(issue148Groups(withRegistry, 8))]) {
+    const result = checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: registered });
+    assert.equal(result.decision, 'BLOCK', `${payload.slice(0, 44)}: ${result.reasons.join()}`);
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), `${payload.slice(0, 44)}: ${result.reasons.join()}`);
+    assert.equal(result.release, undefined, payload.slice(0, 44));
+  }
+  // The independent checks this module already made stay as restrictive as they were: a credential-shaped value
+  // blocks on its own, and a foreign scope or a destination the policy did not authorize refuses the release.
+  const credential = checkEgress({ bytes: enc('password: synthetic-literal-value'), scope: scopeA, destination,
+    authorized: destination, known: null });
+  assert.ok(credential.reasons.includes('HIGH_RISK_PATTERN'), credential.reasons.join());
+  assert.deepEqual(check('clean text', { scope: scopeB }).reasons, ['KNOWN_ORIGINALS_SCOPE_MISMATCH']);
+  assert.deepEqual(check('clean text', { authorized: { ...destination, id: 'other.invalid' } }).reasons, ['DESTINATION_MISMATCH']);
+});
+
+test('issue 148: an incomplete or malformed byte-pair series reconstructs nothing', () => {
+  // The fields a declared byte-pair series is allowed to join, and the ones it must not. A malformed member must
+  // not be dropped from the numbering to make the rest look complete, and a member this reader cannot reconstruct
+  // must withhold the run rather than shorten it: the same rule the hex-labelled escape series follows.
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  // The container signature written as four two-cell fields, so the complete run spells exactly those eight bytes
+  // and a control can be read the same way a payload is.
+  const signature = [0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
+  const pairs = [0, 2, 4, 6].map((at, index) =>
+    `face${index + 1}: ${signature.slice(at, at + 2).map(issue148Hex).join(' ')}`);
+  const complete = pairs.join('\n');
+  const completeObject = JSON.stringify({ parts: pairs.map((line) => Object.fromEntries(
+    [[line.slice(0, line.indexOf(':')), line.slice(line.indexOf(': ') + 2)]])) });
+  for (const [name, payload] of [
+    // A suffix the reader does not support after the last cell.
+    ['a suffix after a cell', pairs.map((line, index) => (index === 1 ? `${line} oops` : line)).join('\n')],
+    ['a suffix after a cell, reversed', [...pairs].reverse().map((line, index) => (index === 1 ? `${line} oops` : line)).join('\n')],
+    // A repeated rank, a missing member and a member written in another spelling, none of which may be discarded so
+    // that the remaining ranks look consecutive.
+    ['a padded duplicate rank', `${complete}\nFACE01: 50`],
+    ['a padded duplicate rank, reversed', `${[...pairs].reverse().join('\n')}\nFACE01: 50`],
+    ['a member missing from the numbering', pairs.filter((_, index) => index !== 3).join('\n')],
+    // A member that is not a byte-pair list at all, at either end of the run: whichever cell it did spell, the run
+    // around it is withheld rather than completed from the rest.
+    ['a first member that is not a byte-pair list', complete.replace('face1: 50 4b', 'face1: 50 zz')],
+    ['a final member that is not a byte-pair list', complete.replace('face4: 00 00', 'face4: 00 zz')],
+    ['a member written as a plain hexadecimal chunk', complete.replace('face3: 00 00', 'face3: 0000')],
+    // A further member of the same name in the same group is a member: five fields whose ranks are not consecutive
+    // are not one complete declaration, so the run is withheld rather than read as four of them.
+    ['a further member of the same name in the group', `${complete}\nface9: 00`],
+  ]) {
+    for (const container of [payload, JSON.stringify({ content: payload })]) {
+      const result = credentialOnly(container);
+      assert.deepEqual(result.reasons, [], `${name}: ${result.reasons.join()}`);
+      assert.deepEqual(result.findings, [], name);
+      assert.ok(result.release instanceof Uint8Array, `${name}: a malformed series released nothing`);
+    }
+  }
+  // The controls: the complete run beside each of those shapes is still read, in both orders and both containers,
+  // so every refusal above is about the member and not about the reading having been switched off.
+  // A field that is not a member at all is the allowed filler of one declaration, exactly as it is for every other
+  // labelled reader, so the run is read through it rather than around it.
+  // Incidental numbers and prose beside the run are not members of it, and neither are they a hole in it: a field
+  // that is not a hex-labelled member is another declaration, exactly as the escape reader rules.
+  for (const control of [complete, [...pairs].reverse().join('\n'), completeObject,
+    JSON.stringify({ content: completeObject }),
+    pairs.map((line, index) => (index === 3 ? `trace: 1a2b3c4d\n${line}` : line)).join('\n'),
+    `${complete}\nchecksum: 1234`]) {
+    const result = credentialOnly(control);
+    assert.deepEqual(result.reasons, ['OPAQUE_EMBEDDED'], `control: ${result.reasons.join()}`);
+    assert.equal(result.release, undefined, 'control');
+  }
+});
+
+/* ---------- Issue #148 R1: a validated pair spelling is its own evidence, whatever the byte mix ---------- */
+
+/**
+ * Issue #148 R1, red at the reviewed head `68d6f63` and reported independently as one P1 blocker.
+ *
+ * The reader validates a field's **spelling** -- two-digit hex cells separated by formatting -- and then stores the
+ * *normalized* bytes for it, without the separators. `declaredRuns` afterwards judged evidence from that normalized
+ * value with the chunk heuristics, which ask whether a token looks encoded: usually a digit plus a hex letter, as in
+ * `1f` or `e0`. A stored (level 0) deflate stream has no such mix, so a legitimate digit-only or letter-only cell was
+ * not evidence, fewer than half the members passed, and the whole reading was dropped before it produced anything:
+ * zero output runs and zero charged units. The registered value was then released.
+ *
+ * The measurements behind this, from the reviewer's auxiliary parser trace on a 42-byte stored stream: at one cell per
+ * member, 42 fields, 42 whole, one valid numeric series, **14 of 42** normalized values accepted, zero output runs; at
+ * two cells, 21 of 21 accepted, one 42-byte declaration, one run, 84 units, 84 work. So the two-cell positives below
+ * passed by accident of byte mix, not because the grammar admits them.
+ *
+ * The correction is to carry the collector's validated evidence with the entry instead of re-guessing it downstream.
+ * This group therefore checks the low-mix stored stream at **both** widths, for both kinds and every container, and
+ * keeps the raw, standard-compression, container-signature, utility and independent checks around it.
+ */
+test('issue 148 R1: a validated byte-pair spelling is its own evidence, whatever the byte mix', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  for (const entry of ISSUE148_ENTRIES) {
+    // One handle per value, so this payload is findable only through the readings under test.
+    const known = createKnownOriginals(scopeA, new Uint8Array(32).fill(41), [entry]);
+    const checkStored = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination,
+      authorized: destination, known });
+    const expected = entry.kind === 'CANARY' ? 'CANARY_DETECTED' : 'KNOWN_ORIGINAL_DETECTED';
+    const findingKind = entry.kind === 'CANARY' ? 'CANARY' : 'KNOWN_ORIGINAL';
+    const precise = (payload, at) => {
+      const result = checkStored(payload);
+      assert.equal(result.decision, 'BLOCK', `${at}: a complete declaration must not depend on the byte mix (${result.reasons.join()})`);
+      assert.ok(result.reasons.includes(expected), `${at}: ${result.reasons.join()}`);
+      assert.ok(result.findings.some((finding) => finding.kind === findingKind && finding.rule === entry.ref),
+        `${at}: ${result.findings.map((finding) => finding.rule).join()}`);
+      assert.equal(result.release, undefined, at);
+      assert.ok(!JSON.stringify(result).includes(entry.value), `${at}: a registered value reached the result`);
+    };
+    // **Stored**, level 0: the low-mix stream the default-compression positives never exercised.
+    const stored = zlib.deflateSync(Buffer.from(entry.value), { level: 0 });
+    assert.ok(stored.length >= 8, `${stored.length}`);
+    for (const width of [1, 2, 4]) {
+      const lines = issue148Groups(stored, width);
+      for (const container of [issue148Object(lines), issue148Raw(lines),
+        JSON.stringify({ content: issue148Object(lines) }),
+        JSON.stringify({ messages: [{ role: 'user', content: issue148Object(lines) }] })]) {
+        precise(container, `${entry.kind}/stored zlib/width ${width}`);
+      }
+      // Both orderings, with and without an unrelated rank, as the wider grammar group already covers.
+      const reversed = [...lines].reverse();
+      const ranked = lines.map((line, index) => `face${lines.length - index}: ${line.slice(line.indexOf(': ') + 2)}`);
+      for (const variant of [reversed, ranked, [...reversed, [`face${2 * lines.length}`, 'ordinary']]]) {
+        precise(issue148Object(variant), `${entry.kind}/stored zlib/width ${width}/reordered`);
+      }
+    }
+    // The default-compression stream is retained: it worked before and must keep working.
+    const standard = zlib.deflateSync(Buffer.from(entry.value));
+    for (const width of [1, 2]) {
+      precise(issue148Object(issue148Groups(standard, width)), `${entry.kind}/standard zlib/width ${width}`);
+    }
+  }
+  // A valid declared container signature is refused at one cell per member exactly as at two: that is the module's
+  // existing container rule over bytes a declaration really spells, not a new opacity authority and not the
+  // decode-only treatment of *unknown* uncompressed binary, which the next group's controls still assert.
+  for (const width of [1, 2, 4]) {
+    const lines = issue148Groups(Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00]), width);
+    for (const container of [issue148Object(lines), issue148Raw(lines)]) {
+      const result = credentialOnly(container);
+      assert.equal(result.decision, 'BLOCK', `container signature width ${width}: ${result.reasons.join()}`);
+      assert.deepEqual(result.reasons, ['OPAQUE_EMBEDDED'], `container signature width ${width}: ${result.reasons.join()}`);
+      assert.deepEqual(result.findings, [], `container signature width ${width}`);
+      assert.equal(result.release, undefined, `container signature width ${width}`);
+    }
+  }
+});
