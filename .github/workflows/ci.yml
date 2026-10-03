@@ -18,6 +18,9 @@ jobs:
           node-version: '22.22.3'
       - name: Reject force-added private paths and non-synthetic fixtures
         run: npm run check:fixtures
+      # Offline documentation guardrail: tracked Markdown paths and local heading anchors only.
+      - name: Check tracked documentation links offline
+        run: npm run check:docs
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-fund
       - run: npm run build
