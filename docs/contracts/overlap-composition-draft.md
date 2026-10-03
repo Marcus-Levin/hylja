@@ -10,7 +10,7 @@ Status: **proposed, unwired, non-enforcing.** This is a reviewable design and a 
 [#40](https://github.com/Marcus-Levin/hylja/issues/40) and
 [#68](https://github.com/Marcus-Levin/hylja/issues/68), with the integration left to
 [#13](https://github.com/Marcus-Levin/hylja/issues/13). Implementation status lives only in
-[plan.md](../plan.md#current-state).
+[capabilities.md](../capabilities.md).
 
 Nothing here is wired into [`classification.ts`](../../src/classification.ts),
 [`policy.ts`](../../src/policy.ts) or any adapter. It does not create a second composer, a second

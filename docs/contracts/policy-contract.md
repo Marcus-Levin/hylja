@@ -1,6 +1,6 @@
 # Source-to-sink policy decision contract
 
-Status: draft foundation contract for issue #4. This documents the pure decision seam, **not** a deployment approval, adapter, broker, authorization proof, transformation, or egress control. Implementation status belongs only in [the plan](../plan.md#current-state).
+Status: draft foundation contract for issue #4. This documents the pure decision seam, **not** a deployment approval, adapter, broker, authorization proof, transformation, or egress control. Implementation status belongs only in [capabilities.md](../capabilities.md).
 
 ## Inputs and authority
 

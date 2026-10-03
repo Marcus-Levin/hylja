@@ -1,6 +1,6 @@
 # Fixed review snapshot for #65 and #66 — 2026-10-01
 
-**AI-prepared review input.** This summarizes the existing discussion preferences for an independent human review; it accepts no design, appoints no reviewer and approves no benchmark. Implementation status belongs to [the plan](../plan.md#current-state). Keep identities, conflict declarations, signed decisions, restricted locations and future blind material outside this public packet.
+**AI-prepared review input.** This summarizes the existing discussion preferences for an independent human review; it accepts no design, appoints no reviewer and approves no benchmark. Current capabilities and limits belong to [docs/capabilities.md](../capabilities.md) and live task status to the GitHub issues; this snapshot's dated record is the retired plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not current state. Keep identities, conflict declarations, signed decisions, restricted locations and future blind material outside this public packet.
 
 ## Revision to review
 

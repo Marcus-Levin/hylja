@@ -10,7 +10,7 @@ The name comes from Old Norse *hylja*: to hide, cover, or conceal.
 
 Foundation only. This repository currently defines product direction, security invariants, architecture, contracts, evaluation policy, and implementation slices. It does **not** yet provide a production privacy boundary.
 
-Implementation status has one authoritative home: [docs/plan.md](docs/plan.md).
+What the software implements today, and its material limits, has one authoritative home: [docs/capabilities.md](docs/capabilities.md). Work status and roadmap order live in GitHub issues ([#36](https://github.com/Marcus-Levin/hylja/issues/36) is the checklist).
 
 ![Hylja concept illustration showing information cloaked between a source and an AI provider](docs/assets/hylja-concept.png)
 
@@ -23,8 +23,8 @@ Implementation status has one authoritative home: [docs/plan.md](docs/plan.md).
 - [docs/security-model.md](docs/security-model.md) - crown jewels, invariants, and security boundaries.
 - [docs/threat-model.md](docs/threat-model.md) - attacker model and abuse cases.
 - [docs/evaluation.md](docs/evaluation.md) - evaluation and continuous-improvement policy.
-- [docs/plan.md](docs/plan.md) - current state and dependency-ordered roadmap.
-- [docs/README.md](docs/README.md) - documentation map.
+- [docs/capabilities.md](docs/capabilities.md) - current implementation capabilities and material limits.
+- [docs/README.md](docs/README.md) - documentation map and task route map.
 
 ## Intended surfaces
 

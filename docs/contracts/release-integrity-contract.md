@@ -1,6 +1,6 @@
 # Release integrity contract (#33)
 
-Status: bounded #33 slice, **NON-ENFORCING for any real release**. Implementation status lives in [plan.md](../plan.md#current-state); this document is the interface, the trust boundaries and the limits.
+Status: bounded #33 slice, **NON-ENFORCING for any real release**. Implementation status lives in [capabilities.md](../capabilities.md); this document is the interface, the trust boundaries and the limits.
 
 This contract answers one question at a release boundary: **do the exact bytes offered for release match signed evidence produced from those same bytes, and do those bytes still satisfy the release owner's independent expectation?** It never signs, writes, publishes, promotes, or contacts a network. Verified evidence is a *necessary, not sufficient*, release condition.
 

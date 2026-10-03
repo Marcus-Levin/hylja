@@ -6,7 +6,7 @@ Status: **proposed design for human review. Not accepted, not normative, not imp
 [decision 010](../decisions/010-separate-information-dimensions-and-task-fidelity.md), the
 [#65 taxonomy research](../research/issue-65-taxonomy-draft-p0.1.md) and the accepted
 [decision 009](../decisions/009-secrets-are-not-synthetic-identities.md) as inputs. Implementation status
-lives only in [the plan](../plan.md#current-state). This document does **not** implement
+lives only in [capabilities.md](../capabilities.md). This document does **not** implement
 [#13](https://github.com/Marcus-Levin/hylja/issues/13), does not accept decision 010 or the #66
 multidimensional draft, changes no v1 classifier or policy rule, appoints no reviewer, and grants no
 destination treatment. It is AI-authored and AI-reviewed only, which satisfies no human adoption gate.

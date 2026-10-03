@@ -2,8 +2,10 @@
 
 **Research evidence for [#113](https://github.com/Marcus-Levin/hylja/issues/113) Stage 2 and
 [#40](https://github.com/Marcus-Levin/hylja/issues/40). Not a benchmark, not an adoption decision,
-not a scored comparison.** Implementation and run status live in
-[the plan](../plan.md#current-state); this document separates what was **measured**, what is a **source
+not a scored comparison.** Current capabilities and limits live in
+[docs/capabilities.md](../capabilities.md) and live run status in the GitHub issues; the dated run record is the retired
+plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not
+current state. This document separates what was **measured**, what is a **source
 claim**, and what remains an **explicit unknown**. Adoption remains
 [#48](https://github.com/Marcus-Levin/hylja/issues/48)'s decision, and any scored comparison still
 requires #39's frozen protocol.

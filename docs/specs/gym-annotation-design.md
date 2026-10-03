@@ -7,7 +7,7 @@ Status: **proposed design, not accepted, not implemented, non-normative.** Track
 [decision 010](../decisions/010-separate-information-dimensions-and-task-fidelity.md) as inputs. Nothing here
 changes classification v1, [policy](../flow-control.md), any adapter or any accepted invariant; nothing here accepts
 decision 010, appoints a reviewer or a custodian, freezes a #39 protocol, or claims a promotion. Implementation
-status lives only in [the plan](../plan.md#current-state). This document proposes a *design and a data format*; it is
+status lives only in [capabilities.md](../capabilities.md). This document proposes a *design and a data format*; it is
 not a live upload service, an annotation UI build, a training system or a production-learning loop. It is filed under
 `specs/` for discoverability next to the other proposed designs; it is a proposed design, not an implementation
 slice.

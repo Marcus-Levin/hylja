@@ -4,7 +4,7 @@ Status: draft foundation contract for a local/synthetic-only shadow measurement 
 observable behavior of [`src/reidentification-shadow.ts`](../../src/reidentification-shadow.ts)
 built on the reviewed [#11 shadow seam](semantic-judge-shadow.md). It is not authorization, not
 policy, not a transformation and not an egress control. Implementation status lives only in
-[plan.md](../plan.md).
+[capabilities.md](../capabilities.md).
 
 Scope follows [issue #12](https://github.com/Marcus-Levin/hylja/issues/12): a re-identification
 question set, a quasi-identifier candidate model, generalization recommendations as advisory

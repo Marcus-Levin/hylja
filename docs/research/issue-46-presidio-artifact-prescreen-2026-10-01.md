@@ -1,6 +1,6 @@
 # Presidio selected-artifact inspection — 2026-10-01
 
-**AI-prepared static public-artifact evidence for #46 and the #40/#44 candidate preparation, not independently reviewed.** The two wheels below were downloaded as ZIP data, hashed and inspected without importing, installing or executing their contents. This is not a benchmark, component selection, adoption approval, signature verification or completed stack prescreen. Implementation and campaign status belong to [the plan](../plan.md#current-state).
+**AI-prepared static public-artifact evidence for #46 and the #40/#44 candidate preparation, not independently reviewed.** The two wheels below were downloaded as ZIP data, hashed and inspected without importing, installing or executing their contents. This is not a benchmark, component selection, adoption approval, signature verification or completed stack prescreen. Current capabilities and limits are in [docs/capabilities.md](../capabilities.md) and live campaign status is in the GitHub issues; the dated campaign record is the retired plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not current state.
 
 ## Selected bytes and source
 

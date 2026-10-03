@@ -4,9 +4,9 @@ This file guides agents developing this repository. It keeps Hylja's authority, 
 
 ## Find the relevant authority
 
-Before implementation, read [docs/charter.md](docs/charter.md), [docs/architecture.md](docs/architecture.md), [docs/security-model.md](docs/security-model.md), [docs/threat-model.md](docs/threat-model.md), [docs/evaluation.md](docs/evaluation.md), and the current state in [docs/plan.md](docs/plan.md#current-state). Read the current slice in [docs/specs](docs/specs/) and accepted decisions in [docs/decisions](docs/decisions/).
+Before implementation, read [docs/charter.md](docs/charter.md), [docs/architecture.md](docs/architecture.md), [docs/security-model.md](docs/security-model.md), [docs/threat-model.md](docs/threat-model.md), [docs/evaluation.md](docs/evaluation.md), and what the software implements today in [docs/capabilities.md](docs/capabilities.md). Then use the [task route map](docs/README.md#task-route-map) to reach the exact slice, contract, decision, source and test for your task. Read the current slice in [docs/specs](docs/specs/) and the **status line** of every decision in [docs/decisions](docs/decisions/) you rely on.
 
-One fact has one authoritative home. Do not copy implementation status into architecture, README, or research documents; link to the plan instead. Research is evidence, not authority. Accepted design changes get a new decision record rather than silently rewriting history.
+One fact has one authoritative home. What is implemented and its limits belong only in [docs/capabilities.md](docs/capabilities.md); work status, priority and dependency order belong only in GitHub issues ([#36](https://github.com/Marcus-Levin/hylja/issues/36) is the roadmap checklist); dated measurements and their attribution live with the pull request or research record that produced them. Do not copy any of these into architecture, README, or research documents; link to the home instead. Research is evidence, not authority. Accepted design changes get a new decision record rather than silently rewriting history.
 
 A record marked **proposed** has no authority until a human accepts it. Do not wire a proposed decision, draft taxonomy, or draft information model into accepted runtime classification or policy, an adapter, or authoritative evaluation labels, scoring, and promotion, and do not weaken an accepted v1 contract or the held-out protocol to make a draft fit. An isolated, clearly labeled, non-enforcing draft module or test on synthetic data is allowed while its proposed status stays visible in its own record. Check the status line of every decision record you rely on.
 
@@ -53,13 +53,13 @@ Install exactly as CI does: `npm ci --ignore-scripts --no-fund` (Node 22, lockfi
 - `npm run check:fixtures` — tracked-path and synthetic-fixture guard. Run it before committing anything touching `test/fixtures/**`, `.gitignore`, or generated output.
 - `npm run build` — compiles `src/**/*.ts` into `dist/`. Tests import `../dist/*.js`, so build before running any test.
 - `npm run typecheck` — `tsc --noEmit` under the same strict config.
-- `npm test` — fixture guard, build, then `node --test` over the curated set `test/*.test.mjs` plus the two `evaluations/` suites.
+- `npm test` — fixture guard, build, then `node --test` over the suite list in [package.json](package.json). Read the script before quoting a count; the suite list changes.
 - `npm run test:coverage` — the same tests with Node coverage. These numbers measure contract exercise, not enforcement, coverage of production traffic, or release safety.
 - `node --test test/<name>.test.mjs` — bounded focused run while iterating, after a build.
 - `node evaluations/preparation-integrity.mjs` — the public, non-enforcing preparation scaffold. Intact state exits 0 with `PREPARATION_VALID_BUT_NOT_ELIGIBLE / PUBLIC_DRAFT_ONLY`; that status never authorizes scoring, custody, a freeze, or release.
-- `npm run audit:deps` and `npm run sbom` — CI gates. The SBOM is ephemeral; never commit it or other generated output (`dist/`, `coverage/`, `artifacts/` are ignored).
+- `npm run audit:deps`, `npm run sbom` and `npm run check:sbom` — CI gates. The SBOM is ephemeral; never commit it or other generated output (`dist/`, `coverage/`, `artifacts/` are ignored).
 
-CI is [.github/workflows/ci.yml](.github/workflows/ci.yml): fixture guard, locked install, build, typecheck, test, coverage, dependency audit, ephemeral SBOM. Verify any command you document here against `package.json` and that workflow before writing it down, and quote CI run links rather than asserting a green run you did not see.
+[package.json](package.json) `scripts` is the one canonical command list and [.github/workflows/ci.yml](.github/workflows/ci.yml) the one canonical step sequence; verify any command you document here against both before writing it down, and quote CI run links rather than asserting a green run you did not see.
 
 No test or script may call a real provider API, use real credentials, reach the network for model traffic, or read private or held-out data. Put ad-hoc scratch scripts in a temp file, run them, and delete them; do not embed long scripts inline in shell commands.
 
@@ -71,7 +71,7 @@ Every security-sensitive feature ships with evaluation evidence: deterministic t
 - Validate the change you made: focused file first, then the full CI sequence when the change touches shared core, policy, crypto, provenance, or serialized bytes. Do not run broad suites for prose-only changes.
 - Prose-only changes need no new test, and a test that greps implementation or documentation text is not evidence for a document.
 - Fixtures stay obviously synthetic and non-routable. Under the guard, only `test/fixtures/synthetic-golden/` may contain credential-like assignments, and only with obviously synthetic values (`synthetic-*.invalid`).
-- Record what you actually ran, the real pass counts, and the explicit unproven surface. Implementation status and evidence live only in [docs/plan.md](docs/plan.md#current-state).
+- Record what you actually ran, the real pass counts, and the explicit unproven surface. Report it in the pull request or the research record that owns the work; update [docs/capabilities.md](docs/capabilities.md) only when the implementation or a durable limit itself changed.
 - Public docs, public fixtures, and public research are **not** a held-out suite. Do not optimize a detector against the held-out suite: never tune questions, thresholds, or detectors against held-out data. A production miss becomes a sanitized regression case; it does not automatically alter policy.
 
 ## Dependencies
@@ -91,7 +91,7 @@ Multiple sessions may work on this repository at once, each in its own branch an
 - If you own a specific in-progress change that is blocking you, preserve just those paths reversibly (`git stash push -- <path>`) and name them. Restore them when you resume that work, or record that the preservation is superseded; do not reapply it over newer published state just to clear the record. Never blanket-stash or blanket-reset, and never treat a stash as a place to park another session's work.
 - On rebase or merge conflicts, resolve only files you modified, and only inside your own checkout. If a conflict lands in a file you did not modify, leave that file alone, record the exact path, branch, and commit, then coordinate with the owner or orchestrator and continue the rest of your authorized integration work instead of stalling. Escalate only genuine ownership ambiguity, a destructive choice, or an accepted design change beyond your authorization.
 - Commit messages are concise and technical (`docs:`, `fix:`, `feat:`), no emoji, and state the behavior change. Never commit generated artifacts or lockfile churn you did not cause.
-- Clean up only what you own: a branch or worktree may be removed once its accepted evidence is merged or recorded in the plan. Preserve commits, evidence references, and linked issue/PR numbers.
+- Clean up only what you own: a branch or worktree may be removed once its accepted evidence is merged or recorded in its pull request and issue. Preserve commits, evidence references, and linked issue/PR numbers.
 
 ## Delegation, review, merge, and issues
 

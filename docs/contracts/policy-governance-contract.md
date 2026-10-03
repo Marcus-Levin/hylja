@@ -4,7 +4,7 @@ Status: draft foundation contract for issue #28. This documents the executable s
 [`src/policy-governance.ts`](../../src/policy-governance.ts), **not** a production policy registry,
 a distribution mechanism, an authentication service, an administrative server, an authorization
 broker, a deployment, or an enforcement boundary. Implementation status belongs only in
-[the plan](../plan.md#current-state).
+[capabilities.md](../capabilities.md).
 
 ## Scope and what this seam is not
 
