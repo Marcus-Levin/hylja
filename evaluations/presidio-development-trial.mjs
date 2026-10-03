@@ -89,6 +89,87 @@ function toEvent(fieldRef, field, candidate) {
     ...(candidate.evidence.claim.subtype ? { subtype: candidate.evidence.claim.subtype } : {}) };
 }
 
+/**
+ * One Presidio candidate-source pass over already-projected development fields.
+ *
+ * This is the #113 arm runner, extracted so that the matched #40 comparison reuses it instead of
+ * re-implementing the field loop, the #6 root-view target, the pinned-scope preparation and the
+ * `#5`-shaped byte-span conversion. It performs no comparison, no scoring and no merging: it returns
+ * the emitted events plus the adapter's own status, reasons, limitations and provenance, and the
+ * caller decides what to compare. Nothing here is sent, captured or authorized.
+ *
+ * `events` are `#5` `CandidateEvent` values (`fieldRef`, UTF-8 byte `start`/`end`, `semanticType`,
+ * optional `subtype`); they carry no matched text, no span text and no worker label.
+ */
+export async function runPresidioDevelopmentArm({ command, fields, manifest, workdir, scope,
+  requestPrefix }) {
+  if (!Array.isArray(fields) || typeof requestPrefix !== 'string' || !requestPrefix.length) {
+    throw new TypeError('invalid Presidio development arm request');
+  }
+  const record = { status: 'COMPLETE', reasons: [], limitations: new Set(), unsupported: new Set(),
+    provenance: null, inexact: 0, transport: [], declaredUnsupported: 0, unpinnedUnsupported: 0,
+    unpinnedLabels: 0, processes: 0, fields: [] };
+  let requestCounter = 0;
+  for (const field of fields) {
+    const normalized = normalizeInput(field.content);
+    // The trial analyses the whole field as one #6 root view. A decoded or folded representation is
+    // reachable through the same adapter, but this trial records only the exact root placement.
+    const prepared = preparePresidioAnalysis(normalized,
+      { kind: 'VIEW', viewId: 0, representation: 'RAW', source: 'STRING', unit: { start: 0, end: 1 } },
+      { requestId: `${requestPrefix}-${requestCounter++}`, inputRef: `${requestPrefix}-${field.ref}`,
+        tenantRef: scope.tenantRef, projectRef: scope.projectRef,
+        // Pinned from the manifest, exactly as the worker will report it. The adapter checks all
+        // three and only ever carries the pinned values into the record, so neither a worker-chosen
+        // string in `runtime.version`/`runtime.language` nor a worker-claimed NER capability can reach
+        // a shared report or erase its own coverage limits.
+        expectedProducerVersion: scope.expectedProducerVersion, expectedLanguage: scope.expectedLanguage,
+        expectedNerAvailable: scope.expectedNerAvailable });
+    if (!prepared.ok) {
+      record.status = 'FAILURE';
+      record.reasons.push(prepared.reason);
+      continue;
+    }
+    const outcome = await runPresidioWorker(prepared.plan.line,
+      { ...command, args: [manifest], cwd: workdir });
+    record.processes += 1;
+    if (outcome.status !== 'REPLY') {
+      record.status = 'FAILURE';
+      record.transport.push({ fieldRef: field.ref, reason: outcome.reason });
+      continue;
+    }
+    const result = completePresidioAnalysis(prepared.plan, outcome.line);
+    if (result.status === 'FAILURE') record.status = 'FAILURE';
+    else if (result.status === 'PARTIAL' && record.status !== 'FAILURE') record.status = 'PARTIAL';
+    record.reasons.push(...result.reasons);
+    for (const code of result.limitations) record.limitations.add(code);
+    // Only a type this repository pins may be named in a shared record; every other refused label is
+    // worker-chosen text and reaches it as a count. The label itself is never read again here.
+    for (const item of result.unsupported) {
+      if (item.entityType === null) record.unpinnedUnsupported += item.count;
+      else record.unsupported.add(item.entityType);
+    }
+    record.declaredUnsupported += result.declaredUnsupportedTypes;
+    record.unpinnedLabels += result.unpinnedUnsupportedTypes;
+    record.provenance = result.provenance;
+    const emitted = result.candidates.filter((item) => item.original.kind === 'ORIGINAL_EXACT')
+      .map((item) => toEvent(field.ref, field, item));
+    for (const candidate of result.candidates) {
+      if (candidate.original.kind !== 'ORIGINAL_EXACT') record.inexact += 1;
+    }
+    record.fields.push({ fieldRef: field.ref, emitted: emitted.length, events: emitted, entities:
+      Object.fromEntries([...new Set(emitted.map((item) => `${item.semanticType}${
+        item.subtype ? `/${item.subtype}` : ''}`))].sort().map((key) => [key,
+        emitted.filter((item) => `${item.semanticType}${item.subtype ? `/${item.subtype}` : ''}` === key).length])) });
+  }
+  return Object.freeze({ status: record.status,
+    reasons: [...new Set(record.reasons)].sort(),
+    limitations: [...record.limitations].sort(),
+    unsupported: [...record.unsupported].sort(), provenance: record.provenance,
+    inexact: record.inexact, transport: record.transport,
+    declaredUnsupported: record.declaredUnsupported, unpinnedUnsupported: record.unpinnedUnsupported,
+    unpinnedLabels: record.unpinnedLabels, processes: record.processes, fields: record.fields });
+}
+
 export async function runPresidioDevelopmentTrial(options) {
   const { command, caseIds, scope } = options;
   const fixtures = JSON.parse(readFileSync(PUBLIC_FIXTURES, 'utf8'));
@@ -102,91 +183,40 @@ export async function runPresidioDevelopmentTrial(options) {
       fixtureId: source.fixtureId, familyId: source.familyId, partition: 'development',
       input: structuredClone(source.input),
     }, LOCAL_SINK);
-    const record = { caseId, familyId: source.familyId, fields: [], status: 'COMPLETE', reasons: [],
-      limitations: new Set(), unsupported: new Set(), provenance: null, inexact: 0, transport: [],
-      droppedControls: [], declaredUnsupported: 0, unpinnedUnsupported: 0, unpinnedLabels: 0 };
-    let requestCounter = 0;
-    for (const field of projection.developmentCase.fields) {
-      const normalized = normalizeInput(field.content);
-      // The trial analyses the whole field as one #6 root view. A decoded or folded representation is
-      // reachable through the same adapter, but this trial records only the exact root placement.
-      const prepared = preparePresidioAnalysis(normalized,
-        { kind: 'VIEW', viewId: 0, representation: 'RAW', source: 'STRING', unit: { start: 0, end: 1 } },
-        { requestId: `trial-${caseId}-${requestCounter++}`, inputRef: `trial-${caseId}-${field.ref}`,
-          tenantRef: scope.tenantRef, projectRef: scope.projectRef,
-          // Pinned from the manifest, exactly as the worker will report it. The adapter checks all
-          // three and only ever carries the pinned values into the record, so neither a worker-chosen
-          // string in `runtime.version`/`runtime.language` nor a worker-claimed NER capability can reach
-          // a shared report or erase its own coverage limits.
-          expectedProducerVersion: scope.expectedProducerVersion, expectedLanguage: scope.expectedLanguage,
-          expectedNerAvailable: scope.expectedNerAvailable });
-      if (!prepared.ok) {
-        record.status = 'FAILURE';
-        record.reasons.push(prepared.reason);
-        continue;
-      }
-      const outcome = await runPresidioWorker(prepared.plan.line,
-        { ...command, args: [options.manifest], cwd: options.workdir });
-      if (outcome.status !== 'REPLY') {
-        record.status = 'FAILURE';
-        record.transport.push({ fieldRef: field.ref, reason: outcome.reason });
-        continue;
-      }
-      const result = completePresidioAnalysis(prepared.plan, outcome.line);
-      if (result.status === 'FAILURE') record.status = 'FAILURE';
-      else if (result.status === 'PARTIAL' && record.status !== 'FAILURE') record.status = 'PARTIAL';
-      record.reasons.push(...result.reasons);
-      for (const code of result.limitations) record.limitations.add(code);
-      // Only a type this repository pins may be named in a shared record; every other refused label is
-      // worker-chosen text and reaches it as a count. The label itself is never read again here.
-      for (const item of result.unsupported) {
-        if (item.entityType === null) record.unpinnedUnsupported += item.count;
-        else record.unsupported.add(item.entityType);
-      }
-      record.declaredUnsupported += result.declaredUnsupportedTypes;
-      record.unpinnedLabels += result.unpinnedUnsupportedTypes;
-      record.provenance = result.provenance;
-      const emitted = result.candidates.filter((item) => item.original.kind === 'ORIGINAL_EXACT')
-        .map((item) => toEvent(field.ref, field, item));
-      for (const candidate of result.candidates) {
-        if (candidate.original.kind !== 'ORIGINAL_EXACT') record.inexact += 1;
-      }
-      record.fields.push({ fieldRef: field.ref, emitted: emitted.length, events: emitted, entities:
-        Object.fromEntries([...new Set(emitted.map((item) => `${item.semanticType}${
-          item.subtype ? `/${item.subtype}` : ''}`))].sort().map((key) => [key,
-          emitted.filter((item) => `${item.semanticType}${item.subtype ? `/${item.subtype}` : ''}` === key).length])) });
-    }
+    const record = { caseId, familyId: source.familyId, droppedControls: [] };
+    const arm = await runPresidioDevelopmentArm({ command, fields: projection.developmentCase.fields,
+      manifest: options.manifest, workdir: options.workdir, scope, requestPrefix: `trial-${caseId}` });
     const controls = (CONTROLS[caseId] ?? []).map((control) => plant(control,
       projection.developmentCase.fields.find((item) => item.ref === control.fieldRef),
       record.droppedControls)).filter(Boolean);
     evaluation.registerCase(projection.developmentCase);
     evaluation.registerOracle({ version: 1, caseId, occurrences: controls });
-    const events = record.fields.flatMap((item) => item.events);
+    const events = arm.fields.flatMap((item) => item.events);
     evaluation.registerCandidateEvents(caseId, events);
     const report = evaluation.report(caseId, capture);
     cases.push({
-      caseId: report.caseId, familyId: record.familyId, adapterStatus: record.status,
-      reasons: [...new Set(record.reasons)].sort(), limitations: [...record.limitations].sort(),
-      unsupportedEntityTypes: [...record.unsupported].sort(), inexactPlacements: record.inexact,
+      caseId: report.caseId, familyId: record.familyId, adapterStatus: arm.status,
+      reasons: arm.reasons, limitations: arm.limitations,
+      unsupportedEntityTypes: arm.unsupported, inexactPlacements: arm.inexact,
       // Refused results whose detector-native type this repository does not pin, summed per analysed
       // field, plus how many distinct labels were dropped. The dropped evidence stays countable and no
       // worker's label becomes reportable.
-      unpinnedUnsupportedResults: record.unpinnedUnsupported,
-      unpinnedUnsupportedLabels: record.unpinnedLabels,
+      unpinnedUnsupportedResults: arm.unpinnedUnsupported,
+      unpinnedUnsupportedLabels: arm.unpinnedLabels,
       // A worker-declared type with no result behind it is counted, never named: a declaration is a
       // claim rather than evidence, and its label is worker-chosen text in a record this trial shares.
-      declaredUnsupportedTypes: record.declaredUnsupported,
-      transportFailures: record.transport, emittedEvents: events.length,
+      declaredUnsupportedTypes: arm.declaredUnsupported,
+      transportFailures: arm.transport, emittedEvents: events.length,
       report: { candidates: report.candidates, observed: report.observed.map((item) => item.claim),
         untested: report.untested.map((item) => `${item.claim}/${item.reason}`) },
       // Pinned values only: `provenance.producerVersion`/`language` are the trusted configuration's,
       // already checked against the reply, so a worker cannot name itself in this record.
-      provenance: record.provenance && { producerId: record.provenance.producerId,
-        producerVersion: record.provenance.producerVersion, mappingVersion: record.provenance.mappingVersion,
-        labelVocabularyVersion: record.provenance.labelVocabularyVersion,
-        language: record.provenance.language, nerAvailable: record.provenance.nerAvailable },
+      provenance: arm.provenance && { producerId: arm.provenance.producerId,
+        producerVersion: arm.provenance.producerVersion, mappingVersion: arm.provenance.mappingVersion,
+        labelVocabularyVersion: arm.provenance.labelVocabularyVersion,
+        language: arm.provenance.language, nerAvailable: arm.provenance.nerAvailable },
       droppedControls: record.droppedControls,
-      fields: record.fields.map(({ events: _events, ...rest }) => rest),
+      fields: arm.fields.map(({ events: _events, ...rest }) => rest),
     });
     evaluation.clear();
   }
@@ -196,7 +226,6 @@ export async function runPresidioDevelopmentTrial(options) {
 }
 
 export const PRESIDIO_TRIAL_LIMITS = Object.freeze(PRESIDIO_WORKER_LIMITS);
-
 function parseArgs(argv) {
   // `--case` restricts the run; without it every case with a development control is analysed. Adding
   // to the defaults instead would make `--case D01-DEV-001` silently analyse D02 as well.
@@ -232,7 +261,7 @@ function parseArgs(argv) {
  * the pin does not have is refused instead of being allowed to erase `NO_NER`/`NO_TEXT_CONTEXT` and
  * turn a degraded run into a clean `COMPLETE`.
  */
-function pinnedRuntime(manifestPath) {
+export function pinnedRuntime(manifestPath) {
   let manifest;
   try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { return null; }
   const artifacts = Array.isArray(manifest?.artifacts) ? manifest.artifacts : [];
@@ -248,7 +277,7 @@ function pinnedRuntime(manifestPath) {
 }
 
 /** Stable, value-free identity of the pinned manifest, so a record says which pin produced it. */
-function manifestDigest(manifestPath) {
+export function manifestDigest(manifestPath) {
   try {
     return createHash('sha256').update(readFileSync(manifestPath)).digest('hex').slice(0, 32);
   } catch { return 'UNAVAILABLE'; }

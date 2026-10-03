@@ -1293,3 +1293,450 @@ test('XML rewrite records carry references, spans and digests only', () => {
   assert.equal(applied.text.includes(TOKEN), false);
   assert.deepEqual([sentinel(applied.text).decision, sentinel(applied.text).reasons], ['ALLOW', []]);
 });
+
+/* ---------- #127 escaped JSON/dotenv source-to-rewrite path, and the boundaries around it ---------- */
+/*
+ * The XML groups above close committed evidence for the XML side of the source-location-to-rewrite path.
+ * What was still only a *classification* record was an escaped JSON value, and an escaped quoted dotenv
+ * value had no committed case at all. Both are sources whose text is not what the value means: the source
+ * holds a longer, differently spelled run whose decode is the planted original, so a covering span is the
+ * only location a candidate may claim, and the honest question is whether plan, apply, an independent
+ * reparse, the exact serialized bytes and #19 all survive that. The last two groups pin the edges of the
+ * supported envelope: a bare dotenv value cannot take this constant, and a percent-escaped run is a #6
+ * decoded view with no byte map back to the source, so it is refused rather than approximated. Every case
+ * is built from `detect()`, `parseStructured()`, the draft's own public functions and `sentinel()` over this
+ * file's own obviously synthetic `.invalid` originals; nothing here wires the draft into anything.
+ */
+
+test('an escaped JSON value rewrites from its covering source location and releases the exact bytes', () => {
+  // The source never holds the planted original: `syn\u002dpass\u002d...` is a longer, different spelling
+  // that decodes to it. A covering span is the only location such a candidate may claim, so the rewrite has
+  // to start from the parsed field that covers the region rather than from a decoded-text offset.
+  const input = '{"password":"syn\\u002dpass\\u002d4f2b9c7e1d.invalid","region":"eu"}';
+  assert.equal(input.includes(PASSWORD), false, 'the source really holds no verbatim planted original');
+
+  // 1. Source location: the #7 parse that will be rewritten is complete, and the protected field's decoded
+  //    value is the planted original while its source slice is the escape spelling.
+  const before = parseStructured(input, 'JSON');
+  assert.equal(before.status, 'COMPLETE');
+  assert.equal(before.coverage, 'FULL');
+  assert.deepEqual(reasonsOf(before), []);
+  assert.deepEqual(before.fields.map((item) => item.path.join('.')), ['password', 'region']);
+  const [password] = before.fields;
+  assert.equal(password.syntax, 'JSON_STRING');
+  assert.equal(password.highRisk, true);
+  assert.equal(password.value, PASSWORD);
+  assert.deepEqual({ start: password.valueStart, end: password.valueEnd }, { start: 13, end: 50 });
+  assert.equal(input.slice(password.valueStart, password.valueEnd), 'syn\\u002dpass\\u002d4f2b9c7e1d.invalid');
+  assert.equal(password.valueStart > password.keyEnd, true, 'the span is the value, not the key');
+
+  // 2. Detection: the value is found in the view and again through the trusted #7 key-path hint, and the
+  //    field-bound candidates state plainly that the decoded value is not the source spelling.
+  const detection = detect(input);
+  assert.equal(detection.status, 'COMPLETE', reasonsOf(detection).join());
+  const bound = detection.candidates.filter((item) => item.field);
+  assert.ok(bound.length >= 2, `${bound.length} field-bound candidates`);
+  for (const item of bound) {
+    assert.equal(item.field.format, 'JSON');
+    assert.equal(item.field.hintSource, 'PATH');
+    assert.equal(item.field.verbatim, false);
+    assert.equal(item.original.kind, 'ORIGINAL_COVER');
+    assert.deepEqual(item.field.span, { start: 13, end: 50 });
+    assert.deepEqual(item.field.valueSpan, { start: 0, end: PASSWORD.length });
+  }
+  // The view scan also matches the escape spelling itself, so the region is a union of an exact text match
+  // and a covering decoded-field match rather than an invented exact offset for the decoded text.
+  const exact = detection.candidates.filter((item) => !item.field && item.original.kind === 'ORIGINAL_EXACT');
+  assert.ok(exact.length >= 1);
+
+  // 3. Composition: nothing lost, one region over the covering span, the credential floor intact.
+  const composition = compose(detection.candidates);
+  assert.equal(composition.retention.received, detection.candidates.length);
+  assert.equal(composition.retention.retained, detection.candidates.length);
+  assert.equal(composition.retention.rejected, 0);
+  assert.equal(composition.retention.uncomposed, 0);
+  assert.equal(composition.regions.length, 1);
+  const [cover] = composition.regions;
+  assert.deepEqual(cover.span, { start: 13, end: 50 });
+  assert.deepEqual(cover.original, { kind: 'ORIGINAL_COVER', span: { start: 13, end: 50 } });
+  assert.deepEqual([...cover.representations], ['RAW']);
+  assert.deepEqual([...cover.fieldFormats], ['JSON']);
+  assert.equal(input.slice(cover.span.start, cover.span.end), 'syn\\u002dpass\\u002d4f2b9c7e1d.invalid');
+  assert.equal(cover.obligations.nonReversibleFloor, true);
+  assert.equal(cover.obligations.highestSensitivity, 'SECRET');
+  assert.equal(cover.composed.sensitivity, 'SECRET');
+  assert.equal(cover.composed.reversible, false);
+  assert.ok(cover.relations.includes('CONTAINING') && cover.relations.includes('IDENTICAL'));
+  assert.equal(new Set(cover.members.map((member) => member.evidenceRef)).size, cover.members.length);
+  for (const member of cover.members) {
+    assert.ok(member.span.start >= cover.span.start && member.span.end <= cover.span.end);
+    assert.equal(input.slice(member.span.start, member.span.end).includes(PASSWORD), false, member.evidenceRef);
+  }
+
+  // 4. Rewrite: the planned span is the parsed value span of the covering field, keyed by a source-bound
+  //    digest rather than by the key name, and every member's evidence reference is carried.
+  const plan = planOverlapRewrite({ composition, source: input, format: 'JSON', replacement: MASK });
+  assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+  assert.deepEqual(reasonsOf(plan), []);
+  assert.equal(plan.regions.length, 1);
+  assert.equal(plan.regions[0].decision, 'REPLACE_FIELD_VALUE');
+  assert.deepEqual(plan.regions[0].fieldSpan, { start: 13, end: 50 });
+  assert.match(plan.regions[0].fieldRef, /^[0-9a-f]{16}$/u);
+  assert.equal(plan.regions[0].evidenceRefs.length, cover.members.length);
+  const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'JSON' });
+  assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? reasonsOf(applied).join() : '');
+
+  // 5. Exact serialized bytes and an independent reparse: the escape spelling is gone, the keys and the
+  //    untouched value survive, and no #6 candidate for the protected value is left in the output.
+  assert.equal(applied.text, '{"password":"****","region":"eu"}');
+  assert.equal(applied.text.includes(PASSWORD), false);
+  assert.equal(applied.text.includes('\\u002d'), false);
+  const after = parseStructured(applied.text, 'JSON');
+  assert.equal(after.status, 'COMPLETE');
+  assert.deepEqual(after.fields.map((item) => item.path.join('.')), before.fields.map((item) => item.path.join('.')));
+  assert.deepEqual(after.fields.map((item) => item.value), [MASK, 'eu']);
+  assert.deepEqual(detect(applied.text).candidates.filter((item) => item.source === 'SECRET'), []);
+  assert.equal(applied.provenance.rewrittenFields, 1);
+  assert.equal(applied.provenance.format, 'JSON');
+  assert.equal(applied.provenance.sourceDigest, createHash('sha256').update(input).digest('hex'));
+  assert.equal(applied.provenance.replacementDigest, createHash('sha256').update(MASK).digest('hex'));
+  assert.equal(applied.provenance.regions[0].fieldSpan.start, 13);
+
+  // 6. Final bytes: #19 blocks the source on its own evidence, naming the registered original by its planted
+  //    reference, and releases exactly the rewritten bytes it was given. The block is the sentinel's catch
+  //    alone; the rewrite above stands or falls on its own results.
+  const source = sentinel(input);
+  assert.equal(source.decision, 'BLOCK');
+  assert.deepEqual([...source.reasons].sort(), ['HIGH_RISK_PATTERN', 'KNOWN_ORIGINAL_DETECTED']);
+  const registered = source.findings.filter((item) => item.kind === 'KNOWN_ORIGINAL');
+  assert.ok(registered.length > 0);
+  assert.deepEqual([...new Set(registered.map((item) => item.rule))], ['planted.secret.1']);
+  const finalBytes = sentinel(applied.text);
+  assert.deepEqual([finalBytes.decision, finalBytes.reasons], ['ALLOW', []]);
+  assert.equal(finalBytes.findings.length, 0);
+  assert.equal(Buffer.from(finalBytes.release).equals(Buffer.from(enc(applied.text))), true);
+  // Diagnostics stay privacy safe: spans, digests and references, no planted value and no key name.
+  const records = [JSON.stringify(composition), JSON.stringify(plan), JSON.stringify(applied.provenance)].join('');
+  assert.equal(records.includes(PASSWORD), false);
+  assert.equal(records.includes('"password"'), false);
+  assert.equal(records.includes('\\u002d'), false);
+});
+
+test('a quoted escaped dotenv value rewrites from its covering source location and releases exact bytes', () => {
+  // The dotenv analogue: the same property, in the one line format whose quoted values carry escapes. The
+  // source holds `syn\-pass\-...`, which #7's double-quoted value rule decodes to the planted original.
+  const input = 'DB_PASSWORD="syn\\-pass\\-4f2b9c7e1d.invalid"\n';
+  assert.equal(input.includes(PASSWORD), false, 'the source really holds no verbatim planted original');
+
+  // 1. Source location: one complete, full-coverage field whose decoded value is the planted original.
+  const before = parseStructured(input, 'DOTENV');
+  assert.equal(before.status, 'COMPLETE');
+  assert.equal(before.coverage, 'FULL');
+  assert.deepEqual(reasonsOf(before), []);
+  assert.equal(before.fields.length, 1);
+  const [field] = before.fields;
+  assert.deepEqual(field.path, ['DB_PASSWORD']);
+  assert.equal(field.syntax, 'DOUBLE_QUOTED');
+  assert.equal(field.highRisk, true);
+  assert.equal(field.value, PASSWORD);
+  assert.deepEqual({ start: field.valueStart, end: field.valueEnd }, { start: 13, end: 42 });
+  assert.equal(input.slice(field.valueStart, field.valueEnd), 'syn\\-pass\\-4f2b9c7e1d.invalid');
+  assert.equal(field.value.length, PASSWORD.length, 'the decoded value is shorter than its source spelling');
+
+  // 2. Detection and 3. composition: a covering original, the credential floor, nothing lost.
+  const detection = detect(input);
+  assert.equal(detection.status, 'COMPLETE', reasonsOf(detection).join());
+  const bound = detection.candidates.filter((item) => item.field);
+  assert.ok(bound.length >= 2, `${bound.length} field-bound candidates`);
+  for (const item of bound) {
+    assert.equal(item.field.format, 'DOTENV');
+    assert.equal(item.field.hintSource, 'PATH');
+    assert.equal(item.field.verbatim, false);
+    assert.equal(item.original.kind, 'ORIGINAL_COVER');
+    assert.deepEqual(item.field.span, { start: 13, end: 42 });
+    assert.deepEqual(item.field.valueSpan, { start: 0, end: PASSWORD.length });
+  }
+  const composition = compose(detection.candidates);
+  assert.equal(composition.retention.uncomposed, 0);
+  assert.equal(composition.retention.rejected, 0);
+  assert.equal(composition.regions.length, 1);
+  const [cover] = composition.regions;
+  assert.deepEqual(cover.span, { start: 13, end: 42 });
+  assert.deepEqual(cover.original, { kind: 'ORIGINAL_COVER', span: { start: 13, end: 42 } });
+  assert.deepEqual([...cover.fieldFormats], ['DOTENV']);
+  assert.equal(cover.obligations.nonReversibleFloor, true);
+  assert.equal(cover.composed.sensitivity, 'SECRET');
+  assert.equal(cover.composed.reversible, false);
+  assert.deepEqual([...cover.relations], ['IDENTICAL']);
+
+  // 4. Rewrite: the planned span is that field's own value span.
+  const plan = planOverlapRewrite({ composition, source: input, format: 'DOTENV', replacement: MASK });
+  assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+  assert.deepEqual(reasonsOf(plan), []);
+  assert.equal(plan.regions.length, 1);
+  assert.deepEqual(plan.regions[0].fieldSpan, { start: 13, end: 42 });
+  const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'DOTENV' });
+  assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? reasonsOf(applied).join() : '');
+
+  // 5. Exact bytes and an independent reparse: the key and its quoting survive, the value is the constant.
+  assert.equal(applied.text, 'DB_PASSWORD="****"\n');
+  assert.equal(applied.text.includes(PASSWORD), false);
+  const after = parseStructured(applied.text, 'DOTENV');
+  assert.equal(after.status, 'COMPLETE');
+  assert.deepEqual(after.fields.map((item) => item.path.join('.')), before.fields.map((item) => item.path.join('.')));
+  assert.deepEqual(after.fields.map((item) => item.syntax), ['DOUBLE_QUOTED']);
+  assert.deepEqual(after.fields.map((item) => item.value), [MASK]);
+  assert.deepEqual(detect(applied.text).candidates.filter((item) => item.source === 'SECRET'), []);
+  assert.equal(applied.provenance.rewrittenFields, 1);
+  assert.equal(applied.provenance.format, 'DOTENV');
+
+  // 6. Final bytes, and the diagnostics that describe the rewrite without carrying it.
+  const source = sentinel(input);
+  assert.equal(source.decision, 'BLOCK');
+  assert.deepEqual([...source.reasons].sort(), ['HIGH_RISK_PATTERN', 'KNOWN_ORIGINAL_DETECTED']);
+  assert.deepEqual(source.findings.filter((item) => item.kind === 'KNOWN_ORIGINAL').map((item) => item.rule),
+    ['planted.secret.1']);
+  const finalBytes = sentinel(applied.text);
+  assert.deepEqual([finalBytes.decision, finalBytes.reasons], ['ALLOW', []]);
+  assert.equal(Buffer.from(finalBytes.release).equals(Buffer.from(enc(applied.text))), true);
+  const records = [JSON.stringify(composition), JSON.stringify(plan), JSON.stringify(applied.provenance)].join('');
+  assert.equal(records.includes(PASSWORD), false);
+  // The key name is payload content; only a source-bound digest of the path reaches a record. The key is
+  // deliberately not the bare word `PASSWORD`, because #8's own PASSWORD *subtype* is classification
+  // vocabulary that legitimately appears in a claim, so a text search could not separate the two.
+  assert.equal(records.includes('DB_PASSWORD'), false);
+  assert.equal(records.includes('DB_PASSWORD='), false);
+  assert.ok(records.includes('hylja.secret-detectors.password'), 'the detector rule id is a producer name');
+  assert.equal(records.includes('\\-pass'), false);
+});
+
+test('dotenv backslash escapes only decode inside double quotes, and a bare value cannot take the mask', () => {
+  // Two boundaries of the quoted path above, asserted here rather than assumed.
+  // First: a backslash escape means nothing in a bare dotenv value, so the field value keeps its backslashes,
+  // the candidate is verbatim, and the protected text there is not the planted original at all. The rewrite
+  // that covers it is refused for a second, independent reason: #7 cannot encode this constant for `BARE`.
+  const bare = 'DB_PASSWORD=syn\\-pass\\-4f2b9c7e1d.invalid\n';
+  assert.equal(bare.includes(PASSWORD), false);
+  const bareParsed = parseStructured(bare, 'DOTENV');
+  assert.equal(bareParsed.fields.length, 1);
+  assert.deepEqual(bareParsed.fields[0].path, ['DB_PASSWORD']);
+  assert.equal(bareParsed.fields[0].syntax, 'BARE');
+  assert.notEqual(bareParsed.fields[0].value, PASSWORD);
+  assert.equal(bareParsed.fields[0].value.includes('\\'), true, 'a bare value decodes no escape');
+  const bareDetection = detect(bare);
+  assert.equal(bareDetection.status, 'COMPLETE', reasonsOf(bareDetection).join());
+  const bareBound = bareDetection.candidates.filter((item) => item.field);
+  assert.equal(bareBound.length >= 1, true);
+  for (const item of bareBound) {
+    assert.equal(item.field.verbatim, true);
+    assert.equal(item.original.kind, 'ORIGINAL_EXACT');
+    assert.deepEqual(item.field.span, { start: 12, end: 41 });
+  }
+  const bareComposition = compose(bareDetection.candidates);
+  assert.equal(regionWith(bareComposition, 'CREDENTIAL_OR_SECRET').original.kind, 'ORIGINAL_EXACT');
+  const barePlan = planOverlapRewrite({ composition: bareComposition, source: bare, format: 'DOTENV',
+    replacement: MASK });
+  assert.equal(barePlan.status, 'PLANNED', reasonsOf(barePlan).join());
+  const bareApplied = applyOverlapRewrite({ plan: barePlan, composition: bareComposition, source: bare,
+    format: 'DOTENV' });
+  assert.deepEqual(bareApplied, { status: 'REFUSED', reasons: ['UNENCODABLE_REPLACEMENT'] });
+  // That refusal is the draft's own outcome. The block below is #19's catch alone: #19's escape round reads a
+  // value #7's bare rule does not, and it is never credit for a merge or a rewrite.
+  const bareBytes = sentinel(bare);
+  assert.equal(bareBytes.decision, 'BLOCK');
+  assert.deepEqual([...bareBytes.reasons].sort(), ['HIGH_RISK_PATTERN', 'KNOWN_ORIGINAL_DETECTED']);
+
+  // Second: the quoted escaped credential next to an ordinary bare line. Both fields are covered and the plan
+  // is `PLANNED`, so a plan is a reviewable artifact rather than a promise: the apply re-derives it and #7
+  // refuses the constant for the bare field, leaving the bytes untransformed.
+  const mixed = 'DB_PASSWORD="syn\\-pass\\-4f2b9c7e1d.invalid"\nDB_HOST=db.example.invalid\n';
+  const mixedComposition = compose(detect(mixed).candidates);
+  assert.equal(mixedComposition.retention.uncomposed, 0);
+  const mixedPlan = planOverlapRewrite({ composition: mixedComposition, source: mixed, format: 'DOTENV',
+    replacement: MASK });
+  assert.equal(mixedPlan.status, 'PLANNED', reasonsOf(mixedPlan).join());
+  assert.deepEqual(mixedPlan.regions.map((item) => item.decision), ['REPLACE_FIELD_VALUE', 'REPLACE_FIELD_VALUE']);
+  const mixedApplied = applyOverlapRewrite({ plan: mixedPlan, composition: mixedComposition, source: mixed,
+    format: 'DOTENV' });
+  assert.deepEqual(mixedApplied, { status: 'REFUSED', reasons: ['UNENCODABLE_REPLACEMENT'] });
+  assert.equal(mixedApplied.text, undefined);
+});
+
+test('quoted dotenv keeps UTF-16 offsets and folds non-BMP, decomposed and invisible spellings', () => {
+  // The same supported quoted path, with the Unicode and normalization cases that move offsets. A non-BMP
+  // character counts as two UTF-16 units; a decomposed letter and a zero-width character are not the source
+  // spelling of the value at all, so the fold reports a covering original and both representations.
+  const cases = [
+    { label: 'non-BMP prefix', input: `DB_PASSWORD="\u{1f600}${PASSWORD}"\n`, span: { start: 13, end: 42 },
+      folded: false, valueUnits: 2 + PASSWORD.length },
+    { label: 'non-BMP suffix', input: `DB_PASSWORD="${PASSWORD}\u{1f600}"\n`, span: { start: 13, end: 42 },
+      folded: false, valueUnits: PASSWORD.length + 2 },
+    { label: 'decomposed letter', input: 'DB_PASSWORD="syn-pa\u0308ss-4f2b9c7e1d.invalid"\n',
+      span: { start: 13, end: 41 }, folded: true, valueUnits: 28 },
+    { label: 'zero-width character', input: 'DB_PASSWORD="syn-p\u200bass-4f2b9c7e1d.invalid"\n',
+      span: { start: 13, end: 41 }, folded: true, valueUnits: 28 },
+  ];
+  for (const { label, input, span, folded, valueUnits } of cases) {
+    // Guard: the input really carries the character the case is about, so no assertion below can pass on an
+    // input that never had it. A code-point match over the non-ASCII range minus the line structure the
+    // source legitimately holds; a literal escape-string search would never be able to fail here.
+    const exotic = new Set(input.match(/[^\u0009\u000a\u000d\u0020-\u007e]/gu) ?? []);
+    assert.ok(exotic.size > 0, `${label} really carries a non-ASCII character`);
+
+    const before = parseStructured(input, 'DOTENV');
+    assert.equal(before.status, 'COMPLETE', label);
+    assert.equal(before.fields.length, 1, label);
+    const [field] = before.fields;
+    assert.deepEqual({ start: field.valueStart, end: field.valueEnd }, span, label);
+    assert.equal(field.value.length, valueUnits, label);
+    assert.equal(input.slice(field.valueStart, field.valueEnd).length, span.end - span.start, label);
+
+    const detection = detect(input);
+    assert.equal(detection.status, 'COMPLETE', `${label}: ${reasonsOf(detection).join()}`);
+    const composition = compose(detection.candidates);
+    assert.equal(composition.retention.uncomposed, 0, label);
+    assert.equal(composition.regions.length, 1, label);
+    const [region] = composition.regions;
+    assert.deepEqual(region.span, span, label);
+    assert.equal(region.obligations.nonReversibleFloor, true, label);
+    assert.equal(region.composed.sensitivity, 'SECRET', label);
+    assert.equal(region.composed.reversible, false, label);
+    if (folded) {
+      // A spelling the source does not hold: the fold finds it, so the original is covering and both
+      // representations are reported. The source holds no verbatim planted original in these two cases.
+      assert.deepEqual([...region.representations], ['FOLDED', 'RAW'], label);
+      assert.equal(region.original.kind, 'ORIGINAL_COVER', label);
+      assert.equal(input.includes(PASSWORD), false, label);
+      assert.ok(detection.candidates.some((item) => item.view.representation === 'FOLDED'), label);
+      for (const item of detection.candidates) {
+        if (item.view.representation === 'FOLDED') assert.equal(item.original.kind, 'ORIGINAL_COVER', label);
+        assert.ok(item.original.span.start >= 0 && item.original.span.end <= input.length, label);
+      }
+      // The composition carries spans and references only, so it echoes no character of the folded spelling.
+      for (const char of exotic) {
+        assert.equal(JSON.stringify(composition).includes(char), false,
+          `${label} U+${char.codePointAt(0).toString(16)}`);
+      }
+    } else {
+      assert.deepEqual([...region.representations], ['RAW'], label);
+      assert.equal(region.original.kind, 'ORIGINAL_EXACT', label);
+    }
+
+    const plan = planOverlapRewrite({ composition, source: input, format: 'DOTENV', replacement: MASK });
+    assert.equal(plan.status, 'PLANNED', `${label}: ${reasonsOf(plan).join()}`);
+    assert.deepEqual(plan.regions.map((item) => item.fieldSpan), [span], label);
+    const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'DOTENV' });
+    assert.equal(applied.status, 'REWRITTEN', `${label}: ${applied.status === 'REFUSED' ? reasonsOf(applied).join() : ''}`);
+    assert.equal(applied.text, 'DB_PASSWORD="****"\n', label);
+    assert.equal(applied.provenance.rewrittenFields, 1, label);
+    for (const char of exotic) assert.equal(applied.text.includes(char), false, `${label} output`);
+    const after = parseStructured(applied.text, 'DOTENV');
+    assert.deepEqual(after.fields.map((item) => [item.path.join('.'), item.value]), [['DB_PASSWORD', MASK]], label);
+    assert.deepEqual(detect(applied.text).candidates.filter((item) => item.source === 'SECRET'), [], label);
+    const source = sentinel(input);
+    assert.equal(source.decision, 'BLOCK', label);
+    assert.ok(source.reasons.includes('KNOWN_ORIGINAL_DETECTED'), label);
+    const finalBytes = sentinel(applied.text);
+    assert.deepEqual([finalBytes.decision, finalBytes.reasons], ['ALLOW', []], label);
+    assert.equal(Buffer.from(finalBytes.release).equals(Buffer.from(enc(applied.text))), true, label);
+  }
+});
+
+test('a dotenv plan refuses a stale source and a mismatched format, and echoes no planted value', () => {
+  const input = 'DB_PASSWORD="syn\\-pass\\-4f2b9c7e1d.invalid"\n';
+  const composition = compose(detect(input).candidates);
+  const plan = planOverlapRewrite({ composition, source: input, format: 'DOTENV', replacement: MASK });
+  assert.equal(plan.status, 'PLANNED', reasonsOf(plan).join());
+
+  // Binding failures on an otherwise clean escaped source: the digest is over the exact bytes, so a one
+  // character edit, an appended line and a removed escape are all a different source rather than a near miss.
+  const stale = [
+    { label: 'one character edited', source: 'DB_PASSWORD="syn\\-pass\\-4f2b9c7e1d.invaliD"\n' },
+    { label: 'line appended', source: `${input}DB_HOST=db.example.invalid\n` },
+    { label: 'escape removed', source: `DB_PASSWORD="${PASSWORD}"\n` },
+  ];
+  for (const { label, source } of stale) {
+    const refused = applyOverlapRewrite({ plan, composition, source, format: 'DOTENV' });
+    assert.deepEqual(refused, { status: 'REFUSED', reasons: ['STALE_SOURCE_BINDING'] }, label);
+    assert.equal(refused.text, undefined, label);
+  }
+  const wrongFormat = applyOverlapRewrite({ plan, composition, source: input, format: 'JSON' });
+  assert.deepEqual(wrongFormat, { status: 'REFUSED', reasons: ['FORMAT_MISMATCH'] });
+  assert.equal(wrongFormat.text, undefined);
+
+  // Ordinary diagnostics: fixed reason codes, no bytes, no planted value, no escape spelling, no key name.
+  for (const refused of [applyOverlapRewrite({ plan, composition, source: stale[0].source, format: 'DOTENV' }),
+    wrongFormat]) {
+    const serialized = JSON.stringify(refused);
+    assert.equal(serialized.includes(PASSWORD), false);
+    assert.equal(serialized.includes('\\-pass'), false);
+    assert.equal(serialized.includes('DB_PASSWORD'), false);
+    assert.deepEqual(Object.keys(refused).sort(), ['reasons', 'status']);
+  }
+  const planRecords = JSON.stringify(plan);
+  assert.equal(planRecords.includes(PASSWORD), false);
+  assert.equal(planRecords.includes('DB_PASSWORD'), false);
+  assert.equal(planRecords.includes('DB_PASSWORD='), false);
+  assert.equal(planRecords.includes('\\-pass'), false);
+
+  // The refusals above are binding checks, not a poisoned plan: the honest plan still rewrites this source.
+  const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'DOTENV' });
+  assert.equal(applied.status, 'REWRITTEN', applied.status === 'REFUSED' ? reasonsOf(applied).join() : '');
+  assert.equal(applied.text, 'DB_PASSWORD="****"\n');
+  assert.deepEqual([sentinel(applied.text).decision, sentinel(applied.text).reasons], ['ALLOW', []]);
+});
+
+test('the same decoded original behind a percent-escaped view has no accepted rewrite path', () => {
+  // The counterpart to the `\u002d` group above, and the edge of the envelope this coverage draws. The
+  // decoded value is the same planted original, but the escape is percent-decoded by #6 into a decoded *view*
+  // rather than by #7 into a field value, and a decoded view has no byte map back to the source.
+  const input = '{"password":"syn%2Dpass%2D4f2b9c7e1d.invalid"}';
+  assert.equal(input.includes(PASSWORD), false);
+  const before = parseStructured(input, 'JSON');
+  assert.equal(before.status, 'COMPLETE');
+  assert.notEqual(before.fields[0].value, PASSWORD, '#7 resolves the JSON escape, not the percent escape');
+
+  const detection = detect(input);
+  assert.equal(detection.status, 'COMPLETE', reasonsOf(detection).join());
+  const decoded = detection.candidates.filter((item) => item.view.viewId !== 0);
+  assert.ok(decoded.length >= 1);
+  for (const item of decoded) assert.equal(item.original.kind, 'ENCODED_RUNS');
+
+  const composition = compose(detection.candidates);
+  assert.equal(composition.retention.uncomposed, 0);
+  assert.ok(composition.refusals.some((item) => item.reason === 'CROSS_VIEW_OVERLAP'));
+  assert.ok(reasonsOf(composition).includes('UNRESOLVED_OVERLAP'));
+  const viewRegion = composition.regions.find((region) => region.viewId !== 0);
+  assert.ok(viewRegion);
+  // Nothing is lost in either coordinate space: the decoded view's own claim is the host-shaped one, and the
+  // credential evidence sits in the raw region. What refuses the rewrite is the claim with no byte map back,
+  // not a dropped or downgraded credential.
+  assert.deepEqual([...viewRegion.obligations.semanticTypes], ['HOST_OR_SERVICE']);
+  assert.equal(viewRegion.obligations.nonReversibleFloor, false);
+  const rawRegion = composition.regions.find((region) => region.viewId === 0);
+  assert.equal(rawRegion.obligations.nonReversibleFloor, true);
+  assert.equal(rawRegion.composed.sensitivity, 'SECRET');
+  assert.equal(rawRegion.composed.reversible, false);
+
+  // The raw field region is coverable; the decoded-view region is not, so the whole plan refuses.
+  const plan = planOverlapRewrite({ composition, source: input, format: 'JSON', replacement: MASK });
+  assert.equal(plan.status, 'REFUSED');
+  assert.deepEqual(reasonsOf(plan), ['ENCODED_VIEW_NOT_REWRITABLE']);
+  const decision = plan.regions.find((item) => item.regionRef === viewRegion.regionRef);
+  assert.equal(decision.decision, 'REFUSED');
+  assert.deepEqual([...decision.reasons], ['ENCODED_VIEW_NOT_REWRITABLE']);
+  assert.equal(plan.regions.some((item) => item.decision === 'REPLACE_FIELD_VALUE'), true,
+    'the refusal comes from the decoded view, not from the field binding');
+  const applied = applyOverlapRewrite({ plan, composition, source: input, format: 'JSON' });
+  // The supplied plan is already `REFUSED`, so the function that returns bytes refuses it before any source
+  // work; the plan-level reason above is where `ENCODED_VIEW_NOT_REWRITABLE` is stated.
+  assert.deepEqual(applied, { status: 'REFUSED', reasons: ['REFUSED_PLAN'] });
+  assert.equal(applied.text, undefined);
+
+  // The block is #19's catch alone; no merge, composition or rewrite succeeded on these bytes.
+  const source = sentinel(input);
+  assert.equal(source.decision, 'BLOCK');
+  assert.ok(source.reasons.includes('KNOWN_ORIGINAL_DETECTED'));
+  assert.deepEqual([...new Set(source.findings.filter((item) => item.kind === 'KNOWN_ORIGINAL')
+    .map((item) => item.rule))], ['planted.secret.1']);
+});

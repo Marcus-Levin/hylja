@@ -613,7 +613,7 @@ function* dumpRuns(text: string): Generator<EncodedRun> {
 }
 const SEPARATED_HEX = /^[0-9A-Fa-f]{2,}(?:[-_/][0-9A-Fa-f]{2,})+$/u;
 const UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/u;
-interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean; joined?: boolean; escaped?: boolean; declared?: boolean }
+interface EncodedRun { start: number; end: number; value: string; prefixed: boolean; countable: boolean; separated?: boolean; joined?: boolean; escaped?: boolean; declared?: boolean; escapedSeries?: boolean }
 // Chunks of any length: a fixed-width split ends in a short remainder (`…Ghs2 M=`), and short words between chunks
 // are dropped by the word-free variant.
 const CHUNK = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{1,1024}={0,2}(?![A-Za-z0-9+/=_-])/gu;
@@ -681,6 +681,13 @@ interface DeclaredReading {
   minimum: number;
   /** Values the encoded-data evidence is judged on, when the join itself differs (`/` glued into a chunk). */
   evidence?: readonly DeclaredEntry[];
+  /**
+   * Values decoded from byte escapes rather than written as chunks. Their encoded-ness evidence is the escape
+   * spelling itself — every value is a list of supported byte escapes, which is stronger than the shape test
+   * `declaredRuns` applies to a chunk — and the decoded bytes are not hex text any sender wrote, so the shape
+   * test is skipped rather than misapplied to them.
+   */
+  escaped?: boolean;
 }
 /** Strip a chunk's own padding and hex `0x` prefix, as the chunk join does before concatenating. */
 function declaredValue(token: string): string {
@@ -732,11 +739,15 @@ function* declaredRuns(start: number, end: number, readings: readonly DeclaredRe
     const entries = reading.entries;
     if (entries.length < reading.minimum) continue;
     const evidence = reading.evidence ?? entries;
-    if (evidence.filter((entry) => chunkLikeLoose(entry.value)).length < evidence.length * 0.5) continue;
-    if (!evidence.some((entry) => chunkLike(entry.value) || HEX_GROUP.test(entry.value))) continue;
+    // A reading of byte escapes is judged by its spelling, not by the shape of the bytes it spells.
+    if (reading.escaped !== true) {
+      if (evidence.filter((entry) => chunkLikeLoose(entry.value)).length < evidence.length * 0.5) continue;
+      if (!evidence.some((entry) => chunkLike(entry.value) || HEX_GROUP.test(entry.value))) continue;
+    }
     const value = entries.map((entry) => declaredValue(entry.value)).join('');
     if (!charge(value, budget)) continue;
-    yield { start, end, value, prefixed: false, countable: false, separated: true, joined: true, declared: true };
+    yield { start, end, value, prefixed: false, countable: false, separated: true, joined: true, declared: true,
+      escapedSeries: reading.escaped === true };
   }
 }
 /**
@@ -910,6 +921,84 @@ function* labelledChunkRuns(text: string, budget: DeclaredBudget): Generator<Enc
     if (value !== undefined) group.push({ label: field[1]!, value, hexLabel: !/[g-zG-Z]/u.test(field[1]!) });
     end = at + field[0].length;
     previous = { at, length: field[0].length };
+  }
+  yield* flush();
+}
+/**
+ * The label half of a labelled field, without its value: `part1:`, `"part2":`, `p3=`, up to the first character of
+ * the value. It is the label grammar `LABELLED_FIELD` already uses — the same bounded label, the optional quoted
+ * key, the same `[ \t]{0,4}` spacing around the separator, and the optional opening quote of a JSON string value
+ * (`"part1":"\x1f"`) — so a field this reader skips for want of an escape is exactly a field the chunk reader owns,
+ * and the two never both claim one field.
+ *
+ * The label may not start inside a backslash escape. In a JSON body the line break between two fields is the two
+ * characters `\n`, and a label scan that started at its `n` read `npart2` for every field after the first: one series
+ * of 159 fields whose join was the payload minus its own first byte, which decoded to nothing and was released while
+ * the same payload in every other spelling was refused. The escape is therefore consumed **before** the label here,
+ * and the label may not follow a backslash at all — a measured hole, not a hypothetical one, and the opposite of
+ * the direction this whole reader exists for.
+ */
+const LABELLED_HEAD = /(?<![A-Za-z0-9_\\])(?:\\[nrtbfunx0-7])?([A-Za-z][A-Za-z0-9_-]{0,23})"?[ \t]{0,4}[:=][ \t]{0,4}"?/gu;
+/**
+ * One reading per declared label series of a group of escape-valued fields, in text order and in numeric-label
+ * order. A series is the same declaration the chunk reader reads — the fields that share a label name, numbered
+ * (`part1 … partN`) or not (`data`, `value`, the keys an array of labelled objects uses) — so this adds a reading
+ * and never removes one. It is a per-name reading, not a search over subsets: a group of n fields yields at most
+ * n/2 series and each costs its own size. A group whose fields are *not* one series is still read, one name at a
+ * time; a payload spread across two declared names is not, which is the limit the chunk reader already publishes.
+ *
+ * Fields whose label comes from the hex alphabet (`face1: \x1f`) are excluded here. That is **stricter** than the
+ * chunk reader beside it, which reads the same fields when `completeHexSeries` declares a complete series: a
+ * hex-labelled escape series is therefore not reconstructed at one escape per field, which is a published gap and
+ * not a parity. It is the same trade the chunk reader makes for a dump offset column, which carries numbers too and
+ * is told apart from a declaration only by a complete run.
+ */
+function escapeReadings(entries: readonly DeclaredEntry[]): DeclaredReading[] {
+  const readings: DeclaredReading[] = [];
+  for (const candidate of labelledSeries(entries.filter((entry) => !entry.hexLabel))) {
+    if (candidate.entries.length < MIN_DECLARED_VALUES) continue;
+    readings.push({ entries: candidate.entries, minimum: MIN_DECLARED_VALUES, escaped: true });
+    const numbered = numericOrder(candidate.entries);
+    if (numbered) readings.push({ entries: numbered, minimum: MIN_DECLARED_VALUES, escaped: true });
+  }
+  return readings;
+}
+/**
+ * Escapes written as the values of one declared label series — `part1: \x1f`, `part2: \x8b`, … — rebuilt as the
+ * one byte string that series spells. Before this reading each of those escapes was a one-byte run below the
+ * floor, so a compressed note, a canary or a blob written this way was read as ordinary text and released.
+ *
+ * It is a **declared series** reading and nothing wider. The fields are grouped exactly as `labelledChunkRuns`
+ * groups them (the same gap rule, the same `MAX_DECLARED_FIELDS`), every field of the series must be an escape
+ * list, and the join is charged through the same per-message `DeclaredBudget`, so a message demanding more
+ * reconstructions than the budget allows is uninspectable in the same way and never quietly clean. Like every
+ * declared reconstruction it is decode-only: it adds no opaque bytes of its own, so ordinary labelled
+ * configuration cannot be blocked by the shape of its values. It reads nothing inside a quoted string (that is
+ * `quoted()`, untouched), and it joins nothing that is not one series — no word skipping, no subset search.
+ */
+function* labelledEscapeRuns(text: string, budget: DeclaredBudget): Generator<EncodedRun> {
+  if (!HAS_LABEL.test(text)) return;
+  let group: DeclaredEntry[] = [];
+  let start = 0, end = 0;
+  let previous: { at: number; end: number } | null = null;
+  const flush = function* (): Generator<EncodedRun> {
+    if (group.length) yield* declaredRuns(start, end, escapeReadings(group), budget);
+    group = [];
+    previous = null;
+  };
+  for (const head of text.matchAll(LABELLED_HEAD)) {
+    const at = head.index!;
+    const pieces = escapeListPieces(text, at + head[0].length);
+    // Not an escape-valued field, so it belongs to no reading here: `LABELLED_FIELD` may still read it as a chunk.
+    if (!pieces.length) continue;
+    const gap = previous ? text.slice(previous.end, at) : '';
+    if (previous && (!labelledGap(gap) || group.length + pieces.length > MAX_DECLARED_FIELDS)) yield* flush();
+    if (group.length === 0) start = at;
+    for (const piece of pieces) {
+      group.push({ label: head[1]!, value: hexBytes(piece.bytes), hexLabel: !/[g-zG-Z]/u.test(head[1]!) });
+    }
+    end = pieces.at(-1)!.end;
+    previous = { at, end: pieces.at(-1)!.end };
   }
   yield* flush();
 }
@@ -1118,6 +1207,7 @@ function* encodedRuns(text: string, budget: DeclaredBudget): Generator<EncodedRu
   yield* chunkSequences(text, /^(?:[\s,"'[\]:;|.&]|\\[nrt]){1,64}$/u, true);
   // Representations that declare their own reconstruction, decode-only and budgeted per message.
   yield* labelledChunkRuns(text, budget);
+  yield* labelledEscapeRuns(text, budget);
   yield* separatorChunkRuns(text, budget);
   yield* decimalByteRuns(text, budget);
 }
@@ -1228,28 +1318,51 @@ function escapedByteAt(text: string, at: number, allowQuotedPrintable = true): {
 }
 
 /**
- * One separator character between two byte escapes, and nothing else: whitespace, `,;:|.&`, quotes and brackets,
- * or the two-character JSON spelling of a line break (`\n`, `\r`, `\t`). Anything wider than one character is
- * ordinary text, so this is a single character and not a class of separators that grows with the sender's
- * formatting; `-` is deliberately not one, because a hyphen between two escapes is as likely to be a word.
+ * A separator character between two byte escapes, and nothing else: whitespace, `,;:|.&`, quotes and brackets,
+ * or the two-character JSON spelling of a line break (`\n`, `\r`, `\t`). `-` is deliberately not one, because a
+ * hyphen between two escapes is as likely to be a word.
  */
 const ESCAPE_SEPARATOR = /^[ \t\r\n,;:|.&"'[\]]$/u;
 const ESCAPE_JSON_SEPARATOR = /\\[nrt]/u;
 /**
- * The end of the separator between two byte escapes in ordinary text, or -1 when the run ends at `at`. The
- * separator is skipped only when exactly one character separates two escapes, so `=41 =42` is one two-byte run while
- * `=41 and =42` and `=41, =42` stay two one-byte runs below the floor.
+ * How wide one separator run between two byte escapes may be, in characters of the text. Formatting is not one
+ * character wide: a list is separated by `, `, ` : `, a tab and a space, a CRLF pair or its JSON spelling `\r\n`,
+ * and a JSON array of escapes by `","` or by `,\n  "`. The run is bounded and drawn from the class above rather
+ * than open, so it stays a statement about the *formatting* between escapes and never becomes a way to skip words:
+ * every character in it is a separator-class character or a JSON line-break spelling, `-` is still not one, and
+ * the run ends at the first character that is neither. A wider gap is ordinary text and ends the run, which is a
+ * declared limit (docs/plan.md #19 known limits) rather than a completeness claim.
+ */
+const MAX_ESCAPE_SEPARATOR = 8;
+/**
+ * The end of the separator run between two byte escapes in ordinary text, or -1 when the run ends at `at`. The run
+ * is skipped only when it is bounded by the class above and is immediately followed by another escape, so `=41 =42`
+ * and `=41,  =42` are one two-byte run while `=41 and =42` and a nine-character gap stay two one-byte runs below
+ * the floor.
  *
  * This is a rule about the **text between** escapes, so it applies where the text is text and nowhere else. Inside
  * a quoted string every literal character is a byte of that string (`b'\x1f\x8b \x08'` holds a space), so the
  * quoted readers below never call this: dropping such a character corrupts the bytes they reconstruct, and a
- * corrupted stream that decodes to nothing lands under `OPAQUE_BYTES` and would be released.
+ * corrupted stream that decodes to nothing lands under `OPAQUE_BYTES` and would be released. Ordinary text has the
+ * same trade and fails the same way: a payload whose own bytes spell separator-class characters, written literally
+ * between its escapes, reconstructs to bytes that are not a stream and are counted opaque rather than released.
  */
 function escapeSeparatorEnd(text: string, at: number): number {
-  const json = ESCAPE_JSON_SEPARATOR.exec(text.slice(at, at + 2))?.[0];
-  const width = json !== undefined ? json.length : ESCAPE_SEPARATOR.test(text[at] ?? '') ? 1 : 0;
-  if (!width || escapedByteAt(text, at + width) === null) return -1;
-  return at + width;
+  const limit = Math.min(text.length, at + MAX_ESCAPE_SEPARATOR);
+  let end = at;
+  while (end < limit) {
+    // A character that opens an escape belongs to that escape, not to the run: `&` is both a separator-class
+    // character and the lead of `&#xNN;`, so a greedy scan would eat the next entity's lead and then fail.
+    if (escapedByteAt(text, end) !== null) break;
+    if (end + 2 <= limit) {
+      const json = ESCAPE_JSON_SEPARATOR.exec(text.slice(end, end + 2))?.[0];
+      if (json !== undefined) { end += 2; continue; }
+    }
+    if (ESCAPE_SEPARATOR.test(text[end]!)) { end += 1; continue; }
+    break;
+  }
+  if (end === at || escapedByteAt(text, end) === null) return -1;
+  return end;
 }
 
 /**
@@ -1262,16 +1375,20 @@ function escapeSeparatorEnd(text: string, at: number): number {
  * string is read whole, as it always was.
  */
 const MAX_ESCAPED_RUN = 32 << 10;
+/** The hex spelling of reconstructed bytes, the one form every reader hands to `decodeRun`. */
+function hexBytes(bytes: readonly number[]): string {
+  return bytes.map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
 function escapedRun(start: number, end: number, bytes: number[], byteSyntax: boolean): EncodedRun {
-  return { start, end, value: bytes.map((byte) => byte.toString(16).padStart(2, '0')).join(''),
+  return { start, end, value: hexBytes(bytes),
     // Unicode escapes for ordinary accented prose are ambiguous Latin-1, so inspect them without opaque counting
     // unless control bytes or explicitly byte-oriented syntax make the representation binary.
     prefixed: false, countable: byteSyntax || bytes.some((byte) => byte < 32 || byte === 127), separated: true, escaped: true };
 }
 
 /**
- * Escape runs in ordinary text. `separated` decides whether one separator character between two escapes is skipped:
- * the contiguous reading this reader has always had, or the separated reading added to it. Both are read from the
+ * Escape runs in ordinary text. `separated` decides whether a bounded separator run between two escapes is
+ * skipped: the contiguous reading this reader has always had, or the separated reading added to it. Both are read from the
  * same text, so a sender cannot lose the contiguous reading by formatting the list, and a character that is a byte
  * of the payload rather than formatting is still read by the contiguous one. A separated run that skipped no
  * separator at all is byte-for-byte the contiguous run and is not yielded twice.
@@ -1303,25 +1420,70 @@ function* textEscapeRuns(text: string, separated: boolean): Generator<EncodedRun
 }
 
 /**
+ * One escape list written as the value of a labelled field: the escape at `at`, then every further escape that
+ * follows a bounded separator run, up to `MAX_ESCAPED_RUN` bytes. It calls the same `escapedByteAt`, the same
+ * separator rule and the same bound as the direct reader above, so an escape family or a separator spelling that
+ * reads in one reader reads in the other and no spelling can appear in only one of them. A list of one escape is a
+ * list: a declared series whose every field carries a single escape is one byte stream, not a sequence of
+ * one-byte runs below the floor.
+ */
+function escapeListAt(text: string, at: number): { bytes: number[]; end: number } | null {
+  const first = escapedByteAt(text, at);
+  if (first === null) return null;
+  const bytes = [first.byte];
+  let end = first.end;
+  while (bytes.length < MAX_ESCAPED_RUN) {
+    const skip = escapeSeparatorEnd(text, end);
+    if (skip < 0) break;
+    const next = escapedByteAt(text, skip);
+    if (next === null) break;
+    bytes.push(next.byte);
+    end = next.end;
+  }
+  return { bytes, end };
+}
+/**
+ * Every escape list one labelled field holds, as one or more pieces of at most `MAX_ESCAPED_RUN` bytes. A field
+ * longer than that bound is split exactly as the direct reader splits a long run, and the split drops no byte:
+ * every piece carries the field's own label, so the declared series concatenates them back into the bytes the
+ * field spells. Without the split a payload straddling the bound would be truncated to its first piece, decode
+ * nothing, and — like every declared reconstruction — carry no opaque bytes of its own.
+ */
+function escapeListPieces(text: string, at: number): { bytes: number[]; end: number }[] {
+  const pieces: { bytes: number[]; end: number }[] = [];
+  let cursor = at;
+  for (;;) {
+    const piece = escapeListAt(text, cursor);
+    if (piece === null) return pieces;
+    pieces.push(piece);
+    if (piece.bytes.length < MAX_ESCAPED_RUN) return pieces;
+    const skip = escapeSeparatorEnd(text, piece.end);
+    cursor = skip < 0 ? piece.end : skip;
+  }
+}
+
+/**
  * Direct escape runs plus mixed byte string literals, including Latin-1 JSON and Python/JS strings.
  *
- * In ordinary text a run is a list of escapes the same way a hex dump is a list of byte pairs: **one** separator
- * character may sit between two escapes, so an escape list the sender formatted (`=1F =8B =08 …`, `%1f %8b …`,
- * `\u001f \u008b …`) is read as the bytes it spells rather than as the formatting around it. Ordinary text is read
- * twice for that reason, in this order: the contiguous reading this reader has always had, then the separated one,
- * which is **added** to it and never instead of it — so neither a sender who formats the list nor a sender whose
- * separator character is a byte of the payload loses a reading. Two or more separator characters, or escapes split
- * across labels and other punctuation, still end a run; that limit is published in docs/plan.md and pinned in the
- * sentinel tests rather than claimed closed.
+ * In ordinary text a run is a list of escapes the same way a hex dump is a list of byte pairs: a **bounded
+ * separator run** may sit between two escapes, so an escape list the sender formatted (`=1F =8B =08 …`,
+ * `%1f, %8b; …`, `\u001f,  \u008b …`, `&#x1f;&#x8b; …` as a JSON array, one escape per line) is read as the bytes
+ * it spells rather than as the formatting around it. Ordinary text is read twice for that reason, in this order:
+ * the contiguous reading this reader has always had, then the separated one, which is **added** to it and never
+ * instead of it — so neither a sender who formats the list nor a sender whose separator characters are bytes of
+ * the payload loses a reading. A gap wider than `MAX_ESCAPE_SEPARATOR`, or one holding any other character, still
+ * ends a run; that limit is published in docs/plan.md and pinned in the sentinel tests rather than claimed closed.
  *
  * Inside a quoted string the escapes are read by `quoted()` below, which is unchanged: there every literal
  * character is a byte of the string, so the separator rule is not applied and no byte is dropped. Both readings
  * reach the same run list, so a formatted escape list is read even when it sits inside a JSON string or a byte
  * literal, and a byte of the string itself is never mistaken for formatting.
  *
- * The four-byte floor, the supported escape families, this one-character separator and `MAX_ESCAPED_RUN` are the
+ * The four-byte floor, the supported escape families, the bounded separator run and `MAX_ESCAPED_RUN` are the
  * whole of the direct reader's grammar, and the work all of it does is bounded by the message limit and the
- * per-view budget it runs inside.
+ * per-view budget it runs inside. Escapes spread across the fields of a **declared label series** are the separate
+ * reading `labelledEscapeRuns` adds below; they are not joined here, because the text between them is a label
+ * rather than formatting and skipping words is not something this reader does.
  */
 function* escapedByteRuns(text: string): Generator<EncodedRun> {
   yield* textEscapeRuns(text, false);
@@ -1642,7 +1804,17 @@ function unescapeOnce(text: string): string | null {
   return softBreaks === text ? null : softBreaks;
 }
 
-interface View { name: string; text: string; derived?: boolean; matchOnly?: boolean }
+/**
+ * One canonical view. `derived` means the text was produced by decoding the message itself, so **nothing inside it
+ * counts toward the opaque total**: it is a switch over the whole view, at both gates that matter (`recognized` and
+ * the decompression output counted for the view). That is too coarse for a text this module *reconstructed* from a
+ * declared escape series: the series' own text is a decode, so re-reading it as an encoded run must not make the
+ * sender's own text opaque — but everything that text **encodes** (a Base64 or hex payload, a signed stream, a
+ * container signature) is new data and must count exactly as it does in every other declared form. `ownText` is the
+ * narrow form of that exemption: the exact strings this view was built from, and only a run whose whole value is one
+ * of them is exempt from the byte count.
+ */
+interface View { name: string; text: string; derived?: boolean; matchOnly?: boolean; ownText?: ReadonlySet<string> }
 const INVALID_BYTE_OCTAL = /\\[4-7][0-7]{2}/u;
 /**
  * All canonical views: each text is decoded by #6 (Base64/percent/hex) and by the escape round, and every
@@ -1688,6 +1860,15 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
       // digest, UUID or public key counts toward OPAQUE_BYTES, whatever its chunking.
       const printables: string[] = [];
       const joinedTexts: string[] = [];
+      /**
+       * The text a **declared escape series** spells. It is inspected as its own view, carrying `ownText` rather
+       * than `derived`: the series' own text is a decode (below), while a Base64 or hex payload *inside* that text,
+       * and any decompression under it, raise the opaque total exactly as they do in a non-derived view. Appending
+       * it to the shared joined text instead was measured as a second, narrower problem in the other direction: a
+       * series spelling only hex letters (`=41 =42 …` -> `ABAB…`) was re-read there as an encoded run of its own and
+       * refused for the sender's own text.
+       */
+      const escapedTexts: string[] = [];
       const binary: Uint8Array[] = [];
       let countable = 0;
       const spans: [number, number][] = [];
@@ -1706,7 +1887,11 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         const decoded = decodeRun(run.value);
         if (!decoded) continue;
         // Text from joined chunks or separated hex is a layer #6 did not see: inspect it like any decoded view.
-        if (isText(decoded)) { if (run.separated) joinedTexts.push(utf8Lenient.decode(Uint8Array.from(decoded))); continue; }
+        if (isText(decoded)) {
+          if (run.separated && run.escapedSeries === true) escapedTexts.push(utf8Lenient.decode(Uint8Array.from(decoded)));
+          else if (run.separated) joinedTexts.push(utf8Lenient.decode(Uint8Array.from(decoded)));
+          continue;
+        }
         const bytes = Uint8Array.from(decoded);
         // Not counted: exact-length digests (with or without a `shaNNN-`/`h1:` prefix), SSH key blobs, UUIDs,
         // identifiers (`http2ServerSessionOptions`), runs that do not look encoded (lower-case paths, snake_case
@@ -1727,6 +1912,11 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         const identified = digest || publicBlocks.some((block) => block.start <= run.start && run.end <= block.end) ||
           B64_ALPHABET.test(run.value) || isSshEd25519PublicKey(before, run.value, bytes) || UUID.test(run.value);
         const recognized = identified || !encodedShape || !run.countable || view.derived === true || isIdentifier(run.value);
+        // This view's own text, decoded from a declared escape series: re-reading it as an encoded run is a decode of
+        // a decode, so its byte count is not new data. Only the exact strings the view was built from are exempt —
+        // a run *inside* one of them, and anything a decompression of it produces, still counts, which is what
+        // `derived` would have waived.
+        const ownShape = view.ownText?.has(run.value) === true;
         // A container signature is opaque at once, unless the run is a digest or id that happens to start with one.
         if (!identified && OPAQUE_SIGNATURES.some((signature) => signature.every((byte, index) => bytes[index] === byte))) return { reason: 'OPAQUE_EMBEDDED' };
         binary.push(bytes);
@@ -1739,7 +1929,7 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
         const byteKey = String.fromCharCode(...bytes.subarray(0, 4096));
         const seen = countedValues.has(run.value) || countedValues.has(run.value.slice(1)) ||
           bytes.length >= 8 && countedBytes.some((counted) => counted.includes(byteKey));
-        const counted = recognized || seen ? 0 : bytes.length;
+        const counted = recognized || seen || ownShape ? 0 : bytes.length;
         if (counted) { countedValues.add(run.value); countedValues.add(run.value.slice(1)); countedBytes.push(byteKey); }
         runCounts.push(counted);
         runIdentified.push(identified);
@@ -1758,6 +1948,8 @@ function canonicalViews(root: string): { views: View[]; opaque: boolean } | { re
       }
       if (printables.length) next.push({ name: `${view.name}>BINARY_PRINTABLE`, text: printables.join('\n'), derived: true });
       if (joinedTexts.length) next.push({ name: `${view.name}>JOINED`, text: joinedTexts.join('\n'), derived: view.derived === true });
+      if (escapedTexts.length) next.push({ name: `${view.name}>DECLARED_ESCAPES`, text: escapedTexts.join('\n'),
+        ownText: new Set(escapedTexts) });
       if (binary.length) {
         // The concatenation takes whole runs and byte-pair runs first, then chunk joins that overlap none of them, in
         // text order and without overlaps, so one stream is not chained to copies of itself (a chunk join and its

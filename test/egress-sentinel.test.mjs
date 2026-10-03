@@ -796,29 +796,360 @@ test('issue 88: separated-escape reconstruction is bounded and fails closed rath
   }
 });
 
-test('issue 88: the escape separator bound is one character, and the rest is measured, not claimed closed', () => {
+/* ---------- Issue #126: a wider escape separator, and escapes across one declared label series ---------- */
+
+/**
+ * Issue #126, RED on the assigned base `7514bbc` and reproduced from the public interface with synthetic data
+ * only, not taken from the issue summary. Two adjacent shapes of #124's escape reader were not read:
+ *
+ * (i) **a gap wider than one character between two escapes.** `escapeSeparatorEnd` accepted a single
+ * separator-class character (or the two-character JSON spelling of one line break), so `=41, =42`, `%1f  %8b`,
+ * `\u001f\t \u008b` and a CRLF line-broken list all ended the run: every remaining escape was a one-byte run below
+ * the four-byte floor. Measured on that base over four compressors x eight escape families x the containers
+ * below, a gzip/zlib/raw-deflate/brotli note carrying a planted original and a canary was returned `ALLOW`
+ * **with `release` bytes** for the quoted-printable (either case), octal and `\u00NN` spellings, and no family
+ * reported the precise known-original finding. The `\x`-prefixed spelling was already blocked by the byte-pair
+ * reader, which rebuilds it at any single-character separator and publishes its own limit above that.
+ *
+ * (ii) **escapes distributed across one declared label series.** `part1: \x1f`, `part2: \x8b`, ... Each escape was
+ * a one-byte run below the floor and the labelled-field reader takes chunk values only (`[A-Za-z0-9+/_-]`), so the
+ * same compressed note, its opaque bytes and its `{"part":N,"data":"…"}` spelling were read as ordinary text.
+ * Measured on that base: every one of those payloads returned `ALLOW` with `release` bytes.
+ *
+ * The fix is two readings, both added to the ones that existed: a **bounded separator run** between escapes in
+ * ordinary text (`MAX_ESCAPE_SEPARATOR`, every character a separator-class character or a JSON line-break
+ * spelling, and the run ends at the first character that opens the next escape), and one reading per **declared
+ * label series** whose every value is an escape list. `quoted()` is untouched — inside a quoted string every
+ * literal character is still a byte — and no threshold, opaque count, budget or other reader moved.
+ */
+const MULTI_ESCAPE_SEPARATORS = ['  ', ', ', ': ', '\r\n', ' , ', '\t ', ',  '];
+
+test('issue 126: escapes separated by more than one character are rebuilt, inflated and matched', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const note = Buffer.from(ESCAPED_NOTE);
+  let dressings = 0;
+  for (const compress of [zlib.gzipSync, zlib.deflateSync, zlib.deflateRawSync, zlib.brotliCompressSync]) {
+    const stream = compress(note);
+    for (const [family, spell] of Object.entries(escapeFamilies())) {
+      for (const separator of MULTI_ESCAPE_SEPARATORS) {
+        const body = [...stream].map(spell).join(separator);
+        assert.ok(body.length <= MAX_MESSAGE_BYTES, `${family}/${JSON.stringify(separator)}`);
+        for (const payload of escapeContainers(body)) {
+          blocksWithOriginal(payload, true);
+          dressings++;
+        }
+      }
+    }
+  }
+  assert.ok(dressings >= 300, `${dressings} generated dressings`);
+  // The same escapes with nothing compressed: the note is spelled out in the bytes themselves, so it is found as
+  // the text those bytes decode to rather than through decompression. Both routes are the same reconstruction.
+  for (const separator of ['  ', ', ', '\t ', ',  ']) {
+    const body = [...note].map(escapeFamilies().quotedPrintable).join(separator);
+    for (const payload of escapeContainers(body)) blocksWithOriginal(payload, true);
+  }
+  // A JSON array of escapes: the separator between two entries is `","` or `",\n  "`, which is the widest
+  // formatting any list of these carries.
+  const spell = escapeFamilies().percent;
+  const stream = zlib.gzipSync(note);
+  for (const wrap of [(list) => JSON.stringify(list), (list) => JSON.stringify(list, null, 2),
+    (list) => JSON.stringify({ parts: list }), (list) => JSON.stringify({ payload: `parts=${list.join(' ')}` })]) {
+    blocksWithOriginal(wrap([...stream].map(spell)), true);
+  }
+  // Findings and the regression record carry codes and refs only: no planted byte reaches a result.
+  const serialized = JSON.stringify(check([...stream].map(escapeFamilies().quotedPrintable).join(', ')));
+  for (const value of ['Orla', 'orla', 'Synthetica', CANARY, 'contact']) assert.ok(!serialized.includes(value), value);
+  assert.deepEqual(Object.keys(check([...stream].map(escapeFamilies().quotedPrintable).join(', ')).regression).sort(),
+    ['reasons', 'rules', 'version', 'views']);
+});
+
+/** One declared label series whose every value is an escape list, in the shapes a sender actually writes. */
+const labelledEscapeSeries = (bytes, spell, perField) => {
+  const fields = [];
+  for (let at = 0; at < bytes.length; at += perField) {
+    fields.push([...bytes.subarray(at, at + perField)].map(spell).join(' '));
+  }
+  return {
+    lines: fields.map((value, index) => `part${index + 1}: ${value}`).join('\n'),
+    json: JSON.stringify({ content: fields.map((value, index) => `part${index + 1}: ${value}`).join('\n') }),
+    query: fields.map((value, index) => `part${index + 1}=${value}`).join('&'),
+    arrayOfObjects: JSON.stringify(fields.map((value, index) => ({ part: index + 1, data: value }))),
+    commajoin: fields.map((value, index) => `"part${index + 1}":"${value}"`).join(',\n'),
+    nonNumbered: fields.map((value) => `data: ${value}`).join('\n'),
+    reversed: fields.map((value, index) => `part${fields.length - index}: ${value}`).join('\n'),
+    interleaved: fields.map((value, index) => index === 1 ? `trace: 1a2b3c4d\npart2: ${value}` : `part${index + 1}: ${value}`).join('\n'),
+  };
+};
+
+test('issue 126: escapes spread across one declared label series are rebuilt, inflated and matched', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const note = Buffer.from(ESCAPED_NOTE);
+  let dressings = 0;
+  for (const compress of [zlib.gzipSync, zlib.deflateSync, zlib.deflateRawSync, zlib.brotliCompressSync]) {
+    const stream = compress(note);
+    for (const [family, spell] of Object.entries(escapeFamilies())) {
+      for (const perField of [1, 2]) {
+        for (const [shape, payload] of Object.entries(labelledEscapeSeries(stream, spell, perField))) {
+          // Every shape below was `ALLOW` with `release` bytes at the base. The `json` container is the one
+          // exception to the *precise* claim: for the entity and percent families the base already refused that
+          // shape opaquely, because the JSON escape round turns those escapes into the bytes themselves, so what
+          // this slice claims there is that nothing is released rather than which finding is reported.
+          if (shape === 'json' && ['percent', 'htmlHex', 'htmlDecimal'].includes(family)) blocksLeak(payload);
+          else blocksWithOriginal(payload, true);
+          dressings++;
+        }
+      }
+    }
+  }
+  assert.ok(dressings >= 200, `${dressings} generated declared-series dressings`);
+  // Several bytes per field, and the same series under a JSON body that escapes its own line breaks: all one
+  // declared series, all read the same way.
+  const spell = escapeFamilies().quotedPrintable;
+  for (const perField of [1, 2, 3, 4]) {
+    const fields = [];
+    for (let at = 0; at < note.length; at += perField) {
+      fields.push([...zlib.gzipSync(note).subarray(at, at + perField)].map(spell).join(' '));
+    }
+    blocksWithOriginal(fields.map((value, index) => `part${index + 1}: ${value}`).join('\n'), true);
+    blocksWithOriginal(fields.map((value, index) => `part${index + 1}: ${value}`).join('\n\n'), true);
+    blocksWithOriginal(fields.map((value, index) => `p${index + 1} = ${value}`).join(', '), true);
+    blocksWithOriginal(JSON.stringify({ content: fields.map((value, index) => `part${index + 1}: ${value}`).join('\n') }), true);
+    blocksWithOriginal(fields.map((value, index) => `part${index + 1}: ${value}`).join('\n').toUpperCase().replace(/PART/g, 'PART'), true);
+  }
+});
+
+test('issue 126: separated escapes and declared label series are refused as opaque with no known original', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const opaque = escapedOpaqueBytes(96);
+  // Uncompressed opaque bytes above the opaque threshold, in the widened separator spellings: only the byte count
+  // can refuse these, and no `release` bytes may come back on any spelling.
+  for (const [family, spell] of Object.entries(escapeFamilies())) {
+    for (const separator of MULTI_ESCAPE_SEPARATORS) {
+      const body = [...opaque].map(spell).join(separator);
+      for (const payload of escapeContainers(body)) {
+        const result = unknown(payload);
+        assert.ok(result.reasons.includes('OPAQUE_EMBEDDED'), `${family}/${JSON.stringify(separator)}: ${result.reasons.join()}`);
+        assert.equal(result.release, undefined, `${family}/${JSON.stringify(separator)}`);
+      }
+    }
+  }
+  // The same bytes compressed: a signed stream's own output is counted, so a declared label series of them is
+  // refused opaquely rather than released.
+  for (const compress of [zlib.gzipSync, zlib.deflateSync]) {
+    for (const [family, spell] of Object.entries(escapeFamilies())) {
+      const stream = compress(opaque);
+      for (const [shape, payload] of Object.entries(labelledEscapeSeries(stream, spell, 1))) {
+        const result = unknown(payload);
+        assert.ok(result.reasons.includes('OPAQUE_EMBEDDED'), `${compress === zlib.gzipSync ? 'gzip' : 'zlib'}/${family}/${shape}: ${result.reasons.join()}`);
+        assert.equal(result.release, undefined, `${family}/${shape}`);
+      }
+    }
+  }
+  // And the published tentative-output limit, pinned in this spelling too: brotli and raw deflate carry no
+  // signature and their output cannot raise the opaque count, so opaque bytes inside them stay uninspectable
+  // rather than clean — nothing is released with a precise claim, and this is a declared limit.
+  for (const compress of [zlib.deflateRawSync, zlib.brotliCompressSync]) {
+    const stream = compress(opaque);
+    const result = unknown(labelledEscapeSeries(stream, escapeFamilies().quotedPrintable, 1).lines);
+    assert.ok(!result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), result.reasons.join());
+    assert.ok(!result.reasons.includes('CANARY_DETECTED'), result.reasons.join());
+  }
+});
+
+/**
+ * One declared label series carrying `perField` escapes of a **text** value (not a byte buffer): the series
+ * spelling of a string the sender encoded as text, which is the shape a nested payload takes when the payload is
+ * itself Base64 or hex.
+ */
+const labelledEscapeText = (text, spell, perField) => {
+  const fields = [];
+  for (let at = 0; at < text.length; at += perField) {
+    fields.push([...text.slice(at, at + perField)].map((char) => spell(char.charCodeAt(0))).join(' '));
+  }
+  return fields.map((value, index) => `part${index + 1}: ${value}`).join('\n');
+};
+
+/**
+ * Independent review of `0724426`, blocking finding, reproduced here: the text a declared escape series spells was
+ * routed into a view marked `derived: true`, and in this module `derived` is the switch that turns off opaque-byte
+ * accounting for a **whole view** — both for the runs inside it and for what a decompression inside it produces. So
+ * an unknown embedded opaque payload written as text inside a declared escape series was released with `release`
+ * bytes while the identical bytes were refused in every other spelling. This group is the direction that must
+ * hold: a declared reconstruction's own spelling exempts nothing about what the reconstruction **encodes**, exactly
+ * as `docs/plan.md` states for every other declared form ("compressed opaque data inside them still blocks").
+ */
+test('issue 126 review: a declared escape series waives no opaque byte count', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  const opaque = escapedOpaqueBytes(96);
+  const qp = (byte) => `=${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  // Four nested payloads, each spelled as text: a signed stream of opaque bytes, the same as hex, the same as a
+  // second signed layer, and a container signature. Each is checked against its own ordinary spellings first, so the
+  // series spelling is compared to the reference rather than to a magic constant.
+  const texts = {
+    base64: zlib.gzipSync(opaque).toString('base64'),
+    hex: zlib.gzipSync(opaque).toString('hex'),
+    nested: zlib.gzipSync(zlib.gzipSync(opaque)).toString('base64'),
+    container: Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), opaque]).toString('hex'),
+  };
+  for (const [label, text] of Object.entries(texts)) {
+    for (const reference of [`x=${text}`, [...text].map((char) => qp(char.charCodeAt(0))).join(' ')]) {
+      const result = unknown(reference);
+      assert.ok(result.reasons.includes('OPAQUE_EMBEDDED'), `${label}/reference: ${result.reasons.join()}`);
+      assert.equal(result.release, undefined, `${label}/reference`);
+    }
+    for (const perField of [1, 2, 3, 4, 5, 8]) {
+      const result = unknown(labelledEscapeText(text, qp, perField));
+      assert.equal(result.decision, 'BLOCK', `${label}/${perField}: ${result.reasons.join()}`);
+      assert.ok(result.reasons.includes('OPAQUE_EMBEDDED'), `${label}/${perField}: ${result.reasons.join()}`);
+      assert.equal(result.release, undefined, `${label}/${perField}`);
+    }
+    for (const [family, spell] of Object.entries(escapeFamilies())) {
+      for (const perField of [1, 3]) {
+        for (const payload of [labelledEscapeText(text, (byte) => spell(byte), perField),
+          JSON.stringify({ content: labelledEscapeText(text, (byte) => spell(byte), perField) })]) {
+          const result = unknown(payload);
+          assert.equal(result.decision, 'BLOCK', `${label}/${family}/${perField}: ${result.reasons.join()}`);
+          assert.ok(result.reasons.includes('OPAQUE_EMBEDDED'), `${label}/${family}/${perField}: ${result.reasons.join()}`);
+          assert.equal(result.release, undefined, `${label}/${family}/${perField}`);
+        }
+      }
+    }
+  }
+  // The own-shape exemption that keeps ordinary text ordinary is unchanged by this, and it stays a property of the
+  // series' own text rather than of its contents: a series spelling text that is itself all hex letters decodes to
+  // no data the sender wrote. Its one ordinary separated-list spelling is refused by the pre-existing chunk reader,
+  // at the base as at this head; the asymmetry between the two spellings is what this reading added and what this
+  // assertion pins, so neither half can be swapped for the other by a later change.
+  assert.equal(unknown(Array.from({ length: 60 }, (_, index) => `part${index + 1}: =41 =42`).join('\n')).decision, 'ALLOW');
+  assert.ok(unknown(Array.from({ length: 60 }, () => '=41 =42').join(' ')).reasons.includes('OPAQUE_EMBEDDED'));
+  // Prose spelled in escapes across a declared series is ordinary text and stays ordinary, and a planted value in
+  // that spelling is still found: the exemption is over the text's shape, not over its contents.
+  assert.equal(unknown(labelledEscapeText('ordinary build log about the synthetic service, nothing protected here',
+    qp, 4)).decision, 'ALLOW');
+  blocksWithOriginal(labelledEscapeText(ESCAPED_NOTE, qp, 1), true);
+  blocksWithOriginal(labelledEscapeText(ESCAPED_NOTE, qp, 2), true);
+});
+
+test('issue 126: ordinary escaped text, labels and configuration stay allowed', () => {
+  const unknown = (payload) => checkEgress({ bytes: enc(payload), scope: scopeA, destination, authorized: destination, known: null });
+  // Accented prose as escapes, entity runs in prose and in a query string, escaped digits, and ordinary text that
+  // merely contains separator-class punctuation. A declared series adds no opaque bytes of its own, so labelled
+  // configuration written in escapes keeps its shape: only a stream inside it is read.
+  for (const payload of [
+    '\\u00e9'.repeat(40), '&#160; &#160; &#160; spacing', '&#8212; &#8217; &euro; &nbsp; in prose',
+    'entities &#8212; &#8217; &euro; &nbsp; in prose', 'width = 41% height = 42px top = 0 left = 0',
+    'time=12:30:45 date=2026-10-02 pid=1234 tid=0x4f2a cpu=3.5% mem=12%',
+    'query: ?a=1&b=22&c=333 filter[status]=200 limit=50 offset=1000', 'budget = 100 &amp; cost = 200 &amp; total = 300',
+    'RAX=EC37B814521BE4FD  RAX=073592AFDF35F68 note', 'key =41 , =42 ; =43 , =44 done',
+    'x =41, y =42, z =43, w =44', 'step 1: =41\nstep 2: =42\nstep 3: =43\n',
+    'part1: \\n\\npart2: \\t\\tpart3: \\r\\rpart4: \\n\\n', 'part1: alpha\npart2: gamma\npart3: delta\n',
+    'matrix = [1, 0, 0, 0, 1, 0, 0, 0, 1]', 'step one / step two / step three', 'alpha + beta > gamma / delta',
+  ]) {
+    assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${unknown(payload).reasons.join()}`);
+    assert.equal(unknown(JSON.stringify({ content: payload })).decision, 'ALLOW', `json ${payload.slice(0, 44)}`);
+  }
+  // A declared series adds no opaque bytes of its own, in raw text: a series of accents, and one of control-byte
+  // escapes below the reconstruction floor, keep their shape however many fields they carry.
+  for (const payload of [Array.from({ length: 24 }, (_, index) => `part${index + 1}: \\u00e9`).join('\n'),
+    Array.from({ length: 12 }, (_, index) => `part${index + 1}: \\x20 \\x09 \\x0a`).join('\n')]) {
+    assert.equal(unknown(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${unknown(payload).reasons.join()}`);
+  }
+  // A compressed blob of ordinary text inside a declared escape series is read, and read as ordinary.
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const ordinary = zlib.gzipSync(Buffer.from('ordinary build log about the synthetic service, nothing protected'));
+  assert.equal(unknown(labelledEscapeSeries(ordinary, escapeFamilies().quotedPrintable, 1).lines).decision,
+    'ALLOW', 'ordinary compressed text');
+});
+
+test('issue 126: reconstruction stays inside the run bound, and a wider gap is refused rather than released', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const spell = escapeFamilies().quotedPrintable;
+  const stream = zlib.gzipSync(Buffer.from(ESCAPED_NOTE));
+  // A declared field holding more than `MAX_ESCAPED_RUN` escapes is split at that bound, and the split drops no
+  // byte: the pieces carry the field's own label and the series concatenates them back. A payload straddling that
+  // bound is not reported by name here, for the reason #124 already published for the direct reader — the run is
+  // far above the opaque threshold, so it is refused by the byte count rather than by its contents. What is
+  // pinned is the direction that matters: a refusal with a reason, and no released bytes.
+  for (const pad of [4_000, 32_760, 40_000]) {
+    const payload = `part1: ${[...Buffer.concat([Buffer.alloc(pad, 0x3d), stream])].map(spell).join(' ')}`;
+    assert.ok(payload.length <= MAX_MESSAGE_BYTES, `${pad}`);
+    const result = check(payload);
+    assert.equal(result.decision, 'BLOCK', `${pad}`);
+    assert.ok(result.reasons.length > 0, `${pad}`);
+    assert.equal(result.release, undefined, `${pad}`);
+  }
+  // A payload whose pieces are each under the bound is read precisely, however many fields carry it.
+  const halves = Math.floor(stream.length / 2);
+  blocksWithOriginal([
+    [...stream.subarray(0, halves)].map(spell).join(' '), [...stream.subarray(halves)].map(spell).join(' '),
+    [...zlib.brotliCompressSync(Buffer.from(ESCAPED_NOTE))].map(spell).join(' '),
+  ].map((value, index) => `part${index + 1}: ${value}`).join('\n'), true);
+  // The separator bound itself: eight separator-class characters between two escapes is still formatting. The
+  // gap beyond it, and a gap holding any other character, are pinned as declared limits in the next group.
+  for (const separator of [' '.repeat(8), ','.repeat(8), `${','.repeat(7)} `]) {
+    blocksWithOriginal([...stream].map(escapeFamilies().quotedPrintable).join(separator), true);
+  }
+  // A declared series split across two names is the other limit the series reading publishes: it joins one series
+  // and never a subset of names, so the alternative to choosing a subset is not reconstructing it at all.
+  const fields = labelledEscapeSeries(stream, spell, 1);
+  const twoNames = fields.lines.split('\n').map((line, index) => line.replace('part', index % 2 ? 'part' : 'chunk')).join('\n');
+  assert.ok(!check(twoNames).reasons.includes('KNOWN_ORIGINAL_DETECTED'), twoNames.slice(0, 40));
+  // A dense 1 MiB escaped list with the wider separator decides inside a work bound rather than uninspectably.
+  const dense = Array.from({ length: 200_000 }, (_, index) => spell(index % 256)).join(', ').slice(0, MAX_MESSAGE_BYTES);
+  const started = process.hrtime.bigint();
+  const denseResult = check(dense);
+  const denseMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(['ALLOW', 'BLOCK'].includes(denseResult.decision), denseResult.reasons.join());
+  assert.ok(denseMs < 5000, `${denseMs.toFixed(0)}ms`);
+  // The same demand written as a declared label series, which is charged like every other reconstruction: a
+  // message demanding more of them than the budget allows is uninspectable rather than quietly clean.
+  const series = Array.from({ length: 60_000 }, (_, index) => `part${index + 1}: ${spell(index % 256)}`).join('\n')
+    .slice(0, MAX_MESSAGE_BYTES);
+  const seriesAt = process.hrtime.bigint();
+  const seriesResult = check(series);
+  const seriesMs = Number(process.hrtime.bigint() - seriesAt) / 1e6;
+  assert.ok(['ALLOW', 'BLOCK'].includes(seriesResult.decision), seriesResult.reasons.join());
+  assert.equal(seriesResult.release, undefined);
+  assert.ok(seriesMs < 5000, `${seriesMs.toFixed(0)}ms`);
+});
+
+test('issue 88: the escape separator bound is a bounded run, and the rest is measured, not claimed closed', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
   const stream = zlib.gzipSync(Buffer.from(ESCAPED_NOTE));
-  // Two or more separator characters between two escapes end this reader's run: each escape is then a one-byte
-  // run, below the floor, so the note is released. That is the adjacent remaining limit of the escape reader,
-  // measured here and pinned so a later change cannot widen this claim by accident. It is a declared limit, not a
-  // completeness claim. The `\x`-prefixed spelling is the one exception, because the byte-pair reader rebuilds it
-  // at any single separator and its own already-published limit covers everything above that.
-  const limited = ['percent', 'unicode', 'octal', 'htmlHex', 'htmlDecimal', 'quotedPrintable', 'quotedPrintableLower'];
-  for (const separator of [', ', '. ', ': ', '  ', '\r\n', ' , ', ' \\u0020 ']) {
+  // Superseded by #126 in one place only: a gap of two or more separator-class characters between two escapes used
+  // to end this reader's run, so each remaining escape was a one-byte run below the floor and the note was
+  // released with `release` bytes. It is read now, by the groups above and by the boundary cases in this one; what
+  // remains is pinned here and is a declared limit, not a completeness claim.
+  //
+  // A gap holding a character outside the class, or wider than `MAX_ESCAPE_SEPARATOR`, still ends the run: this
+  // reader skips formatting between escapes and never skips words. The `\x`-prefixed spelling keeps the
+  // byte-pair reader's own, already-published coverage wherever that reader's separator class reaches (a single
+  // `-`, a run of whitespace), unchanged by this reader either way.
+  const bytePair = new Set(['- ', ' '.repeat(9)]);
+  for (const separator of ['- ', ' -> ', ' and ', ' '.repeat(9), '/ / /']) {
     for (const [family, spell] of Object.entries(escapeFamilies())) {
       const body = [...stream].map(spell).join(separator);
       assert.ok(body.length <= MAX_MESSAGE_BYTES, `${family}/${JSON.stringify(separator)}`);
       const result = check(body);
-      if (limited.includes(family)) {
-        assert.ok(!result.reasons.includes('KNOWN_ORIGINAL_DETECTED'),
-          `${family}/${JSON.stringify(separator)}: ${result.reasons.join()}`);
-      } else assert.equal(result.decision, 'BLOCK', `hex/${JSON.stringify(separator)}`);
+      if (family === 'hex' && bytePair.has(separator)) assert.equal(result.decision, 'BLOCK', `hex/${JSON.stringify(separator)}`);
+      else assert.ok(!result.reasons.includes('KNOWN_ORIGINAL_DETECTED'),
+        `${family}/${JSON.stringify(separator)}: ${result.reasons.join()}`);
     }
   }
   // An escape run shorter than four bytes is not one, and stays ordinary text.
   assert.equal(check('=41 =42 =43 end', { known: null }).decision, 'ALLOW');
   assert.equal(check('&#65 &#66 &#67 end', { known: null }).decision, 'ALLOW');
+  // A single separator character is still read in every spelling, exactly as #124 left it, and the `\x`-prefixed
+  // spelling is rebuilt by the byte-pair reader at a single separator whatever this reader does with it.
+  for (const separator of ESCAPE_SEPARATORS) {
+    for (const [family, spell] of Object.entries(escapeFamilies())) blocksWithOriginal([...stream].map(spell).join(separator), true);
+  }
+  for (const separator of [', ', '. ', ': ', '  ', '\r\n', ' , ', ' \u0020 ']) {
+    assert.equal(check([...stream].map(escapeFamilies().hex).join(separator)).decision, 'BLOCK',
+      `hex/${JSON.stringify(separator)}`);
+  }
 });
 
 /**
@@ -1343,6 +1674,24 @@ test('residual encoded views: a hex-alphabet label name declares its own numbere
     chunks.map((chunk, index) => `${index % 2 ? `face${index + 1}` : `part${index + 1}`}: ${chunk}`).join('\n'),
     chunks.map((chunk, index) => `${index % 2 ? `face${String(index + 1).padStart(3, '0')}` : `part${index + 1}`}: ${chunk}`).join('\n'),
   ]) assert.equal(check(payload).decision, 'ALLOW', `${payload.slice(0, 44)} ${check(payload).reasons.join()}`);
+
+  // The same group's **escape** spelling is stricter than the chunk spelling above, and the gap is pinned rather
+  // than implied: a hex-labelled series of byte escapes is excluded from the series reading outright, because a
+  // dump offset column (`face:`, `d10:`) carries numbers too and only a complete run tells the two apart. With the
+  // planted originals registered this releases the note at one escape per field, exactly as the base did, and the
+  // chunk spelling of the same bytes still blocks one line above. Closing it would mean teaching the escape series
+  // reader the complete-hex-series rule, which is a coverage decision and not this slice's claim.
+  const escapedHexSeries = (perField) => {
+    const fields = [];
+    for (let at = 0; at < compressed.length; at += perField) {
+      fields.push([...compressed.subarray(at, at + perField)]
+        .map((byte) => `\\x${byte.toString(16).padStart(2, '0')}`).join(' '));
+    }
+    return fields.map((value, index) => `face${index + 1}: ${value}`).join('\n');
+  };
+  assert.equal(check(escapedHexSeries(1)).decision, 'ALLOW', 'published gap: a hex-labelled escape series');
+  assert.equal(check(escapedHexSeries(4)).decision, 'BLOCK', 'the direct reader fires at four escapes per field');
+  blocksWithOriginal(chunks.map((chunk, index) => `part${index + 1}: ${chunk}`).join('\n'), true);
 });
 
 test('residual encoded views: byte arrays that spell a container stay opaque', () => {

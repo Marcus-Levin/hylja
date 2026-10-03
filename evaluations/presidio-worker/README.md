@@ -13,6 +13,8 @@ the run.
 | `presidio_worker.py` | Bounded local worker: one request line in, one reply line out. Every recognizer, language, threshold and filtering choice is read from the manifest, not from this file. |
 | `manifest.json` | The pinned configuration: exact artifact identities and digests, licenses, advisory results, Python runtime, enabled recognizers, requested entity set, score thresholds, context handling, duplicate suppression, allow lists and the decision-process seam. Contains no protected configuration value. |
 | `../presidio-development-trial.mjs` | The evaluation bridge: projects #39 public development fixtures, runs the adapter per field, registers events with #5 and prints a privacy-safe record. |
+| `../matched-development-comparison.mjs` | The incremental #40 matched, **unscored** public-development comparison: the same adapter arm, the current native baseline and their measurement-only union over the same cases and the same planted controls. It adds no threshold, recognizer or dependency, and it is not a scored comparison. |
+| `verify_selected_runtime.py` | The pre-execution screen verifier: standard library only, reads the manifest, the wheel directory, the #46 screen report and a candidate runtime's `site-packages`, and prints counts and fixed codes only. It answers three questions a digest-only screen cannot: does each **pinned record's name** match the artifact it names, is every runtime file a byte-identical member of a selected wheel (a symlink, FIFO or device is refused, not skipped, because Python imports through one), and does the runtime carry a `.pth` startup hook or byte-compiled entry. Its `status` is derived from those checks, and the bridge re-derives it from the checks it accepted. A failing check always names its own cause — `NON_REGULAR_RUNTIME_ENTRY`, `RUNTIME_ENTRY_UNREADABLE`, `RUNTIME_FILE_TOO_LARGE_TO_COMPARE`, `RUNTIME_SCAN_TRUNCATED`, `RUNTIME_FILE_NOT_IN_SELECTED_WHEELS` or `RUNTIME_SELECTED_FILE_MISSING` — because a check that fails without saying why cannot be carried into a record and the cause is lost. |
 
 The adapter itself is `src/presidio-candidate-source.ts` (pure protocol/spans/mapping) and
 `src/presidio-worker-process.ts` (the bounded child process). The generated fake worker used by the
@@ -110,6 +112,41 @@ node evaluations/presidio-development-trial.mjs \
 offline configuration: `tldextract` is reconfigured to its bundled snapshot either way, and
 `REGEX_TIMEOUT_SECONDS` bounds Presidio's regex execution either way.
 
+The matched comparison takes the same arguments and reads the same pin from the same manifest. It adds the
+pre-execution verification inputs, and **a run without them accepts no third-party execution evidence** -
+the record says so with the fixed limit
+`EXECUTION_ENVIRONMENT_NOT_VERIFIED_NO_THIRD_PARTY_EXECUTION_EVIDENCE_ACCEPTED`:
+
+```
+python3 -m venv --without-pip $W/venv        # no pip, no setuptools, therefore no .pth startup hook
+# then extract the verified selected wheels' members into $W/venv/.../site-packages with the
+# standard library only: no installer code of any kind runs, and nothing is downloaded.
+
+python3 verify_selected_runtime.py \
+  manifest.json $W/wheels $W/prescreen.json $W/venv/lib/python3.14/site-packages
+# VERIFIED            every pinned record resolves to the artifact it names
+# VERIFIED_WITH_EXCLUSIONS  the executed subset is verified and the excluded records are listed
+# MISMATCH            a check failed; this run's numbers are not acceptable evidence
+
+node ../matched-development-comparison.mjs \
+  --python $W/bwrap-python --worker /trial/presidio_worker.py \
+  --manifest manifest.json --worker-manifest /trial/manifest.json \
+  --workdir $W --tenant tenant-synthetic-01 --project project-synthetic-01 \
+  --verify-script verify_selected_runtime.py --verify-manifest manifest.json \
+  --wheels $W/wheels --screen $W/prescreen.json --site-packages $W/venv/lib/python3.14/site-packages
+```
+
+It reuses this directory's worker and manifest rather than a second pinned configuration, and its
+measured result is recorded in
+[the matched comparison record](../../docs/research/issue-40-matched-development-comparison-2026-10-02.md).
+It sends nothing, so every arm's escape and task claims stay `untested`, and its combined arm is a
+measurement-only event union — not a merge, not a policy outcome and not a #39 or #40 result.
+
+**Bind the committed directory, not a copy of it.** `--ro-bind <repo>/evaluations/presidio-worker /trial`
+makes the worker open the committed `manifest.json` and `presidio_worker.py` byte-for-byte. A copy made
+by a previous step is byte-identical only until someone edits one side; the record's `hostManifestDigest`
+is a fact about the host copy, and the binding is what makes it a fact about the worker's copy too.
+
 ## What the configuration deliberately does not have
 
 * **No NER.** `NoOpNlpEngine` is Presidio's own engine for configurations whose recognizers are all
@@ -167,10 +204,28 @@ to both, not a label the adapter invents at run time.
 
 ## Non-claims and residual limits
 
+- **The manifest is a 51-record pin with a corrected 50-artifact executed subset, not a 51-artifact
+  runtime.** Its `corrections[]` entry records that the `zipp 3.23.0` record's digest, size and member
+  count are those of `setuptools 84.0.0`, whose own metadata says so; `zipp 3.23.0` exists on this host
+  only as a copy vendored inside that wheel. The record is preserved unchanged and **excluded**, never
+  deleted or silently renamed. A record whose artifact cannot identify itself at all is a separate pin defect and is reported as `ARTIFACT_OWNS_NO_SINGLE_TOP_LEVEL_DIST_INFO`. `screen.nameIdentityLimit` records why the #46 screen could not have
+  caught this: it compares downloaded bytes to published records and never checks that a record's **name**
+  matches the artifact it names. A run that has not passed `verify_selected_runtime.py` has demonstrated
+  no execution identity, whatever the manifest says.
+- **`setuptools` is a startup hook, not an inert library.** `distutils-precedence.pth` is exec'd by
+  `site` at interpreter startup whenever its variable is absent or `local`, which is what `--clearenv`
+  plus an explicit `--setenv` list produces. Neither wrapper passes `-S`, so an interpreter that has that
+  distribution on its path runs its shim at every start regardless of whether the analyzer imports
+  anything. The corrected runtime is built with `--without-pip` and standard-library wheel extraction, so
+  it has neither `pip` nor `setuptools` and therefore no hook; a runtime verification that finds one is
+  `MISMATCH`.
+
 - The screen behind the manifest is #46's lightweight host screen: published-digest agreement,
   artifact license/advisory metadata and an OSV version query per package. It is **not** signature
   verification, not an authenticated publisher conclusion, not a transitive or maintenance review and
-  not an adoption decision. 28 of the 51 wheels declare no PEP 639 `License-Expression` and carry only
+  not an adoption decision. `verify_selected_runtime.py` adds a **narrow new** check - record-name
+  identity, runtime file provenance and startup hooks - and is not a substitute for any of the above.
+  28 of the 51 pinned records declare no PEP 639 `License-Expression` and carry only
   a legacy `License` field; that metadata gap is recorded, not resolved, and it is a gate for any future
   packaging or adoption work.
 - The transport *declares* a fixed minimal worker environment; it does not fully control it. Node's coverage
@@ -243,3 +298,10 @@ to both, not a label the adapter invents at run time.
   comparison or a #48 choice.
 - The trial's observed recall and precision over two public development cases are a smoke/conformance
   measurement of one pinned configuration, not a benchmark.
+- The #40 matched comparison runs the same two cases with the same manifest and adds the native baseline
+  and a measurement-only union. Those figures are an **unscored public-development probe**, not a
+  benchmark, not a winner and not a #40 or #48 result, and the union's event count can be *lower* than
+  one arm's because it folds exactly identical duplicates rather than because it removed a finding. It
+  executed a **verified 50-artifact subset** in a fresh runtime with no startup hook, which is a
+  **different environment** from the #113 run above; that run is not re-attributed to it, and neither has
+  been independently re-run.
