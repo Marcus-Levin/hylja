@@ -1,6 +1,6 @@
 # #65/#66 design interview — working notes p0.1
 
-**Status: discussion preferences from 2026-09-28, pending independent human review.** This is a public, non-authoritative record of design direction. It is not an accepted taxonomy, decision 010, glossary, destination policy, #39 oracle or benchmark lock. Keep identities, conflict declarations, private review records and future blind material outside Git, PRs, issues and chat. The [pre-freeze worksheet](issue-39-65-66-prefreeze-worksheet-p0.1.md) lists the distinct review gates; [the plan](../plan.md#current-state) alone records implementation status.
+**Status: discussion preferences from 2026-09-28, pending independent human review.** This is a public, non-authoritative record of design direction. It is not an accepted taxonomy, decision 010, glossary, destination policy, #39 oracle or benchmark lock. Keep identities, conflict declarations, private review records and future blind material outside Git, PRs, issues and chat. The [pre-freeze worksheet](issue-39-65-66-prefreeze-worksheet-p0.1.md) lists the distinct review gates; current capabilities and limits are in [docs/capabilities.md](../capabilities.md), task status in the GitHub issues, and the dated record is the retired plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not current state.
 
 ## Agreed directions, with open edges
 

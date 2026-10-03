@@ -3,8 +3,10 @@
 **Dated research evidence, 2026-10-02. Corrected and re-run on 2026-10-02 after an independent review
 returned REQUEST_CHANGES for `b3af062a`; section 1 and section 8 record what that review changed and
 what it superseded. Not a benchmark, not a score, not #39 v0, not a freeze, not a held-out result, not
-an adoption decision and not a #40 closure.** Implementation and run status live only in
-[the plan](../plan.md#current-state); this document separates what was **measured**, what is a
+an adoption decision and not a #40 closure.** Current capabilities and limits live only in
+[docs/capabilities.md](../capabilities.md) and live run status only in the GitHub issues; the dated run record is the
+retired plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not
+current state. This document separates what was **measured**, what is a
 **source claim** and what remains an **explicit unknown**. The full issue text is
 [#40](https://github.com/Marcus-Levin/hylja/issues/40); the reuse question it feeds is
 [#48](https://github.com/Marcus-Levin/hylja/issues/48)'s, and any scored comparison still requires
@@ -515,4 +517,6 @@ reporting both claims as untested for every arm).
   unaffected by the environment correction (they are the same rules and the same configuration), and its
   invented `persona.de` fragment example is corrected in place there with a pointer to §0.
 * `docs/plan.md` — the single dated status paragraph for this work, and the #113/#113-reopened state root
-  owns.
+  owned. That document has since been retired and its content is frozen at
+  [`f838fc2…:docs/plan.md`](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state);
+  current capabilities and limits are in [`docs/capabilities.md`](../capabilities.md).

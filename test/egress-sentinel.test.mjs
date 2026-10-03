@@ -977,7 +977,8 @@ const labelledEscapeText = (text, spell, perField) => {
  * an unknown embedded opaque payload written as text inside a declared escape series was released with `release`
  * bytes while the identical bytes were refused in every other spelling. This group is the direction that must
  * hold: a declared reconstruction's own spelling exempts nothing about what the reconstruction **encodes**, exactly
- * as `docs/plan.md` states for every other declared form ("compressed opaque data inside them still blocks").
+ * as the frozen #19 known-limits list records for every other declared form ("compressed opaque data inside them
+ * still blocks").
  */
 test('issue 126 review: a declared escape series waives no opaque byte count', () => {
   const zlib = globalThis.process.getBuiltinModule('node:zlib');
@@ -2300,7 +2301,7 @@ test('core audit: the interior read covers every exempt run it can afford, and i
   }
   // The ceiling is explicit rather than silent: the read spends its windows in span order across every exempt
   // run, so a message whose exempt runs need more starting offsets than the budget holds has a declared gap and
-  // no claim of completeness (docs/plan.md #19 known limits, measured at 1,024 starting offsets per message).
+  // no claim of completeness (the frozen #19 known-limits list, measured at 1,024 starting offsets per message).
   // Nothing here claims such a message is clean, and the controls below stay allowed.
   const many = Array.from({ length: 400 }, () => syntheticBytes(64).toString('hex')).join('\n');
   const started = process.hrtime.bigint();

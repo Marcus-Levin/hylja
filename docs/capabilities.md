@@ -1,0 +1,110 @@
+# Current capabilities and limits
+
+Status: authoritative statement of **what the software in this repository implements today, and what it does not**. Read this before changing or evaluating the implementation.
+
+Three things are deliberately **not** here, because each has one other home: **work status, priority and dependency order** are GitHub issues ([#36](https://github.com/Marcus-Levin/hylja/issues/36) is the roadmap checklist - ask the tracker, not this file, whether an issue is open); **product and security rules** are [charter](charter.md), [architecture](architecture.md), [security-model](security-model.md), [threat-model](threat-model.md), [evaluation.md](evaluation.md) and [decision 010](decisions/010-separate-information-dimensions-and-task-fidelity.md) with the accepted records beside it; **dated execution history** is the frozen snapshot under [Historical evidence snapshot](#historical-evidence-snapshot).
+
+Rules are not restated here. Each table row names the contract, source and test that own the behaviour, so read the real statement instead of a paraphrase.
+
+## Capabilities
+
+### Core information path
+
+Pure, in-process TypeScript. Every row is a **seam with an interface and a contract**, not a deployed service.
+
+| Area | Source | Contract | Focused test | Issue |
+|---|---|---|---|---|
+| Normalized interaction envelope, provenance | [`src/interaction-envelope.ts`](../src/interaction-envelope.ts) | [interaction-envelope.md](contracts/interaction-envelope.md) | [`test/interaction-envelope.test.mjs`](../test/interaction-envelope.test.mjs) | [#2](https://github.com/Marcus-Levin/hylja/issues/2) |
+| Classification v1 vocabulary and composition | [`src/classification.ts`](../src/classification.ts) | [classification-contract.md](contracts/classification-contract.md) | [`test/classification.test.mjs`](../test/classification.test.mjs) | [#3](https://github.com/Marcus-Levin/hylja/issues/3) |
+| Bounded normalization and decoded views | [`src/normalization.ts`](../src/normalization.ts) | [architecture.md](architecture.md#detection-pipeline) | [`test/normalization.test.mjs`](../test/normalization.test.mjs) | [#6](https://github.com/Marcus-Levin/hylja/issues/6) |
+| Structured parsers (JSON, DOTENV, INI, URL, connection string, LOG, YAML, TOML, XML) | [`src/structured-parsers.ts`](../src/structured-parsers.ts) | [architecture.md](architecture.md#detection-pipeline) | [`test/structured-parsers.test.mjs`](../test/structured-parsers.test.mjs), [`test/parser-time-budget.test.mjs`](../test/parser-time-budget.test.mjs) | [#7](https://github.com/Marcus-Levin/hylja/issues/7) |
+| Detection composition over raw, folded, decoded and parsed views | [`src/normalized-detection.ts`](../src/normalized-detection.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/normalized-detection.test.mjs`](../test/normalized-detection.test.mjs), [`test/parsed-field-composition.test.mjs`](../test/parsed-field-composition.test.mjs) | [#6](https://github.com/Marcus-Levin/hylja/issues/6), [#7](https://github.com/Marcus-Levin/hylja/issues/7) |
+| Deterministic secret and credential detectors | [`src/secret-detectors.ts`](../src/secret-detectors.ts) | [classification-contract.md](contracts/classification-contract.md) | [`test/secret-detectors.test.mjs`](../test/secret-detectors.test.mjs) | [#8](https://github.com/Marcus-Levin/hylja/issues/8) |
+| Infrastructure, network, cloud and filesystem identifiers | [`src/infrastructure-identifiers.ts`](../src/infrastructure-identifiers.ts) | [classification-contract.md](contracts/classification-contract.md) | [`test/infrastructure-identifiers.test.mjs`](../test/infrastructure-identifiers.test.mjs) | [#9](https://github.com/Marcus-Levin/hylja/issues/9) |
+| Configured customer, project and engineering candidate sources | [`src/configured-candidates.ts`](../src/configured-candidates.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/configured-candidates.test.mjs`](../test/configured-candidates.test.mjs) | [#10](https://github.com/Marcus-Levin/hylja/issues/10) |
+| PERSON/EMAIL/PHONE candidate generation | [`src/contact-candidates.ts`](../src/contact-candidates.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/contact-candidates.test.mjs`](../test/contact-candidates.test.mjs) | [#37](https://github.com/Marcus-Levin/hylja/issues/37) |
+| Accepted-v1 classification units per occurrence | [`src/classification-units.ts`](../src/classification-units.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/configured-units.test.mjs`](../test/configured-units.test.mjs) | [#37](https://github.com/Marcus-Levin/hylja/issues/37), [#10](https://github.com/Marcus-Levin/hylja/issues/10) |
+| Deterministic source-to-sink policy seam | [`src/policy.ts`](../src/policy.ts) | [policy-contract.md](contracts/policy-contract.md) | [`test/policy.test.mjs`](../test/policy.test.mjs) | [#4](https://github.com/Marcus-Levin/hylja/issues/4) |
+
+`decidePolicy` in `src/policy.ts` is the **only** decision identity that selects a treatment. Every other module either calls it or simulates it against a candidate bundle. An adapter that wants a different answer must change policy, not bypass it.
+
+### Assurance, governance and release seams
+
+| Area | Source | Contract | Focused test | Issue |
+|---|---|---|---|---|
+| Independent egress sentinel over the exact serialized outbound bytes | [`src/egress-sentinel.ts`](../src/egress-sentinel.ts) (limits in its module header) | [threat-model.md](threat-model.md#priority-abuse-cases), [evaluation.md](evaluation.md#independent-egress-sentinel) | [`test/egress-sentinel.test.mjs`](../test/egress-sentinel.test.mjs) | [#19](https://github.com/Marcus-Levin/hylja/issues/19), [#88](https://github.com/Marcus-Levin/hylja/issues/88) |
+| Privacy-safe audit ledger and tamper evidence | [`src/audit-ledger.ts`](../src/audit-ledger.ts) | [audit-ledger-contract.md](contracts/audit-ledger-contract.md) | [`test/audit-ledger.test.mjs`](../test/audit-ledger.test.mjs) | [#20](https://github.com/Marcus-Levin/hylja/issues/20) |
+| Offline policy governance substrate | [`src/policy-governance.ts`](../src/policy-governance.ts) | [policy-governance-contract.md](contracts/policy-governance-contract.md) | [`test/policy-governance.test.mjs`](../test/policy-governance.test.mjs) | [#28](https://github.com/Marcus-Levin/hylja/issues/28) |
+| Offline champion/challenger replay and shadow comparison | [`src/champion-replay.ts`](../src/champion-replay.ts) | [champion-replay-contract.md](contracts/champion-replay-contract.md) | [`test/champion-replay.test.mjs`](../test/champion-replay.test.mjs) | [#27](https://github.com/Marcus-Levin/hylja/issues/27) |
+| Release-integrity gate | [`src/release-integrity.ts`](../src/release-integrity.ts), [`src/dependency-evidence.ts`](../src/dependency-evidence.ts), [`src/release-gate-cli.ts`](../src/release-gate-cli.ts) | [release-integrity-contract.md](contracts/release-integrity-contract.md) | [`test/release-integrity.test.mjs`](../test/release-integrity.test.mjs), [`test/dependency-evidence.test.mjs`](../test/dependency-evidence.test.mjs) | [#33](https://github.com/Marcus-Levin/hylja/issues/33) |
+| Synthetic adapter conformance harness | [`src/adapter-conformance.ts`](../src/adapter-conformance.ts) | [adapter-contract.md](contracts/adapter-contract.md) | [`test/adapter-conformance.test.mjs`](../test/adapter-conformance.test.mjs) | [#33](https://github.com/Marcus-Levin/hylja/issues/33) |
+| Synthetic evaluation seam and tenant-scope contract | [`src/evaluation.ts`](../src/evaluation.ts), [`src/synthetic-scope-contract.ts`](../src/synthetic-scope-contract.ts) | [synthetic-evaluation-seam.md](contracts/synthetic-evaluation-seam.md) | [`test/evaluation.test.mjs`](../test/evaluation.test.mjs), [`test/synthetic-scope-contract.test.mjs`](../test/synthetic-scope-contract.test.mjs) | [#5](https://github.com/Marcus-Levin/hylja/issues/5) |
+| Semantic-judge shadow seam, local double only | [`src/semantic-judge-shadow.ts`](../src/semantic-judge-shadow.ts) | [semantic-judge-shadow.md](contracts/semantic-judge-shadow.md) | [`test/semantic-judge-shadow.test.mjs`](../test/semantic-judge-shadow.test.mjs) | [#11](https://github.com/Marcus-Levin/hylja/issues/11) |
+| Contextual re-identification shadow measurement | [`src/reidentification-shadow.ts`](../src/reidentification-shadow.ts) | [reidentification-shadow.md](contracts/reidentification-shadow.md) | [`test/reidentification-shadow.test.mjs`](../test/reidentification-shadow.test.mjs) | [#12](https://github.com/Marcus-Levin/hylja/issues/12) |
+| Narrow Presidio candidate source and bounded child-process transport | [`src/presidio-candidate-source.ts`](../src/presidio-candidate-source.ts), [`src/presidio-worker-process.ts`](../src/presidio-worker-process.ts) | [`evaluations/presidio-worker/README.md`](../evaluations/presidio-worker/README.md) | [`test/presidio-candidate-source.test.mjs`](../test/presidio-candidate-source.test.mjs), [`test/presidio-worker-process.test.mjs`](../test/presidio-worker-process.test.mjs), [`test/presidio-trial-bridge.test.mjs`](../test/presidio-trial-bridge.test.mjs), [`test/presidio-worker-boundary.test.mjs`](../test/presidio-worker-boundary.test.mjs) | [#113](https://github.com/Marcus-Levin/hylja/issues/113) |
+
+The transport and worker-boundary groups drive a real `python3` subprocess and report a **named skip** without one; a run reporting them skipped is not evidence for them.
+
+### Proposed modules: unwired, no authority
+
+These compile, are property-tested and are reachable only from their own tests. No `src/` module, policy, classification v1 or adapter imports them, and `src/index.ts` exports none of them. One exception, and it grants nothing: the evaluation-only [`evaluations/gym-annotation-schema.mjs`](../evaluations/gym-annotation-schema.mjs) imports the draft model's `ATTRIBUTE_STATES` and `FIDELITY_PREDICATES` **names** so the proposed export format cannot drift from contract names; reusing a constant is not adoption and wires nothing into accepted v1. A **proposed** record has no authority until a human accepts it (accepted decisions 001-009 are [here](decisions/009-secrets-are-not-synthetic-identities.md)).
+
+| Module | Status | Contract | Issue |
+|---|---|---|---|
+| [`src/overlap-composition-draft.ts`](../src/overlap-composition-draft.ts) | proposed, unwired | [overlap-composition-draft.md](contracts/overlap-composition-draft.md) | [#114](https://github.com/Marcus-Levin/hylja/issues/114) |
+| [`src/information-model-draft.ts`](../src/information-model-draft.ts) | proposed, unwired | [information-model-draft.md](contracts/information-model-draft.md) | [#66](https://github.com/Marcus-Levin/hylja/issues/66) |
+| [`src/taxonomy-draft.ts`](../src/taxonomy-draft.ts) | proposed, unwired | - | [#65](https://github.com/Marcus-Levin/hylja/issues/65) |
+| [`docs/specs/gym-annotation-design.md`](specs/gym-annotation-design.md) and its checker | proposed, unwired | [spec](specs/gym-annotation-design.md) | [#67](https://github.com/Marcus-Levin/hylja/issues/67) |
+
+[Decision 010](decisions/010-separate-information-dimensions-and-task-fidelity.md) is **proposed**. The separation of semantic, privacy-attribute, sensitivity, trust and task-fidelity dimensions exists only as that draft; accepted classification v1 keeps its current vocabulary. Do not wire a draft into accepted classification, policy, an adapter or authoritative labels.
+
+## Material limits
+
+### Every implemented seam is pure and non-enforcing
+
+The modules above are **evidence for a seam, not a protected-egress boundary**. Each one authenticates nobody, sends no bytes and persists nothing durable. Concretely:
+
+- No caller, subject, workload, `inputRef`, policy handle, destination profile or registry entry is authenticated. Trusted inputs are trusted because the trusted integration supplies them, not because the module verifies them.
+- A `COMPLETE` result means no budget was exceeded. It never means "clean", "safe to send" or "policy allows".
+- `PARTIAL`, `FAILURE` and typed refusals keep uninspected content **opaque**. Treating one as a pass inverts the fail-closed rule in [decision 007](decisions/007-fail-closed-for-protected-egress.md).
+
+### No adapter sits at a real send point
+
+There is no transport interceptor, no vault, no authorization broker, no KMS/HSM binding and no runtime-enforced Policy Engine in this repository. Concretely:
+
+- The [Egress Sentinel](#assurance-governance-and-release-seams) is a core with **no adapter at a real send point**. It has never decided a byte a provider actually received, and [`src/adapter-conformance.ts`](../src/adapter-conformance.ts) only proves a *candidate adapter* behaves against a synthetic controlled capture.
+- The gateway ([#21](https://github.com/Marcus-Levin/hylja/issues/21), [#22](https://github.com/Marcus-Levin/hylja/issues/22)), MCP/file/shell surfaces ([#23](https://github.com/Marcus-Levin/hylja/issues/23)-[#26](https://github.com/Marcus-Levin/hylja/issues/26)), vault and broker ([#14](https://github.com/Marcus-Levin/hylja/issues/14)-[#18](https://github.com/Marcus-Levin/hylja/issues/18)) and the transformation engine ([#13](https://github.com/Marcus-Levin/hylja/issues/13)) are **not implemented**. Cloaked release does not exist end to end: structured rewriting exists only where [#7](https://github.com/Marcus-Levin/hylja/issues/7) `rewriteFieldValues` supports the format, and unstructured/log rewriting does not exist.
+- **No module here may send model or judge traffic.** The semantic-judge seam refuses `EXTERNAL` execution unconditionally, and [`src/typesafe-system-one-adapter.ts`](../src/typesafe-system-one-adapter.ts) is protocol translation with no transport. Any future hosted path needs destination policy for the judge sink, an authenticated binding to the real routed destination and an independent final-byte check first ([architecture.md](architecture.md#semantic-judgment-boundary)).
+
+### Public evidence is unscored; scoring needs human gates
+
+Everything in `evaluations/`, `scripts/research/` and `docs/research/` is **public, synthetic-only, unscored development evidence**. It proves a contract branch or a bounded measurement; it is not a held-out result, a comparative win or adoption approval.
+
+- [`node evaluations/preparation-integrity.mjs`](../evaluations/preparation-integrity.mjs) reports `PREPARATION_VALID_BUT_NOT_ELIGIBLE / PUBLIC_DRAFT_ONLY`. That status never authorizes scoring, custody, a freeze or a release, and `requireScoredV0()` denies unconditionally.
+- A frozen v0 protocol, an independent blind custodian, an accepted destination/task rubric and an approved pre-tuning chronology are still open on [#39](https://github.com/Marcus-Levin/hylja/issues/39). No local winner exists, so the winner-dependent claim on [#41](https://github.com/Marcus-Levin/hylja/issues/41) stays deferred for lack of evidence, and [#48](https://github.com/Marcus-Levin/hylja/issues/48) reuse/buy/build remains a human decision.
+- [`scripts/research/`](../scripts/research/README.md) is security-sensitive tooling outside `npm test` and CI, not product code.
+
+### Proposed designs stay proposed
+
+Accepted: decisions [001](decisions/001-enforcement-core-not-advisory-filter.md)-[009](decisions/009-secrets-are-not-synthetic-identities.md).
+
+Proposed and unwired: [decision 010](decisions/010-separate-information-dimensions-and-task-fidelity.md), the [#65](https://github.com/Marcus-Levin/hylja/issues/65) taxonomy, the [#66](https://github.com/Marcus-Levin/hylja/issues/66) information model, the [#68](https://github.com/Marcus-Levin/hylja/issues/68) transformation semantics and the [#67](https://github.com/Marcus-Levin/hylja/issues/67) Gym design. No merge, green suite or passing preparation checker accepts a proposal.
+
+### Resource bounds are per process
+
+Parser time budgets are cooperative and read from a host-owned clock. Research sandbox limits are per process (and per real UID), so no aggregate memory, CPU or process bound exists without privileges. A budget is not a cause: this repository records unattributed intermittent full-run failures without inferring or excluding a cause, and no budget was raised to accommodate one.
+
+## Historical evidence snapshot
+
+The retired development plan is preserved byte-for-byte as an immutable Git object:
+
+- commit [`f838fc2dc8da0402338d4dfd1c028392a9f4b9ee`](https://github.com/Marcus-Levin/hylja/commit/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee), blob `c5f551872f8b66d21eaeccbb934b42dc3f4d6c8d`, 493542 bytes;
+- [frozen `docs/plan.md` at that commit](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md) ([Current state](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), [milestones](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#dependency-ordered-milestones)).
+
+Verify locally with `git cat-file -s f838fc2dc8da0402338d4dfd1c028392a9f4b9ee:docs/plan.md`.
+
+That snapshot is a **historical record**: dated checkpoints, every measured number, its source revision, its review verdicts and its original attribution. Read it when you need why a decision was made or what a prior head measured. It is **not** current state, not a work queue and not evidence about any code in this checkout. Git history carries every later edit.
+
+## Where to go next
+
+[docs/README.md](README.md) has the task route map: which spec, contract, decision, source file, test and tool a given kind of work starts from.

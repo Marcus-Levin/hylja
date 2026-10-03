@@ -1,7 +1,7 @@
 # Champion/challenger replay and shadow comparison contract (#27)
 
 Status: bounded #27 slice, **OFFLINE, development-only and NON-ENFORCING**. Implementation status
-lives in [plan.md](../plan.md#current-state); evaluation rules and the promotion lifecycle remain in
+lives in [capabilities.md](../capabilities.md); evaluation rules and the promotion lifecycle remain in
 [evaluation.md](../evaluation.md). This document is the interface, the trust boundaries and the
 declared limits.
 

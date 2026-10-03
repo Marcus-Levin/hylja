@@ -3,7 +3,7 @@
 Status: draft foundation contract for issue #20. This documents the executable seam in
 [`src/audit-ledger.ts`](../../src/audit-ledger.ts), **not** a production durable audit service, an
 external checkpoint authority, an authorization broker, a mapping vault, or an enforcement
-boundary. Implementation status belongs only in [the plan](../plan.md#current-state).
+boundary. Implementation status belongs only in [capabilities.md](../capabilities.md).
 
 ## Scope and honest storage boundary
 

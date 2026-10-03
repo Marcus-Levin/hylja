@@ -4,7 +4,7 @@ Status: draft foundation contract for a local/synthetic-only shadow seam. It des
 behavior of [`src/semantic-judge-shadow.ts`](../../src/semantic-judge-shadow.ts) and the narrow
 protocol adapter [`src/typesafe-system-one-adapter.ts`](../../src/typesafe-system-one-adapter.ts). It
 is not authorization, not policy and not an egress control. Implementation status lives only in
-[plan.md](../plan.md).
+[capabilities.md](../capabilities.md).
 
 Scope and dependencies follow [issue #11](https://github.com/Marcus-Levin/hylja/issues/11):
 [#3](https://github.com/Marcus-Levin/hylja/issues/3) classification,

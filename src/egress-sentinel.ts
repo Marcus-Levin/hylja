@@ -642,7 +642,7 @@ function chunkLikeLoose(token: string): boolean {
  * numeric array or labelled configuration list gains opaque authority from its shape. Compressed opaque data
  * still blocks, because a decoded stream's own opaque output is counted, and so does a container signature.
  * Unknown *uncompressed* binary inside these forms can still pass. That is a declared limit, not a completeness
- * claim (docs/plan.md #19 known limits).
+ * claim (the #19 known-limits list, frozen in the retired `docs/plan.md` at commit f838fc2, and the prose above).
  *
  * Work is bounded per message and shared by every view and round: each distinct joined value is read once, and a
  * message demanding more reconstructions than the budget allows is uninspectable rather than clean, because
@@ -654,7 +654,8 @@ const MAX_DECLARED_UNITS = 8 << 20;
  * Characters every declared join costs, counted whether or not the joined value is a new reconstruction: a join
  * that is dropped as a duplicate or as too short still spent the work. It is a ceiling on how far the readers may
  * fan out rather than a threshold tuned to observed traffic: no message within the 1 MiB input limit was found to
- * reach it (docs/plan.md records the measured maximum), and exceeding it is uninspectable, never clean.
+ * reach it (the measured maximum is recorded in the retired `docs/plan.md` at commit f838fc2), and exceeding it is
+ * uninspectable, never clean.
  */
 const MAX_DECLARED_WORK = 8 << 20;
 const MAX_DECLARED_VALUE = 1 << 16;
@@ -1331,7 +1332,8 @@ const ESCAPE_JSON_SEPARATOR = /\\[nrt]/u;
  * than open, so it stays a statement about the *formatting* between escapes and never becomes a way to skip words:
  * every character in it is a separator-class character or a JSON line-break spelling, `-` is still not one, and
  * the run ends at the first character that is neither. A wider gap is ordinary text and ends the run, which is a
- * declared limit (docs/plan.md #19 known limits) rather than a completeness claim.
+ * declared limit (the #19 known-limits list, frozen in the retired `docs/plan.md` at commit f838fc2) rather than a
+ * completeness claim.
  */
 const MAX_ESCAPE_SEPARATOR = 8;
 /**
@@ -1472,7 +1474,7 @@ function escapeListPieces(text: string, at: number): { bytes: number[]; end: num
  * the contiguous reading this reader has always had, then the separated one, which is **added** to it and never
  * instead of it — so neither a sender who formats the list nor a sender whose separator characters are bytes of
  * the payload loses a reading. A gap wider than `MAX_ESCAPE_SEPARATOR`, or one holding any other character, still
- * ends a run; that limit is published in docs/plan.md and pinned in the sentinel tests rather than claimed closed.
+ * ends a run; that limit is a declared limit of this module, pinned in the sentinel tests rather than claimed closed.
  *
  * Inside a quoted string the escapes are read by `quoted()` below, which is unchanged: there every literal
  * character is a byte of the string, so the separator rule is not applied and no byte is dropped. Both readings

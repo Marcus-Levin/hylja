@@ -1,6 +1,6 @@
 # #39 deterministic/no-Jev reference candidate
 
-This is an **evaluation-only, NON-ENFORCING** disposable candidate, not Hylja's Policy Engine, an evaluator, a production detector, a safe-to-send assertion, a broker or a final egress check. It uses only the reviewed public synthetic D01/D02/D05 development syntax. See the [implementation plan](../../docs/plan.md#current-state), [public fixture/rubric](../../docs/research/issue-39-public-rubric-p0.1.md) and [evaluation policy](../../docs/evaluation.md). It neither reads an oracle nor grades itself. No v0 hash, score or freeze follows from its tests.
+This is an **evaluation-only, NON-ENFORCING** disposable candidate, not Hylja's Policy Engine, an evaluator, a production detector, a safe-to-send assertion, a broker or a final egress check. It uses only the reviewed public synthetic D01/D02/D05 development syntax. See [capabilities](../../docs/capabilities.md), [public fixture/rubric](../../docs/research/issue-39-public-rubric-p0.1.md) and [evaluation policy](../../docs/evaluation.md). It neither reads an oracle nor grades itself. No v0 hash, score or freeze follows from its tests.
 
 ## Candidate-facing interface
 

@@ -1,6 +1,6 @@
 # Independent human review handoff for #65 and #66
 
-**PUBLIC REVIEW PACKET — not a role appointment, accepted taxonomy, accepted decision 010, #39 approval, benchmark lock or score.** This packet contains only public synthetic examples. Keep reviewer identities, acceptance, conflict declarations, restricted approval records, real data and future blind material out of Git, issues, PRs, CI and chat. [The plan](../plan.md#current-state) alone records implementation status.
+**PUBLIC REVIEW PACKET — not a role appointment, accepted taxonomy, accepted decision 010, #39 approval, benchmark lock or score.** This packet contains only public synthetic examples. Keep reviewer identities, acceptance, conflict declarations, restricted approval records, real data and future blind material out of Git, issues, PRs, CI and chat. Current capabilities and limits are in [docs/capabilities.md](../capabilities.md), task status in the GitHub issues; the retired plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state) is the dated record, not current state.
 
 ## Start with the short application review
 

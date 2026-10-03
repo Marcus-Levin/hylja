@@ -1,6 +1,6 @@
 # Decision 010: Separate information dimensions; task fidelity is a task contract, not classification
 
-Status: **proposed** — private role acceptance, conflict checks and independent human review are pending. It has no authority until accepted, and it does not change classification v1, policy or any adapter. Tracking: [#66](https://github.com/Marcus-Levin/hylja/issues/66), [#68](https://github.com/Marcus-Levin/hylja/issues/68); implementation status lives only in [the plan](../plan.md#current-state).
+Status: **proposed** — private role acceptance, conflict checks and independent human review are pending. It has no authority until accepted, and it does not change classification v1, policy or any adapter. Tracking: [#66](https://github.com/Marcus-Levin/hylja/issues/66), [#68](https://github.com/Marcus-Levin/hylja/issues/68); implementation status lives only in [capabilities.md](../capabilities.md).
 
 ## Context
 

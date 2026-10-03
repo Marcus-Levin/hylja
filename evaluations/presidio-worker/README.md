@@ -2,8 +2,10 @@
 
 **Evaluation-only, synthetic-only, UNSCORED and NON-ENFORCING.** Nothing here is adoption of
 Presidio, a production configuration, a gateway, a new taxonomy, a second evaluation framework, a
-#scored #40 comparison or a #48 selection. Implementation and run status live in
-[the plan](../../docs/plan.md#current-state); this file describes the interface and how to repeat
+#scored #40 comparison or a #48 selection. Current capabilities and limits live in
+[docs/capabilities.md](../../docs/capabilities.md) and live run status in the GitHub issues; the dated run record is
+[the retired plan's frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not
+current state. This file describes the interface and how to repeat
 the run.
 
 ## Files

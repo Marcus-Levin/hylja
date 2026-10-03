@@ -1,6 +1,6 @@
 # Configured-source and classification-unit composition contract
 
-Status: draft contract for the #37/#10 integration slice. This documents a **pure, NON-ENFORCING** seam, **not** a deployment approval, an adapter, an identity authenticator, a transformation, an egress control or a guarantee about released bytes. Implementation status belongs only in [the plan](../plan.md#current-state).
+Status: draft contract for the #37/#10 integration slice. This documents a **pure, NON-ENFORCING** seam, **not** a deployment approval, an adapter, an identity authenticator, a transformation, an egress control or a guarantee about released bytes. Implementation status belongs only in [capabilities.md](../capabilities.md).
 
 ## Inputs and authority
 

@@ -1,6 +1,6 @@
 # Architecture
 
-Status: accepted foundation direction. Implementation status lives in [plan.md](plan.md#current-state).
+Status: accepted foundation direction. What is implemented lives in [capabilities.md](capabilities.md).
 
 Hylja is a provider- and harness-independent information-control core surrounded by adapters. The core owns normalized interactions, classification composition, policy decisions, protected mappings, authorization, transformations, provenance, and audit evidence. Adapters translate surfaces; they do not own privacy policy.
 
