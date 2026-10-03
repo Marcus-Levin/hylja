@@ -13,6 +13,7 @@
     "test": "npm run check:fixtures && npm run build && node --test --test-concurrency=1 test/*.test.mjs evaluations/candidates/reference.test.mjs evaluations/gym-annotation-schema.test.mjs evaluations/preparation-integrity.test.mjs",
     "test:coverage": "npm run check:fixtures && npm run build && node --test --test-concurrency=1 --experimental-test-coverage test/*.test.mjs evaluations/candidates/reference.test.mjs evaluations/gym-annotation-schema.test.mjs evaluations/preparation-integrity.test.mjs",
     "check:fixtures": "node scripts/check-fixtures.mjs",
+    "check:docs": "node scripts/check-doc-links.mjs",
     "audit:deps": "npm audit --audit-level=high",
     "sbom": "npm sbom --sbom-format cyclonedx",
     "check:sbom": "node scripts/check-sbom.mjs",
