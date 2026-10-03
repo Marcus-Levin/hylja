@@ -139,7 +139,52 @@ test('normalization failures and detector exhaustion cannot become COMPLETE', ()
   assert.ok(invalidKey.uninspected.some((item) => item.reason === 'SECRET_INVALID_FINGERPRINT_KEY'));
 });
 
-test('a mismatched tenant name dictionary stays partial and never supplies a name candidate', () => {
+test('quoted structured phone fields reach the seam as exact root spans, once per occurrence', () => {
+  // #140: a quoted JSON value, a quoted property and an XML element/attribute put a delimiter between the
+  // phone keyword and the digits. The #6 seam must still report the PHONE candidate, with exact root offsets,
+  // and must not double-count one occurrence through the #7 parsed field that covers the same text.
+  const digits = `2025550${String(133).padStart(3, '0')}`;
+  for (const input of [`{"phone":"${digits}","port":"443"}`, `phone="${digits}"`,
+    `<contact><phone>${digits}</phone><port>443</port></contact>`, `<phone number="${digits}"/>`]) {
+    const result = run(input);
+    assert.equal(result.status, 'COMPLETE', input);
+    const phones = result.candidates.filter((item) => item.source === 'CONTACT' && item.subtype === 'PHONE');
+    assert.equal(phones.length, 1, input);
+    const [phone] = phones;
+    assert.equal(phone.basis, 'KEYWORD_CONTEXT', input);
+    assert.equal(phone.view.representation, 'RAW', input);
+    assert.equal(phone.original.kind, 'ORIGINAL_EXACT', input);
+    assert.equal(input.slice(phone.original.span.start, phone.original.span.end), digits, input);
+    // The seam carries metadata only: neither the digits nor the key text that selected the rule appears.
+    const serialized = JSON.stringify(result);
+    assert.equal(serialized.includes(digits), false, input);
+    assert.equal(serialized.includes('phone"'), false, input);
+  }
+  // A number that is not adjacent to a phone keyword keeps its behaviour inside the same structured input.
+  const negative = run(`{"port":"${digits}","note":"call the phone later","ticket":"${digits}"}`);
+  assert.equal(negative.candidates.some((item) => item.source === 'CONTACT' && item.subtype === 'PHONE'), false);
+  // A keyword inside a completed attribute is not key/value context for the element text that follows it.
+  // `<id phone="">…</id>` parses as an empty `@phone` attribute plus the `id` text, so the digits are the
+  // element's value and no phone keyword names them.
+  for (const input of [`<id phone="">${digits}</id>`, `<contact phone="">${digits}</contact>`,
+    `<id data-phone="">${digits}</id>`]) {
+    const result = run(input);
+    assert.equal(result.status, 'COMPLETE', input);
+    assert.equal(result.candidates.filter((item) => item.source === 'CONTACT' && item.subtype === 'PHONE').length,
+      0, input);
+  }
+  // The empty attribute of one element neither suppresses nor supplies context for a sibling phone element.
+  const siblingsInput = `<contact><id phone=""></id><phone>${digits}</phone><port>443</port></contact>`;
+  const siblings = run(siblingsInput);
+  assert.equal(siblings.status, 'COMPLETE');
+  const siblingPhones = siblings.candidates.filter((item) => item.source === 'CONTACT' && item.subtype === 'PHONE');
+  assert.equal(siblingPhones.length, 1);
+  assert.equal(siblingPhones[0].basis, 'KEYWORD_CONTEXT');
+  assert.equal(siblingPhones[0].original.kind, 'ORIGINAL_EXACT');
+  assert.equal(siblingsInput.slice(siblingPhones[0].original.span.start, siblingPhones[0].original.span.end), digits);
+});
+
+test('mismatched tenant name dictionary stays partial and never supplies a name candidate', () => {
   const names = createNameDictionary(scope, ['Synthetic Visitor']);
   const result = run('Synthetic Visitor', { scope: { tenantRef: 'tenant-b', projectRef: 'project-a' }, names });
   assert.equal(result.status, 'PARTIAL');

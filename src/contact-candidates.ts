@@ -2,6 +2,13 @@
  * #37 bounded deterministic candidate source for PERSON NAME, EMAIL and PHONE. Pure and NON-ENFORCING:
  * it emits classification v1 detector evidence and spans only. It never returns matched text, selects a
  * treatment or authorizes release. Input is text the caller has already normalized (#6/#7 are pending).
+ *
+ * Keyword context (#140): a phone keyword supplies context only from a bounded window immediately before the
+ * number, across the key/value shapes the supported structured grammars actually write — a quoted or bare key
+ * with one separator and the value's opening quote, or a keyword that is the element name itself. A finished
+ * value, an attribute name inside another element's start tag and an unrelated field are not key/value
+ * context. The keyword vocabulary is unchanged, so a key whose spelling is not in it is decided by value shape
+ * alone.
  */
 import { createHash } from 'node:crypto';
 import type { ClassificationClaim, EvidenceProvenance } from './classification.js';
@@ -169,7 +176,32 @@ const EMAIL = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}_%+-])(?<![\\p{L}\\p{M}\\p{N}_%
   '(?![\\p{L}\\p{M}\\p{N}]|\\.[\\p{L}\\p{N}])', 'gu');
 // Digit groups with phone separators. `:`, `=` and `#` may precede (keyword forms such as `tel:`).
 const PHONE = /(?<![\p{L}\p{N}_./@-])(?:\+|00)?\(?\d{1,4}\)?(?:[ \-.]?\(?\d{1,4}\)?){1,7}(?![\p{L}\p{N}_@]|[.:\-/]\d)/gu;
-const PHONE_KEYWORD = /(?:\b(?:tel|telephone|phone|mobile|mob|mobil|cell|fax|telefon|tfn|tlf|ring)(?:\s*(?:number|no\.?|nr\.?|#))?|☎)[\s.:#=-]{0,4}$/iu;
+// The v1 phone vocabulary, shared by every keyword form below so the words cannot drift apart: a keyword word
+// plus the optional `number|no|nr|#` suffix it may take. (`phoneNumber:` and `faxNumber:` match because `\b`
+// puts a boundary before the `phone` inside them; `phone_number` and `mobilePhoneNumber` do not, because `_`
+// and a preceding letter are not boundaries. That asymmetry is pre-existing v1 vocabulary, not a composite-key
+// rule, and it is measured rather than assumed.)
+const PHONE_WORDS = '(?:tel|telephone|phone|mobile|mob|mobil|cell|fax|telefon|tfn|tlf|ring)(?:\\s*(?:number|no\\.?|nr\\.?|#))?';
+// Keyword context is read from a bounded window of the text immediately before the number (see the caller), and
+// the text between the keyword and the number must be a shape those grammars actually write, not an unordered
+// bag of delimiters. Three shapes are accepted:
+// - prose, dotenv, INI, YAML and URL forms: up to four of whitespace, `.`, `:`, `#`, `=`, `-` (unchanged);
+// - a quoted or bare key, then exactly one `:`, `=` or `#`, then the value's opening quote (`{"phone":"…"}`,
+//   `{"phone": "…"}`, `phone="…"`, `phone: "…"`). Requiring that single separator is what keeps a *finished*
+//   value from reaching past itself: in `<id phone="">2025550133</id>` the text after the key is `="">`, and in
+//   `{"phone":"","id":"2025550133"}` it is `":"",`. Both are an empty value already closed plus the start of the
+//   next field or of the element text, not a value opening, so neither supplies keyword context;
+// - the `☎` symbol, as before.
+// Anything else — prose, a comment, an unrelated field, a completed attribute — is not keyword context.
+const PHONE_KEYWORD = new RegExp(`(?:\\b${PHONE_WORDS}|☎)` +
+  '(?:[\\s.:#=-]{0,4}|["\'`]\\s*[:=#]\\s*["\'`]?|\\s*[:=#]\\s*["\'`])$', 'iu');
+// Element text (`<phone>2025550133</phone>`): the keyword only names the value when it *is* the element name, so
+// it has to follow `<` directly (optionally after a namespace prefix) and the start tag has to close right
+// after it. An attribute name inside another element's start tag cannot reach that element's text, and the
+// keyword cannot cross a `>` into a sibling. Attributes on the phone element itself (`<phone lang="en">…`) and
+// a keyword outside a tag (`phone>…`) stay outside keyword context: a wider start-tag grammar is a separate
+// change, not a silent widening of this one.
+const PHONE_ELEMENT_KEYWORD = new RegExp(`<(?:[\\w.-]+:)?\\b${PHONE_WORDS}\\s*>\\s*$`, 'iu');
 const BARE_PREFIX = /[:=#]$/u;
 
 /** Drop an unbalanced leading `(` or trailing `)` that belongs to surrounding prose. */
@@ -185,7 +217,7 @@ function balance(start: number, value: string): { start: number; value: string }
 /** Reject shapes that are technical values, not phone numbers. Recall bias: keep when unsure. */
 function plausiblePhone(value: string, before: string): 'PATTERN' | 'KEYWORD_CONTEXT' | null {
   const digits = value.replace(/\D/gu, '');
-  const keyword = PHONE_KEYWORD.test(before);
+  const keyword = PHONE_KEYWORD.test(before) || PHONE_ELEMENT_KEYWORD.test(before);
   if (digits.length < 7 || digits.length > 15) return null;
   // A bare `k=`, `#` or `x:` prefix without a phone keyword marks a key/value or reference, not a phone.
   if (!keyword && BARE_PREFIX.test(before)) return null;
