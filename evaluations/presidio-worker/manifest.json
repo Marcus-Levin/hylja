@@ -63,7 +63,8 @@
     "advisoriesObserved": 0,
     "yanked": 0,
     "licenseExpressionMissing": 28,
-    "limits": "Published-digest agreement, artifact license/advisory metadata and an OSV version query per package. It is not signature verification, not an authenticated publisher conclusion, and not a transitive or maintenance review. The wheels are NOT added to this repository."
+    "limits": "Published-digest agreement, artifact license/advisory metadata and an OSV version query per package. It is not signature verification, not an authenticated publisher conclusion, and not a transitive or maintenance review. The wheels are NOT added to this repository.",
+    "nameIdentityLimit": "The screen above compared downloaded bytes to independently fetched published records. It does not check that a RECORD NAME matches the artifact it names; see corrections."
   },
   "artifacts": [
     {
@@ -729,5 +730,35 @@
       "requiresPython": ">=3.9",
       "uploadTime": "2026-08-08T18:27:56.719708Z"
     }
-  ]
+  ],
+  "corrections": [
+    {
+      "id": "pinned-record-name-does-not-match-its-artifact",
+      "date": "2026-10-02",
+      "raisedBy": "#40 matched comparison, pre-execution verification",
+      "record": "artifacts[] entry name=zipp version=3.23.0",
+      "finding": "That record sha256, sizeBytes and member count are those of setuptools 84.0.0, whose own top-level METADATA declares Name: setuptools, Version: 84.0.0. No zipp artifact was downloaded: zipp 3.23.0 exists on this host only as a vendored copy inside that wheel (setuptools/_vendor/zipp-3.23.0.dist-info). The digest itself is therefore inside the screened digest set, and all 51 pinned digests are present in the cached wheel directory.",
+      "consequence": "The 51-record screen is a complete DIGEST set, but one of its 51 records names a package the bytes are not. The screened bytes therefore include setuptools 84.0.0, which installs an executable startup hook (distutils-precedence.pth: a line beginning import is executed by site at interpreter startup), and the prior runs executed that hook on every worker process start.",
+      "actionTaken": "The record is PRESERVED unchanged as the historical pin. It is EXCLUDED from the executed subset, and the corrected #40 run executes the 50 records whose names match their own artifact metadata, in a fresh runtime built without pip or setuptools and therefore without any .pth startup hook.",
+      "verifiedBy": "evaluations/presidio-worker/verify_selected_runtime.py, run before the corrected run; the verification record is carried in the comparison record under executionEnvironment.",
+      "priorClaimStatus": "Any earlier statement that this manifest describes an exact 51-artifact runtime, or that the extra setuptools distribution did not affect execution, is SUPERSEDED by this correction."
+    }
+  ],
+  "executionEnvironment": {
+    "date": "2026-10-02",
+    "forIssue": "#40 matched public-development comparison (incremental preparation)",
+    "selectedArtifacts": 50,
+    "excludedArtifactRecords": [
+      "zipp"
+    ],
+    "absentDistributions": [
+      "setuptools",
+      "pip"
+    ],
+    "construction": "python3 -m venv --without-pip, then the 50 selected wheel members extracted with the Python standard library only; no installer code of any kind ran, and no package was downloaded.",
+    "startupHooks": 0,
+    "networkAtRuntime": false,
+    "weights": "none: NoOpNlpEngine loads no model",
+    "note": "This declares the subset a run may execute. A run that has not passed verify_selected_runtime.py against this manifest has demonstrated no execution identity and its third-party numbers are not acceptable evidence."
+  }
 }
