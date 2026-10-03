@@ -501,11 +501,12 @@ function isIdentifier(value: string): boolean {
 const HEX_PAIRS = /(?<![0-9A-Fa-f])(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:(?:[ \t\r\n,;:|.&"'[\]]|\\[nrt"\\]|-(?=[ \t0-9A-Fa-f])){1,24}(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?![0-9A-Fa-f])){7,4096}/gu;
 /**
  * One dump row, as its structure rather than as a string: the cells it spells, the width they are written at, how
- * many of them are cells at all, how many there are before its ASCII column, and the byte offset it declares. The
- * offset column is what makes the row width knowable without trusting the column separator, which matters because a
- * sender chooses both the whitespace inside the hex field and the content of the column.
+ * many of them are cells at all, how many there are before its ASCII column, the byte offset it declares, and
+ * whether its ASCII column carries the explicit `|` marker. The offset column is what makes the row width knowable
+ * without trusting the column separator, which matters because a sender chooses both the whitespace inside the hex
+ * field and the content of the column; the marker is what makes the column itself unambiguous.
  */
-interface DumpRow { cells: string[]; width: number; count: number; gap: number; offset: number }
+interface DumpRow { cells: string[]; width: number; count: number; gap: number; offset: number; marked: boolean }
 // Lines with an offset column; the line may carry a prefix (a JSON body's first line: `"content":"00000000  78 9c …`).
 // Dumps without offsets (`od -An`) are plain byte-pair runs.
 const DUMP_OFFSET = /(?:^|[^0-9A-Fa-f])([0-9A-Fa-f]{4,8}):?[ \t]+/u;
@@ -542,8 +543,45 @@ function dumpLineRow(line: string): DumpRow | null {
   // Cells before the ASCII column: every cell up to the first run of two or more spaces. Only an unmarked column
   // can be mistaken for cells, so only an unmarked row has one.
   const gap = ascii < 0 ? /[ \t]{2,}/u.exec(tail) : null;
-  return { cells, width, count, offset: parseInt(offset[1]!, 16),
+  return { cells, width, count, offset: parseInt(offset[1]!, 16), marked: ascii >= 0,
     gap: gap ? tail.slice(0, gap.index).trim().split(/[ \t]+/u).length : count };
+}
+/**
+ * One **explicitly marked** dump row, as its own reading: the row declares its bytes with an ASCII-column marker
+ * (`  |…|`), so the column is unambiguously not data and the cells between the offset and the marker are exactly
+ * the row's bytes. That is a stronger declaration than the multi-row readings need — they take a row's width from
+ * its own offsets — and it is what makes a single row readable without guessing.
+ *
+ * The grammar is deliberately narrow and it is the whole of what this reading claims:
+ *
+ * - one offset-prefixed row, and only one: a block of two or more rows keeps exactly the readings it always had,
+ *   which already span sixteen bytes and read whole rows whatever separator a sender put inside the field;
+ * - at most one standard sixteen-byte row, so a wider row is left to the byte-pair and dump readers above rather
+ *   than given a second reading here;
+ * - **every** token before the marker a cell of the row's own width: `count` stops at the first one that is not,
+ *   which is what the multi-row readings want (a row may spell its column too) and is not enough here. A field
+ *   with prose or any other non-cell after its cells is malformed, and a reading taken from the cell prefix alone
+ *   would invent a stream out of part of a field the sender never finished writing. `xxd`'s final odd byte in a
+ *   four-character row is a cell and is kept;
+ * - every cell hex, so a row of word-like groups (`dead beef cafe food`) is not bytes and is not read as Base64
+ *   either;
+ * - the offset column and the ASCII column are excluded, both by construction (`cells` is the text between them).
+ *
+ * A row this rejects is left exactly as base left it: the byte-pair and multi-row readers still see their own
+ * reading of the same text, so nothing stops being inspected and this reading only declines to invent one.
+ *
+ * It is **decode-only**, exactly like every other dump reading: the row adds no opaque bytes of its own, so an
+ * ordinary one-row dump of a digest, an id or a short piece of compressed prose gains no opaque authority from
+ * its shape, while a compressed note in that row is inflated and matched like any other. What it decodes can still
+ * block as it always does (a container signature, opaque output, an exhausted budget).
+ */
+const MIN_SHORT_DUMP_BYTES = 4;
+const MAX_SHORT_DUMP_BYTES = 16;
+function shortDumpValue(row: DumpRow): string | null {
+  if (!row.marked || row.count !== row.cells.length) return null;
+  const value = row.cells.join('');
+  if (value.length < MIN_SHORT_DUMP_BYTES * 2 || value.length > MAX_SHORT_DUMP_BYTES * 2) return null;
+  return /^(?:[0-9A-Fa-f]{2})+$/u.test(value) ? value : null;
 }
 /**
  * The cell count a block's rows agree on, from their own offsets. A short final row has no successor to compare
@@ -574,6 +612,13 @@ function* dumpRuns(text: string): Generator<EncodedRun> {
   const flush = function* (): Generator<EncodedRun> {
     if (block) {
       const width = dumpRowWidth(block.rows);
+      // One explicitly marked row, read on its own. The readings below need two rows and sixteen bytes of hex and
+      // the byte-pair reader needs eight pairs, so a single row of a short stream was read by nothing at all; this
+      // adds that reading and displaces none.
+      if (block.rows.length === 1) {
+        const value = shortDumpValue(block.rows[0]!);
+        if (value !== null) yield { start: block.start, end: block.end, value, prefixed: false, countable: false, separated: true };
+      }
       for (const [index, hex] of block.hex.entries()) {
         if (block.lines < 2 || hex.join('').length < 32) continue;
         // Reading 0 is the whole row, bounded by the width the offsets declare so a hex-looking unmarked ASCII column
