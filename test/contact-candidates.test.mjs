@@ -13,6 +13,13 @@ const namesB = createNameDictionary(scopeB, ['Quillon Fakeworth']);
 const run = (text, more = {}) => generateContactCandidates({ text, inputRef: 'field-a.invalid', scope: scopeA,
   names: namesA, ...more });
 const spans = (text, result) => result.candidates.map((c) => [c.subtype, text.slice(c.start, c.end)]);
+const phones = (text, more) => spans(text, run(text, more)).filter(([subtype]) => subtype === 'PHONE');
+
+// Runtime-assembled, obviously synthetic structured rows: `20255501xx` is the fictional 555-01xx range, and
+// every host is `example.com`/`.invalid`. Nothing below is a real contact value.
+const docDigits = (last) => `2025550${String(last).padStart(3, '0')}`;
+const jsonField = (key, value) => `{"${key}":"${value}"}`;
+const xmlElement = (key, value) => `<${key}>${value}</${key}>`;
 
 function prng(seed) {
   let state = seed >>> 0;
@@ -201,6 +208,10 @@ test('synthetic golden set: per-subtype recall, precision and false negatives ar
     ['GET https://api.example.com:8443/health 503 from 192.0.2.10 at 2026-09-26T10:00:00Z', []],
     ['{"owner":"brannick.t@eng.example.invalid","tel":"(202) 555-0123","port":443}',
       [['EMAIL', 'brannick.t@eng.example.invalid'], ['PHONE', '(202) 555-0123']]],
+    [`{"owner":"orla.s@support.example.com","phone":"${docDigits(133)}","port":"443"}`,
+      [['NAME', 'orla'], ['EMAIL', 'orla.s@support.example.com'], ['PHONE', docDigits(133)]]],
+    [`<contact><phone>${docDigits(144)}</phone><email>orla.s@support.example.com</email></contact>`,
+      [['PHONE', docDigits(144)], ['NAME', 'orla'], ['EMAIL', 'orla.s@support.example.com']]],
     ['trace 123e4567-e89b-12d3-a456-426614174000 build 2026.09.26.1 rev 10.20.30.40', []],
     ['tel: 2025550133 / mobile 202 555 0144', [['PHONE', '2025550133'], ['PHONE', '202 555 0144']]],
     ['Contact orla via ticket 2025550166', [['NAME', 'orla']]],
@@ -217,6 +228,11 @@ test('synthetic golden set: per-subtype recall, precision and false negatives ar
     assert.equal(fn, 0, `${subtype} false negatives`);
     assert.equal(fp, 0, `${subtype} false positives`);
   }
+  // These counts cover the golden subset above only. The four known recall-biased PHONE over-candidates
+  // (`range 1000-2000`, `ISBN …`, `price 1 234 567 kr`, `order 12345-67890`) are deliberately not in that
+  // subset and are pinned separately in "known over-cloaks are pinned", so a perfect number here is a subset
+  // result, never an overall precision or false-cloak measurement.
+  t.diagnostic(`golden subset: ${golden.length} rows, 4 known PHONE over-candidates excluded and pinned elsewhere`);
 });
 
 test('review regressions: parenthesized and keyword-prefixed phones are found with exact spans', () => {
@@ -228,6 +244,157 @@ test('review regressions: parenthesized and keyword-prefixed phones are found wi
     ['phone number: 2025550143', '2025550143'], ['mob 202 555 0143', '202 555 0143'],
     ['see (202) 555-0199)', '(202) 555-0199'],
   ]) assert.deepEqual(spans(text, run(text)).filter(([s]) => s === 'PHONE'), [['PHONE', expected]], text);
+});
+
+test('structured quoted values keep the phone keyword context with an exact-number span', () => {
+  // The same digits a plain `phone 2025550133` emits are missed when a JSON string, a quoted property or an XML
+  // element/attribute puts a quote or `>` between the keyword and the value. Keyword context is per occurrence,
+  // so the span must stay on the digits themselves: the delimiters are never part of the candidate.
+  const value = docDigits(133);
+  for (const text of [
+    jsonField('phone', value), jsonField('tel', value), `{"phone" :"${value}"}`, `{"phone" : "${value}"}`,
+    `{"phone"  :  "${value}"}`, `{"phone":"${value}", "port":"443"}`,
+    `{phone: "${value}"}`, `phone: "${value}"`, `phone = "${value}"`, `phone="${value}"`, `phone='${value}'`,
+    `PHONE="${value}"`, `data-phone="${value}"`, `phone = ${value}`,
+    xmlElement('phone', value), `<phone>\n  ${value}\n</phone>`, `<phone number="${value}"/>`,
+    `<phone number='${value}' />`, `<contact><phone>${value}</phone><port>443</port></contact>`,
+    `<ns:phone>${value}</ns:phone>`,
+    // An earlier element's completed `phone` attribute neither suppresses nor misdirects the real phone element.
+    `<id phone=""></id><phone>${value}</phone>`,
+  ]) {
+    const result = run(text);
+    assert.deepEqual(phones(text), [['PHONE', value]], JSON.stringify(text));
+    assert.equal(result.candidates.filter((c) => c.subtype === 'PHONE').length, 1, JSON.stringify(text));
+    assert.equal(result.candidates.find((c) => c.subtype === 'PHONE').basis, 'KEYWORD_CONTEXT', JSON.stringify(text));
+    assert.equal(result.status, 'COMPLETE', JSON.stringify(text));
+  }
+  // Two structured fields are two occurrences: each key supplies context for its own value only.
+  const pair = `{"phone":"${value}","mobile":"202 555 0144"}`;
+  assert.deepEqual(phones(pair), [['PHONE', value], ['PHONE', '202 555 0144']], pair);
+  assert.deepEqual(run(pair).candidates.filter((c) => c.subtype === 'PHONE').map((c) => c.basis),
+    ['KEYWORD_CONTEXT', 'KEYWORD_CONTEXT'], pair);
+  // A keyword-separated value and a structured value are the same candidate, so a name dictionary, a field
+  // hint or a tenant scope cannot tell them apart and the structured spelling cannot dodge the phone check.
+  assert.deepEqual(phones(jsonField('phone', value), { fieldHint: 'NAME' }).map(([, v]) => v), [value]);
+});
+
+test('only adjacent structured key/value context supplies the phone keyword', () => {
+  const value = docDigits(166);
+  for (const text of [
+    // Non-phone keys: a numeric identifier keeps its behaviour whatever shape the digits have.
+    jsonField('port', value), jsonField('user_id', value), jsonField('id', value), `{"count":${value}}`,
+    // Keys outside the v1 phone vocabulary. `phoneNumber`/`faxNumber` are inside it (a `\b`-delimited keyword
+    // plus the optional `number` suffix), so those are measured as emitted rather than listed here.
+    jsonField('phone_number', value), jsonField('mobilePhoneNumber', value), jsonField('phone-no', value),
+    jsonField('homePhone', value),
+    // Phone-like key, non-phone value: identifiers, dates and too-short values stay refused.
+    jsonField('phone', '123e4567-e89b-12d3-a456-426614174000'), jsonField('phone', '2026-09-26T10:00:00Z'),
+    jsonField('phone', '2026-09-26'), jsonField('phone', '443'),
+    // A keyword that is not adjacent to the number cannot reach it, however close the text.
+    `{"note":"call the phone later","ticket":"${value}"}`, `The phone was replaced. Ticket ${value} opened.`,
+    `phone: see ticket ${value}`, '<phone>see ticket ' + value + '</phone>',
+    // Cross-field reach is not adjacency: a keyword inside a completed attribute names neither the element text
+    // that follows the start tag nor the next field's value. `<id phone="">` parses as an empty `@phone`
+    // attribute plus the `id` text, so the digits belong to the element, not to the keyword.
+    `<id phone="">${value}</id>`, `<id data-phone="">${value}</id>`, `<id phone="" >${value}</id>`,
+    `phone="" ${value}`, `{"phone":"","id":"${value}"}`, `<contact phone="">${value}</contact>`,
+    // Declared conservative misses: attributes on the phone element itself, and a keyword outside a tag. Base
+    // missed both as well; widening the start-tag grammar is a separate, visible decision.
+    `<phone lang="en">${value}</phone>`, `phone>${value}`,
+    // Documented bound: an unquoted key keeps the four-code-unit separator cap of the base rule, so a wide
+    // whitespace gap is not keyword context. Inside a quoted key/value shape the whitespace is bounded by the
+    // surrounding window instead, because both quotes and the single separator identify the value.
+    `phone:      ${value}`,
+  ]) assert.deepEqual(phones(text), [], JSON.stringify(text));
+});
+
+test('structured phone evidence stays privacy-safe and keeps Unicode-aligned spans', () => {
+  const value = docDigits(177);
+  const text = jsonField('phone', value);
+  const result = run(text);
+  const phone = result.candidates.find((c) => c.subtype === 'PHONE');
+  assert.ok(phone);
+  assert.equal(phone.evidence.provenance.producerId, CONTACT_PRODUCER.id);
+  assert.equal(phone.evidence.claim.semanticType, 'PERSON');
+  assert.equal(phone.evidence.claim.subtype, 'PHONE');
+  assert.equal(phone.evidence.claim.sensitivity, undefined);
+  // Neither the digits nor the key text that produced the candidate leaves the seam.
+  const serialized = JSON.stringify(result);
+  assert.equal(serialized.includes(value), false);
+  assert.equal(serialized.includes('"phone"'), false);
+  // An astral character before a quoted structured value shifts both offset families by the same amount.
+  const astral = `\u{1f4de} ${text}`;
+  const astralPhone = run(astral).candidates.find((c) => c.subtype === 'PHONE');
+  assert.equal([...astral].slice(astralPhone.codePointStart, astralPhone.codePointEnd).join(''), value);
+  assert.equal(astralPhone.end - astralPhone.start, astralPhone.codePointEnd - astralPhone.codePointStart);
+});
+
+test('public synthetic development measurement: phone-like keys, numeric identifiers and vocabulary bounds', (t) => {
+  // Runtime-assembled, obviously synthetic rows on public development data. This measures #37's own behaviour;
+  // it is not held-out data, not a scored evaluation, and says nothing about egress or production traffic.
+  const bare = docDigits(122);
+  const grouped = `+1 ${bare.replace(/^(\d{3})(\d{3})(\d{4})$/u, '$1-$2-$3')}`;
+  const owner = 'Orla Synthetica';
+  const mailbox = 'orla.s@support.example.com';
+  const rows = [
+    // [category, key spelling, text, expected [subtype, value] pairs]
+    ['KEYWORD_CONTEXT', 'phone', jsonField('phone', bare), [['PHONE', bare]]],
+    ['KEYWORD_CONTEXT', 'tel', jsonField('tel', bare), [['PHONE', bare]]],
+    ['KEYWORD_CONTEXT', 'phone + wide json gap', `{"phone"  :  "${bare}"}`, [['PHONE', bare]]],
+    ['KEYWORD_CONTEXT', 'phone number', `<phone number="${bare}"/>`, [['PHONE', bare]]],
+    // CamelCase forms are inside the v1 vocabulary already: a `\b`-delimited keyword plus its optional
+    // `number` suffix, which is why `phoneNumber: 2025550122` was already keyword context before #140.
+    ['KEYWORD_CONTEXT', 'phoneNumber', jsonField('phoneNumber', bare), [['PHONE', bare]]],
+    ['KEYWORD_CONTEXT', 'faxNumber', jsonField('faxNumber', bare), [['PHONE', bare]]],
+    // Value shape alone decides these, with or without a recognized key.
+    ['VALUE_SHAPE', 'mobilePhoneNumber', jsonField('mobilePhoneNumber', grouped), [['PHONE', grouped]]],
+    ['NON_PHONE_KEY', 'port', jsonField('port', bare), []],
+    ['NON_PHONE_KEY', 'user_id', jsonField('user_id', bare), []],
+    ['NON_PHONE_KEY', 'count', `{"count":${bare}}`, []],
+    ['OUTSIDE_VOCABULARY', 'phone_number', jsonField('phone_number', bare), []],
+    ['OUTSIDE_VOCABULARY', 'mobilePhoneNumber', jsonField('mobilePhoneNumber', bare), []],
+    ['OUTSIDE_VOCABULARY', 'homePhone', jsonField('homePhone', bare), []],
+    ['NON_PHONE_VALUE', 'phone + uuid', jsonField('phone', '123e4567-e89b-12d3-a456-426614174000'), []],
+    ['NON_PHONE_VALUE', 'phone + timestamp', jsonField('phone', '2026-09-26T10:00:00Z'), []],
+    ['NON_PHONE_VALUE', 'phone + date', jsonField('phone', '2026-09-26'), []],
+    ['NON_PHONE_VALUE', 'phone + short', jsonField('phone', '443'), []],
+    ['DISTANT_KEYWORD', 'phone in prose', `{"note":"call the phone later","ticket":"${bare}"}`, []],
+    ['CROSS_FIELD_KEYWORD', 'empty phone attribute + element text', `<id phone="">${bare}</id>`, []],
+    ['CROSS_FIELD_KEYWORD', 'phone key with empty value + id', `{"phone":"","id":"${bare}"}`, []],
+    // Declared recall bias, disclosed rather than hidden: an epoch-shaped identifier under a vocabulary phone
+    // key is emitted. The plain `phone 1790000000000` spelling already did this before #140; a digit-count or
+    // shape rule that refuses it would be a separate, visible precision decision.
+    ['RECALL_BIAS', 'phone + epoch-shaped identifier', jsonField('phone', '1790000000000'),
+      [['PHONE', '1790000000000']]],
+    ['BOUNDED_GAP', 'phone + wide unquoted gap', `phone:      ${bare}`, []],
+    // NAME and EMAIL under the same structured context are unaffected and still resolve per subtype.
+    ['STRUCTURED_CONTACT', 'json owner/email/phone',
+      `{"owner":"${owner}","email":"${mailbox}","phone":"${bare}"}`,
+      [['NAME', owner], ['NAME', 'orla'], ['EMAIL', mailbox], ['PHONE', bare]]],
+    ['STRUCTURED_CONTACT', 'xml owner/email/phone',
+      `<contact><owner>${owner}</owner><email>${mailbox}</email><phone>${bare}</phone></contact>`,
+      [['NAME', owner], ['NAME', 'orla'], ['EMAIL', mailbox], ['PHONE', bare]]],
+  ];
+  const counts = new Map();
+  const bySubtype = { NAME: { found: 0, expected: 0 }, EMAIL: { found: 0, expected: 0 }, PHONE: { found: 0, expected: 0 } };
+  let phoneFound = 0;
+  for (const [category, key, text, expected] of rows) {
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+    const result = run(text);
+    assert.deepEqual(spans(text, result), expected, `${category}/${key}: ${text}`);
+    for (const [subtype] of expected) bySubtype[subtype].expected++;
+    for (const [subtype] of spans(text, result)) bySubtype[subtype].found++;
+    const phone = result.candidates.find((c) => c.subtype === 'PHONE');
+    if (phone) { phoneFound++; assert.equal(phone.basis, category === 'VALUE_SHAPE' ? 'PATTERN' : 'KEYWORD_CONTEXT', key); }
+  }
+  const summary = [...counts].sort().map(([category, count]) => `${category}=${count}`).join(' ');
+  t.diagnostic(`#37 phone-key measurement over ${rows.length} synthetic rows: ${summary}`);
+  t.diagnostic(`PHONE candidates ${phoneFound}/${rows.filter(([, , , expected]) => expected.some(([s]) => s === 'PHONE')).length} rows ` +
+    `have one; NAME ${bySubtype.NAME.found}/${bySubtype.NAME.expected}, EMAIL ${bySubtype.EMAIL.found}/${bySubtype.EMAIL.expected}, ` +
+    `PHONE ${bySubtype.PHONE.found}/${bySubtype.PHONE.expected} candidates match their expected span`);
+  for (const [subtype, count] of Object.entries(bySubtype)) {
+    assert.equal(count.found, count.expected, `${subtype} candidates across the measured rows`);
+  }
 });
 
 test('review regressions: non-ASCII and RFC local parts are never truncated', () => {
