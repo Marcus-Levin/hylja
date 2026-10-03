@@ -2196,7 +2196,10 @@ test('issue 88 R2: the remaining declared limits are measured and pinned, not cl
   assert.equal(unknown(camel.slice(0, 3).join(', ')).decision, 'ALLOW');
   assert.ok(unknown(camel.join(', ')).reasons.includes('OPAQUE_EMBEDDED'));
   assert.equal(unknown(Array.from({ length: 11 }, (_, index) => `convertUtf8ToBase64String${index}`).join(', ')).decision, 'ALLOW');
-  // 6. A single short default-`xxd` row is not rebuilt, and a truncated prefix of a longer stream is released.
+  // 6. A truncated prefix of a longer stream is released. A marked row *is* rebuilt (issue 142: a one-row dump of
+  //    a short stream used to be read by nothing at all), but with no known originals registered a truncated
+  //    stream decodes to a partial prefix that matches nothing, so what this measures is the truncated-prefix
+  //    release, not the row reading. The complete dump below still blocks precisely.
   const gz = zlib.gzipSync(Buffer.from(SECRET_NOTE));
   const row = (bytes) => {
     const hex = Buffer.from(bytes).toString('hex');
@@ -2481,4 +2484,129 @@ test('core audit: an unmarked ASCII column is never read as cells, at any column
   }
   // Ordinary text with offsets and words is not a dump, whatever its column looks like.
   assert.equal(credentialOnly('2024-01-02: build step 3 of 9 finished in 4211ms\n2024-01-02: build step 4 of 9 finished').decision, 'ALLOW');
+});
+
+/**
+ * Issue #142, a bounded follow-up to #88, red at base `3f77c32`. The dump reconstruction required two rows and
+ * sixteen bytes of hex, so the smallest realistic dump of a protected value was not read at all: a registered
+ * four-character value, raw-deflate compressed to six bytes, written as **one** offset-prefixed row of two-byte
+ * hex cells with an explicit ASCII-column marker, returned `ALLOW` with `release` bytes in both a raw body and a
+ * JSON-wrapped one, for an `ORIGINAL` and for a `CANARY`. The same stream as whole hex blocked with the registered
+ * entry's reason, and longer rows and brotli controls already blocked, so this is declared-grammar coverage and not
+ * a regression of the multi-row readings.
+ *
+ * Every value here is invented, registered to a key built in this test, and assembled at runtime. Nothing below is
+ * a real dump, a real value or a real tool's output, and nothing reads a real file.
+ */
+const SHORT_DUMP_ENTRIES = Object.freeze([
+  { kind: 'ORIGINAL', value: 'Orla', ref: 'short.original.1' },
+  { kind: 'CANARY', value: 'Q7zx', ref: 'short.canary.1' },
+]);
+const shortDumpKnown = createKnownOriginals(scopeA, new Uint8Array(32).fill(11), SHORT_DUMP_ENTRIES);
+const checkShort = (text) => checkEgress({ bytes: typeof text === 'string' ? enc(text) : text, scope: scopeA,
+  destination, authorized: destination, known: shortDumpKnown });
+/** One dump row: offset, cells of the row's own width, and a marked (`  |…|`) or unmarked ASCII column. */
+const shortDumpRow = (bytes, { group = 2, marker = true, column = null, offset = 0 } = {}) => {
+  const cells = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+    .match(new RegExp(`.{1,${group}}`, 'gu')).join(' ');
+  const ascii = column ?? [...bytes].map((byte) => (byte >= 0x20 && byte < 0x7f ? String.fromCharCode(byte) : '.')).join('');
+  return `${(offset >>> 0).toString(16).padStart(8, '0')}:  ${cells}  ${marker ? `|${ascii}|` : ascii}`;
+};
+const shortDump = (row) => `synthetic dump\n${row}\nend\n`;
+/** The containers a row is checked in: raw text and two JSON bodies, one of them a message turn. */
+const shortDumpContainers = (row) => [shortDump(row),
+  JSON.stringify({ content: shortDump(row) }),
+  JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content: shortDump(row) }] })];
+
+test('issue 142: one explicitly marked short dump row is rebuilt, inflated and matched', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  for (const { kind, value, ref } of SHORT_DUMP_ENTRIES) {
+    const expected = kind === 'CANARY' ? 'CANARY_DETECTED' : 'KNOWN_ORIGINAL_DETECTED';
+    const findingKind = kind === 'CANARY' ? 'CANARY' : 'KNOWN_ORIGINAL';
+    // Each value is six raw-deflate bytes, so one row of two-byte cells spells twelve hex characters: below the
+    // sixteen-byte floor the multi-row reading needs. Each value with a trailing space is seven, so its
+    // four-character row ends in a single odd byte that the reading has to keep.
+    for (const note of [value, `${value} `]) {
+      const stream = zlib.deflateRawSync(Buffer.from(note));
+      for (const group of [2, 4]) {
+        for (const payload of shortDumpContainers(shortDumpRow(stream, { group }))) {
+          const result = checkShort(payload);
+          assert.equal(result.decision, 'BLOCK', `${kind}/${group}/${payload.slice(0, 48)}`);
+          assert.ok(result.reasons.includes(expected), `${kind}/${group}: ${result.reasons.join()}`);
+          assert.ok(result.findings.some((finding) => finding.rule === ref && finding.kind === findingKind),
+            `${kind}/${group}: ${result.findings.map((finding) => finding.rule).join()}`);
+          assert.equal(result.release, undefined, `${kind}/${group}`);
+        }
+      }
+    }
+  }
+});
+
+test('issue 142: the short-row reading excludes the offset and the ASCII column, and keeps ordinary rows readable', () => {
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const stream = zlib.deflateRawSync(Buffer.from('Orla'));
+  // The ASCII column is left out of the bytes: a column that spells hex words of its own (a decoy the sender
+  // chose) still blocks, so the column is not part of the reconstruction in either direction.
+  const decoy = 'deadbeef cafe f00d';
+  for (const payload of shortDumpContainers(shortDumpRow(stream, { column: decoy }))) {
+    const result = checkShort(payload);
+    assert.equal(result.decision, 'BLOCK', payload.slice(0, 48));
+    assert.ok(result.findings.some((finding) => finding.rule === 'short.original.1'), result.reasons.join());
+  }
+  // Utility: the same shape carrying ordinary compressed prose, and ordinary prose and offsets, still pass.
+  const ordinary = zlib.deflateSync(Buffer.from('ordinary build log about the synthetic service'));
+  for (const row of [shortDumpRow(stream, { column: decoy }), shortDumpRow(ordinary), shortDumpRow(ordinary, { group: 4 }),
+    shortDumpRow(ordinary.subarray(0, 9))]) {
+    assert.equal(credentialOnly(shortDump(row)).decision, 'ALLOW', row.slice(0, 48));
+  }
+  for (const prose of ['2024-01-02: build step 3 of 9 finished in 4211ms',
+    'deadbeef cafe f00d 0000 1111 2222 3333 4444\n5555 6666 7777 8888 9999 aaaa bbbb cccc',
+    'offset 00000000:  1f8b 08 00  note about the synthetic build finished']) {
+    assert.equal(credentialOnly(prose).decision, 'ALLOW', prose.slice(0, 48));
+  }
+  // The multi-row readings this change must not disturb: a longer compressed note in a marked dump, the same
+  // note's bytes as whole hex, and the same note spread over two rows, each still block.
+  const longer = zlib.deflateRawSync(Buffer.from(`note ${SHORT_DUMP_ENTRIES[0].value} ${SHORT_DUMP_ENTRIES[1].value} text`));
+  for (const group of [2, 4]) {
+    const rows = Array.from({ length: Math.ceil(longer.length / 16) }, (_, index) =>
+      shortDumpRow(longer.subarray(index * 16, index * 16 + 16), { group, offset: index * 16 })).join('\n');
+    const result = checkShort(shortDump(rows));
+    assert.equal(result.decision, 'BLOCK', `${group}`);
+    assert.ok(result.reasons.includes('KNOWN_ORIGINAL_DETECTED') && result.reasons.includes('CANARY_DETECTED'),
+      `${group}: ${result.reasons.join()}`);
+  }
+  assert.ok(checkShort(longer.toString('hex')).reasons.includes('CANARY_DETECTED'));
+});
+
+test('issue 142: a malformed field before the marker is not read as bytes', () => {
+  // Near miss for the single-row reading, red at `59a4c3b` on independent review. `dumpLineRow` counts a
+  // *prefix* of the field for its other readings -- `count` stops at the first token that is not a cell of the
+  // row's own width -- and that is right for them, because a row that spells its column too is still read up to
+  // its own hex field. This reading had no such rule: it took the prefix alone, dropped the rest of the field and
+  // read bytes the sender never wrote as a complete stream. A row whose first four cells spell a ZIP signature
+  // and whose field then carries prose was BLOCKed `OPAQUE_EMBEDDED` at `59a4c3b` and ALLOWed at base `3f77c32`,
+  // so the change had invented an opaque outcome for a malformed row outside its authorized grammar. The whole
+  // field must be cells of the row's own width before this reading is offered at all.
+  const malformed = ['00000000: 50 4b 03 04 note  |synthetic|',
+    '00000000: dead beef 50 4b 03 04  |......|',
+    '00000000: dead beef cafe food  |deadbeef|',
+    '00000000: 50 4b 03 04 note 00  |synthetic|'];
+  for (const row of malformed) {
+    for (const payload of [row, JSON.stringify({ content: row }),
+      JSON.stringify({ model: 'synthetic', messages: [{ role: 'user', content: row }] })]) {
+      const result = credentialOnly(payload);
+      assert.equal(result.decision, 'ALLOW', payload.slice(0, 48));
+      assert.deepEqual(result.findings, [], payload.slice(0, 48));
+    }
+  }
+  // The near miss is the malformed *field*, not the row: a row whose whole field is cells is still read, so the
+  // planted stream in the same shape still blocks with its own entry and releases nothing.
+  const zlib = globalThis.process.getBuiltinModule('node:zlib');
+  const stream = zlib.deflateRawSync(Buffer.from('Orla'));
+  for (const group of [2, 4]) {
+    const result = checkShort(shortDump(shortDumpRow(stream, { group })));
+    assert.equal(result.decision, 'BLOCK', `${group}`);
+    assert.ok(result.findings.some((finding) => finding.rule === 'short.original.1'), result.reasons.join());
+    assert.equal(result.release, undefined, `${group}`);
+  }
 });
