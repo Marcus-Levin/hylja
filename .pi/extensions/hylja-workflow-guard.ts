@@ -14,9 +14,12 @@
 import { evaluateBashToolInput } from '../lib/hylja-command-guard.mjs';
 
 export default function hyljaWorkflowGuard(pi) {
-	pi.on('tool_call', (event) => {
+	pi.on('tool_call', (event, ctx) => {
 		if (event.toolName !== 'bash') return undefined;
-		const decision = evaluateBashToolInput(event.input);
+		// A foreground child is a session inside the parent process, so the worktree it searches lives in
+		// the session directory, not in process.cwd(). An absent context falls back to the process
+		// directory inside the helper.
+		const decision = evaluateBashToolInput(event.input, { cwd: ctx?.cwd });
 		if (!decision.allowed) return { block: true, reason: decision.reason };
 		event.input.timeout = decision.timeout;
 		return undefined;

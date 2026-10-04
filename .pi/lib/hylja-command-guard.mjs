@@ -8,8 +8,9 @@
  * Two decisions, both pure and total:
  * 1. Block a `find` whose search root is a machine-wide absolute root. Scoped and relative roots, the
  *    caller's home directory and the current worktree stay allowed.
- * 2. Guarantee a finite positive `timeout` for every bash call: a default when the caller omits it, a
- *    tighter explicit value preserved, an excessive value clamped, and a malformed value refused.
+ * 2. Guarantee a finite positive `timeout` for every bash call that reaches this guard: a default when
+ *    the caller omits it, a tighter explicit value preserved, an excessive value clamped, and a
+ *    malformed value refused.
  *
  * Neither decision parses shell. The command string is split on control separators and whitespace,
  * quotes are stripped, and only the leading tokens of each segment are inspected: environment
@@ -17,7 +18,8 @@
  * (`$(...)`, backticks, variables), `eval`, aliases, a wrapper that takes a value argument
  * (`sudo -u other find /`), `find` invoked indirectly, and any other API that reaches a shell are
  * outside this guard by construction. Treat a pass here as a workflow speed bump, never as proof that a
- * command is safe, bounded or correct; only the timeout default still bounds those cases.
+ * command is safe, bounded or correct. The timeout decision bounds only calls that reach this guard's
+ * builtin `bash` handling; other tools and other APIs receive no bound from here.
  *
  * No input text reaches the caller: a refusal is one of two fixed reasons below.
  */

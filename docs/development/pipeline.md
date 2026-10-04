@@ -58,11 +58,15 @@ Two guarantees, both decided before the tool executes, both logged nowhere:
 | Call | Decision |
 |---|---|
 | `find` with a machine-wide absolute root | blocked with a fixed reason naming the allowed roots |
-| `timeout` omitted | set to 120 s, Pi's builtin bash having no default |
+| `timeout` omitted on a builtin bash call | set to 120 s, Pi's builtin bash having no default |
 | `timeout` present, 0 < t <= 300 | preserved unchanged |
 | `timeout` > 300 s | clamped to 300 s |
 | `timeout` malformed, non-finite or <= 0 | blocked with a fixed reason |
-| any other tool | untouched |
+| any other tool | untouched, and no timeout applied |
+
+Wiring: the adapter takes the `tool_call` handler context and forwards `ctx.cwd` as the session
+directory, because a foreground child runs inside the parent process where `process.cwd()` is the
+coordinator's directory, not the child's worktree.
 
 Wiring: project extension discovery loads it for the coordinator (`<cwd>/.pi/extensions/`), and both
 role profiles declare `extensions: ../extensions/hylja-workflow-guard.ts`, an allowlist that keeps
@@ -75,7 +79,8 @@ Limits, stated so no one reads more into it: it is a workflow guard, not a shell
 parser or an enforcement boundary. It splits a command textually on control separators and whitespace,
 strips quotes and inspects only the leading tokens of each segment. Dynamic expansion, `eval`, aliases,
 value-taking wrappers, indirectly invoked `find`, MCP or another harness that reaches a shell, and any
-other API are outside it; the timeout default still bounds those calls, and nothing proves a permitted
+other API are outside it. The timeout applies only to calls that reach this session's guarded builtin
+`bash`; other tools and other APIs receive no bound from this guard, and nothing proves a permitted
 command is safe, bounded or correct. Unlisted absolute roots, `/tmp` and `$HOME`-relative searches are
 allowed on purpose, so the guard cannot block scoped repository discovery or the installed skill paths.
 

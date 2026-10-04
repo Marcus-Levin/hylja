@@ -22,6 +22,11 @@ import {
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const guardPath = resolve(root, '.pi', 'extensions', 'hylja-workflow-guard.ts');
 
+// A foreground child is a session inside the parent process, so its worktree is reachable only from
+// the handler context. These roots are synthetic and are never touched on disk.
+const CHILD_CWD = '/srv/synthetic-lancer/worktree';
+const CHILD_CONTEXT = { cwd: CHILD_CWD };
+
 // Fixed roots so a case never depends on the machine it runs on.
 const OPTIONS = { home: '/home/synthetic-lancer', cwd: '/home/synthetic-lancer/worktree' };
 
@@ -104,6 +109,32 @@ test('a malformed timeout is refused with the fixed reason, never the value', ()
 	}
 });
 
+test('the adapter checks the child session directory, not the parent process directory', async () => {
+	const module = await import(guardPath);
+	const handlers = [];
+	module.default({
+		on(event, handler) {
+			assert.equal(event, 'tool_call');
+			handlers.push(handler);
+		},
+	});
+	const handler = handlers[0];
+
+	const scoped = { command: `find ${CHILD_CWD}/src -name "*.ts"` };
+	assert.equal(handler({ toolName: 'bash', toolCallId: 'call-c1', input: scoped }, CHILD_CONTEXT), undefined);
+	assert.equal(scoped.timeout, DEFAULT_COMMAND_TIMEOUT_SECONDS);
+
+	const tighter = { command: `find ${CHILD_CWD} -name "*.ts"`, timeout: 45 };
+	handler({ toolName: 'bash', toolCallId: 'call-c2', input: tighter }, CHILD_CONTEXT);
+	assert.equal(tighter.timeout, 45);
+
+	// The broad ancestor of the same child root stays refused.
+	const broad = { command: 'find /srv -name "*.ts"' };
+	assert.deepEqual(handler({ toolName: 'bash', toolCallId: 'call-c3', input: broad }, CHILD_CONTEXT),
+		{ block: true, reason: BLOCK_REASON_MACHINE_WIDE_SEARCH });
+	assert.equal(broad.timeout, undefined);
+});
+
 test('the adapter blocks the known search, sets the timeout, and leaves other tools untouched', async () => {
 	const module = await import(guardPath);
 	const handlers = [];
@@ -117,21 +148,21 @@ test('the adapter blocks the known search, sets the timeout, and leaves other to
 	const handler = handlers[0];
 
 	const blockedInput = { command: KNOWN_FAILURE };
-	const blocked = handler({ toolName: 'bash', toolCallId: 'call-1', input: blockedInput });
+	const blocked = handler({ toolName: 'bash', toolCallId: 'call-1', input: blockedInput }, CHILD_CONTEXT);
 	assert.deepEqual(blocked, { block: true, reason: BLOCK_REASON_MACHINE_WIDE_SEARCH });
 	// Refused before execution, so no timeout was applied and the input is otherwise untouched.
 	assert.equal(blockedInput.timeout, undefined);
 
 	const allowedInput = { command: 'npm test' };
-	assert.equal(handler({ toolName: 'bash', toolCallId: 'call-2', input: allowedInput }), undefined);
+	assert.equal(handler({ toolName: 'bash', toolCallId: 'call-2', input: allowedInput }, CHILD_CONTEXT), undefined);
 	assert.equal(allowedInput.timeout, DEFAULT_COMMAND_TIMEOUT_SECONDS);
 
 	const clampedInput = { command: 'npm test', timeout: 9000 };
-	handler({ toolName: 'bash', toolCallId: 'call-3', input: clampedInput });
+	handler({ toolName: 'bash', toolCallId: 'call-3', input: clampedInput }, CHILD_CONTEXT);
 	assert.equal(clampedInput.timeout, MAX_COMMAND_TIMEOUT_SECONDS);
 
 	const readInput = { path: 'src/policy.ts' };
-	assert.equal(handler({ toolName: 'read', toolCallId: 'call-4', input: readInput }), undefined);
+	assert.equal(handler({ toolName: 'read', toolCallId: 'call-4', input: readInput }, CHILD_CONTEXT), undefined);
 	assert.deepEqual(readInput, { path: 'src/policy.ts' });
 });
 
