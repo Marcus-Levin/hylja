@@ -33,7 +33,6 @@ export class CanonicalJsonFailure extends Error {
 const ESCAPES: Readonly<Record<string, string>> = Object.freeze({
   '"': '\\"', '\\': '\\\\', '\b': '\\b', '\f': '\\f', '\n': '\\n', '\r': '\\r', '\t': '\\t',
 });
-const SAFE_INTEGER_MAX = Number.MAX_SAFE_INTEGER;
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
 function isPlainObject(value: object): boolean {

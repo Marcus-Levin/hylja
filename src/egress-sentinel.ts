@@ -19,8 +19,6 @@ const MAX_ROUNDS = 4, MAX_VIEW_UNITS = 8 << 20, MAX_VIEWS = 512;
 const MAX_VERIFICATIONS = 20_000;
 /** Prefilter probes per message (length buckets and short windows); exceeding it blocks as SENTINEL_BUDGET. */
 const MAX_PROBES = 8_000_000;
-/** Base64/hex runs at least this long must decode to text; otherwise they are opaque embedded binary. */
-const OPAQUE_RUN = 128;
 
 export interface SentinelScope { tenantRef: string; projectRef: string }
 export interface Destination { id: string; profileDigest: string }
