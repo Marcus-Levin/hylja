@@ -74,6 +74,14 @@ Read the exact paths the launch supplied, never a filename rebuilt from a rememb
 supplied path that resolves to nothing is reported as unavailable, not replaced by a wider search.
 [Handoff and artifact detail](pipeline-reference.md#evidence-lookup).
 
+## Optional: the native lane CLI
+
+Root may instead run one lane through `node scripts/development/run-native-lane.mjs --config <absolute
+config.json>`, which launches Pi itself, so no coordinator model turn carries the lane. Its config,
+the evidence it requires, and its bounds are
+[Native lane CLI](pipeline-reference.md#native-lane-cli), read only on that branch. It adds no
+authority, invariant or gate: completed is not approved, and no speedup has been measured.
+
 ## Limits
 
 Nothing here is measured. Pins, deadlines and verdicts are configuration and prompt contracts, not

@@ -90,6 +90,118 @@ package is added to this repository.
 installation exceeded its budget without a result, so no background lifecycle, ordering or timing is
 promised.
 
+## Native lane CLI
+
+`.pi/lib/hylja-native-lane.ts` (the opt-in controller) and `scripts/development/run-native-lane.mjs`
+(the root-owned CLI) are developer tooling, outside the tracked build and typecheck scope exactly as the
+guard adapter is. Root runs one lane with `node scripts/development/run-native-lane.mjs --config
+<absolute config.json>`. The CLI launches Pi once with the three extensions named in its config, the one
+fixed input the controller answers, and the one structured foreground delegation call into
+`pi-subagents`. No coordinator model takes part in that process; nothing here is a measured speedup,
+and a run under this CLI is still one lane: no model override, no background mode, no role fallback, no
+nesting, and no child that launches another lane.
+
+The config is root-owned, bounded and absolute. Every path field must start with `/`; `key` and `task`
+are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer` or `hylja-reviewer`;
+`timeoutMs` is a positive integer no greater than that role profile's own frontmatter deadline; a
+`model` key is refused rather than ignored.
+
+```json
+{
+  "key": "issue-182-round2",
+  "agent": "hylja-reviewer",
+  "task": "<the full handoff brief>",
+  "cwd": "/abs/path/to/worktree",
+  "timeoutMs": 900000,
+  "sessionDir": "/abs/fresh/dir/sessions",
+  "receipt": "/abs/fresh/dir/receipt.json",
+  "verification": "/abs/fresh/dir/verification.json",
+  "progress": "/abs/fresh/dir/progress.jsonl",
+  "dispatch": "/abs/fresh/dir/dispatch.json",
+  "pi": "/home/operator/.pi/agent/bin/pi",
+  "subagents": "/home/operator/.pi/agent/npm/node_modules/pi-subagents",
+  "guard": "/abs/path/to/worktree/.pi/extensions/hylja-workflow-guard.ts",
+  "controller": "/abs/path/to/worktree/.pi/lib/hylja-native-lane.ts"
+}
+```
+
+The four entrypoint fields are not interchangeable. `pi` is the executable Pi itself is spawned as.
+`subagents` is the trusted installed package **directory** holding its `package.json`, because both the
+`--extension` argument and the delegation and preflight modules resolve from it, and every resolved
+module URL must stay inside that directory; a file path, a nested entrypoint or a different copy on disk
+is a setup failure. `guard` and `controller` are the two extension **file** paths, named exactly, never
+searched for.
+
+The four evidence paths must be fresh: an existing `receipt`, `verification`, `progress` or `dispatch`
+file is `SETUP_FAILED_STALE_EVIDENCE`, so a previous run's evidence can never pass as this run's.
+
+The controller resolves `resolveSubagentLaunchContract` for this exact task, cwd, fresh context, parent
+model registry and the one bridge value it declares (`LANE_BRIDGE_INPUT`, `{ mode: 'off' }` — off
+explicitly, not left to a default) before it emits anything, then persists the expected launch digest,
+the declared guard identity, the effective model and the dispatch tuple, and only then dispatches.
+
+Before the CLI reports a lane it binds that persisted tuple to the leaf's public terminal receipt
+(literal result, cumulative usage, actual model, thinking and status), to one listing of
+`{sessionDir}/subagent-artifacts/` for `*_meta.json` and `*_output.md` only, and to a runtime record
+whose `runId`, `agent`, model and `launchContractDigest` match, whose `launchResolvedExtensions` is the
+installed launch-resolved schema (`version: 1`, `source: "launch-resolved"`, ambient extensions off,
+the declared guard path, the declared number of configured extensions, and every `omitted` ledger
+entry present and zero). All four resolved lists — `runtime`, `configured`, `required` and
+`effective` — are validated together before any is read: each must be present and an array of
+non-empty digest strings, and every `configured`, `runtime` and `required` digest must occur in
+`effective`. A missing, mistyped or non-string list is refused, never defaulted to an empty list; an
+explicitly empty list is a valid assertion of an empty set and stays distinct from missing evidence.
+Any missing, reused or mismatched part is a setup failure with a fixed code,
+never an inferred pass. Exit codes: `0` verified completed lane, `2` setup or evidence failure
+(INCOMPLETE), `3` the leaf finished non-completed. A `completed` leaf is not approval: the verdict is
+only the leaf's own literal `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE` line.
+
+Four bindings carry that last rule, each refused rather than inferred:
+
+| Pair | Refused |
+|---|---|
+| the fired terminal deadline and the native close | the deadline is latched before the stop, so a child that closes zero after the watchdog fired is `SETUP_FAILED_NON_COMPLETED_STATUS` with `deadlineExceeded: true`, never a verified lane |
+| the receipt's `verdict` field and the literal first line of `result.text` | the field must equal that line, or the text carries no declared verdict and the field is the `INCOMPLETE` fallback the controller assigns it. Empty text, an unbound field and a contradiction are malformed |
+| the discovered `_meta.json` and `_output.md` | both must be the same artifact stem, so `_0_meta.json` beside `_1_output.md` is two attempts, never one pair |
+| the public output and the bound verdict line | the output must lead with the literal line the receipt binds; the terminal text appearing somewhere inside it is not proof of a verdict |
+
+Author results are covered by that second row: an author's result that declares no reviewer verdict
+stays `INCOMPLETE`, and can never resolve to an approval. Progress records are parsed, not trusted: a
+line that is not a plain object becomes a fixed `{"event": "malformed"}` snapshot rather than a thrown
+property read.
+
+Acceptance is reported, never assumed. A direct-API run of either role resolves `not-required`, because
+each role profile disables the native writer gate through the deprecated `false` shorthand, so the
+record carries no native writer acceptance evidence: `writerAcceptanceGate` says `not-required` and
+`acceptanceProvesApproval` is `false`. A run whose gate did resolve reports `checked`; an actual
+acceptance failure is refused. Root admits a writer lane separately, by verifying its clean committed
+scoped paths and its evidence, before any approval.
+
+Bounds: progress records carry model, runId, elapsed milliseconds and tool count only, and
+`recentOutput`, tool arguments, raw sessions and provider reasoning are never read or written.
+Cancellation reaches only the exact owned tuple persisted at dispatch, inside the running process.
+Owned shutdown is finite: the watchdog latches the deadline and stops the CLI's own child one minute
+past the native request timeout, sends SIGTERM, then SIGKILL after 10 s, then waits at most 10 s more
+for `close` — never an indefinite wait.
+
+Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
+real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
+platform (34 tests, 24 of them in the lane file). Two of them
+fake only the child transport, so the shipped default platform is what runs: the default filesystem
+must read the progress tail with bounded positional descriptor reads and close every descriptor it
+opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
+removed on completion. Faking those two adapters had passed while the defaults read the whole progress
+file and registered no listener at all. One case injects only the clock, so the real watchdog is fired
+by its recorded timer rather than by waiting out a ten-minute budget, and proves that identical
+completed approval evidence is refused after expiry and verified without it. A read-only
+smoke on root's own installed Pi ran from
+`/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and
+verification records beside it). It exercised launch and evidence plumbing on a reviewer lane, and its
+`receipt.json`, `verification.json`, and the `subagent-artifacts/` `*_0_meta.json` and `*_output.md`
+next to them are the public schema those fixtures and refusals are written against. It is not code
+approval, and independent review of this helper is still pending. No throughput claim has been
+measured.
+
 ## Evidence lookup
 
 One run searched `~/.pi` while its launch carried an explicit `--session-dir`, then reported the model

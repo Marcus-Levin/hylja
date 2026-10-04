@@ -21,6 +21,7 @@ evidence paths and every human gate. That handoff is enough for the worker: it r
 `AGENTS.md`, its named pointers and its commands, and needs neither this skill nor the pipeline page.
 
 Force the project skill with `/skill:hylja-development` after `/reload`; confirm the workflow guard
-loaded once (`pi list`) before dispatch. Installation, guard behaviour, evidence lookup, the
+loaded once (`pi list`) before dispatch. Installation, guard behaviour, evidence lookup, the optional
+root-owned [native lane CLI](../../../docs/development/pipeline-reference.md#native-lane-cli), the
 historical #147 proposal and the stated limits are in
 [pipeline-reference.md](../../../docs/development/pipeline-reference.md).
