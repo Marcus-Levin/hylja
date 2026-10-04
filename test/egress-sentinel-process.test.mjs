@@ -55,12 +55,103 @@ const DIST = fileURLToPath(new URL('../dist/', import.meta.url));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const text = (value) => new TextEncoder().encode(value);
 
-/** Fail loudly instead of hanging when a parent that should settle never does. */
+/**
+ * Fail loudly instead of hanging when a parent that should settle never does.
+ *
+ * The timer is owned here and cleared in `finally` on every path, including rejection: a losing
+ * `setTimeout` keeps the event loop armed for its full deadline after the race is already decided,
+ * which delays process exit for as long as the longest bound in the suite. No `unref`: the deadline
+ * must still be able to fire.
+ */
 async function bounded(promise, ms, label) {
-  const outcome = await Promise.race([promise, delay(ms).then(() => NEVER)]);
-  assert.notEqual(outcome, NEVER, `${label} did not settle within ${ms}ms`);
-  return outcome;
+  let timer;
+  try {
+    const outcome = await Promise.race([
+      promise,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(NEVER), ms); }),
+    ]);
+    assert.notEqual(outcome, NEVER, `${label} did not settle within ${ms}ms`);
+    return outcome;
+  } finally {
+    clearTimeout(timer);
+  }
 }
+
+/* ------------------------------------------------------------------------------------------- *
+ * The harness helper's own timer ownership, observed in a real child process.
+ * ------------------------------------------------------------------------------------------- */
+
+/** Fixed labels the control child writes, in order. No other child output is read. */
+const CONTROL_LABELS = ['CONTROL-SUCCESS', 'CONTROL-REJECTION', 'CONTROL-TIMEOUT'];
+/** Minimal child environment: this control needs no inherited variable, secret or coverage path. */
+const CONTROL_ENV = Object.freeze({ LANG: 'C', LC_ALL: 'C' });
+/** Finite parent watchdog: a helper whose losing deadline timer stays armed trips this. */
+const CONTROL_WATCHDOG_MS = 1_500;
+const CONTROL_CAPTURE_BYTES = 4_096;
+
+/**
+ * The helper under control, run by its own source text: nothing here re-implements it, so whatever
+ * `bounded` does is what the child does. Its only free names are supplied from this module too -
+ * `assert`, the `NEVER` marker and `delay` - while `Promise`, `Symbol`, `setTimeout` and
+ * `clearTimeout` are the standard runtime. A helper revision that no longer calls `delay` simply
+ * ignores the argument, so the same control runs against both.
+ */
+const CONTROL_DRIVER = [
+  "import assert from 'node:assert/strict';",
+  "const NEVER = Symbol('never-settled');",
+  'const delay = new Function(\'return (\' + __DELAY__ + \');\')();',
+  'const bounded = new Function(\'assert\', \'NEVER\', \'delay\', \'return (\' + __BOUNDED__ + \');\')(',
+  '  assert, NEVER, delay);',
+  "const settled = await bounded(Promise.resolve('synthetic-settled'), 30_000, 'control immediate success');",
+  "assert.equal(settled, 'synthetic-settled');",
+  "process.stdout.write('CONTROL-SUCCESS\\n');",
+  'await assert.rejects(bounded(Promise.reject(new Error(\'synthetic control rejection\')), 30_000,',
+  "  'control immediate rejection'), /synthetic control rejection/);",
+  "process.stdout.write('CONTROL-REJECTION\\n');",
+  // A promise that never settles must still produce the fixed timeout message, not a hang.
+  "await assert.rejects(bounded(new Promise(() => {}), 200, 'control never settles'),",
+  "  (error) => error.message === 'control never settles did not settle within 200ms');",
+  "process.stdout.write('CONTROL-TIMEOUT\\n');",
+  '',
+].join('\n')
+  .replace('__DELAY__', () => JSON.stringify(delay.toString()))
+  .replace('__BOUNDED__', () => JSON.stringify(bounded.toString()));
+
+test('the bounded helper owns its deadline timer: a child that settles at once still exits promptly', async () => {
+  const started = Date.now();
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', CONTROL_DRIVER], {
+    stdio: ['ignore', 'pipe', 'ignore'], env: { ...CONTROL_ENV },
+  });
+  child.stdout.setEncoding('utf8');
+  let out = '';
+  child.stdout.on('data', (chunk) => { if (out.length < CONTROL_CAPTURE_BYTES) out += chunk; });
+
+  let watchdogFired = false;
+  // The only process this test may signal is the synthetic control child it just spawned.
+  const watchdog = setTimeout(() => {
+    watchdogFired = true;
+    try { child.kill('SIGKILL'); } catch { /* already closed */ }
+  }, CONTROL_WATCHDOG_MS);
+  try {
+    const code = await new Promise((resolve, reject) => {
+      child.on('error', reject);
+      child.on('close', (exitCode) => resolve(exitCode));
+    });
+    const elapsed = Date.now() - started;
+
+    // The load-bearing observation: the labels alone prove nothing, because a helper whose losing
+    // deadline timer keeps the event loop armed still writes every label and then hangs.
+    assert.equal(watchdogFired, false,
+      `the control child outlived the ${CONTROL_WATCHDOG_MS}ms watchdog: a losing deadline timer is still armed`);
+    assert.equal(code, 0, 'the control child did not exit 0');
+    for (const label of CONTROL_LABELS) {
+      assert.ok(out.includes(label), `the control child never reached ${label}`);
+    }
+    assert.ok(elapsed < CONTROL_WATCHDOG_MS, `the control child exited late at ${elapsed}ms`);
+  } finally {
+    clearTimeout(watchdog);
+  }
+});
 
 /** `key` is a parameter so a mutation test can submit the exact buffer it then mutates. */
 function registration(scope, entries, key = KEY) {
