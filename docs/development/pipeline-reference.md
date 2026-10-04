@@ -146,7 +146,12 @@ Before the CLI reports a lane it binds that persisted tuple to the leaf's public
 whose `runId`, `agent`, model and `launchContractDigest` match, whose `launchResolvedExtensions` is the
 installed launch-resolved schema (`version: 1`, `source: "launch-resolved"`, ambient extensions off,
 the declared guard path, the declared number of configured extensions, and every `omitted` ledger
-entry present and zero). Any missing, reused or mismatched part is a setup failure with a fixed code,
+entry present and zero). All four resolved lists — `runtime`, `configured`, `required` and
+`effective` — are validated together before any is read: each must be present and an array of
+non-empty digest strings, and every `configured`, `runtime` and `required` digest must occur in
+`effective`. A missing, mistyped or non-string list is refused, never defaulted to an empty list; an
+explicitly empty list is a valid assertion of an empty set and stays distinct from missing evidence.
+Any missing, reused or mismatched part is a setup failure with a fixed code,
 never an inferred pass. Exit codes: `0` verified completed lane, `2` setup or evidence failure
 (INCOMPLETE), `3` the leaf finished non-completed. A `completed` leaf is not approval: the verdict is
 only the leaf's own literal `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE` line.

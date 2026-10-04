@@ -594,6 +594,46 @@ test('discovered artifacts must share one stem, and the resolved extension recor
 	}
 });
 
+test('all four resolved extension lists are validated together, and required must be effective', () => {
+	const { config, cleanup } = tempConfig();
+	const profile = { model: REVIEWER_MODEL, timeoutMs: 900_000 };
+	const artifacts = { meta: join(config.sessionDir, 'schema-meta.json'), output: join(config.sessionDir, 'schema-output.md') };
+	try {
+		const check = (launchResolvedExtensions) => verifyArtifacts(config, profile, dispatchRecord(config), receipt(), artifacts, {
+			exists: () => true,
+			readdir: () => [],
+			readFile: (p) => (p === artifacts.meta ? JSON.stringify(meta({ launchResolvedExtensions })) : 'CHANGES REQUESTED\n\nBody.'),
+		});
+		const base = meta().launchResolvedExtensions;
+		// Positive control: the retained smoke's own record verifies, and so does an explicitly empty
+		// runtime list, which is a real assertion of no runtime extension and not missing evidence.
+		assert.equal(check(base).ok, true, JSON.stringify(check(base)));
+		assert.equal(check({ ...base, runtime: [] }).ok, true, JSON.stringify(check({ ...base, runtime: [] })));
+		// One matrix over each of the four lists: absent, null, a primitive and a non-string member are
+		// each refused, never defaulted to an empty list that would assert the list's contents.
+		for (const name of ['runtime', 'configured', 'required', 'effective']) {
+			for (const [label, value] of [
+				['missing', undefined],
+				['null', null],
+				['primitive', 'sha256:synthetic-primitive'],
+				['non-string element', [...base[name], 42]],
+			]) {
+				const variant = { ...base, [name]: value };
+				if (value === undefined) delete variant[name];
+				assert.equal(check(variant).reason, SETUP_FAILURES.guard, `${name}: ${label}`);
+			}
+		}
+		// A required digest the effective set does not contain is refused: list shape alone is not proof
+		// that the obligation occurred.
+		const absent = 'sha256:00000000000000ff';
+		assert.equal(check({ ...base, required: [absent] }).reason, SETUP_FAILURES.guard);
+		// A required digest that is effective, alongside a configured one that is not, is still refused.
+		assert.equal(check({ ...base, required: [base.effective[0]], effective: [base.effective[0]] }).reason, SETUP_FAILURES.guard);
+	} finally {
+		cleanup();
+	}
+});
+
 test('the runtime record is bound to the preflight contract, and mismatched evidence is refused', () => {
 	const { config, cleanup } = tempConfig();
 	const profile = { model: REVIEWER_MODEL, timeoutMs: 900_000 };

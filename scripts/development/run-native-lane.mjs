@@ -307,30 +307,37 @@ export function verifyArtifacts(config, profile, dispatch, receipt, artifacts, f
 	// Guard identity: the declared guard extension must be in the resolved configured set, ambient
 	// extensions must be off, and nothing may be omitted from the effective set.
 	const resolved = isObject(meta.launchResolvedExtensions) ? meta.launchResolvedExtensions : null;
-	const configured = isDigestList(resolved?.configured) ? resolved.configured : [];
-	const runtime = isDigestList(resolved?.runtime) ? resolved.runtime : [];
-	const required = isDigestList(resolved?.required) ? resolved.required : null;
-	const effective = isDigestList(resolved?.effective) ? resolved.effective : [];
+	// One shared boundary rule for all four lists: each must be present and be an array of non-empty
+	// digest strings, validated together before any of them is extracted. No list is defaulted to `[]`,
+	// because an absent or mistyped list is missing evidence, not an assertion that nothing was
+	// required at runtime. An explicitly empty list is a real assertion and stays valid.
+	const resolvedLists = RESOLVED_EXTENSION_LISTS.every((name) => isDigestList(resolved?.[name]));
+	const configured = resolvedLists ? resolved.configured : null;
+	const runtime = resolvedLists ? resolved.runtime : null;
+	const required = resolvedLists ? resolved.required : null;
+	const effective = resolvedLists ? resolved.effective : null;
 	const omitted = isObject(resolved?.omitted) ? resolved.omitted : null;
 	if (
 		// Only the launch-resolved schema the installed extension actually writes is evidence here:
 		// another version or another source is refused, never read as a weaker field it happens to hold.
 		resolved?.version !== RESOLVED_EXTENSION_VERSION
 		|| resolved?.source !== RESOLVED_EXTENSION_SOURCE
-		|| required === null
+		|| !resolvedLists
 		|| resolved?.disableAmbientExtensions !== true
 		|| expected.disableAmbientExtensions !== true
 		|| expected.guardExtension !== config.guard
 		// The metadata reports opaque extension digests while preflight reports paths, so identity is
 		// bound by the declared guard path above and by the launch digest equality checked earlier;
 		// here the resolved set must be the declared number of configured extensions, ambient-off,
-		// with nothing omitted from the effective set.
+		// with nothing omitted from the effective set, and every configured, runtime and required
+		// digest must occur in the effective set.
 		|| configured.length !== expected.configuredExtensions.length
 		|| omitted === null
 		|| Object.values(omitted).some((count) => count !== 0)
 		|| RESOLVED_EXTENSION_LISTS.some((name) => omitted[name] !== 0)
 		|| !configured.every((digest) => effective.includes(digest))
 		|| !runtime.every((digest) => effective.includes(digest))
+		|| !required.every((digest) => effective.includes(digest))
 	) {
 		return fail(SETUP_FAILURES.guard);
 	}
