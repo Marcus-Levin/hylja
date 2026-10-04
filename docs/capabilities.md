@@ -94,6 +94,8 @@ Proposed and unwired: [decision 010](decisions/010-separate-information-dimensio
 
 Parser time budgets are cooperative and read from a host-owned clock. Research sandbox limits are per process (and per real UID), so no aggregate memory, CPU or process bound exists without privileges. A budget is not a cause: this repository records unattributed intermittent full-run failures without inferring or excluding a cause, and no budget was raised to accommodate one.
 
+`rewriteFieldValues` in [`src/structured-parsers.ts`](../src/structured-parsers.ts) is a pure string function over one caller-supplied source, format, edit list and options object. It snapshots the options both parses share and reads each edit's span and replacement once, so a getter that throws or answers differently later cannot change the rewrite halfway through. A finite synchronous caller-side throw — a throwing getter, a value that is not an edit, an iterator that throws after yielding one valid edit — returns `{status: 'FAILURE', reason: 'REWRITE_ERROR'}` with no text, no exception detail and no partial output; the accepted edits are discarded whole and never returned as success. That boundary is **not** authentication and **not** a freshness check: it establishes only that no caller value threw, never that the caller, the source or the spans are authorized or current, and like the cooperative budget it cannot preempt a getter or callback that never returns.
+
 ## Historical evidence snapshot
 
 The retired development plan is preserved byte-for-byte as an immutable Git object:

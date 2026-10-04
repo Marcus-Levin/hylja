@@ -424,6 +424,55 @@ test('round-trip refuses unsafe edits instead of passing the original through', 
   assert.deepEqual(rewriteFieldValues('a=b', 'LOG', []), { status: 'FAILURE', reason: 'SOURCE_NOT_COMPLETE' });
 });
 
+// A caller argument that throws is contained, not re-thrown: the failure shape is the whole contract.
+const contained = (run) => {
+  try { return run(); } catch { return { threw: true }; }
+};
+const rewritten = { status: 'FAILURE', reason: 'REWRITE_ERROR' };
+
+test('rewrite: a null edit is contained as REWRITE_ERROR, never a thrown TypeError', () => {
+  assert.deepEqual(contained(() => rewriteFieldValues('{"password":"old"}', 'JSON', [null])), rewritten);
+});
+
+test('rewrite: a throwing replacement getter is contained as REWRITE_ERROR', () => {
+  const field = parseStructured('{"password":"old"}', 'JSON').fields[0];
+  const edit = { field, get replacement() { throw new Error('synthetic-probe-replacement'); } };
+  assert.deepEqual(contained(() => rewriteFieldValues('{"password":"old"}', 'JSON', [edit])), rewritten);
+});
+
+test('rewrite: a throwing options.host getter is contained as REWRITE_ERROR', () => {
+  const field = parseStructured('{"password":"old"}', 'JSON').fields[0];
+  const options = { get host() { throw new Error('synthetic-probe-host'); } };
+  assert.deepEqual(contained(() => rewriteFieldValues('{"password":"old"}', 'JSON', [{ field, replacement: 'new' }], options)),
+    rewritten);
+});
+
+test('rewrite: an iterator that throws after one valid edit never returns success or partial output', () => {
+  const source = '{"password":"old","n":1}';
+  const [first, second] = parseStructured(source, 'JSON').fields;
+  const edits = { *[Symbol.iterator]() { yield { field: first, replacement: 'masked' }; throw new Error('synthetic-probe-iterator'); } };
+  const out = contained(() => rewriteFieldValues(source, 'JSON', edits));
+  assert.deepEqual(out, rewritten);
+  // The accepted edit is discarded whole: no rewritten field and no untouched original is returned.
+  assert.ok(!('text' in out));
+  assert.ok(second.value === '1');
+});
+
+test('rewrite: caller options and edit values are read once, so a changing accessor cannot alter the rewrite', () => {
+  const source = '{"password":"old"}';
+  const field = parseStructured(source, 'JSON').fields[0];
+  const host = { now: () => 0 };
+  let hostReads = 0;
+  const options = { get host() { hostReads += 1; if (hostReads > 1) throw new Error('synthetic-probe-host'); return host; } };
+  let replacementReads = 0;
+  const edit = { field, get replacement() { replacementReads += 1; return replacementReads === 1 ? 'first' : 'second'; } };
+  const out = contained(() => rewriteFieldValues(source, 'JSON', [edit], options));
+  assert.equal(out.status, 'OK');
+  assert.equal(parseStructured(out.text, 'JSON').fields[0].value, 'first');
+  assert.equal(hostReads, 1);
+  assert.equal(replacementReads, 1);
+});
+
 test('hidden credentials in unparsed ranges are never reported as inspected', () => {
   const text = `GOOD=1\n${fake} password ${fake}\nOTHER=2`;
   const result = parseStructured(text, 'DOTENV');
