@@ -8,6 +8,11 @@
  * never sends bytes and never performs an effect.
  *
  * Authority and what this seam does not do
+ * - This seam is workload-bound for every operation it supports. A subject is a `principalId` **and** a
+ *   nonempty `workloadId`, and that holds in three places: the untrusted request's subject, the host's
+ *   authenticated subject and the grant's principal. A coherent principal-only request/host/grant is
+ *   outside this seam and denies as malformed; the optional `workloadId` of the general envelope
+ *   `Subject` does not widen it here.
  * - The untrusted request carries no authority. Subject, tenant/project/session, purpose, the actual
  *   destination/profile and the current time are supplied **separately** by the trusted integration;
  *   a caller-asserted trust label, payload field, model string or request timestamp cannot create any
@@ -50,11 +55,14 @@ export const MAPPING_AUTHORIZATION_REASONS = [
 ] as const;
 export type MappingAuthorizationReason = (typeof MAPPING_AUTHORIZATION_REASONS)[number];
 
+/** This seam narrows the envelope `Subject`: a workload identity is required, never optional. */
+export interface WorkloadSubject extends Subject { workloadId: string }
+
 /** Untrusted, bounded. Content here is a claim; none of it authenticates anything. */
 export interface MappingAuthorizationRequest {
   version: 1;
   mappingRef: string;
-  subject: Subject;
+  subject: WorkloadSubject;
   context: RequestContext;
   destination: Destination;
   operation: MappingOperation;
@@ -62,7 +70,7 @@ export interface MappingAuthorizationRequest {
 
 /** Independently supplied by the trusted host; never derived from request or model content. */
 export interface MappingHostContext {
-  authenticated: { subject: Subject; context: RequestContext };
+  authenticated: { subject: WorkloadSubject; context: RequestContext };
   observed: { destination: Destination };
 }
 
@@ -85,7 +93,7 @@ export interface TrustedMappingGrant {
   version: 1;
   mappingRef: string;
   revision: number;
-  principal: Subject;
+  principal: WorkloadSubject;
   context: RequestContext;
   destination: Destination;
   operation: MappingOperation;
@@ -145,10 +153,10 @@ function revision(value: unknown): number {
   if (parsed < 1) fail('INVALID_INPUT');
   return parsed;
 }
-function parseSubject(value: unknown): Subject {
-  const v = fields(value, ['principalId'], ['workloadId']);
-  return { principalId: text(v.principalId),
-    ...(Object.hasOwn(v, 'workloadId') ? { workloadId: text(v.workloadId) } : {}) };
+/** Workload-bound at this seam: both halves of the identity are required and nonempty. */
+function parseSubject(value: unknown): WorkloadSubject {
+  const v = fields(value, ['principalId', 'workloadId']);
+  return { principalId: text(v.principalId), workloadId: text(v.workloadId) };
 }
 function parseContext(value: unknown): RequestContext {
   const v = fields(value, ['tenantId', 'sessionId', 'purpose'], ['projectId']);
@@ -239,6 +247,12 @@ export function authorizeMappingOperation(requestValue: unknown, hostValue: unkn
     try { host = parseHost(hostValue); } catch { return denied('INVALID_CONTEXT'); }
     try { mapping = parseMapping(mappingValue); } catch { return denied('INVALID_CONTEXT'); }
     try { clock = parseClock(clockValue); } catch { return denied('INVALID_CONTEXT'); }
+    // The grant's shape is validated with the other trusted inputs, before congruence and lifecycle,
+    // so a malformed grant names INVALID_CONTEXT even when a later check would also fail. A grant that
+    // is simply absent is not malformed: it keeps its own NO_GRANT check after the mapping checks.
+    let grant: TrustedMappingGrant | undefined;
+    try { grant = grantValue === undefined ? undefined : parseGrant(grantValue); }
+    catch { return denied('INVALID_CONTEXT'); }
     const authenticated = host.authenticated;
     // The untrusted request may only restate what the host authenticated and observed.
     if (!equal(request.subject, authenticated.subject) ||
@@ -253,9 +267,7 @@ export function authorizeMappingOperation(requestValue: unknown, hostValue: unkn
     }
     if (!equal(mapping.scope, scopeOf(authenticated.context))) return denied('SCOPE_MISMATCH');
     // An absent grant is a denial, never an implicit allow.
-    if (grantValue === undefined) return denied('NO_GRANT');
-    let grant: TrustedMappingGrant;
-    try { grant = parseGrant(grantValue); } catch { return denied('INVALID_CONTEXT'); }
+    if (grant === undefined) return denied('NO_GRANT');
     if (grant.mappingRef !== mapping.mappingRef) return denied('GRANT_MISMATCH');
     // A grant pins one exact revision; an older or newer one is not the current mapping.
     if (grant.revision !== mapping.revision) return denied('STALE_REVISION');

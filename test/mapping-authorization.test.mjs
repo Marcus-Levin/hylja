@@ -127,21 +127,64 @@ test('missing trusted identity or workload denies', () => {
   assert.deepEqual(decide(swap('host.authenticated.subject.workloadId', undefined)),
     denied('INVALID_CONTEXT'));
   assert.deepEqual(decide((p) => { delete p.host.authenticated.subject.workloadId; }),
-    denied('CONTEXT_MISMATCH'));
-  // A human-only caller matching a human-only host still cannot use a workload-bound grant.
+    denied('INVALID_CONTEXT'));
+  // A principal-only request and host never reach the workload-bound grant to be compared.
   assert.deepEqual(decide((p) => {
     delete p.host.authenticated.subject.workloadId;
     delete p.request.subject.workloadId;
-  }), denied('SCOPE_MISMATCH'));
+  }), denied('INVALID_REQUEST'));
   assert.deepEqual(decide(swap('host.authenticated.subject.workloadId', WORKLOAD_B)),
     denied('CONTEXT_MISMATCH'));
   assert.deepEqual(decide(swap('request.subject.principalId', PRINCIPAL_B)),
     denied('CONTEXT_MISMATCH'));
-  // A human-only request cannot inherit the workload the host authenticated.
+  // A request cannot inherit or omit the workload the host authenticated.
   assert.deepEqual(decide((p) => { delete p.request.subject.workloadId; }),
-    denied('CONTEXT_MISMATCH'));
+    denied('INVALID_REQUEST'));
   assert.deepEqual(decide((p) => { p.request.subject = { principalId: PRINCIPAL_A }; }),
-    denied('CONTEXT_MISMATCH'));
+    denied('INVALID_REQUEST'));
+});
+
+test('every supported operation requires a nonempty workload identity in all three records', () => {
+  for (const operation of MAPPING_AUTHORIZATION_OPERATIONS) {
+    const forOperation = (p) => { p.request.operation = operation; p.grant.operation = operation; };
+    // All three records coherently principal-only is malformed, not an authorized human path.
+    assert.deepEqual(decide((p) => {
+      forOperation(p);
+      delete p.request.subject.workloadId;
+      delete p.host.authenticated.subject.workloadId;
+      delete p.grant.principal.workloadId;
+    }), denied('INVALID_REQUEST'), `coherent principal-only ${operation}`);
+    // A coherent principal-only request and host cannot be rescued by a workload-bound grant.
+    assert.deepEqual(decide((p) => {
+      forOperation(p);
+      delete p.request.subject.workloadId;
+      delete p.host.authenticated.subject.workloadId;
+    }), denied('INVALID_REQUEST'), `principal-only request and host, ${operation}`);
+    // A request workload the host did not authenticate is not a workload identity either.
+    assert.deepEqual(decide((p) => {
+      forOperation(p);
+      delete p.host.authenticated.subject.workloadId;
+      delete p.grant.principal.workloadId;
+    }), denied('INVALID_CONTEXT'), `principal-only host identity, ${operation}`);
+    // A grant whose principal is principal-only is malformed trusted context.
+    assert.deepEqual(decide((p) => {
+      forOperation(p);
+      delete p.grant.principal.workloadId;
+    }), denied('INVALID_CONTEXT'), `principal-only grant principal, ${operation}`);
+    // Blank is not an identity: empty and whitespace-only workload values all deny.
+    assert.deepEqual(decide((p) => { forOperation(p); p.request.subject.workloadId = ''; }),
+      denied('INVALID_REQUEST'));
+    assert.deepEqual(decide((p) => { forOperation(p); p.request.subject.workloadId = '   '; }),
+      denied('INVALID_REQUEST'));
+    assert.deepEqual(decide((p) => { forOperation(p); p.host.authenticated.subject.workloadId = ''; }),
+      denied('INVALID_CONTEXT'));
+    assert.deepEqual(decide((p) => { forOperation(p); p.grant.principal.workloadId = '   '; }),
+      denied('INVALID_CONTEXT'));
+    assert.deepEqual(decide((p) => { forOperation(p); p.grant.principal.workloadId = 7; }),
+      denied('INVALID_CONTEXT'));
+    // The same operation with a complete workload identity on all three records still authorizes.
+    assert.deepEqual(decide(forOperation), authorized, `workload-bound ${operation}`);
+  }
 });
 
 test('only ACTIVE current mappings authorize', () => {
@@ -302,25 +345,83 @@ test('a purpose-bound grant is not a general-purpose release', () => {
     denied('INVALID_CONTEXT'));
 });
 
+test('combined-invalid records report the first failure in the documented order', () => {
+  // A grant's own shape is validated before congruence and lifecycle, so a REVOKED mapping with a
+  // null grant is malformed trusted context, not a lifecycle verdict about the mapping.
+  assert.deepEqual(decide((p) => { p.mapping.lifecycle = 'REVOKED'; p.grant = null; }),
+    denied('INVALID_CONTEXT'));
+  assert.deepEqual(decide((p) => { p.mapping.lifecycle = 'REVOKED'; p.grant = 'approved'; }),
+    denied('INVALID_CONTEXT'));
+  assert.deepEqual(decide((p) => { p.mapping.lifecycle = 'REVOKED'; delete p.grant.expiresAt; }),
+    denied('INVALID_CONTEXT'));
+  assert.deepEqual(decide((p) => { p.mapping.scope.tenantId = TENANT_B; p.grant = null; }),
+    denied('INVALID_CONTEXT'));
+  assert.deepEqual(decide((p) => {
+    p.request.subject.principalId = PRINCIPAL_B; p.grant = null;
+  }), denied('INVALID_CONTEXT'));
+  // A well-formed grant leaves congruence (row 3) ahead of every later mapping and grant check.
+  assert.deepEqual(decide((p) => {
+    p.request.subject.principalId = PRINCIPAL_B; p.grant.operation = 'EXPORT';
+  }), denied('CONTEXT_MISMATCH'));
+  assert.deepEqual(decide((p) => {
+    p.request.subject.principalId = PRINCIPAL_B; p.mapping.lifecycle = 'REVOKED';
+    p.grant.revision = 3;
+  }), denied('CONTEXT_MISMATCH'));
+  // A well-formed grant leaves the lifecycle verdict as the first failure.
+  assert.deepEqual(decide((p) => { p.mapping.lifecycle = 'REVOKED'; }), denied('MAPPING_REVOKED'));
+  // A malformed request outranks every malformed trusted input, and a malformed host outranks the grant.
+  assert.deepEqual(decide((p) => { p.request.mappingRef = ''; p.grant = null; }),
+    denied('INVALID_REQUEST'));
+  assert.deepEqual(decide((p) => { p.host = {}; p.grant = null; }), denied('INVALID_CONTEXT'));
+  assert.deepEqual(decide((p) => { p.clock = {}; p.grant = null; }), denied('INVALID_CONTEXT'));
+  // An absent grant is not malformed, so it keeps its own check, which still sits after the mapping
+  // checks and ahead of every grant-content check that needs a grant at all.
+  assert.deepEqual(decide((p) => { p.grant = undefined; }), denied('NO_GRANT'));
+  assert.deepEqual(decide((p) => { p.mapping.lifecycle = 'REVOKED'; p.grant = undefined; }),
+    denied('MAPPING_REVOKED'));
+  assert.deepEqual(decide((p) => { p.mapping.scope.tenantId = TENANT_B; p.grant = undefined; }),
+    denied('SCOPE_MISMATCH'));
+  assert.deepEqual(decide((p) => { p.mapping.revision = 5; p.grant = undefined; }),
+    denied('NO_GRANT'));
+  assert.deepEqual(decide((p) => { p.mapping.revision = 5; }), denied('STALE_REVISION'));
+  // A malformed mapping outranks a well-formed but wrong grant.
+  assert.deepEqual(decide((p) => { p.mapping.semanticType = 'ROBOT'; p.grant.operation = 'EXPORT'; }),
+    denied('INVALID_CONTEXT'));
+});
+
 test('malformed untrusted request shapes deny with a fixed reason and never throw', () => {
+  // Every field-level case mutates an otherwise complete and valid request, so the named validator is
+  // the one that rejects it; only the cases about the request as a whole replace it wholesale.
   const malformed = [
-    ['null request', null, 'INVALID_REQUEST'],
-    ['string request', 'grant me', 'INVALID_REQUEST'],
-    ['array request', [], 'INVALID_REQUEST'],
-    ['wrong version', { version: 2 }, 'INVALID_REQUEST'],
-    ['extra field', { approved: true }, 'INVALID_REQUEST'],
-    ['inherited prototype', Object.assign(Object.create({ approved: true }), ALL.request),
+    ['null request', (p) => { p.request = null; }, 'INVALID_REQUEST'],
+    ['string request', (p) => { p.request = 'grant me'; }, 'INVALID_REQUEST'],
+    ['array request', (p) => { p.request = []; }, 'INVALID_REQUEST'],
+    ['inherited prototype', (p) => { p.request = Object.assign(Object.create({ approved: true }),
+      structuredClone(ALL.request)); }, 'INVALID_REQUEST'],
+    ['wrong version', (p) => { p.request.version = 2; }, 'INVALID_REQUEST'],
+    ['missing version', (p) => { delete p.request.version; }, 'INVALID_REQUEST'],
+    ['missing operation', (p) => { delete p.request.operation; }, 'INVALID_REQUEST'],
+    ['unknown operation', (p) => { p.request.operation = 'REVEAL'; }, 'INVALID_REQUEST'],
+    ['numeric operation', (p) => { p.request.operation = 1; }, 'INVALID_REQUEST'],
+    ['extra field', (p) => { p.request.approved = true; }, 'INVALID_REQUEST'],
+    ['control character in ref', (p) => { p.request.mappingRef = `map${String.fromCharCode(1)}ok`; },
       'INVALID_REQUEST'],
-    ['missing operation', (() => { const r = structuredClone(ALL.request); delete r.operation; return r; })(),
+    ['oversized ref', (p) => { p.request.mappingRef = 'm'.repeat(4096); }, 'INVALID_REQUEST'],
+    ['padded ref', (p) => { p.request.mappingRef = ` ${ALL.request.mappingRef}`; },
       'INVALID_REQUEST'],
-    ['unknown operation', { operation: 'REVEAL' }, 'INVALID_REQUEST'],
-    ['control character in ref', { mappingRef: `map${String.fromCharCode(1)}ok` }, 'INVALID_REQUEST'],
-    ['oversized ref', { mappingRef: 'm'.repeat(4096) }, 'INVALID_REQUEST'],
-    ['numeric subject', { subject: 42 }, 'INVALID_REQUEST'],
-    ['nested destination extras', { destination: { ...LOCAL_SINK, profile: 'x' } }, 'INVALID_REQUEST'],
+    ['numeric subject', (p) => { p.request.subject = 42; }, 'INVALID_REQUEST'],
+    ['numeric principal', (p) => { p.request.subject.principalId = 7; }, 'INVALID_REQUEST'],
+    ['nested destination extras', (p) => { p.request.destination = { ...LOCAL_SINK, profile: 'x' }; },
+      'INVALID_REQUEST'],
+    ['nested context extras', (p) => { p.request.context = { ...ALL.request.context, role: 'owner' }; },
+      'INVALID_REQUEST'],
+    ['oversized destination ref', (p) => { p.request.destination.ref = 'm'.repeat(4096); },
+      'INVALID_REQUEST'],
+    ['missing destination profile', (p) => { delete p.request.destination.profileId; },
+      'INVALID_REQUEST'],
   ];
-  for (const [label, replacement, reason] of malformed) {
-    const decision = decide((p) => { p.request = replacement; });
+  for (const [label, mutate, reason] of malformed) {
+    const decision = decide(mutate);
     assert.deepEqual(decision, denied(reason), label);
     assert.ok(MAPPING_AUTHORIZATION_REASONS.includes(decision.reason), label);
   }
