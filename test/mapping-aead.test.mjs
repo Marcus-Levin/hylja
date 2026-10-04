@@ -49,11 +49,13 @@ function assertSealed(result, plaintext) {
   assert.equal(envelope.nonce.byteLength, MAPPING_AEAD_LIMITS.nonceBytes);
   assert.equal(envelope.tag.byteLength, MAPPING_AEAD_LIMITS.tagBytes);
   assert.equal(envelope.ciphertext.byteLength, plaintext.byteLength);
-  // The caller's payload is not reachable through the sealed record in any shape. The comparison is
-  // digest-based and identity-based: no assertion below ever receives a raw payload byte, so a
-  // regression cannot print protected bytes into TAP.
+  // The caller's payload is not reachable through the sealed record in any shape. This is an
+  // identity check on where the bytes are stored, not a statistical claim about their values: a
+  // valid AES-256-GCM ciphertext can equal the plaintext byte for byte (a one-byte payload in
+  // particular), so no ciphertext-vs-plaintext digest inequality is asserted anywhere in this file.
+  // No assertion below ever receives a raw payload byte, so a regression cannot print protected
+  // bytes into TAP.
   assert.equal(envelope.ciphertext === plaintext, false);
-  assert.notEqual(digest(envelope.ciphertext), digest(plaintext), 'the sealed body must not be the plaintext');
   return envelope;
 }
 
@@ -685,10 +687,21 @@ test('a hostile thrown Proxy is one fixed refusal, never an error this boundary 
       return Reflect.get(target, property, receiver);
     },
   });
+  // The count makes the reachability of the index trap observable. Without it a proxy whose
+  // `byteLength` accessor throws first would produce the same fixed refusal, and this case would
+  // pass for the wrong reason instead of exercising the hostile index read.
+  const elementTraps = { count: 0 };
   const throwingElement = () => new Proxy(new Uint8Array(4), {
-    get(target, property, receiver) {
-      if (typeof property === 'string' && /^\d+$/u.test(property)) throw hostile();
-      return Reflect.get(target, property, receiver);
+    get(target, property) {
+      if (typeof property === 'string' && /^\d+$/u.test(property)) {
+        elementTraps.count += 1;
+        throw hostile();
+      }
+      // Forwarded with the real target as the receiver on purpose: a typed-array accessor such as
+      // `byteLength` validates its receiver, so passing the Proxy rejects it natively before any
+      // index read and the index trap above would never run. With the target as receiver the
+      // declared length succeeds and the hostile index read is what the boundary has to contain.
+      return Reflect.get(target, property, target);
     },
   });
   const refusedPayload = attempt(sealMappingPayload,
@@ -699,6 +712,8 @@ test('a hostile thrown Proxy is one fixed refusal, never an error this boundary 
     { scope: scope(), plaintext: throwingElement(), key: key(103) });
   assert.equal(refusedElement.threw, false, 'a throwing element read must not throw out of the boundary');
   assertRefused(refusedElement.result, 'INVALID_PAYLOAD');
+  assert.ok(elementTraps.count > 0, 'the hostile index trap must be the trap that was reached');
+  assert.equal(JSON.stringify(refusedElement.result).includes(planted), false);
   const refusedKey = attempt(sealMappingPayload,
     { scope: scope(), plaintext: randomBytes(8), key: throwingLength() });
   assert.equal(refusedKey.threw, false, 'a throwing key length must not throw out of the boundary');

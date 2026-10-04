@@ -93,12 +93,19 @@ Three rules hold for every value that crosses this boundary, caller-supplied or 
    `getPrototypeOf`, `getOwnPropertyDescriptor`, `byteLength` or index read throws is contained at
    the reader that touched it and reported with that reader's fixed code.
 3. **Owned transient buffers are overwritten on both paths; caller and returned buffers are not.**
-   Every byte buffer this module allocates is either returned to the caller or overwritten: rejected
-   and half-filled snapshots, a rejected key copy, the AAD, the two cipher output buffers, the
-   `decipher.update` and `decipher.final` outputs, and the key, plaintext and sealed-record snapshots.
-   The `finally` blocks run on the success path as well as on every exceptional path. Nothing the
-   caller supplied is reachable from those copies, and the plaintext handed back by `open` is a
-   separate buffer that no hygiene step touches.
+   The cleanup claim covers exactly these buffers: a rejected or half-filled byte snapshot, a
+   rejected key copy, the aggregate AAD buffer, the two cipher output buffers, the
+   `decipher.update` and `decipher.final` outputs, and the key, plaintext and sealed-record
+   snapshots. The `finally` blocks run on the success path as well as on every exceptional path.
+   Nothing the caller supplied is reachable from those copies, and the plaintext handed back by
+   `open` is a separate buffer that no hygiene step touches.
+
+**Outside the cleanup claim.** Not every allocated buffer is covered by rule 3, and this contract does
+not claim that it is. The six `TextEncoder` component buffers built while serializing the AAD are
+copied into the aggregate buffer and then discarded uncleared. The JavaScript strings of the six
+scope fields, and any copy Node's native AES-256-GCM implementation makes internally, are outside the
+claim too. None of this is heap-wide or process-wide zeroization, and no state observable from
+outside this module shows that a particular allocation was ever overwritten.
 
 ## Material limits
 
@@ -127,7 +134,8 @@ Three rules hold for every value that crosses this boundary, caller-supplied or 
   payload, AAD, sealed-body and decipher copies on both the success and the exceptional path is
   best-effort hygiene in JavaScript, **not** a zeroization guarantee for copies held inside native
   crypto, garbage-collected buffers or swapped pages, and nothing observable from outside this
-  module proves a particular buffer was zeroed.
+  module proves a particular buffer was zeroed. The six `TextEncoder` AAD component buffers are
+  named above as outside the cleanup claim entirely.
 
 ## Evidence
 
@@ -142,7 +150,11 @@ Every failure assertion compares fixed codes, lengths, booleans and digests. No 
 raw payload byte, a raw key byte or a native error as an operand, so a regression cannot print
 protected bytes into TAP output. Every hostile case is invoked through a helper that catches an
 escaping exception and asserts only the safe boolean "did the call throw", so a deliberately planted
-error value inside a hostile `Proxy` is contained in the test even while the boundary is wrong.
+error value inside a hostile `Proxy` is contained in the test even while the boundary is wrong. The
+hostile element-read case additionally counts entries into its index trap and asserts that the count
+is non-zero, so a `byteLength` refusal can never stand in for the index read it claims to test. No
+assertion compares ciphertext against plaintext by digest: a valid AES-256-GCM ciphertext may equal
+the plaintext byte for byte, so that inequality is not a property of this or any AEAD.
 
 Round-two review regressions (see `13-review-round2-red-focused-test-final-testfile.log` and
 `15-review-round2-green-focused-test.log`, kept outside the repository): a declared byte length that
