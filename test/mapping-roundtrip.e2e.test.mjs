@@ -663,6 +663,19 @@ test('the same original, entity and key under one other tenant scope still yield
   // tenant, project and session differ, so a difference below is attributable to scope alone and not
   // to a different value, a different entity or a different key.
   assert.equal(FIXTURE_A2.scope.tenantId !== FIXTURE_A.scope.tenantId, true);
+  // Both sides of the cross-tenant open below are brought to the same literal current revision and
+  // the same sealed revision *first*, through the real reducer and a controlled host re-seal, so
+  // revision mismatch cannot explain its refusal. Every other dimension - state, key, entity, value,
+  // key version - is already shared; the tenant is the only difference left, and it has to be the only
+  // one. (Seeding A2 after the cross-open was the defect this ordering fixes.)
+  ensureActive(FIXTURE_A, SYNTHETIC_ORIGINAL_BYTES);
+  ensureActive(FIXTURE_A2, SYNTHETIC_ORIGINAL_BYTES);
+  assert.equal(FIXTURE_A.current.revision, 2);
+  assert.equal(FIXTURE_A2.current.revision, 2);
+  assert.equal(FIXTURE_A.sealedRevision, 2);
+  assert.equal(FIXTURE_A2.sealedRevision, 2);
+  assert.equal(FIXTURE_A.current.state, 'ACTIVE');
+  assert.equal(FIXTURE_A2.current.state, 'ACTIVE');
   assert.equal(FIXTURE_A2.mappingRef !== FIXTURE_A.mappingRef, true);
   assert.equal(FIXTURE_A2.mappingRef.startsWith(ENTITY_REFERENCE_TOKEN_PREFIX), true);
 
@@ -686,12 +699,15 @@ test('the same original, entity and key under one other tenant scope still yield
   assert.equal(crossOpen.hasBytes, false);
 
   // Controls: each record still opens under its own current scope and restores the same independent
-  // literal, asserted through the release path so no byte reaches the output.
+  // literal, asserted through the release path so no byte reaches the output. These open the very
+  // envelopes seeded above - the identical pair used for the cross-open - with no re-seal in between,
+  // so the only difference between a control release and the refusal above is the tenant scope.
   for (const fixture of [FIXTURE_A, FIXTURE_A2]) {
-    ensureActive(fixture, SYNTHETIC_ORIGINAL_BYTES);
+    const sealedRevisionBefore = fixture.sealedRevision;
     const opened = releaseForDisplay(fixture, { grant: grantFor(fixture, 'DISPLAY') });
     assert.equal(opened.outcome, 'RELEASED');
     assert.equal(opened.matched, true);
+    assert.equal(fixture.sealedRevision, sealedRevisionBefore);
   }
   // And a foreign reference is still denied at the seam in the other tenant's scope.
   const foreign = decide(FIXTURE_A2, {

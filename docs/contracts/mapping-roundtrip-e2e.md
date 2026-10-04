@@ -115,8 +115,12 @@ projection, so the projection's own safety is asserted rather than assumed.
    original, the entity id, the DEK, the HMAC key and the key version, and differ only in tenant,
    project and session. Their SESSION-scope references differ, the same contrast holds at the narrower
    TENANT derivation scope, and their ciphertexts do not open in each other's scope even with identical
-   plaintext bytes and an identical key, because the AAD binds the tenant. Each record still opens
-   under its own scope and restores the same independent literal.
+   plaintext bytes and an identical key, because the AAD binds the tenant. Both records are first
+   brought to the *same literal current revision `2`* and the same sealed revision - through the real
+   reducer and a controlled host re-seal - before the cross-tenant open, so state, key, entity, value
+   and revision are identical across the contrast and the tenant scope is the only difference that can
+   explain the refusal. The positive controls then release those same two envelopes, with no re-seal in
+   between, each under its own current scope, restoring the same independent literal.
 7. **Zero plaintext on crypto failure.** Wrong key, wrong classification, wrong revision, wrong key
    version, foreign entity, tampered ciphertext and tampered tag each return the fixed refusal with no
    `plaintext` and no `bytes` field, and no planted marker in the serialized refusal. Every one of
