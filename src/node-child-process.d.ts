@@ -1,14 +1,15 @@
 declare module 'node:child_process' {
   /**
-   * Minimal child-process surface for the bounded local Presidio worker. This project does not depend
-   * on @types/node; only the four events and two stream methods this module actually uses are declared,
-   * with no `any` and no overload set.
+   * Minimal child-process surface for the bounded local Presidio worker and the fixed egress sentinel
+   * worker. This project does not depend on @types/node; only the four events and two stream methods
+   * these modules actually use are declared, with no `any` and no overload set. The sentinel runner
+   * writes one already-framed `Uint8Array`, which is why `write` accepts bytes as well as text.
    */
   export interface WorkerStream {
     on(event: 'data', listener: (chunk: Uint8Array) => void): void;
   }
   export interface WorkerStdin {
-    write(chunk: string): boolean;
+    write(chunk: string | Uint8Array): boolean;
     end(): void;
     destroy(): void;
     on(event: 'error', listener: (error: Error) => void): void;
