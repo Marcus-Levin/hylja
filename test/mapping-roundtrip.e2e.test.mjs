@@ -3,28 +3,44 @@
 // mapping authorization seam and the shipped mapping lifecycle reducer are joined over one explicitly
 // ephemeral in-process synthetic fixture.
 //
+// One revision authority. `fixture.current` is the only record of lifecycle, revision, scope and
+// expiry in this file. It supplies the AEAD's expected AAD revision as well as the authorization
+// metadata and the grant revision, so there is no second, frozen copy of the revision anywhere. A
+// revision embedded in an envelope is never read back as authority: the expected scope is always
+// recomputed from the current record, so a valid old envelope cannot authenticate itself as current.
+//
+// Privacy-safe assertions. No assertion in this file ever receives a crypto result object, a byte
+// buffer, or a plaintext-versus-null operand. Every crypto result is read through `projectOpen`,
+// which returns fixed enum strings, numbers and internally computed booleans only, and byte equality
+// is decided inside `bytesEqual` and asserted as one boolean. The release path passes the restored
+// bytes to a test-local inspector and returns only `outcome`, `code`, `released`, `matched` and
+// `bytes`, so a synthetic original can reach neither ordinary evidence nor model capture.
+//
 // What this proves, precisely: over this fixture, with test-supplied trusted bindings (a literal
 // synthetic DEK, HMAC key, host clock, authenticated workload and explicit grant), an original value
 // exists only as AEAD ciphertext until the trusted host reads the fixture's authoritative current
 // record, the operation is pinned to DISPLAY, and an actual AUTHORIZED DISPLAY decision from the real
-// `authorizeMappingOperation` seam permits one `openMappingPayload` call under an independently
-// supplied expected scope; the restored bytes equal an independent literal expected outcome. USE does
-// not imply DISPLAY or EXPORT and neither operation can be substituted for the other on a release
-// path, cross-scope references and records never resolve, and lifecycle commits to the fixture's
-// current revision so a stale revision, a cached snapshot, a matching old grant or an old ciphertext
-// cannot supersede it.
+// `authorizeMappingOperation` seam permits one `openMappingPayload` call under an expected scope
+// recomputed from that current record; the restored bytes equal an independent literal expected
+// outcome. USE does not imply DISPLAY or EXPORT, cross-scope references and records never resolve, an
+// old but internally valid envelope refuses under a newer current revision while the matched current
+// envelope releases, and lifecycle commits to the fixture's current revision so a stale revision or a
+// cached snapshot cannot supersede it.
 //
 // What it is NOT: not a production vault, broker, KMS/HSM, key-management system, transaction, store,
-// index, durable audit ledger, transport or model. It authenticates nobody: the DEK, the HMAC key, the
-// grant, the authenticated subject, the clock and the current record are test fixtures. No network, no
-// provider traffic, no credentials, no held-out data, no comparison or recovery claim. Parent #15 stays
-// open.
+// index, durable audit ledger, transport or model. It authenticates nobody: the DEK, the HMAC key,
+// the grant, the authenticated subject, the clock and the current record are test fixtures. Re-sealing
+// under a new current revision is controlled synthetic host setup, not a lifecycle rotation, rewrap or
+// storage operation. No network, no provider traffic, no credentials, no held-out data, no comparison
+// or recovery claim. Parent #15 stays open.
 //
 // Every fixture value is invented and obviously synthetic and non-routable (`.invalid` names, fixed
 // byte fills, one planted marker string that is never a real person, host or credential).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { sealMappingPayload, openMappingPayload, MAPPING_AEAD_LIMITS } from '../dist/mapping-aead.js';
+import {
+  sealMappingPayload, openMappingPayload, MAPPING_AEAD_LIMITS, MAPPING_AEAD_FINDINGS,
+} from '../dist/mapping-aead.js';
 import { deriveScopedEntityReference, ENTITY_REFERENCE_TOKEN_PREFIX } from '../dist/scoped-entity-reference.js';
 import { applyMappingLifecycleCommand } from '../dist/mapping-lifecycle.js';
 import { authorizeMappingOperation } from '../dist/mapping-authorization.js';
@@ -36,6 +52,7 @@ import { authorizeMappingOperation } from '../dist/mapping-authorization.js';
 const SYNTHETIC_ORIGINAL = 'synthetic-original-verity-fixture.invalid';
 const SYNTHETIC_ORIGINAL_BYTES = new TextEncoder().encode(SYNTHETIC_ORIGINAL);
 const FOREIGN_ORIGINAL = 'synthetic-original-other-tenant-fixture.invalid';
+const FOREIGN_ORIGINAL_BYTES = new TextEncoder().encode(FOREIGN_ORIGINAL);
 const ENTITY_ID_A = 'entity-verity-fixture';
 const ENTITY_ID_B = 'entity-oskar-fixture';
 
@@ -51,6 +68,80 @@ function bytesEqual(left, right) {
     if (left[index] !== right[index]) return false;
   }
   return true;
+}
+
+/**
+ * The trusted test-local inspector. It sees the restored bytes inside the release path and returns
+ * only one boolean. The original never leaves this callback: it is not returned, not recorded and
+ * never becomes an assertion operand, and the caller receives `matched` alone.
+ */
+const RESTORED_EXACTLY = (plaintext) => bytesEqual(plaintext, SYNTHETIC_ORIGINAL_BYTES);
+
+/* ---------- Privacy-safe projections: fixed enum strings, numbers and booleans only ---------- */
+
+/**
+ * Reads one crypto result into fixed fields. No property of the returned object is a byte buffer or
+ * a caller value, so a failure on any assertion built from it prints codes and numbers only. Every
+ * reading is guarded: a hostile or unreadable result degrades to `UNREADABLE` and never escapes.
+ */
+function projectOpen(value) {
+  const projection = {
+    version: 0, status: 'UNREADABLE', finding: 'UNREADABLE', findingIsKnown: false,
+    hasPlaintext: false, hasBytes: false, plaintextIsBuffer: false, plaintextBytes: 0,
+    plaintextIsEmpty: true,
+  };
+  try {
+    projection.hasPlaintext = 'plaintext' in value;
+    projection.hasBytes = 'bytes' in value;
+    if (value?.version === 1) projection.version = 1;
+    if (value?.status === 'OPENED' || value?.status === 'REFUSED') projection.status = value.status;
+    if (typeof value?.finding === 'string' && MAPPING_AEAD_FINDINGS.includes(value.finding)) {
+      projection.finding = value.finding;
+      projection.findingIsKnown = true;
+    }
+    const plaintext = value?.plaintext;
+    if (plaintext instanceof Uint8Array) {
+      projection.plaintextIsBuffer = true;
+      projection.plaintextBytes = plaintext.byteLength;
+      projection.plaintextIsEmpty = plaintext.byteLength === 0;
+    }
+  } catch {
+    // A hostile result stays UNREADABLE. Nothing read from it is echoed anywhere.
+  }
+  return projection;
+}
+
+/**
+ * Whether a value graph holds a byte buffer or the planted marker string. Returned as one boolean and
+ * used only as an assertion operand. Anything unreadable, symbol-keyed, accessor-backed or deeper
+ * than the bound counts as unsafe, so this check fails closed rather than passing on a value it could
+ * not examine.
+ *
+ * `allowAccessors` is set only for one call: a caught assertion error carries a runtime-installed
+ * lazily-formatted `stack` accessor, and invoking an accessor in order to inspect it would run code to
+ * look for plaintext. That walk therefore skips accessors without reading them, and the operands that
+ * actually reach the assertion - `actual` and `expected` - are checked separately, unskipped.
+ */
+function graphCarriesPlaintext(value, depth = 0, allowAccessors = false) {
+  if (value instanceof Uint8Array) return true;
+  if (typeof value === 'string') return value.includes('synthetic-original');
+  if (value === null || typeof value !== 'object') return false;
+  if (depth >= 3) return true;
+  try {
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== 'string') return true;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor) return true;
+      if (!('value' in descriptor)) {
+        if (!allowAccessors) return true;
+        continue;
+      }
+      if (graphCarriesPlaintext(descriptor.value, depth + 1)) return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
 }
 
 /* ---------- Trusted test bindings (fixtures, not authenticated identities) ---------- */
@@ -96,6 +187,12 @@ const TENANT_D = Object.freeze({
 const TENANT_E = Object.freeze({
   tenantId: 'tenant-echo.invalid', projectId: 'project-echo.invalid', sessionId: 'session-echo.invalid',
 });
+// A sixth, reserved for the old-envelope-against-current-revision case so no other test's commits
+// can influence it.
+const TENANT_F = Object.freeze({
+  tenantId: 'tenant-foxtrot.invalid', projectId: 'project-foxtrot.invalid',
+  sessionId: 'session-foxtrot.invalid',
+});
 
 /* ---------- Model-visible capture: fixed outcomes and opaque tokens only ---------- */
 
@@ -108,6 +205,7 @@ function captureForModel(value) {
 }
 function resetModelCapture() { modelCapture.length = 0; }
 function assertCaptureIsNonSecret() {
+  assert.equal(modelCapture.length > 0, true);
   for (const entry of modelCapture) {
     assert.equal(typeof entry, 'string');
     assert.equal(entry.includes(SYNTHETIC_ORIGINAL), false);
@@ -119,37 +217,67 @@ function assertCaptureIsNonSecret() {
 /* ---------- The ephemeral fixture: ciphertext plus non-secret metadata only ---------- */
 
 /**
- * One ephemeral tenant fixture. It holds the sealed record, the host-held expected scope and DEK, and
- * the metadata the trusted host would read. It stores no original value and no plaintext: after
- * construction this object holds no copy of the original, so the only value it can ever release is
- * what `openMappingPayload` decrypts from the ciphertext it stores.
- * `current` is the fixture's authoritative current record, advanced only by the lifecycle reducer.
+ * One ephemeral tenant fixture. It holds the sealed record, the host-held key material and the
+ * metadata the trusted host would read. It stores no original value and no plaintext: the plaintext is
+ * passed in from the module-level literal for the moment it is sealed and is never retained on the
+ * fixture, so the only value this object can ever release is what `openMappingPayload` decrypts from
+ * the ciphertext it stores.
+ * `current` is the fixture's single authority: lifecycle, revision, scope and expiry all come from
+ * this record, and the AEAD's expected revision is recomputed from it on every open.
  */
-function makeFixture({ scope, key, hmacKey, entityId, original, createdAt, expiresAt }) {
+function makeFixture({ scope, key, hmacKey, entityId, plaintext, createdAt, expiresAt }) {
   const reference = deriveScopedEntityReference({
     scope: 'SESSION', tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId,
     entityId, semanticType: 'PERSON', keyVersion: KEY_VERSION, key: hmacKey,
   });
   assert.equal(reference.state, 'DERIVED');
-  const aadScope = Object.freeze({
-    tenantId: scope.tenantId, projectId: scope.projectId, entityId, classification: 'PERSON',
-    mappingRevision: '1', keyVersion: KEY_VERSION,
-  });
-  const sealed = sealMappingPayload({
-    scope: aadScope, plaintext: new TextEncoder().encode(original), key,
-  });
-  assert.equal(sealed.status, 'SEALED');
   const fixture = {
-    scope, key, hmacKey, aadScope, mappingRef: reference.token,
-    envelope: sealed.envelope,
-    // The authoritative current record: lifecycle metadata only, never a value or a ciphertext.
+    scope, key, hmacKey, entityId, mappingRef: reference.token,
     current: Object.freeze({
       version: 1, mappingRef: reference.token,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId },
       state: 'CREATED', revision: 1, createdAt, expiresAt,
     }),
+    // The revision the stored envelope was sealed under. It is a fact about the ciphertext, never an
+    // input to any decision: nothing reads it back as the expected revision.
+    sealedRevision: 0,
+    envelope: undefined,
   };
+  resealUnderCurrentRevision(fixture, plaintext);
   return fixture;
+}
+
+/**
+ * The expected AEAD scope, recomputed from the fixture's authoritative current record on every call.
+ * This is the only place an AAD revision comes from, and it is never cached, frozen at seal time or
+ * copied out of an envelope.
+ */
+function expectedScope(fixture) {
+  return {
+    tenantId: fixture.scope.tenantId, projectId: fixture.scope.projectId, entityId: fixture.entityId,
+    classification: 'PERSON', mappingRevision: String(fixture.current.revision), keyVersion: KEY_VERSION,
+  };
+}
+
+/**
+ * Seals the fixture's current value under the revision that is now authoritative, drawing a fresh
+ * synthetic nonce from the shipped primitive on every call. This is controlled synthetic host setup
+ * for a test that needs the stored ciphertext to match the current record; it is **not** a lifecycle
+ * rotation, a rewrap, a key rotation or a store. The reducer rotates nothing, the same DEK is reused
+ * deliberately so only the revision differs, and the nonce is never reused to re-seal.
+ */
+function resealUnderCurrentRevision(fixture, plaintext) {
+  const previousNonce = fixture.envelope?.nonce;
+  const sealed = sealMappingPayload({
+    scope: expectedScope(fixture), plaintext, key: fixture.key,
+  });
+  assert.equal(sealed.status, 'SEALED');
+  fixture.envelope = sealed.envelope;
+  fixture.sealedRevision = fixture.current.revision;
+  if (previousNonce !== undefined) {
+    assert.equal(bytesEqual(sealed.envelope.nonce, previousNonce), false);
+  }
+  return sealed.envelope;
 }
 
 /**
@@ -169,6 +297,7 @@ function serializeFixture(fixture) {
     sessionId: fixture.scope.sessionId,
     lifecycle: fixture.current.state,
     revision: fixture.current.revision,
+    sealedRevision: fixture.sealedRevision,
     expiresAt: fixture.current.expiresAt,
     keyVersion: KEY_VERSION,
   });
@@ -222,7 +351,7 @@ function snapshotIsCurrent(fixture, mapping) {
     && mapping.scope?.sessionId === record.scope.sessionId;
 }
 
-/** One explicit, purpose-bound, finite grant. Absent means `undefined`, which the seam denies. */
+/** One explicit, purpose-bound, finite grant, pinned to the same current revision as everything else. */
 function grantFor(fixture, operation, overrides = {}) {
   return {
     version: 1, mappingRef: fixture.mappingRef, revision: fixture.current.revision,
@@ -251,31 +380,41 @@ function decide(fixture, {
   return authorizeMappingOperation(request, host, mapping, grant, { now });
 }
 
+/** One withheld outcome. Fixed strings and booleans only; there is no field a buffer could enter. */
+function withheldOutcome(code) {
+  return { outcome: captureForModel('WITHHELD'), code, released: false, matched: false, bytes: 0 };
+}
+
 /**
  * The DISPLAY release path. Three independent gates stand between a fixture and a plaintext, in this
  * order: the snapshot presented must still be the fixture's current record, the operation is pinned
  * to DISPLAY *after* caller options are applied so no option can substitute USE or EXPORT for it, and
- * only an actual AUTHORIZED decision from the real seam permits one real open under the independently
- * supplied expected scope. Withhold at any gate and no `openMappingPayload` call is made at all, so no
- * plaintext can exist in this process on that path.
+ * only an actual AUTHORIZED decision from the real seam permits one real open under the expected scope
+ * recomputed from that current record. Withhold at any gate and no `openMappingPayload` call is made
+ * at all, so no plaintext can exist in this process on that path.
+ *
+ * On the release path the restored bytes go to `inspect`, a trusted test-local callback that returns
+ * one boolean, and are then overwritten here. Nothing else can see them: the returned record carries
+ * only `outcome`, `code`, `released`, `matched` and `bytes`.
  */
-function releaseForDisplay(fixture, options = {}) {
+function releaseForDisplay(fixture, options = {}, inspect = RESTORED_EXACTLY) {
   const mapping = options.mapping ?? trustedMetadata(fixture);
-  if (!snapshotIsCurrent(fixture, mapping)) {
-    return { outcome: captureForModel('WITHHELD'), code: 'SNAPSHOT_SUPERSEDED', plaintext: null };
-  }
+  if (!snapshotIsCurrent(fixture, mapping)) return withheldOutcome('SNAPSHOT_SUPERSEDED');
   // The operation is pinned last and is never taken from options: this path is DISPLAY by construction.
   const decision = decide(fixture, { ...options, mapping, operation: 'DISPLAY' });
-  if (decision.state !== 'AUTHORIZED') {
-    return { outcome: captureForModel('WITHHELD'), code: decision.reason, plaintext: null };
-  }
+  if (decision.state !== 'AUTHORIZED') return withheldOutcome(decision.reason);
   const opened = openMappingPayload({
-    scope: fixture.aadScope, envelope: cloneEnvelope(fixture.envelope), key: fixture.key,
+    scope: expectedScope(fixture), envelope: cloneEnvelope(fixture.envelope), key: fixture.key,
   });
-  if (opened.status !== 'OPENED') {
-    return { outcome: captureForModel('WITHHELD'), code: opened.finding, plaintext: null };
-  }
-  return { outcome: captureForModel('RELEASED'), code: opened.finding, plaintext: opened.plaintext };
+  const projection = projectOpen(opened);
+  if (projection.status !== 'OPENED') return withheldOutcome(projection.finding);
+  const matched = inspect(opened.plaintext) === true;
+  const bytes = projection.plaintextBytes;
+  // Best-effort hygiene in JavaScript, not a zeroization guarantee: the buffer this process still holds
+  // is overwritten here so the restored bytes do not outlive the inspection.
+  opened.plaintext.fill(0);
+  return { outcome: captureForModel('RELEASED'), code: projection.finding, released: true, matched,
+    bytes };
 }
 
 /**
@@ -302,68 +441,80 @@ function commit(fixture, action, { expectedRevision, now, scope = fixture.curren
   return result;
 }
 
-/** Brings one fixture to ACTIVE through the real reducer, so each test does not depend on a
- *  previous test's commit. There is no bypass: activation always goes through the reducer. */
-function ensureActive(fixture, now = T0 + 1_500) {
+/**
+ * Brings one fixture to ACTIVE through the real reducer, so each test does not depend on a previous
+ * test's commit, and then re-seals the fixture's value under the now-current revision so its stored
+ * ciphertext is the one the current record describes. There is no lifecycle bypass: activation always
+ * goes through the reducer. Tests that must exercise a stale ciphertext call `commit` directly
+ * instead, deliberately skipping the re-seal.
+ */
+function ensureActive(fixture, plaintext, now = T0 + 1_500) {
   if (fixture.current.state === 'CREATED') {
     const activated = commit(fixture, 'ACTIVATE', { expectedRevision: fixture.current.revision, now });
     assert.equal(activated.state, 'CHANGED');
     assert.equal(activated.record.state, 'ACTIVE');
   }
+  resealUnderCurrentRevision(fixture, plaintext);
   return fixture.current;
 }
 
 const FIXTURE_A = makeFixture({
   scope: TENANT_A, key: DEK_A, hmacKey: HMAC_A, entityId: ENTITY_ID_A,
-  original: SYNTHETIC_ORIGINAL, createdAt: T0, expiresAt: T0 + TTL_MS,
+  plaintext: SYNTHETIC_ORIGINAL_BYTES, createdAt: T0, expiresAt: T0 + TTL_MS,
 });
 // Same synthetic original, same entity id, same DEK, same HMAC key as A; a different tenant scope.
 const FIXTURE_A2 = makeFixture({
   scope: TENANT_A2, key: DEK_A, hmacKey: HMAC_A, entityId: ENTITY_ID_A,
-  original: SYNTHETIC_ORIGINAL, createdAt: T0, expiresAt: T0 + TTL_MS,
+  plaintext: SYNTHETIC_ORIGINAL_BYTES, createdAt: T0, expiresAt: T0 + TTL_MS,
 });
 const FIXTURE_B = makeFixture({
   scope: TENANT_B, key: DEK_B, hmacKey: HMAC_B, entityId: ENTITY_ID_B,
-  original: FOREIGN_ORIGINAL, createdAt: T0, expiresAt: T0 + TTL_MS,
+  plaintext: FOREIGN_ORIGINAL_BYTES, createdAt: T0, expiresAt: T0 + TTL_MS,
 });
 // A third ephemeral fixture, a third synthetic tenant, used only for the grant-expiry controls.
 const FIXTURE_C = makeFixture({
   scope: TENANT_C, key: new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(0x66),
   hmacKey: new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(0x77),
-  entityId: 'entity-juno-fixture', original: SYNTHETIC_ORIGINAL, createdAt: T0, expiresAt: T0 + TTL_MS,
+  entityId: 'entity-juno-fixture', plaintext: SYNTHETIC_ORIGINAL_BYTES, createdAt: T0,
+  expiresAt: T0 + TTL_MS,
 });
 // A fourth and fifth, each dedicated to one authority control so no test depends on another's commits.
 const FIXTURE_D = makeFixture({
   scope: TENANT_D, key: new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(0x88),
   hmacKey: new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(0x99),
-  entityId: 'entity-delta-fixture', original: SYNTHETIC_ORIGINAL, createdAt: T0, expiresAt: T0 + TTL_MS,
+  entityId: 'entity-delta-fixture', plaintext: SYNTHETIC_ORIGINAL_BYTES, createdAt: T0,
+  expiresAt: T0 + TTL_MS,
 });
 const FIXTURE_E = makeFixture({
   scope: TENANT_E, key: new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(0xaa),
   hmacKey: new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(0xbb),
-  entityId: 'entity-echo-fixture', original: SYNTHETIC_ORIGINAL, createdAt: T0, expiresAt: T0 + TTL_MS,
+  entityId: 'entity-echo-fixture', plaintext: SYNTHETIC_ORIGINAL_BYTES, createdAt: T0,
+  expiresAt: T0 + TTL_MS,
 });
 
 /* ---------- 1. Accepted DISPLAY round-trip exactness ---------- */
 
 test('an original is restored byte-exactly only after an actual AUTHORIZED DISPLAY decision', () => {
-  ensureActive(FIXTURE_A);
+  ensureActive(FIXTURE_A, SYNTHETIC_ORIGINAL_BYTES);
   resetModelCapture();
   // Control: with no grant at all the seam denies, and nothing is opened. The lifecycle and mapping
   // checks precede the absent-grant check, so the fixture is active first.
   const withheld = releaseForDisplay(FIXTURE_A, { grant: undefined });
   assert.equal(withheld.outcome, 'WITHHELD');
   assert.equal(withheld.code, 'NO_GRANT');
-  assert.equal(withheld.plaintext, null);
+  assert.equal(withheld.released, false);
+  assert.equal(withheld.matched, false);
+  assert.equal(withheld.bytes, 0);
 
   // Positive: an explicit DISPLAY grant over the active current record authorizes one open.
   const released = releaseForDisplay(FIXTURE_A, { grant: grantFor(FIXTURE_A, 'DISPLAY') });
   assert.equal(released.outcome, 'RELEASED');
   assert.equal(released.code, 'OPENED');
-  // The oracle is the independent literal's own encoding, compared here and asserted as one boolean, so
-  // a failure prints `true`/`false` and never a byte of the synthetic original.
-  assert.equal(bytesEqual(released.plaintext, SYNTHETIC_ORIGINAL_BYTES), true);
-  assert.equal(released.plaintext.byteLength, SYNTHETIC_ORIGINAL_BYTES.byteLength);
+  assert.equal(released.released, true);
+  // The oracle is the independent literal's own encoding, decided inside the release path and asserted
+  // here as one boolean, so a failure prints `true`/`false` and never a byte of the synthetic original.
+  assert.equal(released.matched, true);
+  assert.equal(released.bytes, SYNTHETIC_ORIGINAL_BYTES.byteLength);
   assertCaptureIsNonSecret();
 });
 
@@ -387,6 +538,9 @@ test('the ephemeral fixture holds ciphertext plus non-secret metadata and never 
   assert.equal(FIXTURE_A.envelope.nonce.byteLength, MAPPING_AEAD_LIMITS.nonceBytes);
   assert.equal('key' in FIXTURE_A.envelope, false);
   assert.equal('scope' in FIXTURE_A.envelope, false);
+  // The stored ciphertext is sealed under the current revision: one authority, no frozen AAD copy.
+  assert.equal(FIXTURE_A.sealedRevision, FIXTURE_A.current.revision);
+  assert.equal(serialized.includes(`"sealedRevision":${FIXTURE_A.current.revision}`), true);
 });
 
 /* ---------- 3. USE does not imply DISPLAY or EXPORT ---------- */
@@ -409,7 +563,7 @@ test('a USE-only grant authorizes USE and denies DISPLAY and EXPORT, and USE rev
     const withheld = releaseForDisplay(FIXTURE_A, { grant: useGrant });
     assert.equal(withheld.outcome, 'WITHHELD');
     assert.equal(withheld.code, 'OPERATION_NOT_GRANTED');
-    assert.equal(withheld.plaintext, null);
+    assert.equal(withheld.released, false);
   }
 
   // The model capture holds fixed non-secret outcomes and the opaque reference, never an original.
@@ -421,7 +575,7 @@ test('a USE-only grant authorizes USE and denies DISPLAY and EXPORT, and USE rev
 /* ---------- 4. Neither operation can be substituted for the other ---------- */
 
 test('the operation is pinned per path: a USE grant is not a DISPLAY, and a DISPLAY is not a USE', () => {
-  ensureActive(FIXTURE_D);
+  ensureActive(FIXTURE_D, SYNTHETIC_ORIGINAL_BYTES);
   resetModelCapture();
   const useGrant = grantFor(FIXTURE_D, 'USE');
   const displayGrant = grantFor(FIXTURE_D, 'DISPLAY');
@@ -432,7 +586,7 @@ test('the operation is pinned per path: a USE grant is not a DISPLAY, and a DISP
     const override = releaseForDisplay(FIXTURE_D, { grant: useGrant, operation: requested });
     assert.equal(override.outcome, 'WITHHELD');
     assert.equal(override.code, 'OPERATION_NOT_GRANTED');
-    assert.equal(override.plaintext, null);
+    assert.equal(override.released, false);
   }
   // The same substitution in the other direction: a DISPLAY grant cannot be spent as a USE.
   const usedAsDisplay = useMapping(FIXTURE_D, { grant: displayGrant, operation: 'DISPLAY' });
@@ -447,7 +601,7 @@ test('the operation is pinned per path: a USE grant is not a DISPLAY, and a DISP
   assert.equal(used.code, 'AUTHORIZED');
   const released = releaseForDisplay(FIXTURE_D, { grant: displayGrant });
   assert.equal(released.outcome, 'RELEASED');
-  assert.equal(bytesEqual(released.plaintext, SYNTHETIC_ORIGINAL_BYTES), true);
+  assert.equal(released.matched, true);
   assertCaptureIsNonSecret();
   resetModelCapture();
 });
@@ -455,8 +609,8 @@ test('the operation is pinned per path: a USE grant is not a DISPLAY, and a DISP
 /* ---------- 5. Scope-bound references and cross-scope nonresolution ---------- */
 
 test('one original yields distinct references per tenant, and a foreign scope never resolves', () => {
-  ensureActive(FIXTURE_A);
-  ensureActive(FIXTURE_B);
+  ensureActive(FIXTURE_A, SYNTHETIC_ORIGINAL_BYTES);
+  ensureActive(FIXTURE_B, FOREIGN_ORIGINAL_BYTES);
   // The same synthetic original sealed in both tenants, under both a derived reference and a DEK.
   assert.equal(FIXTURE_A.mappingRef !== FIXTURE_B.mappingRef, true);
   assert.equal(deriveScopedEntityReference({
@@ -492,12 +646,14 @@ test('one original yields distinct references per tenant, and a foreign scope ne
 
   // Even bypassing authorization, tenant B's ciphertext cannot be opened in tenant A's scope: the AAD
   // binds the tenant and the DEK differs, so no foreign original or metadata is returned.
-  const crossOpen = openMappingPayload({
-    scope: FIXTURE_A.aadScope, envelope: cloneEnvelope(FIXTURE_B.envelope), key: FIXTURE_A.key,
-  });
+  const crossOpen = projectOpen(openMappingPayload({
+    scope: expectedScope(FIXTURE_A), envelope: cloneEnvelope(FIXTURE_B.envelope), key: FIXTURE_A.key,
+  }));
   assert.equal(crossOpen.status, 'REFUSED');
   assert.equal(crossOpen.finding, 'AUTHENTICATION_FAILED');
-  assert.equal('plaintext' in crossOpen, false);
+  assert.equal(crossOpen.hasPlaintext, false);
+  assert.equal(crossOpen.hasBytes, false);
+  assert.equal(crossOpen.plaintextIsBuffer, false);
 });
 
 /* ---------- 6. The controlled same-original, same-entity, same-key scope contrast ---------- */
@@ -521,25 +677,23 @@ test('the same original, entity and key under one other tenant scope still yield
 
   // Identical plaintext bytes and an identical key, but the AAD binds the tenant: the ciphertexts are
   // not interchangeable, and neither opens in the other's scope.
-  const crossOpen = openMappingPayload({
-    scope: FIXTURE_A.aadScope, envelope: cloneEnvelope(FIXTURE_A2.envelope), key: FIXTURE_A.key,
-  });
+  const crossOpen = projectOpen(openMappingPayload({
+    scope: expectedScope(FIXTURE_A), envelope: cloneEnvelope(FIXTURE_A2.envelope), key: FIXTURE_A.key,
+  }));
   assert.equal(crossOpen.status, 'REFUSED');
   assert.equal(crossOpen.finding, 'AUTHENTICATION_FAILED');
-  assert.equal('plaintext' in crossOpen, false);
-  assert.equal('bytes' in crossOpen, false);
+  assert.equal(crossOpen.hasPlaintext, false);
+  assert.equal(crossOpen.hasBytes, false);
 
-  // Controls: each record still opens under its own scope and restores the same independent literal,
-  // asserted as booleans so no byte reaches the output.
+  // Controls: each record still opens under its own current scope and restores the same independent
+  // literal, asserted through the release path so no byte reaches the output.
   for (const fixture of [FIXTURE_A, FIXTURE_A2]) {
-    const opened = openMappingPayload({
-      scope: fixture.aadScope, envelope: cloneEnvelope(fixture.envelope), key: fixture.key,
-    });
-    assert.equal(opened.status, 'OPENED');
-    assert.equal(bytesEqual(opened.plaintext, SYNTHETIC_ORIGINAL_BYTES), true);
+    ensureActive(fixture, SYNTHETIC_ORIGINAL_BYTES);
+    const opened = releaseForDisplay(fixture, { grant: grantFor(fixture, 'DISPLAY') });
+    assert.equal(opened.outcome, 'RELEASED');
+    assert.equal(opened.matched, true);
   }
   // And a foreign reference is still denied at the seam in the other tenant's scope.
-  ensureActive(FIXTURE_A2);
   const foreign = decide(FIXTURE_A2, {
     operation: 'DISPLAY', mappingRef: FIXTURE_A.mappingRef, grant: grantFor(FIXTURE_A2, 'DISPLAY'),
   });
@@ -547,63 +701,165 @@ test('the same original, entity and key under one other tenant scope still yield
   assert.equal(foreign.reason, 'UNKNOWN_MAPPING');
 });
 
-/* ---------- 7. AEAD failures produce zero plaintext ---------- */
+/* ---------- 7. AEAD failures produce zero plaintext, through the projection only ---------- */
 
 test('tampering, a wrong key and a wrong AAD each fail with zero plaintext capture', () => {
-  const expected = { version: 1, status: 'REFUSED', finding: 'AUTHENTICATION_FAILED' };
   const cases = {
     wrongKey: () => openMappingPayload({
-      scope: FIXTURE_A.aadScope, envelope: cloneEnvelope(FIXTURE_A.envelope), key: UNRELATED_DEK,
+      scope: expectedScope(FIXTURE_A), envelope: cloneEnvelope(FIXTURE_A.envelope), key: UNRELATED_DEK,
     }),
     wrongClassification: () => openMappingPayload({
-      scope: { ...FIXTURE_A.aadScope, classification: 'USER_ACCOUNT' },
+      scope: { ...expectedScope(FIXTURE_A), classification: 'USER_ACCOUNT' },
       envelope: cloneEnvelope(FIXTURE_A.envelope), key: FIXTURE_A.key,
     }),
     wrongRevision: () => openMappingPayload({
-      scope: { ...FIXTURE_A.aadScope, mappingRevision: '99' },
+      scope: { ...expectedScope(FIXTURE_A), mappingRevision: '99' },
       envelope: cloneEnvelope(FIXTURE_A.envelope), key: FIXTURE_A.key,
     }),
     wrongKeyVersion: () => openMappingPayload({
-      scope: { ...FIXTURE_A.aadScope, keyVersion: '2.0' },
+      scope: { ...expectedScope(FIXTURE_A), keyVersion: '2.0' },
       envelope: cloneEnvelope(FIXTURE_A.envelope), key: FIXTURE_A.key,
     }),
     tamperedCiphertext: () => {
       const envelope = cloneEnvelope(FIXTURE_A.envelope);
       envelope.ciphertext[0] = (envelope.ciphertext[0] + 1) & 0xff;
-      return openMappingPayload({ scope: FIXTURE_A.aadScope, envelope, key: FIXTURE_A.key });
+      return openMappingPayload({ scope: expectedScope(FIXTURE_A), envelope, key: FIXTURE_A.key });
     },
     tamperedTag: () => {
       const envelope = cloneEnvelope(FIXTURE_A.envelope);
       envelope.tag[0] = (envelope.tag[0] + 1) & 0xff;
-      return openMappingPayload({ scope: FIXTURE_A.aadScope, envelope, key: FIXTURE_A.key });
+      return openMappingPayload({ scope: expectedScope(FIXTURE_A), envelope, key: FIXTURE_A.key });
     },
     foreignEntity: () => openMappingPayload({
-      scope: { ...FIXTURE_A.aadScope, entityId: ENTITY_ID_B },
+      scope: { ...expectedScope(FIXTURE_A), entityId: ENTITY_ID_B },
       envelope: cloneEnvelope(FIXTURE_A.envelope), key: FIXTURE_A.key,
     }),
   };
   for (const [name, run] of Object.entries(cases)) {
-    const result = run();
-    assert.deepEqual(result, expected, name);
-    assert.equal('plaintext' in result, false, name);
-    assert.equal('bytes' in result, false, name);
+    // Every crypto assertion reads the projection, never the result object itself, so a regression
+    // that returned OPENED here would still print only fixed codes and booleans.
+    const projection = projectOpen(run());
+    assert.equal(projection.version, 1, name);
+    assert.equal(projection.status, 'REFUSED', name);
+    assert.equal(projection.finding, 'AUTHENTICATION_FAILED', name);
+    assert.equal(projection.findingIsKnown, true, name);
+    assert.equal(projection.hasPlaintext, false, name);
+    assert.equal(projection.hasBytes, false, name);
+    assert.equal(projection.plaintextIsBuffer, false, name);
+    assert.equal(projection.plaintextIsEmpty, true, name);
     // A refusal is one fixed code: it carries no planted value and no native error text.
-    assert.equal(JSON.stringify(result).includes('synthetic-original'), false, name);
+    assert.equal(graphCarriesPlaintext(projection), false, name);
   }
   // Control: the untouched record still opens, so the refusals above are not vacuous.
-  const control = openMappingPayload({
-    scope: FIXTURE_A.aadScope, envelope: cloneEnvelope(FIXTURE_A.envelope), key: FIXTURE_A.key,
-  });
+  const control = projectOpen(openMappingPayload({
+    scope: expectedScope(FIXTURE_A), envelope: cloneEnvelope(FIXTURE_A.envelope), key: FIXTURE_A.key,
+  }));
   assert.equal(control.status, 'OPENED');
-  assert.equal(bytesEqual(control.plaintext, SYNTHETIC_ORIGINAL_BYTES), true);
+  assert.equal(control.hasPlaintext, true);
+  assert.equal(control.plaintextIsBuffer, true);
+  assert.equal(control.plaintextBytes, SYNTHETIC_ORIGINAL_BYTES.byteLength);
 });
 
-/* ---------- 8. Lifecycle commits to the current revision ---------- */
+/* ---------- 8. The diagnostic path cannot print an opened result's plaintext ---------- */
+
+test('a planted OPENED result cannot carry plaintext into a caught assertion', () => {
+  // An intentionally OPENED result whose `plaintext` field really is a byte buffer, standing in for the
+  // regression this projection exists to contain: a refusal path that starts returning plaintext.
+  const planted = {
+    version: 1, status: 'OPENED', finding: 'OPENED',
+    plaintext: SYNTHETIC_ORIGINAL_BYTES, bytes: SYNTHETIC_ORIGINAL_BYTES.byteLength,
+  };
+  const projection = projectOpen(planted);
+  assert.equal(projection.status, 'OPENED');
+  assert.equal(projection.finding, 'OPENED');
+  assert.equal(projection.hasPlaintext, true);
+  assert.equal(projection.hasBytes, true);
+  assert.equal(projection.plaintextIsBuffer, true);
+  assert.equal(projection.plaintextBytes, SYNTHETIC_ORIGINAL_BYTES.byteLength);
+  // The projection is itself safe to assert on: no buffer, no planted marker anywhere in its graph.
+  assert.equal(graphCarriesPlaintext(projection), false);
+
+  // The failing assertion below therefore receives only two fixed codes as operands.
+  let caught;
+  try {
+    assert.equal(projection.status, 'REFUSED');
+  } catch (error) {
+    caught = error;
+  }
+  assert.equal(caught !== undefined, true);
+  assert.equal(typeof caught.actual, 'string');
+  assert.equal(typeof caught.expected, 'string');
+  assert.equal(caught.actual, 'OPENED');
+  assert.equal(caught.expected, 'REFUSED');
+  // And the caught error's own actual/expected graph carries neither a buffer nor the marker. This is
+  // the check the projection exists to satisfy, so it is asserted, not assumed.
+  assert.equal(graphCarriesPlaintext(caught, 0, true), false);
+  assert.equal(graphCarriesPlaintext(caught.actual), false);
+  assert.equal(graphCarriesPlaintext(caught.expected), false);
+
+  // The negative control for that check: it really does fire on a graph that holds the bytes, so the
+  // assertions above are not vacuously true.
+  assert.equal(graphCarriesPlaintext({ nested: { deeper: SYNTHETIC_ORIGINAL_BYTES } }), true);
+  assert.equal(graphCarriesPlaintext({ nested: SYNTHETIC_ORIGINAL }), true);
+  assert.equal(graphCarriesPlaintext({ version: 1, status: 'REFUSED' }), false);
+});
+
+/* ---------- 9. One current revision authority, and an old envelope refuses under it ---------- */
+
+test('an old valid envelope refuses under the current revision while the current envelope releases', () => {
+  resetModelCapture();
+  // Built at the creation revision 1, so its stored ciphertext is sealed under revision 1.
+  const fixture = makeFixture({
+    scope: TENANT_F, key: new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(0xcc),
+    hmacKey: new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(0xdd),
+    entityId: 'entity-foxtrot-fixture', plaintext: SYNTHETIC_ORIGINAL_BYTES,
+    createdAt: T0, expiresAt: T0 + TTL_MS,
+  });
+  assert.equal(fixture.current.revision, 1);
+  assert.equal(fixture.sealedRevision, 1);
+
+  // The current record moves to revision 2 through the real reducer. Nothing re-seals the fixture, so
+  // its untouched ciphertext is now a coherent *old* record that still authenticates under revision 1.
+  const activated = commit(fixture, 'ACTIVATE', { expectedRevision: 1, now: T0 + 1_500 });
+  assert.equal(activated.state, 'CHANGED');
+  assert.equal(activated.record.state, 'ACTIVE');
+  assert.equal(fixture.current.revision, 2);
+  assert.equal(fixture.sealedRevision, 1);
+
+  // Current metadata, a current grant and a genuinely authorized DISPLAY: the only thing that can
+  // refuse now is the stale ciphertext under the current expected revision.
+  const decision = decide(fixture, { operation: 'DISPLAY', grant: grantFor(fixture, 'DISPLAY') });
+  assert.equal(decision.state, 'AUTHORIZED');
+  const stale = releaseForDisplay(fixture, { grant: grantFor(fixture, 'DISPLAY') });
+  assert.equal(stale.outcome, 'WITHHELD');
+  assert.equal(stale.code, 'AUTHENTICATION_FAILED');
+  assert.equal(stale.released, false);
+  assert.equal(stale.matched, false);
+  assert.equal(stale.bytes, 0);
+
+  // The expected AAD revision is the current record's, never the envelope's and never a frozen copy:
+  // the ciphertext's own revision is a fact about it, not an authority over it.
+  assert.equal(expectedScope(fixture).mappingRevision, '2');
+  assert.equal(fixture.sealedRevision, 1);
+
+  // Matched control: after the controlled host re-seal, the current envelope releases byte-exactly.
+  const resealed = resealUnderCurrentRevision(fixture, SYNTHETIC_ORIGINAL_BYTES);
+  assert.equal(fixture.sealedRevision, 2);
+  assert.equal(resealed.nonce.byteLength, MAPPING_AEAD_LIMITS.nonceBytes);
+  const current = releaseForDisplay(fixture, { grant: grantFor(fixture, 'DISPLAY') });
+  assert.equal(current.outcome, 'RELEASED');
+  assert.equal(current.released, true);
+  assert.equal(current.matched, true);
+  assert.equal(current.bytes, SYNTHETIC_ORIGINAL_BYTES.byteLength);
+  assertCaptureIsNonSecret();
+});
+
+/* ---------- 10. Lifecycle commits to the current revision ---------- */
 
 test('the reducer commits monotonic revisions and a stale revision or snapshot cannot supersede them', () => {
   // One activation from a record created at revision 1 commits the literal revision 2. The oracle is
   // the literal, not a comparison against whatever the reducer happened to return.
-  const activated = ensureActive(FIXTURE_A);
+  const activated = ensureActive(FIXTURE_A, SYNTHETIC_ORIGINAL_BYTES);
   assert.equal(activated.state, 'ACTIVE');
   assert.equal(activated.revision, 2);
   // Creation, expiry, scope and reference are immutable through a transition.
@@ -631,7 +887,7 @@ test('the reducer commits monotonic revisions and a stale revision or snapshot c
   const cachedRelease = releaseForDisplay(FIXTURE_A, { grant: staleGrant });
   assert.equal(cachedRelease.outcome, 'WITHHELD');
   assert.equal(cachedRelease.code, 'STALE_REVISION');
-  assert.equal(cachedRelease.plaintext, null);
+  assert.equal(cachedRelease.released, false);
   const cachedMapping = trustedMetadata(FIXTURE_A, { revision: activated.revision - 1 });
   assert.equal(decide(FIXTURE_A, {
     operation: 'DISPLAY', mapping: cachedMapping, grant: grantFor(FIXTURE_A, 'DISPLAY'),
@@ -648,10 +904,10 @@ test('the reducer commits monotonic revisions and a stale revision or snapshot c
   assert.equal(reactivate.reason, 'INVALID_TRANSITION');
 });
 
-/* ---------- 9. A coherent cached snapshot, grant and ciphertext cannot supersede the current record ---------- */
+/* ---------- 11. A coherent cached snapshot, grant and ciphertext cannot supersede the current record ---------- */
 
 test('a cached ACTIVE snapshot with its own grant and the old ciphertext releases nothing after revocation', () => {
-  ensureActive(FIXTURE_E);
+  ensureActive(FIXTURE_E, SYNTHETIC_ORIGINAL_BYTES);
   resetModelCapture();
 
   // The stale triple is captured while the record is genuinely ACTIVE at the literal revision 2.
@@ -671,7 +927,7 @@ test('a cached ACTIVE snapshot with its own grant and the old ciphertext release
   // Positive control before the revocation: the same fixture releases once under the live record.
   const before = releaseForDisplay(FIXTURE_E, { grant: grantFor(FIXTURE_E, 'DISPLAY') });
   assert.equal(before.outcome, 'RELEASED');
-  assert.equal(bytesEqual(before.plaintext, SYNTHETIC_ORIGINAL_BYTES), true);
+  assert.equal(before.matched, true);
 
   // The authoritative current record moves: activation, then revocation, each through the reducer.
   const revoked = commit(FIXTURE_E, 'REVOKE', { expectedRevision: activeRevision, now: T0 + 2_000 });
@@ -684,7 +940,7 @@ test('a cached ACTIVE snapshot with its own grant and the old ciphertext release
   const stale = releaseForDisplay(FIXTURE_E, { mapping: cachedSnapshot, grant: cachedGrant });
   assert.equal(stale.outcome, 'WITHHELD');
   assert.equal(stale.code, 'SNAPSHOT_SUPERSEDED');
-  assert.equal(stale.plaintext, null);
+  assert.equal(stale.released, false);
 
   // Attribution, stated honestly: the pure seam alone trusts the snapshot the host hands it, so it
   // does authorize this stale triple. What refuses it is the fixture's own current-record authority
@@ -703,19 +959,18 @@ test('a cached ACTIVE snapshot with its own grant and the old ciphertext release
   const currentRelease = releaseForDisplay(FIXTURE_E, { grant: grantFor(FIXTURE_E, 'DISPLAY') });
   assert.equal(currentRelease.outcome, 'WITHHELD');
   assert.equal(currentRelease.code, 'MAPPING_REVOKED');
-  assert.equal(currentRelease.plaintext, null);
+  assert.equal(currentRelease.released, false);
 
   // Zero plaintext capture across every attempt on this path: the capture holds outcome labels only.
   assertCaptureIsNonSecret();
-  for (const entry of modelCapture) assert.equal(entry.includes('synthetic-original'), false);
   resetModelCapture();
 });
 
-/* ---------- 10. Expired, revoked and deleted records cannot resolve ---------- */
+/* ---------- 12. Expired, revoked and deleted records cannot resolve ---------- */
 
 test('expiry, revocation and deletion each deny at the seam and withhold any release', () => {
   resetModelCapture();
-  ensureActive(FIXTURE_A);
+  ensureActive(FIXTURE_A, SYNTHETIC_ORIGINAL_BYTES);
   assert.equal(FIXTURE_A.current.revision, 2);
   const expired = commit(FIXTURE_A, 'EXPIRE', {
     expectedRevision: FIXTURE_A.current.revision, now: FIXTURE_A.current.expiresAt,
@@ -726,7 +981,7 @@ test('expiry, revocation and deletion each deny at the seam and withhold any rel
   const afterExpiry = releaseForDisplay(FIXTURE_A, { grant: grantFor(FIXTURE_A, 'DISPLAY') });
   assert.equal(afterExpiry.outcome, 'WITHHELD');
   assert.equal(afterExpiry.code, 'MAPPING_EXPIRED');
-  assert.equal(afterExpiry.plaintext, null);
+  assert.equal(afterExpiry.released, false);
   // An expiry cannot be rolled back by reactivation.
   const revive = commit(FIXTURE_A, 'ACTIVATE', {
     expectedRevision: FIXTURE_A.current.revision, now: T0 + 6_000,
@@ -736,7 +991,7 @@ test('expiry, revocation and deletion each deny at the seam and withhold any rel
   assert.equal(FIXTURE_A.current.state, 'EXPIRED');
   assert.equal(FIXTURE_A.current.revision, 3);
 
-  ensureActive(FIXTURE_B);
+  ensureActive(FIXTURE_B, FOREIGN_ORIGINAL_BYTES);
   assert.equal(FIXTURE_B.current.revision, 2);
   const revoked = commit(FIXTURE_B, 'REVOKE', {
     expectedRevision: FIXTURE_B.current.revision, now: T0 + 2_000,
@@ -746,7 +1001,7 @@ test('expiry, revocation and deletion each deny at the seam and withhold any rel
   assert.equal(revoked.record.revision, 3);
   const afterRevoke = releaseForDisplay(FIXTURE_B, { grant: grantFor(FIXTURE_B, 'DISPLAY') });
   assert.equal(afterRevoke.code, 'MAPPING_REVOKED');
-  assert.equal(afterRevoke.plaintext, null);
+  assert.equal(afterRevoke.released, false);
 
   const deleted = commit(FIXTURE_B, 'DELETE', {
     expectedRevision: FIXTURE_B.current.revision, now: T0 + 3_000,
@@ -756,7 +1011,7 @@ test('expiry, revocation and deletion each deny at the seam and withhold any rel
   assert.equal(deleted.record.revision, 4);
   const afterDelete = releaseForDisplay(FIXTURE_B, { grant: grantFor(FIXTURE_B, 'DISPLAY') });
   assert.equal(afterDelete.code, 'MAPPING_REVOKED');
-  assert.equal(afterDelete.plaintext, null);
+  assert.equal(afterDelete.released, false);
 
   // A terminal command is idempotent. The state before the repeat command is captured independently, so
   // the assertion is not comparing the result against a value the commit itself just assigned.
@@ -775,17 +1030,17 @@ test('expiry, revocation and deletion each deny at the seam and withhold any rel
 
   // An expired grant is refused by its own check on a still-active fixture, independently of the
   // lifecycle and mapping checks that precede it.
-  ensureActive(FIXTURE_C);
+  ensureActive(FIXTURE_C, SYNTHETIC_ORIGINAL_BYTES);
   assert.equal(FIXTURE_C.current.revision, 2);
   const expiredGrant = releaseForDisplay(FIXTURE_C, {
     grant: grantFor(FIXTURE_C, 'DISPLAY', { expiresAt: T0 + 10 }), now: T0 + 100,
   });
   assert.equal(expiredGrant.outcome, 'WITHHELD');
   assert.equal(expiredGrant.code, 'GRANT_EXPIRED');
-  assert.equal(expiredGrant.plaintext, null);
+  assert.equal(expiredGrant.released, false);
   // Positive control on the same fixture: a live grant still restores the independent literal.
   const live = releaseForDisplay(FIXTURE_C, { grant: grantFor(FIXTURE_C, 'DISPLAY'), now: T0 + 100 });
   assert.equal(live.outcome, 'RELEASED');
-  assert.equal(bytesEqual(live.plaintext, SYNTHETIC_ORIGINAL_BYTES), true);
+  assert.equal(live.matched, true);
   assertCaptureIsNonSecret();
 });
