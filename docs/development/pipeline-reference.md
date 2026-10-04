@@ -104,8 +104,8 @@ nesting, and no child that launches another lane.
 The config is root-owned, bounded and absolute. Every path field must start with `/`; `key` and `task`
 are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer` or `hylja-reviewer`;
 `timeoutMs` is a positive integer no greater than that role profile's own frontmatter deadline; an
-optional `softBudgetMs` is a positive integer strictly below `timeoutMs`; a `model` key is refused
-rather than ignored.
+optional `softBudgetMs` is a positive integer strictly below `timeoutMs`; an optional
+`requiredReferences` list is described below; a `model` key is refused rather than ignored.
 
 ```json
 {
@@ -123,7 +123,11 @@ rather than ignored.
   "pi": "/home/operator/.pi/agent/bin/pi",
   "subagents": "/home/operator/.pi/agent/npm/node_modules/pi-subagents",
   "guard": "/abs/path/to/worktree/.pi/extensions/hylja-workflow-guard.ts",
-  "controller": "/abs/path/to/worktree/.pi/lib/hylja-native-lane.ts"
+  "controller": "/abs/path/to/worktree/.pi/lib/hylja-native-lane.ts",
+  "requiredReferences": [
+    { "label": "required contract", "path": "/abs/fresh/dir/retained-contract.md" },
+    { "label": "retained red log", "path": "/abs/fresh/dir/207-evidence/RED.log" }
+  ]
 }
 ```
 
@@ -136,6 +140,28 @@ searched for.
 
 The four evidence paths must be fresh: an existing `receipt`, `verification`, `progress` or `dispatch`
 file is `SETUP_FAILED_STALE_EVIDENCE`, so a previous run's evidence can never pass as this run's.
+
+**When `requiredReferences` is configured** (and only then): it is one structured declaration, never
+prose that is parsed. The only accepted shape is an array of at most 16 `{ label, path }` entries, a
+label of at most 128 characters with no control character, and an absolute path of at most 4096
+characters. Anything else — a bare path string, a label-to-path map, a primitive entry, an unknown
+field, a relative or overbound path, a control character in a label, or an overbound count — is
+`SETUP_FAILED_REQUIRED_REFERENCE` in both readers, never a repaired value, and no declared label or
+path is echoed into any record. An absent key and an explicit empty list are the same assertion of no
+references, and run no probe at all.
+
+Admission is file metadata alone: each path must be an existing regular file the launching process can
+open for reading. Nothing is read from the file, no path is resolved, searched for, or substituted for
+another file, and nothing is inferred from the task prose. The CLI probes before it spawns Pi and the
+controller probes again before it resolves the launch contract, so a missing, directory, unreadable or
+otherwise non-regular entry is the fixed reference refusal with zero dispatch: no launch contract, no
+child process, no persisted dispatch record, no armed timer, and every existing artifact left exactly
+as it was. Symlinks are followed, so a link to a readable regular file is admitted and a broken one is
+missing. Admitted labels and exact paths are rendered once, into the one effective task that both the
+launch contract and the dispatched request carry, inside the existing 1 MiB raw cap; an effective task
+past that cap fails restrictively rather than dropping a pointer. A process that bypasses file
+permissions admits what it can actually open, so admission is not approval and no promise is made
+that a path still exists, or is still readable, when the leaf reads it.
 
 The controller resolves `resolveSubagentLaunchContract` for this exact task, cwd, fresh context, parent
 model registry and the one bridge value it declares (`LANE_BRIDGE_INPUT`, `{ mode: 'off' }` — off
@@ -214,7 +240,7 @@ provably the same code and not a re-implementation of it.
 
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (44 tests, 34 of them in the lane file). Two of them
+platform (47 tests, 37 of them in the lane file). Two of them
 fake only the child transport, so the shipped default platform is what runs: the default filesystem
 must read the progress tail with bounded positional descriptor reads and close every descriptor it
 opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
@@ -238,7 +264,16 @@ metadata. A window counted in characters rather than serialized bytes fails the 
 escape and multibyte cases are what keep the byte count honest. The lane file
 keeps a planted candidate note and
 the leaf's own evidence and proves a hard deadline leaves both untouched, reports INCOMPLETE and arms
-no surviving timer. A read-only
+no surviving timer. The required-reference cases use a real temporary file: the positive case admits a
+real readable file and asserts that the exact generated label and path reach the fake native request
+and the one effective task, while every negative case — bare string, map, primitive entry, unknown
+field, empty or overbound label, relative or overbound path, overbound count, missing path, directory,
+unreadable, non-regular, and an absent metadata seam — is refused with zero dispatch, no preflight
+call, no armed timer and the planted artifact preserved. The unreadable branch is driven through the
+injected metadata probe in both readers, because a mode-000 file is genuinely readable to a root
+process and a permission bit would prove nothing there; the real-fs branches (missing, directory,
+regular readable file) run the shipped probe unpatched.
+A read-only
 smoke on root's own installed Pi ran from
 `/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and
 verification records beside it). It exercised launch and evidence plumbing on a reviewer lane, and its

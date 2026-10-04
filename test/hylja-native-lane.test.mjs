@@ -1543,6 +1543,227 @@ test('the installed Pi executable, role profiles and controller entrypoint are r
 	assert.equal(readRoleProfile('hylja-reviewer').timeoutMs, 900_000);
 });
 
+/** Real temporary reference targets: a readable regular file, a directory and an absent path. */
+function tempReferences(dir) {
+	const file = join(dir, 'required-reference.md');
+	writeFileSync(file, 'synthetic required reference body\n');
+	const directory = join(dir, 'required-reference-dir');
+	mkdirSync(directory);
+	return { file, directory, absent: join(dir, 'absent-required-reference.md') };
+}
+
+/** One bounded structured list of simple labels and absolute paths, exactly as root supplies it. */
+const referenceList = (...entries) => entries.map(([label, path]) => ({ label, path }));
+
+test('a required reference is admitted once, rendered once, and bound to both the preflight and the request', async () => {
+	const { dir, config, configPath, cleanup } = tempConfig();
+	try {
+		const refs = tempReferences(dir);
+		writeFileSync(configPath, JSON.stringify({
+			...config,
+			requiredReferences: referenceList(['required contract', refs.file], ['candidate note', refs.file]),
+		}, null, 2));
+		const loaded = readLaneConfig(configPath);
+		assert.equal(loaded.requiredReferences.length, 2);
+		const { pi, emitted } = fakePi();
+		const preflight = fakePreflight({ guard: config.guard });
+		const controller = await createLaneController(pi, loaded, { delegation, preflight }, { addSignalListener: noSignals });
+		assert.equal(controller.setupFailure, null, String(controller.setupFailure));
+		const task = String(controller.request.task);
+		// The raw task is kept verbatim and the pointers are appended, never searched for in prose.
+		assert.equal(task.startsWith(loaded.task), true);
+		const rendered = task.slice(loaded.task.length).split('\n').filter((line) => line.startsWith('- '));
+		assert.deepEqual(rendered, [`- required contract: ${refs.file}`, `- candidate note: ${refs.file}`],
+			'each label and each exact path is rendered once, in the declared order');
+		// Metadata admission is exactly that: not approval, and no guarantee of later availability.
+		assert.equal(/metadata/i.test(task), true, 'the task states what admission was');
+		assert.equal(/not approval/i.test(task), true, 'admission is not approval');
+		assert.equal(/still exists or is still readable/i.test(task), true, 'no later availability is promised');
+		// One task for both halves, so the bound digest covers exactly the bytes the child receives.
+		assert.equal(preflight.calls[0].task, task);
+		assert.equal(task.length <= 1_048_576, true, 'the effective task stays inside the existing raw cap');
+		assert.equal(emitted.filter((entry) => entry.event === delegation.SUBAGENT_DELEGATION_REQUEST_EVENT).length, 1);
+		completeLeaf(pi, controller);
+		await controller.settle();
+
+		// Omission preserves behaviour exactly: no list, no rendered block, byte-identical task.
+		const plain = tempConfig();
+		try {
+			const plainLoaded = readLaneConfig(plain.configPath);
+			assert.equal(plainLoaded.requiredReferences, undefined);
+			const plainPi = fakePi();
+			const plainPreflight = fakePreflight({ guard: plain.config.guard });
+			const unconfigured = await createLaneController(plainPi.pi, plainLoaded,
+				{ delegation, preflight: plainPreflight }, { addSignalListener: noSignals });
+			assert.equal(unconfigured.setupFailure, null);
+			assert.equal(unconfigured.request.task, plainLoaded.task);
+			assert.equal(plainPreflight.calls[0].task, plainLoaded.task);
+		} finally {
+			plain.cleanup();
+		}
+	} finally {
+		cleanup();
+	}
+});
+
+test('a missing, relative, wrong-shape, directory, unreadable or overbound reference is refused with zero dispatch', async () => {
+	const profile = { model: REVIEWER_MODEL, timeoutMs: 900_000 };
+	const { dir, config, configPath, cleanup } = tempConfig();
+	const refs = tempReferences(dir);
+	// A planted candidate note is the artifact a refusal must leave untouched.
+	const planted = join(dir, 'synthetic-candidate-note.md');
+	const plantedBody = `${PLANTED_RECENT}\n`;
+	writeFileSync(planted, plantedBody);
+	let variant = 0;
+	const variantPath = (overrides) => {
+		const path = join(dir, `lane-reference-${variant += 1}.json`);
+		writeFileSync(path, JSON.stringify({ ...config, ...overrides }, null, 2));
+		return path;
+	};
+	try {
+		// Shape is refused by both readers before anything is launched: no repaired value, no truncation,
+		// and no label or path echoed back to the caller.
+		const refusedShapes = [
+			['a bare path string', refs.file],
+			['a label-to-path map', { 'required contract': refs.file }],
+			['an empty list entry', ['']],
+			['a primitive entry', [refs.file]],
+			['an unknown entry field', [{ label: 'required contract', path: refs.file, note: 'synthetic' }]],
+			['a relative path', referenceList(['required contract', 'relative/reference.md'])],
+			['a control character in the label', referenceList(['required\ncontract', refs.file])],
+			['an overbound label', referenceList(['l'.repeat(129), refs.file])],
+			['an overbound path', referenceList(['required contract', `/${'p'.repeat(4096)}`])],
+			['an overbound count', referenceList(...Array.from({ length: 17 }, (unused, index) => [`ref ${index}`, `/${dir}/ref-${index}`]))],
+		];
+		for (const [name, requiredReferences] of refusedShapes) {
+			const path = variantPath({ requiredReferences });
+			let message = '';
+			try {
+				readLaneConfig(path);
+			} catch (error) {
+				message = String(error.message);
+			}
+			assert.equal(message, LANE_SETUP_FAILURES.references, `controller: ${name}`);
+			assert.equal(validateLaneConfig({ ...config, requiredReferences }, profile).reason, SETUP_FAILURES.references, `CLI: ${name}`);
+		}
+		assert.equal(validateLaneConfig({ ...config, requiredReferences: [] }, profile).ok, true, 'an empty list asserts no references');
+
+		// Metadata refusals happen in the controller, before preflight and before any dispatch. As root a
+		// mode-000 file is genuinely readable, so the unreadable branch is driven through the injected
+		// probe instead of a permission bit that would prove nothing about the refusal itself.
+		const refusedMetadata = [
+			{ name: 'missing', references: referenceList(['required contract', refs.absent]) },
+			{ name: 'directory', references: referenceList(['required contract', refs.directory]) },
+			{
+				name: 'unreadable',
+				references: referenceList(['required contract', refs.file]),
+				probe: () => ({ isFile: true, isDirectory: false, readable: false }),
+			},
+			{
+				name: 'not a regular file',
+				references: referenceList(['required contract', refs.file]),
+				probe: () => ({ isFile: false, isDirectory: false, readable: true }),
+			},
+			{
+				name: 'no metadata',
+				references: referenceList(['required contract', refs.file]),
+				probe: () => null,
+			},
+		];
+		for (const { name, references, probe } of refusedMetadata) {
+			const loaded = readLaneConfig(variantPath({ requiredReferences: references }));
+			const { pi, emitted } = fakePi();
+			const clock = fakeClock();
+			const preflight = fakePreflight({ guard: config.guard });
+			const controller = await createLaneController(pi, loaded, { delegation, preflight },
+				{ now: clock.now, arm: clock.arm, addSignalListener: noSignals, ...(probe === undefined ? {} : { referenceProbe: probe }) });
+			await controller.settle();
+			assert.equal(controller.setupFailure, LANE_SETUP_FAILURES.references, name);
+			assert.equal(preflight.calls.length, 0, `${name}: no launch contract was resolved`);
+			assert.equal(emitted.some((entry) => entry.event === delegation.SUBAGENT_DELEGATION_REQUEST_EVENT), false, `${name}: zero dispatch`);
+			assert.equal(existsSync(config.dispatch), false, `${name}: no dispatch was persisted`);
+			assert.equal(readFileSync(config.progress, 'utf8').includes('setup_failure'), true, `${name}: reported as a setup failure`);
+			assert.deepEqual(clock.timers, [], `${name}: no timer was armed`);
+			assert.equal(readFileSync(planted, 'utf8'), plantedBody, `${name}: the planted artifact is preserved`);
+			assert.equal(readFileSync(config.progress, 'utf8').includes(refs.file), false, `${name}: no planted path is echoed`);
+		}
+	} finally {
+		cleanup();
+	}
+});
+
+test('the CLI admits a real required reference before it launches and refuses one it cannot admit', async () => {
+	const { dir, config, configPath, cleanup } = tempConfig();
+	const refs = tempReferences(dir);
+	const planted = join(dir, 'synthetic-candidate-note.md');
+	const plantedBody = `${PLANTED_RECENT}\n`;
+	writeFileSync(planted, plantedBody);
+	let variant = 0;
+	const variantPath = (overrides) => {
+		const path = join(dir, `lane-cli-reference-${variant += 1}.json`);
+		writeFileSync(path, JSON.stringify({ ...config, ...overrides }, null, 2));
+		return path;
+	};
+	const clearEvidence = () => {
+		for (const path of [config.receipt, config.dispatch, config.verification, config.progress]) rmSync(path, { force: true });
+	};
+	try {
+		// Positive: the exact generated pointer reaches the native request the child is launched with.
+		clearEvidence();
+		const record = [];
+		const launched = await runNativeLane(['--config', variantPath({ requiredReferences: referenceList(['required contract', refs.file]) })], {
+			spawn: fakeSpawn({
+				record,
+				onLaunch: (options) => {
+					const childConfig = JSON.parse(readFileSync(options.env[ 'HYLJA_NATIVE_LANE_CONFIG' ], 'utf8'));
+					assert.deepEqual(childConfig.requiredReferences, [{ label: 'required contract', path: refs.file }],
+						'the child is launched with the exact path root admitted');
+				},
+			}),
+		});
+		assert.equal(record.length, 1, 'an admitted reference launches the lane once');
+		assert.equal(record[0].args.at(-1), FIXED_LANE_INPUT);
+		assert.equal(launched.reason, SETUP_FAILURES.receipt, 'the fake child leaves no leaf evidence behind');
+		assert.equal(readFileSync(planted, 'utf8'), plantedBody, 'the planted artifact survives the launched lane');
+
+		// Negatives: a fixed refusal, zero child processes and every artifact left exactly as it was.
+		// The unreadable case is injected through the CLI's own filesystem seam, so it holds as root.
+		const refused = [
+			{ name: 'missing', references: referenceList(['required contract', refs.absent]) },
+			{ name: 'directory', references: referenceList(['required contract', refs.directory]) },
+			{ name: 'relative', references: referenceList(['required contract', 'relative/reference.md']) },
+			{ name: 'wrong shape', references: { 'required contract': refs.file } },
+			{
+				name: 'unreadable',
+				references: referenceList(['required contract', refs.file]),
+				fs: { exists: existsSync, readFile: (path) => readFileSync(path, 'utf8'), file: () => ({ isFile: true, isDirectory: false, readable: false }) },
+			},
+			{
+				name: 'no metadata seam',
+				references: referenceList(['required contract', refs.file]),
+				fs: { exists: existsSync, readFile: (path) => readFileSync(path, 'utf8') },
+			},
+		];
+		for (const { name, references, fs } of refused) {
+			clearEvidence();
+			const record2 = [];
+			const result = await runNativeLane(['--config', variantPath({ requiredReferences: references })], {
+				spawn: fakeSpawn({ record: record2 }),
+				...(fs === undefined ? {} : { fs }),
+			});
+			assert.equal(result.reason, SETUP_FAILURES.references, name);
+			assert.equal(record2.length, 0, `${name}: zero dispatch`);
+			for (const path of [config.receipt, config.dispatch, config.verification, config.progress]) {
+				assert.equal(existsSync(path), false, `${name}: nothing was written to ${path}`);
+			}
+			assert.equal(readFileSync(planted, 'utf8'), plantedBody, `${name}: the planted artifact is preserved`);
+			assert.equal(readFileSync(configPath, 'utf8').includes('synthetic-planted-recent-output'), false, `${name}: no config echo`);
+		}
+	} finally {
+		cleanup();
+	}
+});
+
 /**
  * Real default adapters, real default platform. These two cases exist because injected fake
  * dependencies passed while the shipped defaults did not: a fake range read honored the range while
