@@ -22,18 +22,22 @@ none of them authorizes anything by itself.
 
 ## The fixture is explicitly ephemeral and synthetic
 
-Three in-process tenant fixtures, all values invented and non-routable: `*.invalid` tenant, project,
+Six in-process tenant fixtures, all values invented and non-routable: `*.invalid` tenant, project,
 session, principal, workload, purpose, sink and profile names; fixed byte fills as DEK and HMAC key
 material; one fixed synthetic epoch instant; one planted literal marker string. The fixtures live only
 for the duration of the test process, are never written to disk, never serialized to a snapshot and
-never sent anywhere.
+never sent anywhere. Two of them (`alpha` and `alpha-alt`) deliberately share the **same original,
+the same entity id, the same DEK, the same HMAC key and the same key version**, so that every
+difference observed between them is attributable to the tenant scope alone.
 
 A fixture holds **AEAD ciphertext plus non-secret metadata only**: `{version, nonce, ciphertext, tag}`
 from `sealMappingPayload`, the opaque `her1:` reference, the tenant/project/session scope, the current
 lifecycle state and revision, and the expiry instant. It holds no original value, no plaintext buffer,
-no store, no index, no blind-index equality lookup and no reversible credential alias. After
-construction, the only copy of the synthetic original anywhere in the process is the independent
-literal constant in the test file.
+no store, no index, no blind-index equality lookup and no reversible credential alias. The claim proved
+here is scoped to what the fixture *holds and emits*: no fixture property and no serialized fixture
+image contains the original. It is **not** a process-wide memory claim - nothing here inspects or
+guarantees the absence of copies inside the JavaScript heap, garbage-collected buffers, native crypto or
+swapped pages.
 
 **Authentication, key provision, clock and current-record authority are test fixtures, not
 mechanisms.** The DEK and HMAC key are literal byte arrays in the test, the authenticated subject is a
@@ -42,9 +46,19 @@ authenticates a principal, verifies a proof, wraps or rotates a key, reads a rea
 real destination or survives the test process. The "current record" is an object in the test process
 that the reducer commits to; it is not a database row, a transaction or a compare-and-set.
 
-`openMappingPayload` overwrites the sealed-record buffers it is handed on every exit, so the test
-copies the envelope for each open attempt. That is a harness detail of an ephemeral fixture, not
-persistence, retention or durability.
+Three gates stand between a fixture and a plaintext on the DISPLAY path, in this order: the mapping
+snapshot presented to the seam must still be the fixture's authoritative current record, the operation
+is pinned to `DISPLAY` *after* caller options are applied, and only an actual `AUTHORIZED` decision
+from the real seam permits one real `openMappingPayload` call. The second gate is why a caller cannot
+substitute its own operation: the release helper never reads an operation from its options.
+
+**Caller buffers and primitive hygiene.** The accepted AEAD contract is explicit that
+`openMappingPayload` never overwrites a buffer the caller supplied and never overwrites the plaintext
+it returns; it clears only the owned snapshots it took of the key and the envelope, and that hygiene is
+best effort in JavaScript, not a zeroization guarantee for copies held inside native crypto,
+garbage-collected buffers or swapped pages. The test clones the envelope for each open attempt so that
+repeated attempts over one fixture do not share buffers: that is harness convenience for reuse, not
+retention, persistence or durability, and it is not a claim that the primitive mutates caller memory.
 
 ## What the test verifies
 
@@ -60,29 +74,54 @@ persistence, retention or durability.
    `EXPORT` with `OPERATION_NOT_GRANTED`; a `DISPLAY` request under that grant withholds any release.
    The trusted test-local USE callback returns only the fixed non-secret outcome `USED`, and the model
    capture holds only that outcome and the opaque reference, never an original or a byte of one.
-4. **Scope-bound references.** The same synthetic original in two tenants yields two distinct opaque
+4. **The operation is pinned per path.** The release path pins `DISPLAY` and the USE path pins `USE`
+   *after* caller options are applied, so no option can substitute an operation. A `USE` grant asked
+   for as `USE` or `EXPORT` on the DISPLAY path is denied `OPERATION_NOT_GRANTED` with no open, and a
+   `DISPLAY` grant cannot be spent as a `USE`. Positive controls on the same fixture show the USE grant
+   authorizing `USE` and the DISPLAY grant authorizing exactly one DISPLAY release, so the refusals are
+   not vacuous.
+5. **Scope-bound references.** The same synthetic original in two tenants yields two distinct opaque
    `her1:` references from the existing keyed derivation. A foreign reference, tenant, session or
    subject denies at the seam (`UNKNOWN_MAPPING`, `SCOPE_MISMATCH`), a foreign observed destination
    denies at the grant's own destination binding (`GRANT_MISMATCH`), and tenant B's ciphertext opened
    under tenant A's expected scope and key is one indistinguishable `AUTHENTICATION_FAILED` with no
    plaintext field.
-5. **Zero plaintext on crypto failure.** Wrong key, wrong classification, wrong revision, wrong key
+6. **Controlled same-original, same-entity, same-key scope contrast.** `alpha` and `alpha-alt` share the
+   original, the entity id, the DEK, the HMAC key and the key version, and differ only in tenant,
+   project and session. Their SESSION-scope references differ, the same contrast holds at the narrower
+   TENANT derivation scope, and their ciphertexts do not open in each other's scope even with identical
+   plaintext bytes and an identical key, because the AAD binds the tenant. Each record still opens
+   under its own scope and restores the same independent literal.
+7. **Zero plaintext on crypto failure.** Wrong key, wrong classification, wrong revision, wrong key
    version, foreign entity, tampered ciphertext and tampered tag each return the fixed refusal with no
    `plaintext` and no `bytes` field, and no planted marker in the serialized refusal. A control case
    opens the untouched record, so the refusals are not vacuous.
-6. **Lifecycle commits to the current revision.** Activation commits a monotonic increment through the
-   real reducer; creation, expiry, scope and reference are unchanged by the transition. A stale
+8. **Lifecycle commits to the current revision.** Activation commits the literal revision `2` through
+   the real reducer; creation, expiry, scope and reference are unchanged by the transition. A stale
    `expectedRevision` is `STALE_REVISION` and never mutates the current record, a grant pinned to a
    superseded revision denies even against a record the host reads now, a cached snapshot of the
    record cannot authorize a grant pinned to the current revision, and `ACTIVATE` on an `ACTIVE`
    record is `INVALID_TRANSITION`.
-7. **Expiry, revocation and deletion cannot resolve.** `EXPIRED` denies `MAPPING_EXPIRED`, `REVOKED`
-   and `DELETED` deny `MAPPING_REVOKED`, reactivation of an expired record is `INVALID_TRANSITION`, a
-   repeated terminal command is idempotent (`UNCHANGED`, same revision) and an expired grant on a live
-   fixture denies `GRANT_EXPIRED` while a live grant on the same fixture still releases the literal.
+9. **A coherent cached snapshot cannot supersede the current record.** The stale triple - the cached
+   `ACTIVE` snapshot at revision `2`, a grant coherent with it (same reference, revision, scope and
+   destination, unexpired), and the fixture's own untouched ciphertext - is captured while the record is
+   genuinely active, released once under the live record, then presented again after a real revocation
+   to revision `3`. It withholds `SNAPSHOT_SUPERSEDED` with no open, while the live current record
+   denies `MAPPING_REVOKED` at the seam for the same ciphertext. The test states the attribution
+   explicitly: called on its own, the pure seam authorizes that stale triple, because a pure decision
+   seam trusts the snapshot the host hands it.
+10. **Expiry, revocation and deletion cannot resolve.** `EXPIRED` denies `MAPPING_EXPIRED`, `REVOKED`
+    and `DELETED` deny `MAPPING_REVOKED`, reactivation of an expired record is `INVALID_TRANSITION`, a
+    repeated terminal command is idempotent (`UNCHANGED`, and the same revision as the state captured
+    independently before that command) and an expired grant on a live fixture denies `GRANT_EXPIRED`
+    while a live grant on the same fixture still releases the literal. Each expected revision is a
+    literal (`2` after activation, `3` after expiry or revocation, `4` after deletion), never a
+    comparison against whatever the reducer returned.
 
-Every assertion compares fixed codes, states, booleans, lengths, tokens and byte arrays. A failure
-prints a code or a length, never a key byte, a plaintext byte or a native error.
+Every assertion compares fixed codes, states, booleans, lengths and tokens. Plaintext equality is
+decided by a local helper that returns one boolean, so an assertion failure prints `true`/`false` and
+never a byte of the synthetic original, a key byte or a native error. The model-visible capture admits
+only fixed outcome labels (`RELEASED`, `WITHHELD`, `USED`) and the opaque reference.
 
 ## Limits
 
@@ -92,9 +131,14 @@ prints a code or a length, never a key byte, a plaintext byte or a native error.
 - **No compare-and-set or race safety.** `expectedRevision` is compared against the one record the
   test process holds. There is no row lock, no transaction, no rollback detection and no claim about
   distributed races or concurrent writers.
-- **Not fresh by itself.** A valid old envelope still authenticates under a matching scope. Currency,
-  lifecycle and authority come from the trusted host record and the explicit grant, and here that host
-  is the test process itself.
+- **Current-record authority is host-side fixture code, not a shipped seam.** The snapshot check that
+  refuses a superseded snapshot is local harness logic modelling what a trusted store or broker must do;
+  `authorizeMappingOperation` itself has no store and cannot tell a current snapshot from a cached one.
+  A stale snapshot that reaches the seam with a coherent grant is authorized, and the test asserts that
+  fact rather than hiding it.
+- **Not fresh by itself.** A valid old envelope still authenticates under a matching scope, including
+  the revision `'1'` its AAD was sealed with. Currency, lifecycle and authority come from the trusted
+  host record and the explicit grant, and here that host is the test process itself.
 - **Not a vault, store, index or transport.** No persistence, no lookup, no equality search, no
   recovery, no backup, no external send, no network of any kind.
 - **Not an enforcement boundary.** The test proves that these four seams compose without leaking a
