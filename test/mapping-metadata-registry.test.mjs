@@ -707,3 +707,71 @@ test('every refusal code this registry can return is one of its fixed codes', ()
     'STALE_REVISION', 'UNKNOWN_MAPPING']);
   assert.equal(seen.has('REVISION_OVERFLOW'), false, 'the reducer ceiling was never reached');
 });
+
+test('a planted thrown value that also throws on inspection never escapes an operation', () => {
+  // A finite planted value: a proxy trap throws it, and asking it what it is throws again, so a
+  // classifier that interrogates the thrown value cannot answer at all.
+  const planted = new Proxy(new Error('planted-internal-detail.invalid'), {
+    getPrototypeOf() { throw new Error('planted-trap-fired.invalid'); },
+  });
+  const seededProxy = (target) => new Proxy(target, { ownKeys() { throw planted; } });
+  const registry = createMappingMetadataRegistry({ capacity: 4 });
+  registry.insert(insertRequest(), clock());
+  const calls = [
+    ['insert request', seededProxy(insertRequest()), clock()],
+    ['current request', seededProxy(lookup()), clock()],
+    ['transition request', seededProxy(command()), clock()],
+    ['insert clock', insertRequest(), seededProxy(clock())],
+    ['current clock', lookup(), seededProxy(clock())],
+    ['transition clock', command(), seededProxy(clock())],
+  ];
+  for (const [label, request, hostClock] of calls) {
+    for (const [operation, call] of [['insert', registry.insert], ['current', registry.current],
+      ['transition', registry.transition]]) {
+      const result = call.call(registry, request, hostClock);
+      assert.deepEqual(result, refused('INVALID_REQUEST'), `${label} via ${operation}`);
+      assert.equal(escapes(() => call.call(registry, request, hostClock)), false,
+        `${label} via ${operation} must not throw`);
+      const rendered = JSON.stringify(result);
+      for (const leaked of ['planted', 'Error', ' at ', 'getPrototypeOf']) {
+        assert.ok(!rendered.includes(leaked), `${label} via ${operation} must not disclose ${leaked}`);
+      }
+    }
+  }
+  // Nothing planted reached the registry either: the hostile request is refused, not partly applied.
+  assert.equal(registry.size, 1);
+  assert.equal(registry.current(lookup(), clock()).state, 'FOUND');
+});
+
+test('a duplicate insert observes the held record before it refuses as a duplicate', () => {
+  // Expiry is restrictive at every operation, and a duplicate insert is one of them: it names a
+  // record this registry owns, so it observes it the way `current` and `transition` do.
+  const atExpiry = createMappingMetadataRegistry({ capacity: 4 });
+  assert.equal(atExpiry.insert(insertRequest({ expiresAt: 200 }), clock(100)).state, 'INSERTED');
+  assert.deepEqual(atExpiry.insert(insertRequest({ expiresAt: 200 }), clock(200)),
+    refused('DUPLICATE_MAPPING'));
+  // The expiry instant latched it, so reading behind that observation cannot be `FOUND`: the clock
+  // moved backwards and is refused.
+  const behind = atExpiry.current(lookup(), clock(199));
+  assert.notEqual(behind.state, 'FOUND');
+  assert.deepEqual(behind, refused('CLOCK_ROLLBACK'));
+  // The observation drove `EXPIRE` through the same reducer, so it consumed a revision like any other
+  // effective change and the record the caller cached is now stale.
+  assert.deepEqual(atExpiry.transition(command({ expectedRevision: 1 }), clock(250)),
+    refused('STALE_REVISION'));
+  // The same duplicate past the expiry, then a later and valid clock: still expired, never live.
+  const past = createMappingMetadataRegistry({ capacity: 4 });
+  past.insert(insertRequest({ expiresAt: 200 }), clock(100));
+  assert.deepEqual(past.insert(insertRequest({ expiresAt: 200 }), clock(201)),
+    refused('DUPLICATE_MAPPING'));
+  assert.deepEqual(past.current(lookup(), clock(250)), absent('NOT_LIVE'));
+  assert.deepEqual(past.insert(insertRequest({ expiresAt: 200 }), clock(300)),
+    refused('DUPLICATE_MAPPING'), 'a held tombstone is still a duplicate');
+  // An ordinary duplicate inside the live window is still a plain duplicate refusal, and it observes
+  // nothing that changes the record or the registry.
+  const live = createMappingMetadataRegistry({ capacity: 4 });
+  const inserted = live.insert(insertRequest(), clock()).metadata;
+  assert.deepEqual(live.insert(insertRequest(), clock()), refused('DUPLICATE_MAPPING'));
+  assert.equal(live.size, 1);
+  assert.deepEqual(live.current(lookup(), clock()), { version: 1, state: 'FOUND', metadata: inserted });
+});

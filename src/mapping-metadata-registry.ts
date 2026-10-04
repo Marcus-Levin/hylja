@@ -113,11 +113,26 @@ const INSERT_KEYS = ['version', 'mappingRef', 'scope', 'expiresAt'];
 const LOOKUP_KEYS = ['version', 'mappingRef', 'scope'];
 const TRANSITION_KEYS = ['version', 'mappingRef', 'scope', 'expectedRevision', 'action'];
 
-class Invalid extends Error { constructor(readonly reason: MappingMetadataReason) { super(reason); } }
-function fail(reason: MappingMetadataReason): never { throw new Invalid(reason); }
-/** A hostile value that escaped the parsers still yields a fixed code and no exception detail. */
-function reasonOf(error: unknown): MappingMetadataReason {
-  return error instanceof Invalid ? error.reason : 'INVALID_REQUEST';
+/**
+ * Internal refusal sentinel. The reason lives in a module-private identity map, never on the object,
+ * so classifying a thrown value reads no property, message, `toString`, `reason` or getter off it.
+ */
+class Invalid extends Error { }
+const REFUSALS = new WeakMap<object, MappingMetadataReason>();
+function fail(reason: MappingMetadataReason): never {
+  const error = new Invalid();
+  REFUSALS.set(error, reason);
+  throw error;
+}
+/**
+ * Total classification of any thrown value, including a caller-planted one. Identity against the
+ * module-private map is the only lookup, and neither `typeof` nor a `WeakMap` key comparison invokes
+ * anything on the value, so a proxy whose traps throw cannot make this classify fail or escape. A
+ * value this module did not create is refused as an invalid request and no detail of it is read.
+ */
+function reasonOf(thrown: unknown): MappingMetadataReason {
+  if (typeof thrown !== 'object' || thrown === null) return 'INVALID_REQUEST';
+  return REFUSALS.get(thrown) ?? 'INVALID_REQUEST';
 }
 function fields(value: unknown, required: readonly string[], reason: MappingMetadataReason): Fields {
   if (value === null || typeof value !== 'object' || Array.isArray(value) ||
@@ -318,8 +333,12 @@ export function createMappingMetadataRegistry(optionsValue: unknown): MappingMet
     try {
       const request = parseInsert(requestValue);
       const now = parseClock(clockValue);
-      // Reference before capacity: a full registry still names the reference it already holds.
-      if (locate(request.scope, request.mappingRef) !== undefined) return refused('DUPLICATE_MAPPING');
+      // Reference before capacity: a full registry still names the reference it already holds. A
+      // duplicate insert is an operation on the held record like any other, so it observes it first:
+      // expiry latches here exactly as it does in `current` and `transition`, and a clock that moved
+      // backwards is refused rather than answered as a plain duplicate.
+      const held = locate(request.scope, request.mappingRef);
+      if (held !== undefined) { observe(held, now); return refused('DUPLICATE_MAPPING'); }
       if (request.expiresAt <= now) return refused('INVALID_EXPIRY');
       if (size >= capacity) return refused('REGISTRY_FULL');
       const entry: Entry = { mappingRef: request.mappingRef, scope: request.scope, state: 'CREATED',
