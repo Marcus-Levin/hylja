@@ -1116,44 +1116,64 @@ function rewriteFailure(parsed: ParseResult, fallback: string): string {
  * everywhere else. Any mismatch is a FAILURE: callers must not fall back to emitting the original text.
  * A source or round-trip parse that runs out of its time budget, or loses its clock, is a FAILURE too, and
  * the failure result carries no text at all.
+ *
+ * Caller arguments are read once inside a sanitization boundary, and a finite synchronous throw from one is
+ * a FAILURE: `REWRITE_ERROR` carries no text, no exception detail, no original and no partial rewrite, so a
+ * rewrite either completes every edit or emits nothing. A throwing or answer-changing getter, a value that
+ * is not an edit, and an iterator that throws after yielding one all take that path. Nothing here preempts a
+ * getter or callback that never returns: like the parse budget, this bounds what the parser charges, not
+ * arbitrary same-process code.
  */
 export function rewriteFieldValues(text: string, format: Format, edits: readonly RewriteEdit[], options: RewriteOptions = {}):
   { status: 'OK'; text: string } | { status: 'FAILURE'; reason: string } {
-  const before = parseStructured(text, format, options.budget, options.host);
-  if (before.status !== 'COMPLETE' || before.coverage !== 'FULL') {
-    return { status: 'FAILURE', reason: rewriteFailure(before, 'SOURCE_NOT_COMPLETE') };
-  }
-  if (before.reasons.includes('DUPLICATE_KEY')) return { status: 'FAILURE', reason: 'SOURCE_AMBIGUOUS' };
-  if (before.comments.length && options.comments !== 'REMOVE') return { status: 'FAILURE', reason: 'SOURCE_HAS_COMMENTS' };
-  const byStart = new Map(before.fields.map((field, index) => [`${field.valueStart}:${field.valueEnd}`, index]));
-  const replacements = new Map<number, string>();
-  for (const edit of edits) {
-    const index = byStart.get(`${edit.field?.valueStart}:${edit.field?.valueEnd}`);
-    if (index === undefined || typeof edit.replacement !== 'string' || replacements.has(index)) {
-      return { status: 'FAILURE', reason: 'INVALID_EDIT' };
+  try {
+    // Snapshot the options both parses share, once. A getter that throws, or that answers differently later,
+    // cannot swap the budget or the clock halfway through the rewrite.
+    const { budget, host } = options;
+    const before = parseStructured(text, format, budget, host);
+    if (before.status !== 'COMPLETE' || before.coverage !== 'FULL') {
+      return { status: 'FAILURE', reason: rewriteFailure(before, 'SOURCE_NOT_COMPLETE') };
     }
-    replacements.set(index, edit.replacement);
+    if (before.reasons.includes('DUPLICATE_KEY')) return { status: 'FAILURE', reason: 'SOURCE_AMBIGUOUS' };
+    if (before.comments.length && options.comments !== 'REMOVE') return { status: 'FAILURE', reason: 'SOURCE_HAS_COMMENTS' };
+    const byStart = new Map(before.fields.map((field, index) => [`${field.valueStart}:${field.valueEnd}`, index]));
+    const replacements = new Map<number, string>();
+    for (const edit of edits) {
+      // One read of each caller value per edit: a span read twice, or a replacement read once for its type
+      // and again for its value, lets a getter that answers differently the second time move or swap an edit
+      // that has already been decided.
+      const field = edit.field;
+      const index = byStart.get(`${field?.valueStart}:${field?.valueEnd}`);
+      if (index === undefined || replacements.has(index)) return { status: 'FAILURE', reason: 'INVALID_EDIT' };
+      const replacement = edit.replacement;
+      if (typeof replacement !== 'string') return { status: 'FAILURE', reason: 'INVALID_EDIT' };
+      replacements.set(index, replacement);
+    }
+    // Splice right to left: field values, then removed comment text, never overlapping.
+    const splices: { start: number; end: number; text: string }[] = [];
+    for (const [index, replacement] of replacements) {
+      const field = before.fields[index]!;
+      const encoded = encodeFor(field.syntax, replacement);
+      if (encoded === null) return { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' };
+      splices.push({ start: field.valueStart, end: field.valueEnd, text: encoded });
+    }
+    for (const comment of before.comments) splices.push({ start: format === 'XML' ? comment.start : comment.start + 1,
+      end: comment.end, text: '' });
+    splices.sort((a, b) => b.start - a.start);
+    let output = text;
+    for (const splice of splices) output = output.slice(0, splice.start) + splice.text + output.slice(splice.end);
+    const after = parseStructured(output, format, budget, host);
+    if (after.status !== 'COMPLETE') return { status: 'FAILURE', reason: rewriteFailure(after, 'ROUND_TRIP_MISMATCH') };
+    if (after.fields.length !== before.fields.length) return { status: 'FAILURE', reason: 'ROUND_TRIP_MISMATCH' };
+    for (let index = 0; index < before.fields.length; index++) {
+      const expected = replacements.get(index) ?? before.fields[index]!.value;
+      if (JSON.stringify(after.fields[index]!.path) !== JSON.stringify(before.fields[index]!.path) ||
+        after.fields[index]!.value !== expected) return { status: 'FAILURE', reason: 'ROUND_TRIP_MISMATCH' };
+    }
+    return { status: 'OK', text: output };
+  } catch {
+    // A finite synchronous caller-side throw is a rewrite failure, never a crash and never a partial rewrite:
+    // nothing spliced or emitted leaves this branch, and the reason names no exception, cause or value.
+    return { status: 'FAILURE', reason: 'REWRITE_ERROR' };
   }
-  // Splice right to left: field values, then removed comment text, never overlapping.
-  const splices: { start: number; end: number; text: string }[] = [];
-  for (const [index, replacement] of replacements) {
-    const field = before.fields[index]!;
-    const encoded = encodeFor(field.syntax, replacement);
-    if (encoded === null) return { status: 'FAILURE', reason: 'UNENCODABLE_REPLACEMENT' };
-    splices.push({ start: field.valueStart, end: field.valueEnd, text: encoded });
-  }
-  for (const comment of before.comments) splices.push({ start: format === 'XML' ? comment.start : comment.start + 1,
-    end: comment.end, text: '' });
-  splices.sort((a, b) => b.start - a.start);
-  let output = text;
-  for (const splice of splices) output = output.slice(0, splice.start) + splice.text + output.slice(splice.end);
-  const after = parseStructured(output, format, options.budget, options.host);
-  if (after.status !== 'COMPLETE') return { status: 'FAILURE', reason: rewriteFailure(after, 'ROUND_TRIP_MISMATCH') };
-  if (after.fields.length !== before.fields.length) return { status: 'FAILURE', reason: 'ROUND_TRIP_MISMATCH' };
-  for (let index = 0; index < before.fields.length; index++) {
-    const expected = replacements.get(index) ?? before.fields[index]!.value;
-    if (JSON.stringify(after.fields[index]!.path) !== JSON.stringify(before.fields[index]!.path) ||
-      after.fields[index]!.value !== expected) return { status: 'FAILURE', reason: 'ROUND_TRIP_MISMATCH' };
-  }
-  return { status: 'OK', text: output };
 }
