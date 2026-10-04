@@ -40,10 +40,50 @@ package is added to this repository.
 - Headless: `--no-skills --skill .agents/skills/hylja-development` loads only that skill; without
   `--no-skills`, every discovered global skill is also eligible for automatic selection.
 - Grant project trust once: `/trust`, or `--approve`.
-- Launch: `subagent({ agent: "hylja-implementer", task: <brief>, cwd: <worktree>, async: false })`. Both role profiles set `async: false`, so a lane is a foreground native child and its result returns in-session. An empty `extensions:` value in each profile disables ambient extension loading in the child; builtin tools, the providers the host registered, and host-required child extensions still load.
+- Launch: `subagent({ agent: "hylja-implementer", task: <brief>, cwd: <worktree>, async: false })`. Both role profiles set `async: false`, so a lane is a foreground native child and its result returns in-session. Each profile's `extensions:` value is an allowlist rather than empty, so ambient extension loading stays disabled in the child while the project workflow guard loads; builtin tools, the providers the host registered, and host-required child extensions still load.
 
 Another checkout needs no installer: copy each `principle-*/SKILL.md` from the pinned upstream pstack
 commit into `~/.agents/skills/<name>/`, MIT license kept.
+
+## Workflow guard
+
+`.pi/extensions/hylja-workflow-guard.ts` is a Pi adapter over the pure helper
+`.pi/lib/hylja-command-guard.mjs`; both are developer tooling, and neither is in the tracked typecheck
+or build scope (`tsconfig.json` includes `src/**/*.ts`). It exists because one run spent eight minutes
+on `find / -name hylja-implementer.md` after the exact path had been supplied; a prompt alone did not
+prevent the recurrence.
+
+Two guarantees, both decided before the tool executes, both logged nowhere:
+
+| Call | Decision |
+|---|---|
+| `find` with a machine-wide absolute root | blocked with a fixed reason naming the allowed roots |
+| `timeout` omitted | set to 120 s, Pi's builtin bash having no default |
+| `timeout` present, 0 < t <= 300 | preserved unchanged |
+| `timeout` > 300 s | clamped to 300 s |
+| `timeout` malformed, non-finite or <= 0 | blocked with a fixed reason |
+| any other tool | untouched |
+
+Wiring: project extension discovery loads it for the coordinator (`<cwd>/.pi/extensions/`), and both
+role profiles declare `extensions: ../extensions/hylja-workflow-guard.ts`, an allowlist that keeps
+ambient extensions off in a foreground child while the host-required child extensions, the registered
+providers and the builtin tools still resolve. The relative entry resolves against the agent file's own
+directory, which is what pi-subagents does for a path-like `extensions` entry; the profiles' other
+settings are unchanged.
+
+Limits, stated so no one reads more into it: it is a workflow guard, not a shell sandbox, a command
+parser or an enforcement boundary. It splits a command textually on control separators and whitespace,
+strips quotes and inspects only the leading tokens of each segment. Dynamic expansion, `eval`, aliases,
+value-taking wrappers, indirectly invoked `find`, MCP or another harness that reaches a shell, and any
+other API are outside it; the timeout default still bounds those calls, and nothing proves a permitted
+command is safe, bounded or correct. Unlisted absolute roots, `/tmp` and `$HOME`-relative searches are
+allowed on purpose, so the guard cannot block scoped repository discovery or the installed skill paths.
+
+Evidence: `node --test test/hylja-workflow-guard.test.mjs` exercises the helper and the adapter
+directly, including the exact command shape that failed, quoted and absolute-executable variants, scoped
+discovery, the timeout default, preservation, clamp and refusal, that no other tool is mutated, and that
+each role profile's declared path resolves to an existing file. The load path itself is proven by a
+native smoke run, not by this document.
 
 ## Admission and concurrency
 
@@ -97,7 +137,8 @@ ordering or timing.
 ## Limits
 
 Nothing here is measured: no throughput, cost or defect-rate improvement is claimed. Pins, deadlines
-and verdicts are configuration and prompt contracts, not enforcement boundaries.
+and verdicts are configuration and prompt contracts, not enforcement boundaries. The workflow guard
+removes one observed stall; it is not a measured gain and it is not a safety property.
 
 ## Proposed execution brief for #147 (proposal, not applied)
 

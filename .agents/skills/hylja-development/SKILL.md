@@ -19,6 +19,37 @@ The principle files are installed with `disable-model-invocation: true`, so the 
 out of child prompt injection: `skills:` entries deliver names, not contents. Both role prompts name
 the paths and require a full read first. An unreadable path is INCOMPLETE.
 
+## Workflow guard
+
+Load [`.pi/extensions/hylja-workflow-guard.ts`](../../../.pi/extensions/hylja-workflow-guard.ts). Project
+extension discovery loads it for this coordinator session, and each role profile lists it explicitly
+under `extensions:` because an allowlist disables ambient extensions in a child. Confirm it is loaded
+once per session (`pi list`) before dispatching a lane; an absent guard is a setup failure, not a
+silently weaker run.
+
+It refuses two things: a `find` whose search root is a machine-wide absolute root, and a malformed bash
+timeout. It also guarantees every builtin bash call a finite timeout (120s default, 300s ceiling, a
+tighter explicit value preserved). Refusals name the allowed roots and log no command, argument or
+output.
+
+Persistent operating rules, because a prompt alone did not stop the recurrence:
+
+- The initial handoff uses the exact entry points already supplied: brief pointers, decision paths,
+  `.pi/agents/`, this skill, `docs/development/pipeline.md`, and the three installed principle paths.
+  Do not rediscover them by searching the machine.
+- Search a filesystem only when a pointer is absent, and then only inside the repository worktree or a
+  root named in the brief or in these paths (for example the home directory holding the installed
+  skills). Scoped `find .`, `find src` and `grep` stay allowed.
+- A guard refusal is a setup finding: use the exact path you were given, or report that the pointer is
+  missing. Never retry the same search in another quoting, wrapper or executable form.
+- Root owns the wall clock. Watch public tool progress in the session and stop a command that has run
+  past its named budget instead of waiting for the deadline; the guard's timeout bounds a single call,
+  not the lane budget.
+
+It is a workflow guard, not a shell sandbox or a command parser: dynamic expansion, `eval`, aliases,
+value-taking wrappers, indirect execution and other APIs are outside it, and it proves nothing about
+what a permitted command does.
+
 ## Admit
 
 1. Take issues whose brief states outcome, pointers, scope, acceptance, invariants, exact verification commands, prerequisites and human gates. Form: `.github/ISSUE_TEMPLATE/agent-task.yml`.
@@ -28,14 +59,14 @@ the paths and require a full read first. An unreadable path is INCOMPLETE.
 
 `subagent({ agent: "hylja-implementer", task: <brief>, cwd: <worktree>, async: false })`.
 
-A foreground native child is the default: root launches the lane and the result arrives in-session. Pinned to `opencode-go/space-bunny-free:max`, 20-minute deadline, fresh context, `AGENTS.md` inherited, three principles read explicitly, ambient extensions off, no nested agents. Required before the lane ends: red test first for a contract change, green verification commands, a commit. Anything unmet ends INCOMPLETE with the reason, never an implicit pass.
+A foreground native child is the default: root launches the lane and the result arrives in-session. Pinned to `opencode-go/space-bunny-free:max`, 20-minute deadline, fresh context, `AGENTS.md` inherited, three principles read explicitly, ambient extensions off with the workflow guard as the only allowlisted one, no nested agents. Required before the lane ends: red test first for a contract change, green verification commands, a commit. Anything unmet ends INCOMPLETE with the reason, never an implicit pass.
 
 ## Review lane
 
 Only after the implementer commit exists, one independent review of that exact SHA:
 `subagent({ agent: "hylja-reviewer", task: <SHA, brief, changed surface>, cwd: <worktree>, async: false })`.
 
-Pinned to `openai-codex/gpt-6.1-sol:max`, 15-minute deadline, read and `bash` only. It reviews that exact SHA and changed surface from source, not the author's claims, reuses unchanged evidence by identity, and batches every actionable finding. A blocker cites a contract, a source location or a reproduction.
+Pinned to `openai-codex/gpt-6.1-sol:max`, 15-minute deadline, read and `bash` only, with the workflow guard loaded as its one allowlisted extension. It reviews that exact SHA and changed surface from source, not the author's claims, reuses unchanged evidence by identity, and batches every actionable finding. A blocker cites a contract, a source location or a reproduction.
 
 Verdicts: APPROVED, CHANGES REQUESTED, INCOMPLETE. Expiry, a missing verdict or an unresolved error is
 INCOMPLETE; approval is never inferred from silence.

@@ -16,9 +16,10 @@ allowNestedSubagents: false
 acceptanceRole: read-only
 async: false
 timeoutMs: 900000
-# Empty value: no ambient extensions load in this foreground child. Builtin tools and the providers
-# the host registered still resolve, and host-required child extensions survive this setting.
-extensions:
+# Allowlist, not empty: ambient extensions stay off in this foreground child, and only the project
+# workflow guard loads, resolved against this file's directory. Builtin tools and the providers the
+# host registered still resolve, and host-required child extensions survive this setting.
+extensions: ../extensions/hylja-workflow-guard.ts
 tools: read, grep, find, ls, bash
 ---
 
@@ -34,6 +35,10 @@ injection. Expand `~` to the home directory (here `/home/marcus`).
 - `~/.agents/skills/principle-guard-the-context-window/SKILL.md`
 - `~/.agents/skills/principle-sequence-verifiable-units/SKILL.md`
 - `~/.agents/skills/principle-prove-it-works/SKILL.md`
+
+Use those exact paths. Search a filesystem only when a pointer is missing, and then only inside the
+repository or a named root. The workflow guard above refuses a machine-wide `find` and gives every
+`bash` call a finite timeout; a refusal names the allowed roots, so comply instead of retrying variants.
 
 Apply them to this review. Read no other skill or playbook. If any of the three is missing or
 unreadable, stop and report INCOMPLETE with that path before reviewing anything.
