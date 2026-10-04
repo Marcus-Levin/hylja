@@ -1,0 +1,77 @@
+name: Agent task
+description: A delegated implementation task with an observable outcome, bounded scope, and exact verification commands.
+title: "[agent-task] "
+labels:
+  - agent-task
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Developer tooling only, not a security or evaluation authority. No real customer, employee,
+        infrastructure, credential or production data. A section left vague blocks admission to a
+        delegation lane. Never weaken an existing security contract or a proposed/human gate to fit
+        a plan.
+
+  - type: input
+    id: outcome
+    attributes:
+      label: Observable outcome
+      description: One sentence describing the behavior a reviewer can see. No plan or background.
+    validations:
+      required: true
+
+  - type: textarea
+    id: pointers
+    attributes:
+      label: Pointers
+      description: Relevant source files, contracts, specs and decisions, with their status lines.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: In scope (paths/behavior) and explicitly out of scope.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Executable examples or observable checks. Prefer these over a written plan.
+    validations:
+      required: true
+
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Invariants that must not change
+      description: Security invariants, contract clauses and evaluation protocol rules that must hold.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Exact verification commands
+      description: The exact commands, in order, that must pass before review.
+    validations:
+      required: true
+
+  - type: textarea
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      description: What must actually exist or be installed now. State "none" if nothing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: gates
+    attributes:
+      label: Human gates and open decisions
+      description: Decisions needing a human, their current status, and who may accept them. "None" if none.
+    validations:
+      required: true
