@@ -90,6 +90,42 @@ discovery, the timeout default, preservation, clamp and refusal, that no other t
 each role profile's declared path resolves to an existing file. The load path itself is proven by a
 native smoke run, not by this document.
 
+## Native lane controller (no coordinator-model turn)
+
+Root may instead run one lane through `node scripts/development/run-native-lane.mjs --config <absolute
+config.json>`. The CLI launches Pi once with three extensions it is given by exact path (the installed
+`pi-subagents` entry, `.pi/extensions/hylja-workflow-guard.ts`, and the opt-in controller
+`.pi/lib/hylja-native-lane.ts`), disables extension, skill and prompt-template discovery, sends the one
+fixed input `hylja-native-lane`, and the controller answers it through `pi-subagents`' documented
+structured foreground delegation API. No coordinator model participates in that process, so a burst of
+lanes no longer waits for a coordinator turn; nothing here is a measured speedup.
+
+The root-owned config is bounded and explicit: `key`, `agent` (`hylja-implementer` or
+`hylja-reviewer`), `task`, `cwd`, `timeoutMs` (at most that profile's own frontmatter deadline, 20 and
+15 minutes), `sessionDir`, `receipt`, `verification`, `progress`, `dispatch`, and the exact `pi`,
+`subagents`, `guard` and `controller` paths. A `model` key is refused rather than ignored, so no model
+override exists. Paths are never discovered, the guard is always loaded, and no background mode, role
+fallback or nesting is available.
+
+Evidence the CLI requires before it reports a lane: the controller's public terminal receipt with the
+literal public result, authoritative cumulative usage and the actual model, thinking level and status;
+one listing of `{sessionDir}/subagent-artifacts/` for `*_meta.json` and `*_output.md` only; and a
+runtime record whose `runId` and `agent` match, whose effective `model` equals the role profile's `:max`
+model, whose `launchContractDigest` equals the terminal response's, whose
+`launchResolvedExtensions` shows `disableAmbientExtensions: true` with the declared allowlist present in
+the effective set, and whose `acceptance` is explicit. Absent or mismatched evidence is a setup failure,
+never an inferred pass. A `completed` leaf is never approval: the verdict is only the leaf's own literal
+`APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE` line.
+
+Bounds, stated so no one reads more into it: progress lines carry model, runId, elapsed milliseconds and
+tool count only, and `recentOutput`, tool arguments, raw sessions and provider reasoning are never read
+or written. Cancellation reaches only the exact owned tuple that `dispatch` persists, and only inside
+the running process, so cancelling a lane root no longer owns is out of scope here. The CLI kills its
+own child one minute past the native request timeout. The role profile remains the only place a model is
+configured, the launch path is proven by the behaviour tests plus a native smoke run, and this is
+developer tooling, not a shell sandbox, an authorization point or an enforcement boundary. No throughput
+claim has been measured.
+
 ## Admission and concurrency
 
 The coordinator admits only *ready* issues: an accepted brief and no unmet human gate on its critical

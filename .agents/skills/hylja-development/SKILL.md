@@ -50,6 +50,19 @@ It is a workflow guard, not a shell sandbox or a command parser: dynamic expansi
 value-taking wrappers, indirect execution and other APIs are outside it, and it proves nothing about
 what a permitted command does.
 
+## Native lane controller (optional, no coordinator turn)
+
+`node scripts/development/run-native-lane.mjs --config <absolute config.json>` runs one lane with no
+coordinator-model turn: the CLI launches Pi once with the installed `pi-subagents`, the project workflow
+guard and the opt-in controller `.pi/lib/hylja-native-lane.ts`, and the controller answers the single
+fixed input `hylja-native-lane` through the documented foreground delegation API. Give it the role,
+worktree, task, a deadline no greater than that profile's, the session and evidence paths, and the exact
+`pi`, `subagents`, `guard` and `controller` paths. There is no model override (a `model` key is refused),
+no background mode, no role fallback and no nesting. Read
+[pipeline.md](../../../docs/development/pipeline.md#native-lane-controller-no-coordinator-model-turn) for
+the evidence it requires and for its stated limits: completed is not approved, missing or mismatched
+runtime evidence is a setup failure, and no speedup has been measured.
+
 ## Admit
 
 1. Take issues whose brief states outcome, pointers, scope, acceptance, invariants, exact verification commands, prerequisites and human gates. Form: `.github/ISSUE_TEMPLATE/agent-task.yml`.
