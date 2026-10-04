@@ -607,6 +607,166 @@ test('a route or profile that changes before dispatch refuses with no await in b
     }
   });
 
+test('a cancellation raised inside the last host observation withholds the dispatch',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const commit = { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(BUNDLE) };
+    const observation = Object.freeze({ destination: { id: SINK.ref, profileDigest: PROFILE_DIGEST }, commit });
+
+    // Positive control: the same host and the same queued second observation, cancelling nothing. One
+    // real fixed-worker check, one real loopback capture, exactly the independently declared image.
+    const safe = await harness(t, { observations: [observation, observation] });
+    assert.deepEqual(await bounded(safe.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    }), 'final observation without a cancel'), { status: 'SENT' });
+    assert.equal(safe.dispatch.length, 1);
+    assert.equal(safe.sink.captures.length, 1);
+    assert.equal(safe.sink.captures[0].equals(expectedImage()), true);
+    assert.equal(safe.sender.state, 'IDLE');
+
+    // The send point cancels from inside the last observation it returns. Sticky cancellation is read
+    // again AFTER that callback, so the transport is still never invoked and nothing reaches the sink.
+    const sink = await startSink();
+    t.after(() => sink.close());
+    const { host, dispatch } = createHost(sink, { observations: [observation, observation] });
+    const transport = host.sendPoint;
+    const owner = { sender: null };
+    let calls = 0;
+    host.sendPoint = Object.freeze({
+      observe: () => {
+        calls += 1;
+        if (calls === 2) owner.sender.cancel();
+        return observation;
+      },
+      sendExact: transport.sendExact,
+    });
+    const sender = createOpenAiKeepSender(host);
+    owner.sender = sender;
+    assert.deepEqual(await bounded(sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    }), 'cancelled inside the final observation'), { status: 'REFUSED', code: 'CANCELLED' });
+    assert.equal(calls, 2, 'the refusal came after the final observation, not before it');
+    assert.equal(sender.state, 'CANCELLED');
+    assertNothingSent(sink, dispatch);
+  });
+
+test('an accepted transport is captured, so a send-point Proxy get trap cannot run at dispatch',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const sink = await startSink();
+    t.after(() => sink.close());
+    const { host, dispatch } = createHost(sink);
+    const owner = { sender: null };
+    let methodReads = 0;
+    // A supported Proxy send point: exactly the two declared own data properties, so it is accepted
+    // like any other host. Its `get` trap cancels the sender the first time the transport method is
+    // read back off it. Reading that method at the dispatch point is a host callback after the last
+    // guard, so the accepted function must be captured during validation and invoked from there.
+    host.sendPoint = new Proxy(host.sendPoint, {
+      get(object, key, receiver) {
+        if (key === 'sendExact') {
+          methodReads += 1;
+          if (owner.sender !== null) owner.sender.cancel();
+        }
+        return Reflect.get(object, key, receiver);
+      },
+    });
+    const sender = createOpenAiKeepSender(host);
+    owner.sender = sender;
+    assert.deepEqual(await bounded(sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    }), 'proxy send point'), { status: 'SENT' });
+    assert.equal(methodReads, 0, 'the accepted transport method was never looked up again');
+    assert.equal(sender.state, 'IDLE', 'no host callback cancelled this sender after the guards');
+    assert.equal(dispatch.length, 1, 'exactly one trusted transport dispatch');
+    assert.equal(sink.connections, 1);
+    assert.equal(sink.captures.length, 1);
+    assert.equal(sink.captures[0].equals(expectedImage()), true, 'the sink received the declared image');
+  });
+
+test('a captured transport keeps its own receiver and is not retargeted by a later method swap',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const commit = { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(BUNDLE) };
+    const observation = Object.freeze({ destination: { id: SINK.ref, profileDigest: PROFILE_DIGEST }, commit });
+    let observations = 0;
+    let receiverPreserved = true;
+    let released = null;
+    // Exactly the two declared own data properties. Every host state these methods use lives in this
+    // closure, so the only way `this` can be wrong is a lost receiver.
+    const sendPoint = {
+      observe() { if (this !== sendPoint) receiverPreserved = false; observations += 1; return observation; },
+      async sendExact(image) { if (this !== sendPoint) receiverPreserved = false; released = Buffer.from(image); },
+    };
+    const point = await harness(t, { sink: null, host: { sendPoint } });
+    // A host that replaces its own transport method after construction does not retarget this sender.
+    let swapped = 0;
+    sendPoint.sendExact = async () => { swapped += 1; };
+    assert.deepEqual(await bounded(point.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    }), 'captured transport'), { status: 'SENT' });
+    assert.equal(receiverPreserved, true, 'each captured method ran on the send point it was accepted on');
+    assert.equal(observations, 2, 'the route is still observed fresh for the check and at the dispatch');
+    assert.equal(swapped, 0, 'the replacement installed after construction was never invoked');
+    assert.equal(released.equals(expectedImage()), true, 'the captured transport sent the declared image');
+    assert.equal(point.dispatch.length, 0, 'the replaced method is not what dispatched');
+    assert.equal(point.sender.state, 'IDLE');
+  });
+
+test('boundary evidence that expires during a finite inspection never authorizes a dispatch',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // One proof window, and the real elapsed time this fixture spends inside the trusted inspection
+    // under it. Nothing here is stubbed: the envelope, the sender and the expiry check all read the
+    // same real `Date.now()`, and time only ever moves forward, so this cannot flake the other way.
+    const PROOF_WINDOW_MS = 200;
+    const INSPECTION_MS = 600;
+    const spinTo = (deadline) => {
+      for (let now = Date.now(); now < deadline; now = Date.now()) { /* finite real inspection */ }
+    };
+
+    for (const [name, windowMs, result] of [
+      ['expired before the dispatch', PROOF_WINDOW_MS, { status: 'REFUSED', code: 'INTERACTION_REFUSED' }],
+      ['still current at the dispatch', 60_000, { status: 'SENT' }],
+    ]) {
+      // Initially VALID evidence in both cases: issued now, expiring `windowMs` from now.
+      const issuedAt = Date.now();
+      const fresh = (ref) => Object.freeze({
+        ref,
+        issuedAt: new Date(issuedAt).toISOString(),
+        expiresAt: new Date(issuedAt + windowMs).toISOString(),
+      });
+      const boundary = Object.freeze({
+        authenticated: {
+          ...BOUNDARY.authenticated,
+          identityProof: fresh('identity-window.invalid'), requestProof: fresh('request-window.invalid'),
+        },
+        observed: {
+          ...BOUNDARY.observed,
+          sourceProof: fresh('source-window.invalid'), routeProof: fresh('route-window.invalid'),
+        },
+      });
+      const point = await harness(t, {
+        boundary,
+        inspect: (image, binding) => {
+          spinTo(issuedAt + INSPECTION_MS);
+          return inspectWholeImage(image, binding);
+        },
+      });
+      assert.deepEqual(await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+      }), name), result, name);
+      if (result.status === 'SENT') {
+        // The identical finite inspection with current evidence still reaches the real transport.
+        assert.equal(point.dispatch.length, 1, name);
+        assert.equal(point.sink.captures.length, 1, name);
+        assert.equal(point.sink.captures[0].equals(expectedImage()), true, name);
+        assert.equal(point.sender.state, 'IDLE', name);
+      } else {
+        // The real fixed-worker child ALLOWed these bytes; only the dispatch-time freshness re-read
+        // withheld them, so nothing was dispatched, connected or captured.
+        assertNothingSent(point.sink, point.dispatch);
+        assert.equal(point.sender.state, 'IDLE', name);
+      }
+    }
+  });
+
 test('a dispatch failure is a fixed code and never leaks the transport exception',
   { timeout: TEST_TIMEOUT_MS }, async (t) => {
     const { sender, dispatch } = await harness(t, {
@@ -694,5 +854,33 @@ test('an unusable trusted host yields a permanently restrictive sender, never a 
       // Cancelling an unusable sender is a no-op, not a crash and not a state change.
       sender.cancel();
       assert.equal(sender.state, 'FAILED', name);
+    }
+  });
+
+test('a revoked Proxy anywhere in the trusted host is contained as an unusable sender',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const { host, dispatch } = createHost(null);
+    // A revoked Proxy throws from every trap, including the array check the structural reader starts
+    // with. That is contained by the structural refusal, not by an exception escaping construction.
+    const revokedHost = Proxy.revocable(host, {});
+    revokedHost.revoke();
+    const revokedSendPoint = Proxy.revocable(host.sendPoint, {});
+    revokedSendPoint.revoke();
+
+    for (const [name, unusable] of [
+      ['revoked host', revokedHost.proxy],
+      ['revoked send point', { ...host, sendPoint: revokedSendPoint.proxy }],
+    ]) {
+      let sender = null;
+      let threw = false;
+      try { sender = createOpenAiKeepSender(unusable); } catch { threw = true; }
+      assert.equal(threw, false, `${name}: construction never throws`);
+      assert.equal(sender.state, 'FAILED', name);
+      assert.deepEqual(await bounded(sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+      }), name), { status: 'REFUSED', code: 'HOST_INVALID' }, name);
+      sender.cancel();
+      assert.equal(sender.state, 'FAILED', name);
+      assert.equal(dispatch.length, 0, `${name}: the transport was never invoked`);
     }
   });

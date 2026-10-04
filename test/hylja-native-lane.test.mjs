@@ -19,6 +19,7 @@ import ts from 'typescript';
 
 import {
 	FIXED_LANE_INPUT,
+	MAX_PROGRESS_BYTES,
 	MAX_PROGRESS_RECORDS,
 	SETUP_FAILURES as LANE_SETUP_FAILURES,
 	createLaneController,
@@ -34,6 +35,7 @@ import {
 	readProgress,
 	readRoleProfile,
 	runNativeLane,
+	MAX_RANGE_READ_BYTES,
 	SETUP_FAILURES,
 	validateLaneConfig,
 	verifyArtifacts,
@@ -271,6 +273,49 @@ function fakeSpawn({ onLaunch, record = [], exitCode = 0, hang = false } = {}) {
 	};
 }
 
+/**
+ * One fake clock for the controller's injected `now` and `arm`: every armed timer is recorded with
+ * its delay, and the closure it handed back is what cancels it. A case can therefore fire or drain a
+ * soft budget deterministically, without waiting out wall-clock minutes and without a timer type cast.
+ */
+function fakeClock() {
+	const timers = [];
+	let current = 0;
+	return {
+		timers,
+		now: () => current,
+		arm(handler, delayMs) {
+			const timer = { handler, delayMs, due: current + delayMs, cancelled: false, fired: false };
+			timers.push(timer);
+			return () => {
+				timer.cancelled = true;
+			};
+		},
+		fire(delayMs) {
+			const timer = timers.find((entry) => entry.delayMs === delayMs && !entry.fired);
+			if (timer === undefined) throw new Error(`synthetic: no armed timer at ${delayMs}`);
+			timer.fired = true;
+			current = timer.due;
+			timer.handler();
+		},
+	};
+}
+
+/** The soft-budget warnings the controller has actually persisted, parsed from its own progress file. */
+const softWarnings = (path) => readFileSync(path, 'utf8').split('\n')
+	.filter((line) => line.length > 0)
+	.map((line) => JSON.parse(line))
+	.filter((entry) => entry.event === 'soft_budget_reached');
+
+/** Shutdown wiring is not what these cases exercise, so no case here touches the real process. */
+const noSignals = () => () => {};
+
+/** A terminal completed response for exactly this controller's own tuple. */
+const completeLeaf = (pi, controller, text = 'APPROVED\n\nBody.') => {
+	pi.events.emit(delegation.SUBAGENT_DELEGATION_RESPONSE_EVENT,
+		{ ...receipt(), ...controller.tuple, result: { kind: 'text', text } });
+};
+
 test('unexpected input is handled by this controller and never reaches a parent model', async () => {
 	const { dir, configPath, cleanup } = tempConfig();
 	try {
@@ -498,6 +543,411 @@ test('a lane config outside the contract is refused before any process is launch
 		assert.equal(validateLaneConfig({ ...base, agent: 'hylja-implementer', timeoutMs: 1_200_001 }, implementer).reason, SETUP_FAILURES.config);
 		assert.equal(validateLaneConfig({ ...base, agent: 'hylja-implementer', timeoutMs: 1_200_000 }, implementer).ok, true);
 	} finally {
+		cleanup();
+	}
+});
+
+test('an optional soft budget is validated, and an invalid one is refused before any dispatch', async () => {
+	const profile = { model: REVIEWER_MODEL, timeoutMs: 900_000 };
+	const { dir, config, configPath, cleanup } = tempConfig();
+	let variant = 0;
+	const variantPath = (overrides) => {
+		const path = join(dir, `lane-variant-${variant += 1}.json`);
+		writeFileSync(path, JSON.stringify({ ...config, ...overrides }, null, 2));
+		return path;
+	};
+	try {
+		// Absent stays absent: the lane keeps its old behaviour and arms no warning timer at all.
+		assert.equal(readLaneConfig(configPath).softBudgetMs, undefined);
+		assert.equal(readLaneConfig(variantPath({ softBudgetMs: 360_000 })).softBudgetMs, 360_000);
+		// Positive, integral and strictly below the finite hard timeout. Anything else is the fixed
+		// config refusal in both readers, never a value that is silently repaired.
+		for (const softBudgetMs of [0, -1, 600_000, 600_001, 360_000.5, '360000', null, true]) {
+			assert.throws(() => readLaneConfig(variantPath({ softBudgetMs })), /SETUP_FAILED_LANE_CONFIG/, JSON.stringify(softBudgetMs));
+			assert.equal(validateLaneConfig({ ...config, softBudgetMs }, profile).reason, SETUP_FAILURES.config, JSON.stringify(softBudgetMs));
+		}
+		for (const softBudgetMs of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+			assert.equal(validateLaneConfig({ ...config, softBudgetMs }, profile).reason, SETUP_FAILURES.config, String(softBudgetMs));
+		}
+		assert.equal(validateLaneConfig({ ...config, softBudgetMs: 360_000 }, profile).ok, true);
+		assert.equal(validateLaneConfig({ ...config, softBudgetMs: 599_999 }, profile).ok, true);
+		// A 6-minute soft budget under the writer's own unchanged 20-minute ceiling.
+		const writer = readRoleProfile('hylja-implementer');
+		assert.equal(validateLaneConfig({ ...config, agent: 'hylja-implementer', timeoutMs: 1_200_000, softBudgetMs: 360_000 }, writer).ok, true);
+		assert.equal(validateLaneConfig({ ...config, agent: 'hylja-implementer', timeoutMs: 1_200_001, softBudgetMs: 360_000 }, writer).reason, SETUP_FAILURES.config);
+		// The same refusal end to end: an invalid soft budget launches no child at all, and a valid
+		// one is an ordinary lane whose only missing part here is the leaf's own evidence.
+		const transport = { spawn: fakeSpawn(), addSignalListener: () => () => {} };
+		assert.equal((await runNativeLane(['--config', variantPath({ softBudgetMs: 0 })], transport)).reason, SETUP_FAILURES.config);
+		assert.equal((await runNativeLane(['--config', variantPath({ softBudgetMs: 360_000 })], transport)).reason, SETUP_FAILURES.receipt);
+	} finally {
+		cleanup();
+	}
+});
+
+test('one role-aware numeric soft and hard guide is bound to both the preflight and the native request', async () => {
+	const reviewerCase = tempConfig();
+	try {
+		const loaded = readLaneConfig(reviewerCase.configPath);
+		const reviewer = { ...loaded, softBudgetMs: 360_000 };
+		const { pi, emitted } = fakePi();
+		const preflight = fakePreflight({ guard: reviewerCase.config.guard, model: REVIEWER_MODEL });
+		const controller = await createLaneController(pi, reviewer, { delegation, preflight }, { addSignalListener: noSignals });
+		const request = controller.request;
+		const guide = String(request.task).slice(reviewer.task.length);
+		assert.equal(String(request.task).startsWith(reviewer.task), true, 'the raw task is kept verbatim');
+		assert.equal(String(request.task).length <= 1_048_576, true, 'the effective task stays inside the raw cap');
+		assert.equal(String(request.task).length, reviewer.task.length + guide.length, 'nothing is truncated off the guide');
+		// One effective task, not two constructions of it: the bound contract and the dispatched task
+		// are the same string, so the launch digest covers exactly what the child was given.
+		assert.equal(preflight.calls[0].task, request.task);
+		assert.equal(String(preflight.calls[0].task).length, reviewer.task.length + guide.length);
+		// Numeric, role-aware, and it grants no authority the role body does not already carry.
+		assert.equal(guide.includes('360000'), true, 'the soft budget travels as a number');
+		assert.equal(guide.includes('600000'), true, 'the hard deadline travels as a number');
+		assert.equal(/\bverdict\b/i.test(guide), true, 'the reviewer guide asks for the verdict');
+		assert.equal(/read-only/i.test(guide), true);
+		assert.equal(/commit/i.test(guide), false, 'the reviewer guide hands over no writer work');
+		assert.equal(/grant/i.test(guide), true, 'the guide states that it grants no authority');
+		assert.equal(guide.trim().split('\n').length, 1, 'one concise paragraph, not a rulesprawl');
+		assert.equal(guide.length < 600, true, `${guide.length}`);
+		// The lane is still the foreground structured public call: no async mode, no steer surface,
+		// and the one declared bridge value is the same for the preflight and the request.
+		assert.equal('async' in request, false);
+		assert.equal('steer' in request, false);
+		assert.deepEqual(preflight.calls[0].intercomBridge, request.intercomBridge);
+		completeLeaf(pi, controller);
+		await controller.settle();
+
+		// Without a configured soft budget the task is byte-identical to the raw one: no guide, no
+		// warning timer, the pre-change behaviour exactly.
+		const clock = fakeClock();
+		const plain = fakePi();
+		const plainPreflight = fakePreflight({ guard: reviewerCase.config.guard, model: REVIEWER_MODEL });
+		const unconfigured = await createLaneController(plain.pi, loaded, { delegation, preflight: plainPreflight },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		assert.equal(unconfigured.request.task, loaded.task);
+		assert.equal(plainPreflight.calls[0].task, loaded.task);
+		assert.deepEqual(clock.timers, [], 'no warning timer exists when no soft budget is configured');
+		completeLeaf(plain.pi, unconfigured);
+		await unconfigured.settle();
+		assert.equal(emitted.some((e) => e.event === delegation.SUBAGENT_DELEGATION_REQUEST_EVENT), true);
+	} finally {
+		reviewerCase.cleanup();
+	}
+
+	const writerCase = tempConfig();
+	try {
+		const writer = { ...readLaneConfig(writerCase.configPath), agent: 'hylja-implementer', timeoutMs: 1_200_000, softBudgetMs: 360_000 };
+		const { pi } = fakePi();
+		const preflight = fakePreflight({ guard: writerCase.config.guard, model: WRITER_MODEL });
+		const controller = await createLaneController(pi, writer, { delegation, preflight }, { addSignalListener: noSignals });
+		const guide = String(controller.request.task).slice(writer.task.length);
+		assert.equal(preflight.calls[0].task, controller.request.task);
+		assert.equal(guide.includes('360000'), true, 'soft 6 minutes');
+		assert.equal(guide.includes('1200000'), true, 'hard 20 minutes');
+		assert.equal(/commit/i.test(guide), true, 'the writer guide asks for checks, then the commit');
+		assert.equal(/report/i.test(guide), true);
+		assert.equal(/\bverdict\b/i.test(guide), false, 'the writer guide does not issue review authority');
+		completeLeaf(pi, controller, 'Implemented the correction.\n');
+		await controller.settle();
+	} finally {
+		writerCase.cleanup();
+	}
+});
+
+test('the soft budget warns root exactly once and cancels nothing before the hard deadline', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	const clock = fakeClock();
+	try {
+		const loaded = { ...readLaneConfig(configPath), softBudgetMs: 360_000 };
+		const { pi, emitted } = fakePi();
+		const controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		assert.deepEqual(clock.timers.map((timer) => timer.delayMs), [360_000], 'exactly one armed timer');
+		assert.equal(clock.timers[0].cancelled, false);
+
+		clock.fire(360_000);
+		const warned = softWarnings(config.progress);
+		assert.equal(warned.length, 1, 'one bounded numeric warning');
+		assert.equal(warned[0].elapsedMs, 360_000);
+		assert.deepEqual(Object.keys(warned[0]).sort(), ['elapsedMs', 'event', 'key']);
+		// A repeated callback cannot manufacture a second warning.
+		clock.timers[0].handler();
+		assert.equal(softWarnings(config.progress).length, 1);
+		// The soft deadline is a warning for the reader and nothing else: no cancellation, no kill,
+		// no deletion, no reset, no approval, and the dispatch this lane owns is still intact.
+		assert.equal(emitted.filter((e) => e.event === delegation.SUBAGENT_DELEGATION_CANCEL_EVENT).length, 0,
+			'the soft deadline emitted no cancellation at all');
+		assert.equal(existsSync(config.dispatch), true);
+
+		// The hard deadline has not arrived, so a completed leaf is still the accepted outcome.
+		completeLeaf(pi, controller);
+		const value = await controller.settle();
+		const written = writeTerminalReceipt(loaded, value);
+		assert.equal(written.status, 'completed');
+		assert.equal(written.verdict, 'APPROVED');
+		assert.equal(softWarnings(config.progress).length, 1, 'the warning is not rewritten at settlement');
+		assert.equal(clock.timers[0].cancelled, true, 'the owner timer is drained on settlement');
+		for (const event of [delegation.SUBAGENT_DELEGATION_STARTED_EVENT, delegation.SUBAGENT_DELEGATION_UPDATE_EVENT,
+			delegation.SUBAGENT_DELEGATION_CANCEL_EVENT, delegation.SUBAGENT_DELEGATION_RESPONSE_EVENT]) {
+			assert.equal(pi.live(event), 0, `${event} listener drained`);
+		}
+	} finally {
+		cleanup();
+	}
+});
+
+test('the one soft warning survives the capped progress tail the CLI reads after the child exits', async () => {
+	// Root reads the tail of this file only after the leaf is gone, so a warning a busy child's own
+	// updates push out of the cap is a warning nobody ever sees. More owned updates than the file
+	// keeps, all fired after the warning, and the warning must still be exactly one numeric snapshot.
+	const { config, configPath, cleanup } = tempConfig();
+	const clock = fakeClock();
+	const updates = MAX_PROGRESS_RECORDS + 8;
+	try {
+		const loaded = { ...readLaneConfig(configPath), softBudgetMs: 360_000 };
+		const { pi, emitted } = fakePi();
+		const controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		clock.fire(360_000);
+		assert.equal(softWarnings(config.progress).length, 1, 'the warning fired once before the updates');
+
+		for (let toolCount = 0; toolCount < updates; toolCount += 1) {
+			pi.events.emit(delegation.SUBAGENT_DELEGATION_UPDATE_EVENT,
+				{ ...controller.tuple, model: REVIEWER_MODEL, runId: RUN_ID, toolCount, durationMs: 360_000 + toolCount });
+		}
+		completeLeaf(pi, controller);
+		await controller.settle();
+		assert.equal(controller.setupFailure, null);
+		assert.equal(clock.timers[0].cancelled, true, 'the armed warning timer is drained on settlement');
+		assert.equal(emitted.filter((entry) => entry.event === delegation.SUBAGENT_DELEGATION_CANCEL_EVENT).length, 0,
+			'no retained record cancelled anything');
+
+		// The shipped CLI reader, over the file the real controller actually wrote.
+		const fs = { exists: existsSync, size: (p) => statSync(p).size, read: (p, offset, length) => readFileSync(p).subarray(offset, offset + length) };
+		const snapshots = readProgress(config.progress, fs);
+		assert.equal(snapshots.length <= MAX_PROGRESS_RECORDS, true, `the cap is unchanged: ${snapshots.length}`);
+		const warned = snapshots.filter((entry) => entry.event === 'soft_budget_reached');
+		assert.equal(warned.length, 1, 'exactly one warning survives the cap');
+		assert.deepEqual(Object.keys(warned[0]).sort(), ['elapsedMs', 'event', 'model', 'runId', 'toolCount'],
+			'still one bounded numeric snapshot with no field the reader does not bound');
+		assert.equal(Number.isFinite(warned[0].elapsedMs) && warned[0].elapsedMs >= 0, true, 'a finite elapsed count');
+		assert.equal(warned[0].elapsedMs, 360_000);
+		// Chronological order is kept: the warning stays where it fired, ahead of every update that
+		// followed it, and the newest updates are the ones the cap keeps.
+		assert.equal(snapshots[0].event, 'soft_budget_reached');
+		const counts = snapshots.filter((entry) => entry.event === 'progress').map((entry) => entry.toolCount);
+		assert.deepEqual(counts, [...counts].sort((a, b) => a - b), 'retained updates keep chronological order');
+		assert.equal(snapshots.at(-1).toolCount, updates - 1, 'the newest update is retained');
+	} finally {
+		cleanup();
+	}
+});
+
+test('the one soft warning survives the reader byte window that maximum-length metadata produces', async () => {
+	// The record cap and the reader's byte cap are one contract, not two. A record the writer keeps
+	// because it fits the record cap can still sit far outside the byte-bounded tail root reads after
+	// the leaf exits, and then the warning exists in the file but never reaches the reader. Long
+	// accepted metadata is the case that splits the two caps, so it is the case that must be proven.
+	const { config, configPath, cleanup } = tempConfig();
+	const clock = fakeClock();
+	const updates = MAX_PROGRESS_RECORDS + 8;
+	// The longest string the controller accepts for each bounded field, so every record here is as
+	// large as the accepted contract allows it to be.
+	const longModel = 'm'.repeat(4096);
+	const longRunId = 'r'.repeat(4096);
+	try {
+		const loaded = { ...readLaneConfig(configPath), softBudgetMs: 360_000 };
+		const { pi, emitted } = fakePi();
+		const controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		clock.fire(360_000);
+		assert.equal(softWarnings(config.progress).length, 1, 'the warning fired once before the updates');
+
+		for (let toolCount = 0; toolCount < updates; toolCount += 1) {
+			pi.events.emit(delegation.SUBAGENT_DELEGATION_UPDATE_EVENT,
+				{ ...controller.tuple, model: longModel, runId: longRunId, toolCount, durationMs: 360_000 + toolCount });
+		}
+		completeLeaf(pi, controller);
+		await controller.settle();
+		assert.equal(controller.setupFailure, null);
+		assert.equal(clock.timers[0].cancelled, true, 'the armed warning timer is drained on settlement');
+		// Retaining the warning costs root nothing: no cancel, no kill, no deletion, no reset and no
+		// approval timing changes, and the dispatch this lane owns is untouched.
+		assert.equal(emitted.filter((entry) => entry.event === delegation.SUBAGENT_DELEGATION_CANCEL_EVENT).length, 0,
+			'no retained record cancelled anything');
+		assert.equal(existsSync(config.dispatch), true, 'the lane keeps its own dispatch');
+		assert.equal(writeTerminalReceipt(loaded, receipt()).verdict, 'CHANGES REQUESTED',
+			'the warning is not an approval and never rewrites the receipt verdict');
+
+		// The persisted file is inside both halves of the one window the reader parses.
+		const bytes = statSync(config.progress).size;
+		assert.equal(bytes <= MAX_PROGRESS_BYTES, true, `${bytes} bytes exceeds the ${MAX_PROGRESS_BYTES} byte window`);
+		const persisted = readFileSync(config.progress, 'utf8').split('\n').filter((line) => line.length > 0);
+		assert.equal(persisted.length <= MAX_PROGRESS_RECORDS, true, `${persisted.length} records`);
+		assert.equal(Buffer.byteLength(readFileSync(config.progress, 'utf8'), 'utf8'), bytes,
+			'the cap is measured in the serialized UTF-8 bytes the reader reads');
+
+		// The shipped CLI reader, over the file the real controller actually wrote.
+		const fs = { exists: existsSync, size: (p) => statSync(p).size, read: (p, offset, length) => readFileSync(p).subarray(offset, offset + length) };
+		const snapshots = readProgress(config.progress, fs);
+		assert.equal(snapshots.length <= MAX_PROGRESS_RECORDS, true, `the record cap is unchanged: ${snapshots.length}`);
+		const warned = snapshots.filter((entry) => entry.event === 'soft_budget_reached');
+		assert.equal(warned.length, 1, 'exactly one warning reaches the reader');
+		assert.deepEqual(Object.keys(warned[0]).sort(), ['elapsedMs', 'event', 'model', 'runId', 'toolCount'],
+			'still one bounded snapshot with no field the reader does not bound');
+		assert.equal(Number.isFinite(warned[0].elapsedMs) && warned[0].elapsedMs >= 0, true, 'a finite elapsed count');
+		assert.equal(warned[0].elapsedMs, 360_000);
+		// Chronological order survives, and the newest update is one the reader actually has.
+		const counts = snapshots.filter((entry) => entry.event === 'progress').map((entry) => entry.toolCount);
+		assert.deepEqual(counts, [...counts].sort((a, b) => a - b), 'retained updates keep chronological order');
+		assert.equal(snapshots.at(-1).toolCount, updates - 1, 'the newest update is retained');
+		assert.equal(snapshots.at(-1).model, longModel, 'the retained update is the one that was written');
+		assert.equal(snapshots.at(-1).runId, longRunId);
+	} finally {
+		cleanup();
+	}
+});
+
+test('the byte window counts serialized UTF-8 bytes of multibyte and escaped metadata, not characters', async () => {
+	// A window measured in characters is not the window the reader reads: a JSON escape and a
+	// multibyte character each turn one accepted character into several serialized bytes, so a
+	// character-counted budget silently persists far more than the reader can ever see. Both halves
+	// of the one window come from one shared constant, and neither is raised to compensate.
+	const { config, configPath, cleanup } = tempConfig();
+	const clock = fakeClock();
+	const updates = MAX_PROGRESS_RECORDS + 8;
+	// One character of each accepted field is inflated on the way to bytes: a control character is
+	// escaped to six, a three-byte character costs three, and neither is one byte per character.
+	const escapedModel = '\u0001'.repeat(4096);
+	const multibyteRunId = '一'.repeat(4096);
+	const updateLine = JSON.stringify({
+		event: 'progress', key: config.key, model: escapedModel, runId: multibyteRunId, toolCount: 1, elapsedMs: 1,
+	});
+	assert.equal(MAX_PROGRESS_BYTES / updateLine.length >= 4, true,
+		`a character-counted budget would admit four of these records (${updateLine.length} characters each)`);
+	assert.equal(4 * Buffer.byteLength(updateLine, 'utf8') > MAX_PROGRESS_BYTES, true,
+		`four of them are ${4 * Buffer.byteLength(updateLine, 'utf8')} serialized bytes, past the byte window`);
+	assert.equal(Buffer.byteLength(updateLine, 'utf8') > updateLine.length, true,
+		'the serialized UTF-8 size exceeds the accepted character count');
+	try {
+		const loaded = { ...readLaneConfig(configPath), softBudgetMs: 360_000 };
+		const { pi } = fakePi();
+		const controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		clock.fire(360_000);
+		for (let toolCount = 0; toolCount < updates; toolCount += 1) {
+			pi.events.emit(delegation.SUBAGENT_DELEGATION_UPDATE_EVENT,
+				{ ...controller.tuple, model: escapedModel, runId: multibyteRunId, toolCount, durationMs: 360_000 + toolCount });
+		}
+		completeLeaf(pi, controller);
+		await controller.settle();
+		assert.equal(controller.setupFailure, null);
+
+		const bytes = statSync(config.progress).size;
+		assert.equal(bytes <= MAX_PROGRESS_BYTES, true, `${bytes} bytes exceeds the ${MAX_PROGRESS_BYTES} byte window`);
+		const persisted = readFileSync(config.progress, 'utf8').split('\n').filter((line) => line.length > 0);
+		assert.equal(persisted.length <= MAX_PROGRESS_RECORDS, true, `${persisted.length} records`);
+
+		const fs = { exists: existsSync, size: (p) => statSync(p).size, read: (p, offset, length) => readFileSync(p).subarray(offset, offset + length) };
+		const snapshots = readProgress(config.progress, fs);
+		assert.equal(snapshots.filter((entry) => entry.event === 'soft_budget_reached').length, 1,
+			'exactly one warning reaches the reader through a byte-counted window');
+		assert.equal(snapshots.at(-1).toolCount, updates - 1, 'the newest update is retained');
+		assert.equal(snapshots.at(-1).model, escapedModel, 'escaped metadata round-trips through the bounded read');
+		assert.equal(snapshots.at(-1).runId, multibyteRunId, 'multibyte metadata round-trips through the bounded read');
+
+		// One window, not two coincidentally equal numbers: the reader clamps its positional read to
+		// the same constant the writer persists inside, and neither bound was raised.
+		assert.equal(MAX_PROGRESS_BYTES, MAX_PROGRESS_RECORDS * 512, 'the byte window is the existing one');
+		assert.equal(MAX_RANGE_READ_BYTES, MAX_PROGRESS_BYTES, 'the reader and the writer share one window');
+	} finally {
+		cleanup();
+	}
+});
+
+test('settling, failing or overflowing before the soft budget leaves no timer behind', async () => {
+	const settledCase = tempConfig();
+	const clock = fakeClock();
+	try {
+		const loaded = { ...readLaneConfig(settledCase.configPath), softBudgetMs: 360_000 };
+		const { pi } = fakePi();
+		const controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: settledCase.config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		completeLeaf(pi, controller);
+		await controller.settle();
+		assert.equal(clock.timers.length, 1);
+		assert.equal(clock.timers[0].cancelled, true, 'settlement drains the armed warning');
+		clock.fire(360_000);
+		assert.equal(softWarnings(settledCase.config.progress).length, 0, 'a settled lane warns nothing');
+	} finally {
+		settledCase.cleanup();
+	}
+
+	const failureCase = tempConfig();
+	try {
+		const failing = fakePreflight({ guard: failureCase.config.guard });
+		failing.resolveSubagentLaunchContract = async () => ({ ok: false, code: 'restricted_agent', message: 'synthetic', diagnostics: [] });
+		const clock2 = fakeClock();
+		const { pi } = fakePi();
+		const loaded = { ...readLaneConfig(failureCase.configPath), softBudgetMs: 360_000 };
+		const controller = await createLaneController(pi, loaded, { delegation, preflight: failing },
+			{ now: clock2.now, arm: clock2.arm, addSignalListener: noSignals });
+		await controller.settle();
+		assert.equal(controller.setupFailure, LANE_SETUP_FAILURES.contract);
+		assert.deepEqual(clock2.timers, [], 'a lane that never dispatched arms no warning timer');
+	} finally {
+		failureCase.cleanup();
+	}
+
+	// An effective task past the raw cap fails restrictively. Truncating the task or dropping the
+	// guide would dispatch a leaf with a task nobody bound a digest to.
+	const oversizeCase = tempConfig();
+	try {
+		const clock3 = fakeClock();
+		const { pi, emitted } = fakePi();
+		const loaded = readLaneConfig(oversizeCase.configPath);
+		const controller = await createLaneController(pi, { ...loaded, task: 'x'.repeat(1_048_576), softBudgetMs: 360_000 },
+			{ delegation, preflight: fakePreflight({ guard: oversizeCase.config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock3.now, arm: clock3.arm, addSignalListener: noSignals });
+		await controller.settle();
+		assert.equal(controller.setupFailure, LANE_SETUP_FAILURES.config);
+		assert.equal(emitted.some((e) => e.event === delegation.SUBAGENT_DELEGATION_REQUEST_EVENT), false, 'no leaf is launched');
+		assert.equal(existsSync(oversizeCase.config.dispatch), false);
+		assert.deepEqual(clock3.timers, []);
+	} finally {
+		oversizeCase.cleanup();
+	}
+});
+
+test('the shipped default arm really fires the warning once and is drained on settlement', async () => {
+	// Only the fake Pi host is injected, so the real timer and the real clock are what run: a fake
+	// dependency must not be the only path that can warn.
+	const { config, configPath, cleanup } = tempConfig();
+	let pi = null;
+	let controller = null;
+	try {
+		const loaded = { ...readLaneConfig(configPath), softBudgetMs: 1 };
+		const host = fakePi();
+		pi = host.pi;
+		controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: config.guard, model: REVIEWER_MODEL }) });
+		await new Promise((done) => setTimeout(done, 20));
+		const warned = softWarnings(config.progress);
+		assert.equal(warned.length, 1, `${warned.length}`);
+		assert.equal(Number.isFinite(warned[0].elapsedMs) && warned[0].elapsedMs >= 0, true, 'the real clock reported a finite elapsed count');
+	} finally {
+		// A failed assertion must still settle the real signal listeners this case registered.
+		if (controller !== null && pi !== null) {
+			completeLeaf(pi, controller);
+			await controller.settle();
+		}
 		cleanup();
 	}
 });
@@ -930,6 +1380,61 @@ test('a fired watchdog is latched before the stop and refuses late zero-exit com
 		assert.equal(control.ok, true, JSON.stringify(control));
 		assert.equal(control.record.verdict, 'APPROVED');
 		assert.equal(control.record.deadlineExceeded, false);
+	} finally {
+		cleanup();
+	}
+});
+
+test('a hard deadline is INCOMPLETE, keeps the planted evidence and leaves no timer alive', async () => {
+	const { config, configPath, cleanup } = tempConfig({ softBudgetMs: 360_000 });
+	const timers = [];
+	const cleared = [];
+	const artifactsDir = join(config.sessionDir, 'subagent-artifacts');
+	mkdirSync(artifactsDir, { recursive: true });
+	const candidate = join(artifactsDir, 'synthetic-candidate-note.md');
+	const candidateBody = `${PLANTED_RECENT}\n`;
+	writeFileSync(candidate, candidateBody);
+	try {
+		const result = await runNativeLane(['--config', configPath], {
+			setTimeout: (fn, ms) => {
+				const timer = { fn, ms };
+				timers.push(timer);
+				return timer;
+			},
+			clearTimeout: (timer) => cleared.push(timer),
+			addSignalListener: () => () => {},
+			spawn: fakeSpawn({ hang: true, onLaunch: (_options, child) => {
+				writeFileSync(config.receipt, JSON.stringify(receipt({
+					verdict: 'APPROVED', result: { kind: 'text', text: 'APPROVED\n\nBody.' },
+				})));
+				writeFileSync(config.dispatch, `${JSON.stringify(dispatchRecord(config), null, 2)}\n`);
+				writeFileSync(config.progress, `${JSON.stringify({ event: 'dispatch', key: config.key })}\n`
+					+ `${JSON.stringify({ event: 'soft_budget_reached', key: config.key, toolCount: 12, elapsedMs: 360_000 })}\n`);
+				const watchdog = timers.find((timer) => timer.ms === config.timeoutMs + WATCHDOG_GRACE_MS);
+				assert.notEqual(watchdog, undefined, 'the hard watchdog is armed one grace past the request timeout');
+				watchdog.fn();
+				child.emit('close', 0);
+			} }),
+		});
+		// A hard timeout is never an approval, and the soft warning that preceded it is not one either.
+		assert.equal(result.ok, false, JSON.stringify(result));
+		assert.equal(result.reason, SETUP_FAILURES.status);
+		assert.equal(result.record.verdict, 'INCOMPLETE');
+		assert.equal(result.record.deadlineExceeded, true);
+		assert.equal(result.record.status, 'completed');
+		// The warning reached root's own record, as a bounded numeric progress snapshot.
+		const warned = result.record.progress.filter((entry) => entry.event === 'soft_budget_reached');
+		assert.equal(warned.length, 1, JSON.stringify(result.record.progress));
+		assert.equal(warned[0].elapsedMs, 360_000);
+		assert.equal(warned[0].toolCount, 12);
+		// A known hard timeout keeps the worktree evidence: nothing planted or written by the leaf is
+		// deleted or rewritten, so root can recover from exactly what the attempt left behind.
+		assert.equal(readFileSync(candidate, 'utf8'), candidateBody, 'a planted candidate file survives the timeout');
+		assert.equal(JSON.parse(readFileSync(config.receipt, 'utf8')).verdict, 'APPROVED', 'the leaf receipt is left as the leaf wrote it');
+		assert.equal(JSON.parse(readFileSync(config.verification, 'utf8')).verdict, 'INCOMPLETE');
+		// Nothing survives: every armed timer, including the kill ladder, was cleared.
+		assert.equal(timers.length >= 2, true, `${timers.length}`);
+		assert.deepEqual([...cleared].sort(), [...timers].sort(), 'every armed timer was disarmed');
 	} finally {
 		cleanup();
 	}

@@ -103,8 +103,9 @@ nesting, and no child that launches another lane.
 
 The config is root-owned, bounded and absolute. Every path field must start with `/`; `key` and `task`
 are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer` or `hylja-reviewer`;
-`timeoutMs` is a positive integer no greater than that role profile's own frontmatter deadline; a
-`model` key is refused rather than ignored.
+`timeoutMs` is a positive integer no greater than that role profile's own frontmatter deadline; an
+optional `softBudgetMs` is a positive integer strictly below `timeoutMs`; a `model` key is refused
+rather than ignored.
 
 ```json
 {
@@ -113,6 +114,7 @@ are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer` or `
   "task": "<the full handoff brief>",
   "cwd": "/abs/path/to/worktree",
   "timeoutMs": 900000,
+  "softBudgetMs": 360000,
   "sessionDir": "/abs/fresh/dir/sessions",
   "receipt": "/abs/fresh/dir/receipt.json",
   "verification": "/abs/fresh/dir/verification.json",
@@ -178,22 +180,65 @@ acceptance failure is refused. Root admits a writer lane separately, by verifyin
 scoped paths and its evidence, before any approval.
 
 Bounds: progress records carry model, runId, elapsed milliseconds and tool count only, and
-`recentOutput`, tool arguments, raw sessions and provider reasoning are never read or written.
-Cancellation reaches only the exact owned tuple persisted at dispatch, inside the running process.
+`recentOutput`, tool arguments, raw sessions and provider reasoning are never read or written. The
+persisted progress file is bounded by one window with two halves that the writer and the reader share
+as a single constant: at most 256 records and at most 128 KiB of serialized UTF-8 bytes, measured
+after JSON escaping because that is what is written. Retention at the writer is therefore available at
+the reader — a record the writer keeps is a record the CLI's bounded positional read can still reach —
+which a record count alone did not establish. An ordinary lane with ordinary metadata keeps the same
+256 records it always did; a lane whose accepted metadata is long keeps fewer, because the byte window
+binds before the record count does, so that oversized tail is deliberately not byte-identical to what
+a count-only window persisted. Cancellation reaches only the exact owned tuple
+persisted at dispatch, inside the running process.
 Owned shutdown is finite: the watchdog latches the deadline and stops the CLI's own child one minute
 past the native request timeout, sends SIGTERM, then SIGKILL after 10 s, then waits at most 10 s more
 for `close` — never an indefinite wait.
 
+**When `softBudgetMs` is configured** (and only then): the child learns the two numbers once, in its
+initial task, as one role-aware paragraph — reviewer: report a literal verdict and stay read-only;
+writer: finish the checks, commit, then report — and that paragraph grants no authority the role body
+does not already carry. Root receives exactly one bounded numeric `soft_budget_reached` progress
+snapshot at the soft budget, which appears in the verification record's `progress` array. That snapshot
+is pinned inside both halves of that window: when a busy leaf's own later updates would push it out of
+the tail root reads after the child exits, it joins as the oldest survivor and the ordinary records it
+displaces are dropped from the oldest end, so neither bound is raised, the surviving records keep
+their chronological order and the newest updates are the ones kept. Pinning it costs the window
+nothing it was already allowed to keep, and it is a warning for the reader and nothing more: it is
+never delivered to the running child, and
+it never cancels, kills, deletes, resets or approves anything. The hard path is unchanged and finite —
+native request timeout, plus the one-minute watchdog, SIGTERM, SIGKILL after 10 s, at most 10 s more
+for `close`. A lane that reaches it reports INCOMPLETE with `deadlineExceeded: true`, keeps its
+worktree, receipt, dispatch, progress and artifact files for recovery, and is never an approval; a
+recovery handoff must name the exact source SHA whose tree the resumed lane runs, so a resumed lane is
+provably the same code and not a re-implementation of it.
+
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (34 tests, 24 of them in the lane file). Two of them
+platform (44 tests, 34 of them in the lane file). Two of them
 fake only the child transport, so the shipped default platform is what runs: the default filesystem
 must read the progress tail with bounded positional descriptor reads and close every descriptor it
 opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
 removed on completion. Faking those two adapters had passed while the defaults read the whole progress
 file and registered no listener at all. One case injects only the clock, so the real watchdog is fired
 by its recorded timer rather than by waiting out a ten-minute budget, and proves that identical
-completed approval evidence is refused after expiry and verified without it. A read-only
+completed approval evidence is refused after expiry and verified without it. The optional soft budget
+is driven by an injected `now` and `arm` pair whose cancel closure is recorded, so a case can fire,
+repeat, refuse and drain a soft budget deterministically; the shipped default `arm` has its own case
+so the fake clock is not the only path that can warn. One case fires that warning and then pushes more
+owned updates than the file keeps, settles, and reads the file back through the shipped `readProgress`,
+because the warning only matters if root's own reader still finds exactly one of it. Two further
+cases drive the same real controller and the same shipped reader with the longest metadata the
+contract accepts: one at 4096-character model and runId values, one with a JSON-escaped and a
+multibyte field, each pushing more owned updates past both bounds. They assert the persisted file
+stays inside both halves of the window, that exactly one warning reaches the reader with a finite
+elapsed count, that the newest update and chronological order survive, and that reader and writer
+clamp to the same constant. The retained RED shows what they caught first: a 2,116,489-byte file
+holding 256 records against a 131,072-byte reader window, and 9,427,849 bytes of escaped and multibyte
+metadata. A window counted in characters rather than serialized bytes fails the second case, so the
+escape and multibyte cases are what keep the byte count honest. The lane file
+keeps a planted candidate note and
+the leaf's own evidence and proves a hard deadline leaves both untouched, reports INCOMPLETE and arms
+no surviving timer. A read-only
 smoke on root's own installed Pi ran from
 `/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and
 verification records beside it). It exercised launch and evidence plumbing on a reviewer lane, and its

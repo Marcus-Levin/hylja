@@ -26,6 +26,16 @@
  *   unit coverage, a classification digest that matches the record actually used, a real `RESOLVED`
  *   classification carrying detector evidence, a real `SELECTED`/`KEEP` policy decision, and a real
  *   `ALLOW` from the sentinel child over these exact bytes.
+ * - Authorization does not outlive its evidence. Sticky cancellation is re-read after the last host
+ *   observation, and the snapshotted boundary proof intervals are re-read for freshness at the dispatch
+ *   point, immediately before the transport call. That is freshness, never authenticity: authenticating
+ *   those proofs remains the host's obligation, and an unchanged digest is not a current proof.
+ * - Every accepted method is captured once, on the receiver it was validated on, and is never looked up
+ *   on the host object again. `inspect`, `observe` and `sendExact` run as the function references the
+ *   validated data properties held, so reading a method back off the host at the dispatch point - a
+ *   Proxy `get` trap away from running after the last guard - never happens, and a host that replaces
+ *   its own method later does not retarget a sender that already exists. Invoking the captured transport
+ *   is still host code: its honesty, and anything it does with its receiver, remain host obligations.
  * - Detector absence is never clearance: an empty or partial finding set, an unclassified remainder, a
  *   caller-supplied digest or an `UNRESOLVED` record all refuse.
  *
@@ -35,7 +45,7 @@
  */
 import { createHash } from 'node:crypto';
 import { createInteractionEnvelope } from './interaction-envelope.js';
-import type { BoundaryContext, InteractionDraft } from './interaction-envelope.js';
+import type { BoundaryContext, InteractionDraft, InteractionEnvelope } from './interaction-envelope.js';
 import { TRUST_LEVELS } from './classification.js';
 import type { Classification, Trust } from './classification.js';
 import { decidePolicy, digestClassification, KNOWN_POLICY_BUNDLE } from './policy.js';
@@ -198,15 +208,32 @@ const CONTENT_TYPE = 'application/json; charset=utf-8';
 const encoder = new TextEncoder();
 
 type Fields = Record<string, unknown>;
+type ObserveMethod = () => KeepSenderObservation;
+type SendExactMethod = (image: Uint8Array) => Promise<void>;
+type InspectMethod = (image: Uint8Array, binding: KeepInspectionBinding) => unknown;
+
+/**
+ * Bind one already-accepted method to the receiver it was validated on, once. The wrapper calls that
+ * captured function through the trusted `Reflect.apply`, which performs the call directly: it reads no
+ * property of the host object and never looks up `.call`, `.bind` or `.apply` on it. Calling the captured
+ * function is therefore the only host code that runs, the receiver is preserved, and reading a method
+ * back off the host later - the one way a Proxy `get` trap could run after the dispatch-point guards -
+ * never happens.
+ */
+function captured<A extends unknown[], R>(method: (...args: A) => R, receiver: unknown): (...args: A) => R {
+  return (...args: A): R => Reflect.apply(method, receiver, args) as R;
+}
 
 /**
  * Own enumerable DATA properties only, and exactly the declared set. A getter, a symbol key, an
  * unknown key or a hostile trap is refused without being invoked, and a refused value is never read.
  */
 function exact(value: unknown, names: readonly string[]): Fields | null {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value === null || typeof value !== 'object') return null;
+  // A revoked Proxy throws from every trap, the array check included, so the whole structural refusal
+  // is inside one containment. Nothing here is read before it has been proved to be a plain value.
   let keys: (string | symbol)[];
-  try { keys = Reflect.ownKeys(value); } catch { return null; }
+  try { if (Array.isArray(value)) return null; keys = Reflect.ownKeys(value); } catch { return null; }
   if (keys.length !== names.length) return null;
   const out: Fields = Object.create(null) as Fields;
   for (const key of keys) {
@@ -276,8 +303,10 @@ function trustedHost(value: unknown): KeepSenderHost | null {
   if (fields === null) return null;
   const sendPoint = exact(fields['sendPoint'], SEND_POINT_KEYS);
   if (sendPoint === null) return null;
-  if (typeof fields['inspect'] !== 'function' || typeof sendPoint['observe'] !== 'function' ||
-    typeof sendPoint['sendExact'] !== 'function') return null;
+  const inspect = fields['inspect'];
+  const observe = sendPoint['observe'];
+  const sendExact = sendPoint['sendExact'];
+  if (typeof inspect !== 'function' || typeof observe !== 'function' || typeof sendExact !== 'function') return null;
   if (!(TRUST_LEVELS as readonly string[]).includes(fields['sourceTrust'] as string)) return null;
   const recordish = fields['boundary'];
   const bundle = fields['policyBundle'];
@@ -287,7 +316,19 @@ function trustedHost(value: unknown): KeepSenderHost | null {
     scope === null || typeof scope !== 'object' || sentinel === null || typeof sentinel !== 'object') return null;
   const known = fields['known'];
   if (known !== null && (known === null || typeof known !== 'object')) return null;
-  return fields as unknown as KeepSenderHost;
+  // The validated data-property snapshot is authoritative for the callables: each one is captured on the
+  // receiver it was found on and is never read off the host again. The send point keeps its own object
+  // as its receiver, so a host method that reads its own state still sees it, while a later host-side
+  // replacement of `observe` or `sendExact` cannot retarget a sender that already exists.
+  const snapshot = Object.freeze({ ...fields });
+  return Object.freeze({
+    ...snapshot,
+    inspect: captured(inspect as InspectMethod, snapshot),
+    sendPoint: Object.freeze({
+      observe: captured(observe as ObserveMethod, fields['sendPoint']),
+      sendExact: captured(sendExact as SendExactMethod, fields['sendPoint']),
+    }),
+  }) as unknown as KeepSenderHost;
 }
 
 /* ---------- The exact private image and its unit decomposition ---------- */
@@ -409,6 +450,28 @@ function usableClassification(finding: KeepInspectionFinding): Classification | 
   return pinned === finding.classificationDigest ? finding.classification : null;
 }
 
+/** The envelope contract's own five-minute window, re-declared so the dispatch-point re-read uses it. */
+const MAX_PROOF_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * Are the proof intervals this interaction was actually bound under still current? This re-reads the
+ * envelope's own snapshots against the clock at the dispatch point, exactly as
+ * `parseInteractionEnvelope` requires a wire timestamp to be inside every proof interval, and it
+ * changes nothing about which proofs these are: an identical digest is not a current proof, a closed
+ * window grants nothing back, and a boundary that went stale mid-send cannot be bound to this
+ * dispatch. Freshness only; authenticating a proof stays the host's obligation.
+ */
+function currentEvidence(envelope: InteractionEnvelope, now: number): boolean {
+  for (const claim of envelope.provenance) {
+    const issued = Date.parse(claim.issuedAt);
+    const expires = Date.parse(claim.expiresAt);
+    if (!Number.isFinite(issued) || !Number.isFinite(expires) || issued > now || expires <= now ||
+      expires - issued > MAX_PROOF_AGE_MS) return false;
+  }
+  const occurred = Date.parse(envelope.occurredAt);
+  return Number.isFinite(occurred) && occurred <= now && occurred >= now - MAX_PROOF_AGE_MS;
+}
+
 /* ---------- The sender ---------- */
 
 /**
@@ -494,13 +557,25 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
     if (outcome.status !== 'ALLOW') return refused(outcome.code === 'CANCELLED' ? 'CANCELLED' : 'SENTINEL_BLOCKED');
     const release = outcome.release;
 
-    // The last checks and the dispatch share one synchronous turn: nothing is awaited after the route,
-    // profile and policy commit were last observed, and a cancel is refused rather than raced.
+    // The dispatch point, deliberately ordered. The transport and observation callables were captured
+    // during validation, so this is the last point at which any host property is read at all: the final
+    // host observation and every structural and freshness check it can invalidate happen first; sticky
+    // cancellation is then re-read with nothing between that read and the transport call but this frame,
+    // so a cancel raised by that last callback can no longer reach a dispatch. The early read below only
+    // spares the host a second observation.
     if (cancelled) return refused('CANCELLED');
     const current = observationOf(trusted.sendPoint.observe());
     if (current === null) return refused('ROUTE_REFUSED');
     if (!same(current.destination, observed.destination)) return refused('ROUTE_CHANGED');
     if (!same(current.commit, observed.commit)) return refused('POLICY_STALE');
+    // The finite trusted callback and the fixed-worker child both took real time. Re-read the boundary
+    // evidence this interaction was bound under: a proof window that closed during the send is not a
+    // still-current context, and the identity, context and observed route it authorized are no longer
+    // usable for this dispatch. Recreating the envelope instead would mint a new interaction identity
+    // and invalidate every digest, unit reference and policy decision already pinned over it.
+    if (!currentEvidence(envelope, Date.now())) return refused('INTERACTION_REFUSED');
+    // No callback and no await separates this read from the effect it guards.
+    if (cancelled) return refused('CANCELLED');
     try { await trusted.sendPoint.sendExact(release); }
     catch { return refused('DISPATCH_FAILED'); }
     // The effect already happened once. It is never retried, repeated or replayed from a returned handle.

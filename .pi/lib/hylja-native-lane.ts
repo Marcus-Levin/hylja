@@ -18,11 +18,20 @@
  * expectation, status, model, elapsed milliseconds, tool count and the leaf's own literal public
  * result. `recentOutput`, `currentToolArgs`, `recentTools`, raw session transcripts and provider
  * reasoning are never read.
+ *
+ * A root may configure one optional `softBudgetMs`, strictly below the finite hard `timeoutMs`. It
+ * adds exactly two things: a numeric soft/hard timing paragraph to the child's own initial task, and
+ * one bounded `soft_budget_reached` progress snapshot at the soft budget. That snapshot is a warning
+ * for root and the progress file only: it is pinned inside both halves of the progress window, so the
+ * leaf's own later updates cannot push it out of the tail root reads after the child exits. It is
+ * never delivered to the running child, and it never cancels, kills, deletes, resets or approves
+ * anything. Without it the lane behaves exactly as before and arms no timer.
  */
 
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { clearTimeout as cancelTimer, setTimeout as startTimer } from 'node:timers';
 import { pathToFileURL } from 'node:url';
 
 /** The one input this controller runs a lane for. */
@@ -42,7 +51,17 @@ export const LANE_VERDICTS = ['APPROVED', 'CHANGES REQUESTED', 'INCOMPLETE'];
 /** Hard cap on persisted progress records. The file is rewritten, never appended without bound. */
 export const MAX_PROGRESS_RECORDS = 256;
 
-const MAX_TASK_CHARS = 1_048_576;
+/**
+ * Hard cap on the serialized UTF-8 bytes the persisted progress file may occupy. This is the same
+ * window the CLI reader parses its tail through, so a record this writer retains is a record the
+ * reader can actually see: the record cap and this byte cap are two halves of one end-to-end
+ * contract, not two independent caps that happen to disagree. The CLI imports this exact constant
+ * rather than deriving a second number that could drift from the writer's.
+ */
+export const MAX_PROGRESS_BYTES = MAX_PROGRESS_RECORDS * 512;
+
+/** The raw cap on one task, and the cap the effective task must also stay inside. */
+export const MAX_TASK_CHARS = 1_048_576;
 
 /**
  * The one bridge value used for both the preflight and the request it is compared against: a lane leaf
@@ -70,6 +89,8 @@ export interface LaneConfig {
 	readonly task: string;
 	readonly cwd: string;
 	readonly timeoutMs: number;
+	/** Optional soft budget. Absent means no warning timer and no timing guide. */
+	readonly softBudgetMs?: number;
 	readonly sessionDir: string;
 	readonly receipt: string;
 	readonly dispatch: string;
@@ -181,6 +202,8 @@ export interface LaneTerminalReceipt {
 export interface LaneControllerDeps {
 	readonly addSignalListener?: (name: string, handler: () => void) => () => void;
 	readonly now?: () => number;
+	/** Arms one bounded warning timer and returns the closure that cancels exactly that timer. */
+	readonly arm?: (handler: () => void, delayMs: number) => () => void;
 }
 
 export interface LaneController {
@@ -222,6 +245,14 @@ export function readLaneConfig(path: string): LaneConfig {
 	const task = text('task');
 	if (task.length > MAX_TASK_CHARS) throw new Error(SETUP_FAILURES.config);
 	if (!isCount(value.timeoutMs) || !Number.isInteger(value.timeoutMs)) throw new Error(SETUP_FAILURES.config);
+	// Optional soft budget. Present means a positive integer strictly below the finite hard timeout;
+	// anything else is the fixed config refusal. Absent keeps the previous behaviour exactly.
+	let softBudgetMs: number | undefined;
+	if ('softBudgetMs' in value) {
+		const soft = value.softBudgetMs;
+		if (typeof soft !== 'number' || !Number.isInteger(soft) || soft <= 0 || soft >= value.timeoutMs) throw new Error(SETUP_FAILURES.config);
+		softBudgetMs = soft;
+	}
 	if (typeof value.pid !== 'undefined') throw new Error(SETUP_FAILURES.config);
 	const paths = {} as Record<'cwd' | 'sessionDir' | 'receipt' | 'dispatch' | 'progress' | 'guard', string>;
 	for (const field of ['cwd', 'sessionDir', 'receipt', 'dispatch', 'progress', 'guard'] as const) {
@@ -234,8 +265,37 @@ export function readLaneConfig(path: string): LaneConfig {
 		agent: value.agent,
 		task,
 		timeoutMs: value.timeoutMs,
+		...(softBudgetMs === undefined ? {} : { softBudgetMs }),
 		...paths,
 	};
+}
+
+/**
+ * The one paragraph a configured soft budget adds to the child's task: the two numbers it will be
+ * measured against, that role's own closing move, and an explicit statement that the guide carries no
+ * authority the role body does not already have. An unconfigured lane gets its task back unchanged.
+ */
+const TIMING_GUIDE: Record<string, string> = {
+	'hylja-implementer': 'Finish the scoped checks, commit the scoped paths, then report.',
+	'hylja-reviewer': 'Report one literal verdict line (APPROVED, CHANGES REQUESTED or INCOMPLETE) and stay read-only.',
+};
+
+/**
+ * The exact string the launch contract is resolved for and the exact string that is dispatched. The
+ * raw cap still binds it: an effective task past the cap fails restrictively instead of losing its
+ * tail, because a truncated task would dispatch a leaf whose digest covers different bytes than the
+ * task it was given.
+ */
+export function buildEffectiveTask(config: LaneConfig): string {
+	if (config.softBudgetMs === undefined) return config.task;
+	const role = TIMING_GUIDE[config.agent];
+	if (role === undefined) throw new Error(SETUP_FAILURES.config);
+	const effective = `${config.task}\n\n[Lane timing] Soft budget ${config.softBudgetMs} ms, hard deadline ${config.timeoutMs} ms,`
+		+ ' both counted from dispatch. Root is warned once at the soft budget; that warning is not sent to you,'
+		+ ' cancels nothing and approves nothing. '
+		+ `${role} This guide grants no authority beyond your role body.`;
+	if (effective.length > MAX_TASK_CHARS) throw new Error(SETUP_FAILURES.config);
+	return effective;
 }
 
 /**
@@ -270,10 +330,68 @@ function readCount(value: unknown): number | null {
 	return isCount(value) ? value : null;
 }
 
-/** Persists at most `MAX_PROGRESS_RECORDS` records; the newest snapshot replaces the older tail. */
+/** The one warning snapshot a configured soft budget adds, and the one record the cap retains. */
+const SOFT_BUDGET_EVENT = 'soft_budget_reached';
+
+/** One UTF-8 encoder for the serialized size of the exact bytes the progress file carries. */
+const UTF8 = new TextEncoder();
+
+/**
+ * The serialized cost of one progress line inside the file: its UTF-8 bytes plus the one newline that
+ * separates it from the next. N such lines, joined and terminated, are exactly the sum of their costs,
+ * so this is the file's size and not an estimate of it. Measured after JSON escaping and in UTF-8,
+ * because that is what is persisted and what the reader's bounded positional read counts.
+ */
+const progressLineBytes = (line: string): number => UTF8.encode(line).length + 1;
+
+/**
+ * The bounded tail this writer persists: inside the record cap and the byte window at the same time,
+ * so a record the writer retains is a record the reader's own window can still reach. Retention at
+ * the writer is only meaningful if it implies availability at the reader, and a record count alone
+ * never established that: a leaf whose accepted metadata is long fills the byte window long before it
+ * fills the record cap, which drops the records root reads after exit without ever writing past the
+ * count cap. The one soft warning is pinned inside that window and the newest ordinary updates fill
+ * what it leaves, oldest survivor first; when the window binds, ordinary records are what is evicted.
+ */
+function retainedProgress(records: readonly LaneProgressRecord[]): LaneProgressRecord[] {
+	// The newest ordinary updates fill the window first, against the count cap and the byte cap at the
+	// same time, so the survivors are one chronological tail rather than two independently chosen sets.
+	const windowed = records.slice(-MAX_PROGRESS_RECORDS);
+	let used = 0;
+	const kept: LaneProgressRecord[] = [];
+	for (let index = windowed.length - 1; index >= 0; index -= 1) {
+		const item = windowed[index];
+		if (item === undefined) break;
+		const cost = progressLineBytes(JSON.stringify(item));
+		// The newest update is never the one dropped: every persisted field is bounded far below the
+		// window, so one record always fits it. Everything older stops at the first that no longer does.
+		if (kept.length > 0 && used + cost > MAX_PROGRESS_BYTES) break;
+		kept.unshift(item);
+		used += cost;
+	}
+	// The warning is looked for across the whole history and not only this tail, because the leaf's own
+	// later updates are exactly what can have pushed it out of the window. It joins as the oldest
+	// survivor and the ordinary records it displaces are dropped from the oldest end, so pinning it
+	// costs the window neither a record nor a byte it was already allowed to keep.
+	const warned = records.find((item) => item.event === SOFT_BUDGET_EVENT);
+	if (warned === undefined || kept.includes(warned)) return kept;
+	kept.unshift(warned);
+	used += progressLineBytes(JSON.stringify(warned));
+	// `used` stays the exact file size here: the sum of the kept records' serialized costs.
+	while (kept.length > 1 && (kept.length > MAX_PROGRESS_RECORDS || used > MAX_PROGRESS_BYTES)) {
+		const dropped = kept.splice(1, 1)[0];
+		used -= dropped === undefined ? 0 : progressLineBytes(JSON.stringify(dropped));
+	}
+	return kept;
+}
+
+/**
+ * Persists inside both halves of the one progress window: at most `MAX_PROGRESS_RECORDS` records and
+ * at most `MAX_PROGRESS_BYTES` serialized UTF-8 bytes. The file is rewritten, never appended.
+ */
 function pushProgress(path: string, key: string, records: LaneProgressRecord[], entry: LaneProgressRecord): void {
 	records.push(entry);
-	const kept = records.slice(-MAX_PROGRESS_RECORDS);
+	const kept = retainedProgress(records);
 	records.length = 0;
 	records.push(...kept);
 	writeFileSync(path, `${kept.map((item) => JSON.stringify(item)).join('\n')}\n`, { mode: 0o600 });
@@ -331,12 +449,13 @@ const ownsTuple = (value: unknown, tuple: LaneTuple): boolean => {
 async function resolveExpectation(
 	pi: LanePiHost,
 	config: LaneConfig,
+	effectiveTask: string,
 	preflight: LanePreflightModule,
 ): Promise<LaneExpectation> {
 	const availableModels = typeof pi.modelRegistry?.getAvailable === 'function' ? pi.modelRegistry.getAvailable() : undefined;
 	const result = await preflight.resolveSubagentLaunchContract({
 		agent: config.agent,
-		task: config.task,
+		task: effectiveTask,
 		context: 'fresh',
 		cwd: config.cwd,
 		sessionRoot: config.sessionDir,
@@ -385,6 +504,7 @@ export async function createLaneController(
 ): Promise<LaneController> {
 	const addSignalListener = deps.addSignalListener ?? defaultSignalListener;
 	const now = deps.now ?? (() => Date.now());
+	const arm = deps.arm ?? defaultArm;
 	const request: Record<string, unknown> = {
 		requestId: randomUUID(),
 		ownerRunId: randomUUID(),
@@ -406,10 +526,12 @@ export async function createLaneController(
 	const records: LaneProgressRecord[] = [];
 	let settled = false;
 	let cancelled = false;
+	let warned = false;
 	let expectation: LaneExpectation | null = null;
 	let setupFailure: LaneSetupFailure | null = null;
 	const offs: Array<() => void> = [];
-	const signals: Array<() => void> = [];
+	/** Everything this lane owns and must drain: the two signal hooks and any armed warning timer. */
+	const cleanups: Array<() => void> = [];
 
 	/** Bounded progress: an event token, the lane key, a model and runId string, finite counters. */
 	const progress = (event: string, fields: {
@@ -478,11 +600,11 @@ export async function createLaneController(
 				// A listener that refuses to drain cannot be retried; the lane is reported below.
 			}
 		}
-		for (const off of signals.splice(0)) {
+		for (const off of cleanups.splice(0)) {
 			try {
 				off();
 			} catch {
-				// Same: cleanup uncertainty is recorded, never awaited indefinitely.
+				// A cleanup that refuses to drain cannot be retried; the lane is reported below.
 			}
 		}
 	};
@@ -506,7 +628,11 @@ export async function createLaneController(
 	};
 
 	try {
-		expectation = await resolveExpectation(pi, config, modules.preflight);
+		// One effective task, bound to both the launch contract and the dispatched request, so the
+		// expected digest always covers exactly the bytes the child is given.
+		const effectiveTask = buildEffectiveTask(config);
+		request.task = effectiveTask;
+		expectation = await resolveExpectation(pi, config, effectiveTask, modules.preflight);
 		const dispatch: LaneDispatchRecord = {
 			...tuple,
 			agent: config.agent,
@@ -516,8 +642,18 @@ export async function createLaneController(
 		};
 		writeJson(config.dispatch, dispatch);
 		progress('dispatch', { model: expectation.model });
-		signals.push(addSignalListener('SIGINT', cancel));
-		signals.push(addSignalListener('SIGTERM', cancel));
+		cleanups.push(addSignalListener('SIGINT', cancel));
+		cleanups.push(addSignalListener('SIGTERM', cancel));
+		if (config.softBudgetMs !== undefined) {
+			cleanups.push(arm(() => {
+				// Root's warning and nothing more. The running child keeps only the numbers it was
+				// given in its initial task: no cancel event, no kill, no deletion, no reset, and no
+				// approval is produced here. One warning per dispatch, or none at all.
+				if (warned || settled || cancelled || setupFailure !== null) return;
+				warned = true;
+				progress(SOFT_BUDGET_EVENT);
+			}, config.softBudgetMs));
+		}
 		pi.events.emit(modules.delegation.SUBAGENT_DELEGATION_REQUEST_EVENT, request);
 	} catch (error: unknown) {
 		settled = true;
@@ -537,6 +673,14 @@ function defaultSignalListener(name: string, handler: () => void): () => void {
 	process.once(name, wrapped);
 	return () => {
 		process.removeListener(name, wrapped);
+	};
+}
+
+/** The shipped arm: one real bounded timer, and the closure that cancels exactly that timer. */
+function defaultArm(handler: () => void, delayMs: number): () => void {
+	const timer = startTimer(handler, delayMs);
+	return () => {
+		cancelTimer(timer);
 	};
 }
 

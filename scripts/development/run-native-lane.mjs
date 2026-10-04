@@ -31,6 +31,7 @@ import {
 	LANE_ROLES,
 	LANE_SUBAGENTS_ENV,
 	LANE_VERDICTS,
+	MAX_PROGRESS_BYTES,
 	MAX_PROGRESS_RECORDS,
 	resolveInstalledModules,
 } from '../../.pi/lib/hylja-native-lane.ts';
@@ -45,8 +46,12 @@ export const WATCHDOG_GRACE_MS = 60_000;
 export const KILL_GRACE_MS = 10_000;
 /** Final finite wait for `close` after SIGKILL. Never an indefinite wait. */
 export const CLOSE_WAIT_MS = 10_000;
-/** Hard ceiling on one positional read of the default platform, whatever a caller asks for. */
-export const MAX_RANGE_READ_BYTES = MAX_PROGRESS_RECORDS * 512;
+/**
+ * Hard ceiling on one positional read of the default platform, whatever a caller asks for. It is the
+ * writer's own byte window, not a second number beside it: a read clamped below the window the
+ * progress parser must cover would silently hide the records the writer retained.
+ */
+export const MAX_RANGE_READ_BYTES = MAX_PROGRESS_BYTES;
 
 export const SETUP_FAILURES = {
 	argv: 'SETUP_FAILED_ARGUMENTS',
@@ -134,6 +139,17 @@ export function validateLaneConfig(value, profile) {
 	if (!Number.isInteger(value.timeoutMs) || value.timeoutMs <= 0 || value.timeoutMs > profile.timeoutMs) {
 		return fail(SETUP_FAILURES.config);
 	}
+	// Optional soft budget: a positive integer strictly below the finite hard timeout. Absent keeps
+	// the lane's previous behaviour; present but invalid is a refusal, never a repaired value. It
+	// arms one warning timer in the child and grants the child no authority, so root still owns the
+	// hard clock, the watchdog and every verdict.
+	let softBudgetMs;
+	if ('softBudgetMs' in value) {
+		if (!Number.isInteger(value.softBudgetMs) || value.softBudgetMs <= 0 || value.softBudgetMs >= value.timeoutMs) {
+			return fail(SETUP_FAILURES.config);
+		}
+		softBudgetMs = value.softBudgetMs;
+	}
 	const paths = ['cwd', 'sessionDir', 'receipt', 'verification', 'progress', 'dispatch', 'pi', 'subagents', 'guard', 'controller'];
 	for (const field of paths) {
 		if (typeof value[field] !== 'string' || !value[field].startsWith('/')) return fail(SETUP_FAILURES.config);
@@ -147,6 +163,7 @@ export function validateLaneConfig(value, profile) {
 			task: value.task,
 			cwd: value.cwd,
 			timeoutMs: value.timeoutMs,
+			...(softBudgetMs === undefined ? {} : { softBudgetMs }),
 			sessionDir: value.sessionDir,
 			receipt: value.receipt,
 			verification: value.verification,
@@ -437,7 +454,11 @@ function launch(config, deps) {
 	});
 }
 
-/** Reads the bounded numeric progress snapshots from the tail of a capped-size file. */
+/**
+ * Reads the bounded numeric progress snapshots from the tail of the file the controller persisted. The
+ * window is the writer's own: this reader parses exactly the bytes the writer bounded itself to, so a
+ * record the writer retained is one this read can still reach.
+ */
 export function readProgress(path, fs) {
 	if (!fs.exists(path)) return [];
 	let size;
@@ -446,7 +467,7 @@ export function readProgress(path, fs) {
 	} catch {
 		return [];
 	}
-	const cap = MAX_PROGRESS_RECORDS * 512;
+	const cap = MAX_PROGRESS_BYTES;
 	const offset = Math.max(0, size - cap);
 	let text;
 	try {

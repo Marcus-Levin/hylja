@@ -50,7 +50,7 @@ Each row is the starting point for one kind of work, not a status list. [Capabil
 | Comparative, reuse or adoption evidence | [research/](research/) dated records (evidence, not authority) | the issue it supports: [#38](https://github.com/Marcus-Levin/hylja/issues/38), [#39](https://github.com/Marcus-Levin/hylja/issues/39), [#48](https://github.com/Marcus-Levin/hylja/issues/48) | Markdown records |
 | Retired development-plan history | [docs/plan.md](plan.md) | the immutable snapshot it links | Markdown, frozen |
 
-The core is TypeScript on Node.js and provider- and harness-independent. Python appears only in the pinned upstream Presidio worker and in research-only Python helpers; neither is part of the core, `npm test` or CI. Proposed drafts are **not** accepted: read the status line of every decision and draft you rely on, and never wire one into accepted classification v1, policy, an adapter or authoritative labels.
+The core is TypeScript on Node.js and provider- and harness-independent. Python appears only in the pinned upstream Presidio worker and in research-only Python helpers; neither is part of the core, `npm test` or CI. `npm run test:e2e` is a focused developer shortcut over the `test/*.e2e.test.mjs` glob ([synthetic E2E route](development/synthetic-e2e.md)); those files also run in `npm test` and CI, so it replaces neither gate. Proposed drafts are **not** accepted: read the status line of every decision and draft you rely on, and never wire one into accepted classification v1, policy, an adapter or authoritative labels.
 
 ## Decisions - `decisions/`
 
