@@ -30,11 +30,11 @@ and nothing is logged.
 | --- | --- |
 | `INVALID_INPUT` | the request record itself is structurally wrong: not a plain object, missing a required field, an unknown field, an accessor instead of a data property, or a reflective failure |
 | `INVALID_CONTEXT` | a scope field is malformed, or `classification` is outside accepted classification v1 |
-| `INVALID_KEY` | the key is not a byte view, is not exactly 32 bytes, or is all zeroes |
+| `INVALID_KEY` | the key is not a byte view, is not exactly 32 bytes, is all zeroes, or reports a length that is not a primitive nonnegative safe integer |
 | `SECRET_NOT_REVERSIBLE` | `classification` is `CREDENTIAL_OR_SECRET` |
-| `INVALID_PAYLOAD` | the payload is not a byte view, is not made of bytes, or is empty |
-| `PAYLOAD_TOO_LARGE` | the payload exceeds 65536 bytes |
-| `INVALID_ENVELOPE` | the sealed record is malformed: wrong version, wrong nonce or tag length, empty or oversized body, unknown field |
+| `INVALID_PAYLOAD` | the payload is not a byte view, is not made of bytes, is empty, or reports a length that is not a primitive nonnegative safe integer |
+| `PAYLOAD_TOO_LARGE` | the payload reports a primitive length greater than 65536 bytes |
+| `INVALID_ENVELOPE` | the sealed record is malformed: wrong version, wrong nonce or tag length, empty or oversized body, unknown field, or a byte field whose declared length is not a primitive nonnegative safe integer |
 | `AUTHENTICATION_FAILED` | on `open`, the tag did not authenticate under the expected scope and key |
 | `CRYPTO_UNAVAILABLE` | on `seal`, the platform AEAD call failed |
 
@@ -72,6 +72,34 @@ refused in both directions: credentials are not reversible synthetic mappings.
 Empty payloads are refused consistently. `seal` refuses a zero-byte payload as `INVALID_PAYLOAD`, and
 `open` refuses a zero-byte body as `INVALID_ENVELOPE`, so no valid envelope of zero bytes exists.
 
+## Boundary enforcement
+
+Three rules hold for every value that crosses this boundary, caller-supplied or derived.
+
+1. **A declared length is a primitive, nonnegative safe integer, checked before any allocation.** A
+   byte source is a `Uint8Array` (a `Proxy` over one included), and its `byteLength` is read once.
+   Anything else - an object with a `length` and a `valueOf`, a string, a bigint, a fractional,
+   negative, `NaN` or infinite number, a getter that throws - is a malformed byte source and is
+   refused with the payload, key or envelope code before a buffer is allocated. The bound is
+   therefore never bypassed by a claim that only compares false against it, and `PAYLOAD_TOO_LARGE`
+   remains reserved for a genuine primitive length above the cap.
+2. **Refusal is fixed, text-free and non-throwing, whatever is thrown at it.** Both entry points
+   convert every outcome into one fixed refusal record and never propagate an error. Recognising
+   this module's own internal refusal does **not** use `instanceof` or any prototype walk, because
+   `instanceof` reads `error.[[GetPrototypeOf]]` and a hostile thrown `Proxy` can trap that read and
+   throw again from inside the catch block. The internal refusal carries a module-private brand that
+   is compared by strict identity under a guard, so a trap degrades to the fixed fallback code
+   instead of escaping. Every reader contains its own hostile reads: a `Proxy` whose `ownKeys`,
+   `getPrototypeOf`, `getOwnPropertyDescriptor`, `byteLength` or index read throws is contained at
+   the reader that touched it and reported with that reader's fixed code.
+3. **Owned transient buffers are overwritten on both paths; caller and returned buffers are not.**
+   Every byte buffer this module allocates is either returned to the caller or overwritten: rejected
+   and half-filled snapshots, a rejected key copy, the AAD, the two cipher output buffers, the
+   `decipher.update` and `decipher.final` outputs, and the key, plaintext and sealed-record snapshots.
+   The `finally` blocks run on the success path as well as on every exceptional path. Nothing the
+   caller supplied is reachable from those copies, and the plaintext handed back by `open` is a
+   separate buffer that no hygiene step touches.
+
 ## Material limits
 
 - **A valid old envelope is not a fresh authorized mapping.** AEAD context detects a record
@@ -94,9 +122,12 @@ Empty payloads are refused consistently. `seal` refuses a zero-byte payload as `
   mapping is persisted, and production recovery remains a separate slice.
 - **Copying is one pass.** Caller byte inputs are snapshotted into owned buffers before use and
   results are fresh plain `Uint8Array` copies, so no output aliases a caller key or payload. A byte
-  source that yields a non-byte is refused instead of coerced. Overwriting owned transient key and
-  payload copies after use is best-effort hygiene in JavaScript, **not** a zeroization guarantee for
-  copies held inside native crypto, garbage-collected buffers or swapped pages.
+  source that yields a non-byte is refused instead of coerced, and a declared length that is not a
+  primitive nonnegative safe integer is refused before allocation. Overwriting owned transient key,
+  payload, AAD, sealed-body and decipher copies on both the success and the exceptional path is
+  best-effort hygiene in JavaScript, **not** a zeroization guarantee for copies held inside native
+  crypto, garbage-collected buffers or swapped pages, and nothing observable from outside this
+  module proves a particular buffer was zeroed.
 
 ## Evidence
 
@@ -105,7 +136,23 @@ generated synthetic byte cases and a local host-supplied test DEK. It is not a m
 It covers byte-exact round-trips, nonce/ciphertext/tag uniqueness over repeated writes, every
 individual scope swap and revision/key-version swap in both directions, independent tenant A and
 tenant B keys, nonce, tag and ciphertext tampering, size and shape limits, malformed and hostile
-inputs, and the refusal shape. Failure assertions compare fixed codes, lengths and digests and never
-print a payload byte.
+inputs, and the refusal shape.
+
+Every failure assertion compares fixed codes, lengths, booleans and digests. No assertion receives a
+raw payload byte, a raw key byte or a native error as an operand, so a regression cannot print
+protected bytes into TAP output. Every hostile case is invoked through a helper that catches an
+escaping exception and asserts only the safe boolean "did the call throw", so a deliberately planted
+error value inside a hostile `Proxy` is contained in the test even while the boundary is wrong.
+
+Round-two review regressions (see `13-review-round2-red-focused-test-final-testfile.log` and
+`15-review-round2-green-focused-test.log`, kept outside the repository): a declared byte length that
+is not a primitive safe integer is refused before allocation in the payload, key and every sealed
+record field; a hostile thrown `Proxy` from `ownKeys`, `getPrototypeOf`,
+`getOwnPropertyDescriptor`, `byteLength` or an index read is a fixed refusal and never an error the
+boundary throws; and clearing owned transient buffers never wipes a returned plaintext or a
+caller-supplied buffer. The buffer-clearing rule has no externally observable failing case, because
+the internal buffers a cleared copy occupies are unreachable once the call returns; the test pins the
+observable half of it (independence of the returned plaintext, and byte-for-byte survival of caller
+buffers across a refusal) instead of claiming a zeroization it cannot see.
 
 Run it with `npm run --silent build && node --test test/mapping-aead.test.mjs`.

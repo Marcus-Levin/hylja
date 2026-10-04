@@ -49,9 +49,11 @@ function assertSealed(result, plaintext) {
   assert.equal(envelope.nonce.byteLength, MAPPING_AEAD_LIMITS.nonceBytes);
   assert.equal(envelope.tag.byteLength, MAPPING_AEAD_LIMITS.tagBytes);
   assert.equal(envelope.ciphertext.byteLength, plaintext.byteLength);
-  // The caller's payload is not reachable through the sealed record in any shape.
+  // The caller's payload is not reachable through the sealed record in any shape. The comparison is
+  // digest-based and identity-based: no assertion below ever receives a raw payload byte, so a
+  // regression cannot print protected bytes into TAP.
   assert.equal(envelope.ciphertext === plaintext, false);
-  assert.notDeepEqual(envelope.ciphertext, plaintext);
+  assert.notEqual(digest(envelope.ciphertext), digest(plaintext), 'the sealed body must not be the plaintext');
   return envelope;
 }
 
@@ -67,13 +69,26 @@ function assertRefused(result, finding) {
   assert.equal(JSON.stringify(result).includes('Error'), false);
 }
 
-/** Calls through a hostile argument and reports a throw instead of leaking it as an assertion error. */
+/** Calls through a hostile argument and reports a throw instead of leaking it as an assertion error.
+ *  Every hostile case below goes through here, so a value the boundary was supposed to contain -
+ *  including the deliberately planted error text inside a hostile thrown Proxy - is reduced to the
+ *  safe boolean `threw` and never printed into TAP. */
 function attempt(run, request) {
   try {
     return { threw: false, result: run(request) };
   } catch {
     return { threw: true, result: undefined };
   }
+}
+
+/** A byte source that reports `length` in place of its `byteLength`. */
+function declaring(source, length) {
+  return new Proxy(source, {
+    get(target, property, receiver) {
+      if (property === 'byteLength') return length;
+      return Reflect.get(target, property, receiver);
+    },
+  });
 }
 
 test('the module publishes a closed finding vocabulary and fixed bounds', () => {
@@ -364,8 +379,9 @@ test('mutable caller buffers are copied: no alias to a key or plaintext survives
   const flat = Buffer.concat([Buffer.from(envelope.nonce), Buffer.from(envelope.ciphertext),
     Buffer.from(envelope.tag)]);
   assert.equal(flat.includes(Buffer.from(key(53))), false);
-  assert.notDeepEqual(envelope.nonce, key(53));
-  assert.notDeepEqual(envelope.tag, key(53));
+  const keyDigest = digest(key(53));
+  assert.notEqual(digest(envelope.nonce), keyDigest);
+  assert.notEqual(digest(envelope.tag), keyDigest);
   // The caller wipes its own plaintext afterwards: the sealed record is self-contained.
   plaintext.fill(0);
   const opened = openMappingPayload({ scope: scope(), key: key(53), envelope });
@@ -606,6 +622,169 @@ test('the same request yields the same refusal every time', () => {
     serialized.add(JSON.stringify(opened.result));
   }
   assert.equal(serialized.size, 1, 'a refusal must be byte-identical across repeats');
+  plaintext.fill(0);
+});
+
+test('a declared byte length is a primitive safe integer before anything is allocated', () => {
+  // A byte source that claims an oversized length through an object is the reviewed bypass: an
+  // object compares false against the cap and still allocates. Every claim below must be refused as
+  // a malformed byte source, with no allocation and no seal.
+  const oversizedClaims = [
+    { length: MAPPING_AEAD_LIMITS.plaintextBytes + 1, valueOf: () => 0 },
+    { length: MAPPING_AEAD_LIMITS.ciphertextBytes + 1, valueOf: () => 0 },
+    { length: Number.MAX_SAFE_INTEGER, valueOf: () => 0 },
+    { length: MAPPING_AEAD_LIMITS.plaintextBytes + 1, toString: () => '0' },
+  ];
+  const malformedClaims = [undefined, null, '8', 8n, -1, -0.5, 1.5, Number.NaN,
+    Number.POSITIVE_INFINITY, true, {}, [], () => 8, Symbol.iterator];
+  for (const claim of [...oversizedClaims, ...malformedClaims]) {
+    const refused = attempt(sealMappingPayload,
+      { scope: scope(), plaintext: declaring(new Uint8Array(4), claim), key: key(101) });
+    assert.equal(refused.threw, false, 'a declared length must never throw');
+    assertRefused(refused.result, 'INVALID_PAYLOAD');
+    const refusedKey = attempt(sealMappingPayload,
+      { scope: scope(), plaintext: randomBytes(8), key: declaring(key(101), claim) });
+    assert.equal(refusedKey.threw, false, 'a declared key length must never throw');
+    assertRefused(refusedKey.result, 'INVALID_KEY');
+  }
+  // The sealed record's own byte fields obey the same rule, and a hostile claim there is a
+  // malformed record rather than an un-authenticated body.
+  const sealed = sealMappingPayload({ scope: scope(), plaintext: randomBytes(8), key: key(101) });
+  assertSealed(sealed, new Uint8Array(8));
+  for (const field of ['nonce', 'ciphertext', 'tag']) {
+    for (const claim of [...oversizedClaims, ...malformedClaims]) {
+      const forged = { ...sealed.envelope, [field]: declaring(sealed.envelope[field], claim) };
+      const opened = attempt(openMappingPayload, { scope: scope(), key: key(101), envelope: forged });
+      assert.equal(opened.threw, false, `a declared ${field} length must never throw`);
+      assertRefused(opened.result, 'INVALID_ENVELOPE');
+    }
+  }
+  // A source that declares its true length is untouched by the rule, and a genuine oversized
+  // primitive number is still `PAYLOAD_TOO_LARGE` rather than a malformed source.
+  const honest = sealMappingPayload({ scope: scope(), plaintext: declaring(new Uint8Array(16), 16),
+    key: key(101) });
+  assertSealed(honest, new Uint8Array(16));
+  const oversized = attempt(sealMappingPayload,
+    { scope: scope(), plaintext: randomBytes(MAPPING_AEAD_LIMITS.plaintextBytes + 1), key: key(101) });
+  assert.equal(oversized.threw, false);
+  assertRefused(oversized.result, 'PAYLOAD_TOO_LARGE');
+});
+
+test('a hostile thrown Proxy is one fixed refusal, never an error this boundary throws', () => {
+  const planted = 'planted-thrown-proxy-detail';
+  // `hostile` throws a plain error carrying obviously synthetic planted text; the returned value is
+  // then itself a Proxy whose prototype read throws again. Every case below is asserted through
+  // `attempt`, so that planted text can never reach TAP even while the boundary is still wrong.
+  const hostile = () => new Proxy({}, { getPrototypeOf() { throw new Error(planted); } });
+  // First, the case the review reported: a byte source whose length read throws a hostile value.
+  // Reflective identification of that value is what let a caller-controlled error escape, so this
+  // is the assertion that carries the reviewed defect.
+  const throwingLength = () => new Proxy(new Uint8Array(4), {
+    get(target, property, receiver) {
+      if (property === 'byteLength') throw hostile();
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const throwingElement = () => new Proxy(new Uint8Array(4), {
+    get(target, property, receiver) {
+      if (typeof property === 'string' && /^\d+$/u.test(property)) throw hostile();
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const refusedPayload = attempt(sealMappingPayload,
+    { scope: scope(), plaintext: throwingLength(), key: key(103) });
+  assert.equal(refusedPayload.threw, false, 'a throwing byteLength must not throw out of the boundary');
+  assertRefused(refusedPayload.result, 'INVALID_PAYLOAD');
+  const refusedElement = attempt(sealMappingPayload,
+    { scope: scope(), plaintext: throwingElement(), key: key(103) });
+  assert.equal(refusedElement.threw, false, 'a throwing element read must not throw out of the boundary');
+  assertRefused(refusedElement.result, 'INVALID_PAYLOAD');
+  const refusedKey = attempt(sealMappingPayload,
+    { scope: scope(), plaintext: randomBytes(8), key: throwingLength() });
+  assert.equal(refusedKey.threw, false, 'a throwing key length must not throw out of the boundary');
+  assertRefused(refusedKey.result, 'INVALID_KEY');
+  const hostileKey = attempt(sealMappingPayload,
+    { scope: scope(), plaintext: randomBytes(8), key: declaring(key(103), hostile()) });
+  assert.equal(hostileKey.threw, false, 'a hostile key length must not throw out of the boundary');
+  assertRefused(hostileKey.result, 'INVALID_KEY');
+  // The same rule inside a sealed record: a hostile read is a malformed record, not an escape.
+  const sealed = sealMappingPayload({ scope: scope(), plaintext: randomBytes(8), key: key(103) });
+  assertSealed(sealed, new Uint8Array(8));
+  for (const field of ['nonce', 'ciphertext', 'tag']) {
+    for (const [label, build] of [['length', throwingLength], ['element', throwingElement]]) {
+      const opened = attempt(openMappingPayload, { scope: scope(), key: key(103),
+        envelope: { ...sealed.envelope, [field]: build() } });
+      assert.equal(opened.threw, false, `a throwing ${field} ${label} must not throw out of the boundary`);
+      assertRefused(opened.result, 'INVALID_ENVELOPE');
+      assert.equal(JSON.stringify(opened.result).includes(planted), false);
+    }
+  }
+  // Then the request record's own reflective traps, whose hostile values used to escape the inner
+  // reader and surface as an unrelated fallback code at the outer boundary.
+  for (const name of ['ownKeys', 'getPrototypeOf', 'getOwnPropertyDescriptor']) {
+    const refused = attempt(sealMappingPayload, new Proxy(
+      { scope: scope(), plaintext: randomBytes(8), key: key(103) }, { [name]: () => { throw hostile(); } }));
+    assert.equal(refused.threw, false, `a hostile ${name} trap must not throw out of the boundary`);
+    assertRefused(refused.result, 'INVALID_INPUT');
+    assert.equal(JSON.stringify(refused.result).includes(planted), false);
+  }
+  // A hostile value in a position that is checked structurally never reaches a trap at all.
+  for (const planted_scope of [
+    { ...scope(), tenantId: hostile() }, { ...scope(), classification: hostile() },
+    { ...scope(), mappingRevision: hostile() },
+  ]) {
+    const refused = attempt(sealMappingPayload,
+      { scope: planted_scope, plaintext: randomBytes(8), key: key(103) });
+    assert.equal(refused.threw, false, 'a hostile scope field must not throw out of the boundary');
+    assertRefused(refused.result, 'INVALID_CONTEXT');
+    const opened = attempt(openMappingPayload,
+      { scope: planted_scope, key: key(103), envelope: sealed.envelope });
+    assert.equal(opened.threw, false, 'a hostile expected scope field must not throw out of the boundary');
+    assertRefused(opened.result, 'INVALID_CONTEXT');
+  }
+});
+
+test('clearing owned transient buffers never wipes a returned or caller-supplied buffer', () => {
+  const plaintext = randomBytes(48);
+  const expected = digest(plaintext);
+  const sealed = sealMappingPayload({ scope: scope(), plaintext, key: key(107) });
+  const envelope = assertSealed(sealed, plaintext);
+  const record = {
+    nonce: digest(envelope.nonce), ciphertext: digest(envelope.ciphertext), tag: digest(envelope.tag),
+  };
+  // A refused open leaves every caller buffer byte-for-byte intact.
+  for (const request of [
+    { scope: scope({ tenantId: 'tenant-b.invalid' }), key: key(107), envelope: sealed.envelope },
+    { scope: scope(), key: key(109), envelope: sealed.envelope },
+    { scope: scope(), key: key(107), envelope: { ...envelope, tag: randomBytes(16) } },
+    { scope: scope(), key: key(107), envelope: { ...envelope, ciphertext: randomBytes(48) } },
+  ]) {
+    const refused = attempt(openMappingPayload, request);
+    assert.equal(refused.threw, false);
+    assertRefused(refused.result, 'AUTHENTICATION_FAILED');
+    assert.equal(digest(envelope.nonce), record.nonce, 'a refusal must not touch the caller record');
+    assert.equal(digest(envelope.ciphertext), record.ciphertext, 'a refusal must not touch the caller record');
+    assert.equal(digest(envelope.tag), record.tag, 'a refusal must not touch the caller record');
+  }
+  // A successful open hands back a buffer no later open and no internal copy shares: wiping it
+  // leaves a second open of the same record intact and still byte-exact.
+  const first = openMappingPayload({ scope: scope(), key: key(107), envelope });
+  assert.equal(first.status, 'OPENED');
+  first.plaintext.fill(0);
+  const second = openMappingPayload({ scope: scope(), key: key(107), envelope });
+  assert.equal(second.status, 'OPENED');
+  assert.equal(digest(second.plaintext), expected, 'a returned buffer must not alias a later open');
+  second.plaintext.fill(0);
+  // The caller's own payload and key survive both directions untouched.
+  assert.equal(digest(plaintext), expected, 'a seal must not touch the caller payload');
+  const callerPayload = randomBytes(24);
+  const callerDigest = digest(callerPayload);
+  const refused = attempt(sealMappingPayload, { scope: scope({ classification: 'CREDENTIAL_OR_SECRET' }),
+    plaintext: callerPayload, key: key(107) });
+  assert.equal(refused.threw, false);
+  assertRefused(refused.result, 'SECRET_NOT_REVERSIBLE');
+  assert.equal(digest(callerPayload), callerDigest, 'a refusal must not touch the caller payload');
+  callerPayload.fill(0);
   plaintext.fill(0);
 });
 

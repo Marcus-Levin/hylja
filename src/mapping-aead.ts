@@ -23,11 +23,16 @@ import type { SemanticClass } from './classification.js';
  * crypto, it does not authorize anyone.
  *
  * Failure handling. Every refusal is one fixed code from `MAPPING_AEAD_REFUSALS`, carries no caller
- * text, and never carries a native error, message or cause. Nothing is written to a log. Bytes
- * produced by `decipher.update` before the tag is verified are never returned: they are held and
- * discarded unless `final` authenticates. Owned transient copies of caller key and payload bytes are
- * overwritten after use; that is best-effort hygiene in JavaScript, not a zeroization guarantee for
- * copies held inside native crypto, garbage-collected buffers or swapped pages.
+ * text, and never carries a native error, message or cause. Nothing is written to a log. Refusal
+ * identification is non-reflective and guarded, so a hostile thrown `Proxy` cannot make the boundary
+ * itself throw. A declared byte length is validated as a primitive, nonnegative safe integer before
+ * any buffer is allocated, so a lying or oversized claim never buys an allocation. Bytes produced by
+ * `decipher.update` before the tag is verified are never returned: they are held and discarded unless
+ * `final` authenticates. Owned transient copies of caller key, payload, AAD, sealed-body and
+ * decipher bytes are overwritten on the success path and on every exceptional path; that is
+ * best-effort hygiene in JavaScript, not a zeroization guarantee for copies held inside native
+ * crypto, garbage-collected buffers or swapped pages. A buffer this module returns to the caller, and
+ * a buffer the caller supplied, are never overwritten by that hygiene.
  */
 const ALGORITHM = 'aes-256-gcm' as const;
 const encoder = new TextEncoder();
@@ -100,8 +105,43 @@ export type MappingOpenResult =
 // reflective failure is the same fixed refusal as a malformed record, never an escaped error.
 // ---------------------------------------------------------------------------------------------
 type Fields = Record<string, unknown>;
-class Invalid extends Error { constructor(readonly code: MappingAeadRefusal) { super(code); } }
-function fail(code: MappingAeadRefusal): never { throw new Invalid(code); }
+/** Private brand of this module's own refusals. It is module-private, never placed on a returned
+ *  result and never handed to caller code, so caller code cannot forge it. */
+const REFUSAL_BRAND: unique symbol = Symbol('hylja.mapping-aead.refusal');
+
+class Refusal extends Error {
+  /** The fixed code is the whole message. No caller text, native message or cause is ever kept. */
+  constructor(readonly code: MappingAeadRefusal) {
+    super(code);
+    this.name = 'Refusal';
+  }
+  /** Compared by strict equality only. This type is never recognised by a prototype walk. */
+  readonly brand: typeof REFUSAL_BRAND = REFUSAL_BRAND;
+}
+
+/** Recognises one of this module's own refusals without reflection, and cannot itself throw.
+ *
+ *  `instanceof` walks `error.[[GetPrototypeOf]]`, so a hostile thrown `Proxy` can trap that call and
+ *  throw a second time from inside our own catch block; that is how a planted error escaped this
+ *  boundary before. This reads one private brand under a guard instead: a trap on that read degrades
+ *  to `undefined` and the caller falls back to its fixed refusal code. The code is re-checked against
+ *  the closed refusal vocabulary, so even a forged brand could only select another fixed code. */
+function refusalCode(error: unknown): MappingAeadRefusal | undefined {
+  try {
+    if (error === null || typeof error !== 'object') return undefined;
+    const candidate = error as { brand?: unknown; code?: unknown };
+    if (candidate.brand !== REFUSAL_BRAND) return undefined;
+    const code: unknown = candidate.code;
+    return typeof code === 'string' && (MAPPING_AEAD_REFUSALS as readonly string[]).includes(code)
+      ? (code as MappingAeadRefusal)
+      : undefined;
+  } catch {
+    // Reading a property of a hostile thrown Proxy can throw again. Identification must never be able
+    // to escape, so a trap here degrades to the fixed fallback refusal.
+    return undefined;
+  }
+}
+function fail(code: MappingAeadRefusal): never { throw new Refusal(code); }
 function fields(value: unknown, required: readonly string[], cap: number,
   code: MappingAeadRefusal = 'INVALID_INPUT'): Fields {
   try {
@@ -119,27 +159,48 @@ function fields(value: unknown, required: readonly string[], cap: number,
     for (const name of required) if (!Object.hasOwn(result, name)) fail(code);
     return result;
   } catch (error) {
-    if (error instanceof Invalid) throw error;
+    // One of our own refusals keeps its code; anything else, including a hostile thrown Proxy, is
+    // this fixed code. `refusalCode` is guarded, so this catch cannot itself throw out of the call.
+    const own = refusalCode(error);
+    if (own !== undefined) throw error;
     fail(code);
   }
 }
-/** One bounded copy of one byte source: the declared length is read once, then each index exactly
- *  once, so a source that changes between reads cannot change under the copy. A non-byte element is
- *  refused rather than silently coerced. */
+/** One bounded copy of one byte source: the declared length is read once, validated as a primitive,
+ *  nonnegative safe integer **before** any buffer is allocated, then each index is read exactly once,
+ *  so a source that changes between reads cannot change under the copy and a lying or oversized
+ *  length claim cannot buy an allocation or a bound bypass. A non-byte element is refused rather than
+ *  silently coerced, and a partial copy is overwritten before it is abandoned. */
 function snapshotBytes(value: unknown, maximum: number, invalid: MappingAeadRefusal,
   oversized: MappingAeadRefusal): Uint8Array {
-  if (!(value instanceof Uint8Array)) fail(invalid);
-  const size = value.byteLength;
-  if (size > maximum) fail(oversized);
-  const copy = new Uint8Array(size);
-  for (let index = 0; index < size; index += 1) {
-    const byte: unknown = value[index];
-    if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 0xff) fail(invalid);
-    copy[index] = byte;
+  let copy: Uint8Array | undefined;
+  try {
+    if (!(value instanceof Uint8Array)) fail(invalid);
+    const declared: unknown = value.byteLength;
+    if (typeof declared !== 'number' || !Number.isSafeInteger(declared) || declared < 0) fail(invalid);
+    if (declared > maximum) fail(oversized);
+    copy = new Uint8Array(declared);
+    for (let index = 0; index < declared; index += 1) {
+      const byte: unknown = value[index];
+      if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 0xff) fail(invalid);
+      copy[index] = byte;
+    }
+    return copy;
+  } catch (error) {
+    // A rejected or half-filled copy never leaves this module uncleared.
+    clear(copy);
+    const own = refusalCode(error);
+    if (own !== undefined) throw error;
+    fail(invalid);
   }
-  return copy;
 }
 function clear(bytes: Uint8Array | undefined): void { if (bytes) bytes.fill(0); }
+/** Overwrites every owned buffer in one list and drops the references. Best effort, never a
+ *  zeroization guarantee, and never applied to a buffer the caller supplied or one returned to it. */
+function clearAll(owned: Uint8Array[]): void {
+  for (const bytes of owned) bytes.fill(0);
+  owned.length = 0;
+}
 function join(parts: readonly Uint8Array[]): Uint8Array {
   let total = 0;
   for (const part of parts) total += part.byteLength;
@@ -208,47 +269,74 @@ function canonicalAad(scope: MappingScope): Uint8Array {
  *  wrapping and destruction are key-management obligations this module neither performs nor claims. */
 function dek(value: unknown): Uint8Array {
   const key = snapshotBytes(value, LIMIT.keyBytes, 'INVALID_KEY', 'INVALID_KEY');
-  if (key.byteLength !== LIMIT.keyBytes) fail('INVALID_KEY');
-  let filled = false;
-  for (let index = 0; index < key.byteLength && !filled; index += 1) filled = key[index] !== 0;
-  if (!filled) fail('INVALID_KEY');
-  return key;
+  try {
+    if (key.byteLength !== LIMIT.keyBytes) fail('INVALID_KEY');
+    let filled = false;
+    for (let index = 0; index < key.byteLength && !filled; index += 1) filled = key[index] !== 0;
+    if (!filled) fail('INVALID_KEY');
+    return key;
+  } catch (error) {
+    // A rejected copy of key bytes is owned here and nowhere else, so it is overwritten here.
+    clear(key);
+    throw error;
+  }
 }
 function envelopeOf(value: unknown): MappingSealedEnvelope {
   const v = fields(value, ['version', 'nonce', 'ciphertext', 'tag'], 6, 'INVALID_ENVELOPE');
   if (v.version !== MAPPING_AEAD_VERSION) fail('INVALID_ENVELOPE');
-  const nonce = snapshotBytes(v.nonce, LIMIT.nonceBytes, 'INVALID_ENVELOPE', 'INVALID_ENVELOPE');
-  const tag = snapshotBytes(v.tag, LIMIT.tagBytes, 'INVALID_ENVELOPE', 'INVALID_ENVELOPE');
-  const ciphertext = snapshotBytes(v.ciphertext, LIMIT.ciphertextBytes, 'INVALID_ENVELOPE',
-    'INVALID_ENVELOPE');
-  // One sealed value is never empty: an empty payload is refused at seal time, so an empty body is
-  // a malformed record rather than a valid envelope of zero bytes.
-  if (nonce.byteLength !== LIMIT.nonceBytes || tag.byteLength !== LIMIT.tagBytes ||
-    ciphertext.byteLength === 0) fail('INVALID_ENVELOPE');
-  return { version: MAPPING_AEAD_VERSION, nonce, ciphertext, tag };
+  let nonce: Uint8Array | undefined;
+  let tag: Uint8Array | undefined;
+  let ciphertext: Uint8Array | undefined;
+  try {
+    nonce = snapshotBytes(v.nonce, LIMIT.nonceBytes, 'INVALID_ENVELOPE', 'INVALID_ENVELOPE');
+    tag = snapshotBytes(v.tag, LIMIT.tagBytes, 'INVALID_ENVELOPE', 'INVALID_ENVELOPE');
+    ciphertext = snapshotBytes(v.ciphertext, LIMIT.ciphertextBytes, 'INVALID_ENVELOPE',
+      'INVALID_ENVELOPE');
+    // One sealed value is never empty: an empty payload is refused at seal time, so an empty body is
+    // a malformed record rather than a valid envelope of zero bytes.
+    if (nonce.byteLength !== LIMIT.nonceBytes || tag.byteLength !== LIMIT.tagBytes ||
+      ciphertext.byteLength === 0) fail('INVALID_ENVELOPE');
+    return Object.freeze({ version: MAPPING_AEAD_VERSION, nonce, ciphertext, tag });
+  } catch (error) {
+    // Snapshots taken before the malformed field are owned here; on the path that delivers nothing,
+    // every one of them is overwritten.
+    clear(nonce);
+    clear(tag);
+    clear(ciphertext);
+    throw error;
+  }
 }
 
 function sealWith(scope: MappingScope, key: Uint8Array, plaintext: Uint8Array): MappingSealedEnvelope {
   let aad: Uint8Array | undefined;
   let nonce: Uint8Array | undefined;
+  let tag: Uint8Array | undefined;
+  const body: Uint8Array[] = [];
   try {
     aad = canonicalAad(scope);
     nonce = snapshotBytes(randomBytes(LIMIT.nonceBytes), LIMIT.nonceBytes, 'CRYPTO_UNAVAILABLE',
       'CRYPTO_UNAVAILABLE');
     const cipher = createCipheriv(ALGORITHM, key, nonce);
     cipher.setAAD(aad, { plaintextLength: plaintext.byteLength });
-    const body = cipher.update(plaintext);
-    const tail = cipher.final();
-    const tag = snapshotBytes(cipher.getAuthTag(), LIMIT.tagBytes, 'CRYPTO_UNAVAILABLE',
+    // Both cipher output buffers are owned by this call, and `join` copies them into the returned
+    // ciphertext. They are therefore overwritten on the way out, success or not.
+    body.push(cipher.update(plaintext));
+    body.push(cipher.final());
+    tag = snapshotBytes(cipher.getAuthTag(), LIMIT.tagBytes, 'CRYPTO_UNAVAILABLE',
       'CRYPTO_UNAVAILABLE');
-    return Object.freeze({ version: MAPPING_AEAD_VERSION, nonce,
-      ciphertext: join([body, tail]), tag });
+    // On this path the nonce and tag are the returned record's own arrays, so they are not cleared.
+    return Object.freeze({ version: MAPPING_AEAD_VERSION, nonce, ciphertext: join(body), tag });
   } catch {
+    // Nothing is delivered on this path, so every snapshot above is an owned transient copy.
+    clear(nonce);
+    clear(tag);
     // A native failure is a fixed refusal here: this direction produces no plaintext, so the cause
     // carries nothing an attacker could use, and it never reaches the caller.
-    clear(nonce);
     fail('CRYPTO_UNAVAILABLE');
-  } finally { clear(aad); }
+  } finally {
+    clearAll(body);
+    clear(aad);
+  }
 }
 function openWith(scope: MappingScope, key: Uint8Array, envelope: MappingSealedEnvelope): Uint8Array {
   let aad: Uint8Array | undefined;
@@ -262,15 +350,21 @@ function openWith(scope: MappingScope, key: Uint8Array, envelope: MappingSealedE
     pending.push(decipher.update(envelope.ciphertext));
     decipher.setAuthTag(envelope.tag);
     pending.push(decipher.final());
-    const plaintext = join(pending);
-    pending.length = 0;
-    return plaintext;
+    // `join` copies the authenticated bytes into a fresh buffer. The pending parts are this module's
+    // own decipher output and are never the buffer handed back to the caller, so the finally below
+    // can overwrite them on the success path as well as on every exceptional path.
+    return join(pending);
   } catch {
     // Authentication failure, a wrong scope, a wrong key and a native error are one indistinguishable
     // fixed refusal. The native message and cause are never inspected, logged or returned.
-    for (const part of pending) part.fill(0);
     fail('AUTHENTICATION_FAILED');
-  } finally { clear(aad); }
+  } finally {
+    // Runs on the success path and on every exceptional path. `pending` holds only this call's own
+    // decipher output - never a caller buffer and never the copy returned above - so this can
+    // neither withhold the plaintext nor wipe the returned one.
+    clearAll(pending);
+    clear(aad);
+  }
 }
 
 /**
@@ -295,7 +389,8 @@ export function sealMappingPayload(requestValue: unknown): MappingSealResult {
     return Object.freeze({ version: MAPPING_AEAD_VERSION, status: 'SEALED', finding: 'SEALED',
       envelope: sealWith(target, key, plaintext) });
   } catch (error) {
-    return refuse(error instanceof Invalid ? error.code : 'CRYPTO_UNAVAILABLE');
+    // Non-reflective: see `refusalCode`. A hostile thrown Proxy is one fixed refusal, never an escape.
+    return refuse(refusalCode(error) ?? 'CRYPTO_UNAVAILABLE');
   } finally {
     clear(key);
     clear(plaintext);
@@ -314,15 +409,22 @@ export function openMappingPayload(requestValue: unknown): MappingOpenResult {
   const refuse = (finding: MappingAeadRefusal): MappingOpenResult =>
     Object.freeze({ version: MAPPING_AEAD_VERSION, status: 'REFUSED', finding });
   let key: Uint8Array | undefined;
+  let envelope: MappingSealedEnvelope | undefined;
   try {
     const request = fields(requestValue, ['scope', 'envelope', 'key'], 4);
     const expected = mappingScope(request.scope);
     key = dek(request.key);
-    const envelope = envelopeOf(request.envelope);
+    envelope = envelopeOf(request.envelope);
     const plaintext = openWith(expected, key, envelope);
     return Object.freeze({ version: MAPPING_AEAD_VERSION, status: 'OPENED', finding: 'OPENED',
       plaintext, bytes: plaintext.byteLength });
   } catch (error) {
-    return refuse(error instanceof Invalid ? error.code : 'AUTHENTICATION_FAILED');
-  } finally { clear(key); }
+    // Non-reflective: see `refusalCode`. A hostile thrown Proxy is one fixed refusal, never an escape.
+    return refuse(refusalCode(error) ?? 'AUTHENTICATION_FAILED');
+  } finally {
+    // Owned transient copies only: the returned plaintext is a separate buffer that is never touched
+    // here, and nothing the caller supplied is reachable from either copy.
+    clear(key);
+    if (envelope) { clear(envelope.nonce); clear(envelope.ciphertext); clear(envelope.tag); }
+  }
 }
