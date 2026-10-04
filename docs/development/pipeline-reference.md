@@ -165,8 +165,14 @@ Owned shutdown is finite: the watchdog stops the CLI's own child one minute past
 timeout, sends SIGTERM, then SIGKILL after 10 s, then waits at most 10 s more for `close` — never an
 indefinite wait.
 
-Evidence: `node --test test/hylja-native-lane.test.mjs` drives the real controller and CLI exports
-against a fake event API, a fake preflight and a synthetic temporary platform (28 tests). A read-only
+Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
+real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
+platform (30 tests, 20 of them in the lane file). Two of them
+fake only the child transport, so the shipped default platform is what runs: the default filesystem
+must read the progress tail with bounded positional descriptor reads and close every descriptor it
+opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
+removed on completion. Faking those two adapters had passed while the defaults read the whole progress
+file and registered no listener at all. A read-only
 smoke on root's own installed Pi ran from
 `/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and
 verification records beside it). It exercised launch and evidence plumbing on a reviewer lane; it is not

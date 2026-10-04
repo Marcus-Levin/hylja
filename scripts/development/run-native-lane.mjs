@@ -20,7 +20,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,6 +44,8 @@ export const WATCHDOG_GRACE_MS = 60_000;
 export const KILL_GRACE_MS = 10_000;
 /** Final finite wait for `close` after SIGKILL. Never an indefinite wait. */
 export const CLOSE_WAIT_MS = 10_000;
+/** Hard ceiling on one positional read of the default platform, whatever a caller asks for. */
+export const MAX_RANGE_READ_BYTES = MAX_PROGRESS_RECORDS * 512;
 
 export const SETUP_FAILURES = {
 	argv: 'SETUP_FAILED_ARGUMENTS',
@@ -98,7 +100,20 @@ const defaultFs = {
 	readFile: (path) => readFileSync(path, 'utf8'),
 	exists: existsSync,
 	size: (path) => statSync(path).size,
-	read: (path, offset, length) => readFileSync(path).subarray(offset, offset + length),
+	read: (path, offset, length) => {
+		// A bounded positional read of exactly the requested window, never a whole-file read: the
+		// caller sizes the tail, this clamps it, and the descriptor is closed in every path.
+		if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(length)) throw new Error(SETUP_FAILURES.malformed);
+		const want = Math.min(length, MAX_RANGE_READ_BYTES);
+		if (want <= 0) return Buffer.alloc(0);
+		const handle = openSync(path, 'r');
+		try {
+			const buffer = Buffer.allocUnsafe(want);
+			return buffer.subarray(0, readSync(handle, buffer, 0, want, offset));
+		} finally {
+			closeSync(handle);
+		}
+	},
 	readdir: (path) => readdirSync(path),
 	writeFile: (path, data) => writeFileSync(path, data, { mode: 0o600 }),
 };
@@ -324,6 +339,7 @@ function launch(config, deps) {
 			deps.clearTimeout(timer);
 		};
 		let settled = false;
+		let stopped = false;
 		let deadline = false;
 		let stderrBytes = 0;
 		let killTimer = null;
@@ -342,7 +358,10 @@ function launch(config, deps) {
 			env: { ...process.env, [LANE_CONFIG_ENV]: deps.configPath, [LANE_SUBAGENTS_ENV]: config.subagents },
 		});
 		// Shutdown reaches exactly this owned child: SIGTERM, then SIGKILL, then a finite close wait.
+		// Idempotent, so a second SIGINT, a SIGTERM and the watchdog cannot stack kill ladders.
 		const stop = () => {
+			if (settled || stopped) return;
+			stopped = true;
 			child.kill('SIGTERM');
 			killTimer = arm(() => {
 				killTimer = null;
@@ -353,7 +372,12 @@ function launch(config, deps) {
 				}, CLOSE_WAIT_MS);
 			}, KILL_GRACE_MS);
 		};
-		signoffs = deps.addSignalListener('SIGINT', stop);
+		// Each registration returns one unsubscribe function, exactly as the shipped adapter contract
+		// declares. They are collected, never spread: a function is not an iterable of signoffs.
+		signoffs = [
+			deps.addSignalListener('SIGINT', stop),
+			deps.addSignalListener('SIGTERM', stop),
+		];
 		arm(stop, config.timeoutMs + WATCHDOG_GRACE_MS);
 		child.stderr.on('data', (chunk) => {
 			// Only a bounded byte count is retained; a child message is never echoed into the receipt.
@@ -401,7 +425,16 @@ export function readProgress(path, fs) {
 	return snapshots;
 }
 
-const defaultSignalOffs = () => [];
+/** The real default hook: this process owns the listener it adds, and removing it is idempotent. */
+const defaultSignalOffs = (name, handler) => {
+	process.on(name, handler);
+	let removed = false;
+	return () => {
+		if (removed) return;
+		removed = true;
+		process.removeListener(name, handler);
+	};
+};
 
 /** The whole lane. Returns a public verification record; it never returns leaf text. */
 export async function runNativeLane(argv, deps = {}) {
@@ -410,7 +443,7 @@ export async function runNativeLane(argv, deps = {}) {
 		spawn,
 		setTimeout,
 		clearTimeout,
-		addSignalListener: () => defaultSignalOffs(),
+		addSignalListener: defaultSignalOffs,
 		configPath: '',
 		log: () => {},
 		...deps,

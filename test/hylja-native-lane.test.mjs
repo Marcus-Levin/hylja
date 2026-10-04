@@ -7,7 +7,9 @@
 // did not leak.
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import nodeFs from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -821,4 +823,127 @@ test('the installed Pi executable, role profiles and controller entrypoint are r
 	assert.equal(readRoleProfile('hylja-reviewer').model, REVIEWER_MODEL);
 	assert.equal(readRoleProfile('hylja-implementer').timeoutMs, 1_200_000);
 	assert.equal(readRoleProfile('hylja-reviewer').timeoutMs, 900_000);
+});
+
+/**
+ * Real default adapters, real default platform. These two cases exist because injected fake
+ * dependencies passed while the shipped defaults did not: a fake range read honored the range while
+ * the default read the whole file and sliced it, and fake signal hooks recorded a callback while the
+ * default registered nothing at all. Nothing here needs an installed Pi, a provider or the network:
+ * the temporary platform above supplies synthetic entrypoints and the child transport is fake, so the
+ * only real components under test are the CLI's own default filesystem and signal registration.
+ */
+test('the real default filesystem reads a bounded positional progress tail and closes every fd', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	// A whole-file read of this planted progress file is 8 MiB; the tail cap is 128 KiB.
+	const cap = MAX_PROGRESS_RECORDS * 512;
+	const planted = `${'synthetic-padding-'.repeat(512 * 1024)}\n`
+		+ `${JSON.stringify({ event: 'progress', key: config.key, runId: RUN_ID, model: REVIEWER_MODEL, toolCount: 53, elapsedMs: 296_680 })}\n`;
+	assert.equal(planted.length > cap * 8, true, 'the planted file must exceed the cap by more than eight times');
+
+	const realOpen = nodeFs.openSync;
+	const realRead = nodeFs.readSync;
+	const realClose = nodeFs.closeSync;
+	const realReadFile = nodeFs.readFileSync;
+	const opened = new Set();
+	const closed = new Set();
+	const positional = [];
+	const wholeFile = [];
+	nodeFs.openSync = (path, ...rest) => {
+		const fd = realOpen(path, ...rest);
+		if (path === config.progress) opened.add(fd);
+		return fd;
+	};
+	nodeFs.readSync = (fd, buffer, offset, length, position) => {
+		if (opened.has(fd)) positional.push({ allocated: buffer.length, length, position });
+		return realRead(fd, buffer, offset, length, position);
+	};
+	nodeFs.closeSync = (fd) => {
+		if (opened.has(fd)) closed.add(fd);
+		return realClose(fd);
+	};
+	nodeFs.readFileSync = (path, ...rest) => {
+		const data = realReadFile(path, ...rest);
+		if (path === config.progress) wholeFile.push(data.length);
+		return data;
+	};
+	syncBuiltinESMExports();
+	try {
+		// Only the child transport is injected, so the default filesystem is the one under test. The
+		// leaf writes the oversized progress file, as a real lane would, after the freshness check.
+		const result = await runNativeLane(['--config', configPath], {
+			spawn: fakeSpawn({ onLaunch: () => {
+				writeFileSync(config.progress, planted);
+				assert.equal(statSync(config.progress).size > cap * 8, true, 'the planted file must exceed the cap');
+			} }),
+		});
+		assert.equal(result.reason, SETUP_FAILURES.receipt);
+		assert.deepEqual(wholeFile, [], 'the default platform must never read the whole progress file');
+		assert.equal(positional.length >= 1, true, 'the default platform must read the tail positionally');
+		for (const read of positional) {
+			assert.equal(read.allocated <= cap, true, `allocation ${read.allocated} exceeds the ${cap} byte cap`);
+			assert.equal(read.length <= cap, true, `read ${read.length} exceeds the ${cap} byte cap`);
+			assert.equal(Number.isInteger(read.position) && read.position > 0, true, `positional read ${read.position}`);
+		}
+		assert.deepEqual([...opened], [...closed], 'every default-read descriptor is closed in a finally');
+		// The bounded read is still the correct tail: the newest snapshot survives.
+		const written = JSON.parse(readFileSync(config.verification, 'utf8'));
+		assert.equal(written.progress.at(-1).toolCount, 53);
+		assert.equal(written.progress.length <= MAX_PROGRESS_RECORDS, true, `${written.progress.length}`);
+	} finally {
+		nodeFs.openSync = realOpen;
+		nodeFs.readSync = realRead;
+		nodeFs.closeSync = realClose;
+		nodeFs.readFileSync = realReadFile;
+		syncBuiltinESMExports();
+		cleanup();
+	}
+});
+
+test('the real default signal hooks own SIGINT and SIGTERM, stop once, and are removed on completion', async () => {
+	const { configPath, cleanup } = tempConfig();
+	try {
+		const kills = [];
+		let childRef = null;
+		const baseline = {
+			SIGINT: process.listenerCount('SIGINT'),
+			SIGTERM: process.listenerCount('SIGTERM'),
+		};
+		const pending = runNativeLane(['--config', configPath], {
+			spawn: fakeSpawn({ hang: true, onLaunch: (_options, child) => {
+				childRef = child;
+				child.kill = (signal) => { kills.push(signal); return true; };
+			} }),
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		let result = null;
+		try {
+		assert.equal(process.listenerCount('SIGINT'), baseline.SIGINT + 1, 'the lane owns one SIGINT listener');
+		assert.equal(process.listenerCount('SIGTERM'), baseline.SIGTERM + 1, 'the lane owns one SIGTERM listener');
+		// Delivered to the installed listener, never to the operating system: no signal can reach the
+		// test runner itself, because the handler is registered before anything is emitted.
+		assert.equal(process.emit('SIGINT'), true);
+		assert.deepEqual(kills, ['SIGTERM'], 'a signal stops exactly the owned child with SIGTERM first');
+		assert.equal(process.emit('SIGTERM'), true);
+		assert.equal(process.emit('SIGINT'), true);
+		assert.deepEqual(kills, ['SIGTERM'], 'repeated stops are idempotent, never a second kill ladder');
+		assert.equal(childRef.kill('SIGKILL'), true);
+		kills.pop();
+
+		childRef.emit('close', 143);
+		result = await pending;
+		// A signalled child is not a completed lane, and nothing owned outlives the promise.
+		assert.equal(result.reason, SETUP_FAILURES.nativeExit);
+		assert.equal(result.record.nativeExitCode, 143);
+		assert.deepEqual(kills, ['SIGTERM']);
+		assert.equal(process.listenerCount('SIGINT'), baseline.SIGINT, 'the SIGINT listener is removed');
+		assert.equal(process.listenerCount('SIGTERM'), baseline.SIGTERM, 'the SIGTERM listener is removed');
+		} finally {
+			// A failed assertion must not leave a hung lane: the owned child is always closed out.
+			childRef?.emit('close', 143);
+			await pending;
+		}
+	} finally {
+		cleanup();
+	}
 });
