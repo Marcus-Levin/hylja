@@ -365,11 +365,18 @@ function performEffect(mapping, revision, backend) {
 /* ---------- The trusted USE path: audit before effect, currency before and after ---------- */
 
 /**
- * The USE path this file exists to pin. Seven gates stand between a scenario and a resource effect,
- * in this fixed order:
+ * The USE path this file exists to pin. Before gate 1 stands one gate of this host's own: this path
+ * is the USE path, so the authorization request, the Policy Engine request and the effect all speak
+ * one operation, and a requested operation other than USE is refused before any of them runs. A
+ * matching DISPLAY or EXPORT grant is neither honoured nor reported as missing - the host has no
+ * such effect - so the refusal carries the host's own code and one denied authorization attempt for
+ * the requested operation.
+ *
+ * Seven gates then stand between a scenario and a resource effect, in this fixed order:
  *
  *   1. a fresh registry `current` read, before anything else is decided;
- *   2. an actual `AUTHORIZED` decision from the real authorization seam for exactly this operation;
+ *   2. an actual `AUTHORIZED` decision from the real authorization seam for `USE`, the only
+ *      operation that can reach this path;
  *   3. an actual `SELECTED` + `KEEP` decision from the real Policy Engine for `USE`;
  *   4. real `appendAuditEvent` calls for the authorization attempt and the policy decision, each one
  *      gated by `gateHighRiskEffect` on the result `appendAuditEvent` itself returned;
@@ -391,6 +398,17 @@ function useMapping(mapping, options = {}) {
   const bundle = options.bundle ?? policyBundle('KEEP');
   const backend = options.backend ?? createResourceBackend();
   const operation = options.operation ?? 'USE';
+
+  // Gate 0: the operation this host actually performs. The authorization request below, the policy
+  // request in `decideUse` and the effect in `performEffect` are all USE, so a request for another
+  // operation cannot be answered here at all - not by a USE grant, not by a matching DISPLAY or
+  // EXPORT grant, and not by a USE effect. `RESOLUTION_DENIED` under the requested operation is
+  // what the shipped taxonomy accepts for that refusal.
+  if (operation !== 'USE') {
+    appendAuditEvent(audit.ledger, auditDraft('AUTHORIZATION_ATTEMPT', operation, 'DENIED',
+      'RESOLUTION_DENIED', mapping, bundle), audit.trusted);
+    return withheld('OPERATION_NOT_SUPPORTED');
+  }
 
   // Gate 1: fresh registry currency, before anything else is decided.
   const fresh = readCurrent(mapping, now, { mappingRef: options.mappingRef, scope: options.scope });
@@ -505,6 +523,12 @@ test('an audited USE opens a real resource lookup and returns only a fixed non-s
   assert.equal(verified.anchorsChecked, 1);
   assert.equal(verified.anchoredThrough, 2);
   assert.equal(verified.unanchoredEntries, 0);
+  // The anchor an external store must retain is privacy-safe in its own right: scope-bound digests
+  // and a sequence, never the planted marker or the mapping reference.
+  const anchorImage = JSON.stringify(anchor);
+  assert.equal(anchorImage.includes(MARKER), false);
+  assert.equal(anchorImage.includes(SYNTHETIC_ORIGINAL), false);
+  assert.equal(anchorImage.includes(mapping.mappingRef), false);
   const unanchored = verifyAuditStream(audit.ledger, audit.trusted, []);
   assert.equal(unanchored.status, 'UNANCHORED');
   assert.equal(unanchored.finding, 'NO_ANCHOR');
@@ -535,9 +559,9 @@ test('an audited USE opens a real resource lookup and returns only a fixed non-s
   assert.equal(effectCalls, 1);
 });
 
-/* ---------- 2. A USE grant never authorizes DISPLAY or EXPORT ---------- */
+/* ---------- 2. Only a USE authorization may precede a USE effect ---------- */
 
-test('a USE grant is spent as DISPLAY or EXPORT by nothing, while USE itself still works', () => {
+test('only a USE authorization precedes a USE effect, whatever grant another operation carries', () => {
   const mapping = activeMapping();
   const audit = makeAudit();
   resetCalls();
@@ -552,13 +576,30 @@ test('a USE grant is spent as DISPLAY or EXPORT by nothing, while USE itself sti
   assert.equal(openCalls, 1);
   assert.equal(effectCalls, 1);
 
-  // A USE grant handed to any other operation authorizes nothing: no opener call, no effect call.
+  // A USE grant handed to any other operation buys no effect. This host refuses the operation
+  // itself, before the authorization seam is asked, so no opener call and no effect call.
   for (const operation of ['DISPLAY', 'EXPORT']) {
     const escalated = useMapping(mapping, { audit, grant: useGrant, operation, now: T0 + 61_000 });
     assert.equal(escalated.outcome, 'WITHHELD', operation);
-    assert.equal(escalated.code, 'OPERATION_NOT_GRANTED', operation);
+    assert.equal(escalated.code, 'OPERATION_NOT_SUPPORTED', operation);
     assert.equal(escalated.opened, false, operation);
     assert.equal(escalated.resource, 'NOT_CALLED', operation);
+    assert.equal(openCalls, 1, operation);
+    assert.equal(effectCalls, 1, operation);
+  }
+
+  // The same request under a grant that really does cover the requested operation. A matching
+  // DISPLAY or EXPORT grant is not missing and is not claimed to be: this host's effect is USE,
+  // and only a USE authorization may precede a USE effect. The refusal is the host's own gate.
+  for (const operation of ['DISPLAY', 'EXPORT']) {
+    const matching = useMapping(mapping, {
+      audit, grant: grantFor(mapping, fresh.metadata, operation), operation, now: T0 + 61_000 });
+    assert.equal(matching.outcome, 'WITHHELD', operation);
+    assert.equal(matching.code, 'OPERATION_NOT_SUPPORTED', operation);
+    assert.equal(matching.opened, false, operation);
+    assert.equal(matching.matched, false, operation);
+    assert.equal(matching.resource, 'NOT_CALLED', operation);
+    assert.equal(matching.bytes, 0, operation);
     assert.equal(openCalls, 1, operation);
     assert.equal(effectCalls, 1, operation);
   }
@@ -572,10 +613,10 @@ test('a USE grant is spent as DISPLAY or EXPORT by nothing, while USE itself sti
 
   // Every refusal was evidenced privately: two ALLOWED decisions, then one denial per attempt,
   // and no event ever claiming an effect.
-  assert.equal(audit.ledger.entries.length, 5);
+  assert.equal(audit.ledger.entries.length, 7);
   assert.deepEqual(audit.ledger.entries.map((item) => [item.event.operation, item.event.outcome]),
     [['USE', 'ALLOWED'], ['USE', 'ALLOWED'], ['DISPLAY', 'DENIED'], ['EXPORT', 'DENIED'],
-      ['USE', 'DENIED']]);
+      ['DISPLAY', 'DENIED'], ['EXPORT', 'DENIED'], ['USE', 'DENIED']]);
   assert.equal(audit.ledger.entries[2].event.reason, 'RESOLUTION_DENIED');
   assert.equal(verifyAuditStream(audit.ledger, audit.trusted,
     [createAuditCheckpoint(audit.ledger, audit.trusted)]).status, 'VERIFIED');
@@ -770,6 +811,12 @@ test('unaccepted or malformed audit evidence withholds before any opener call or
       policyBundle('KEEP')), audit.trusted);
   assert.equal(appended.status, 'RECORDED');
   assert.equal(gateHighRiskEffect(appended).finding, 'EVIDENCE_RECORDED');
+  // The receipt the shipped append returned is evidence, not content: a pseudonymous correlation
+  // reference and digests, never the planted marker or the mapping reference.
+  const receiptImage = JSON.stringify(appended.receipt);
+  assert.equal(receiptImage.includes(MARKER), false);
+  assert.equal(receiptImage.includes(SYNTHETIC_ORIGINAL), false);
+  assert.equal(receiptImage.includes(mapping.mappingRef), false);
 });
 
 /* ---------- 7. Currency is rechecked after the audit, so a revocation there cannot be spent ---- */
@@ -903,9 +950,10 @@ test('the audit stream is scope-isolated and the scenario holds ciphertext plus 
   const fresh = readCurrent(mapping, T0 + 60_000);
   assert.equal(Object.keys(fresh.metadata).sort().join(','),
     'createdAt,expiresAt,mappingRef,revision,scope,state,version');
-  assert.equal('plaintext' in mapping, false);
-  assert.equal('original' in mapping, false);
-  assert.equal('ciphertext' in mapping, false);
+  // The complete key set, so a host that kept a decrypted value on the scenario object would be
+  // caught here rather than merely absent from the three names this file thought to check.
+  assert.equal(Object.keys(mapping).sort().join(','),
+    'entityId,envelope,expiresAt,hmacKey,key,mappingRef,registry,scope');
   assert.equal(Object.keys(mapping.envelope).sort().join(','), 'ciphertext,nonce,tag,version');
   const image = JSON.stringify({ version: mapping.envelope.version,
     nonce: [...mapping.envelope.nonce], ciphertext: [...mapping.envelope.ciphertext],

@@ -35,17 +35,21 @@ revision and no second authority anywhere in the file.
 
 `useMapping` is the trusted host path under test, and its order is the contract it pins:
 
-1. a fresh registry `current` read, before anything else is decided;
-2. an actual `AUTHORIZED` decision from the real authorization seam for exactly the requested
-   operation, on an explicitly supplied grant;
-3. an actual `SELECTED` + `KEEP` decision from the real Policy Engine for `USE`, over a pinned
+1. the operation gate: this path is the USE path, so a requested operation other than `USE` is
+   refused before any registry read, authorization request, policy decision or effect runs, with the
+   host's own `OPERATION_NOT_SUPPORTED` and one denied `AUTHORIZATION_ATTEMPT` under the requested
+   operation - never as a grant the caller did not have;
+2. a fresh registry `current` read, before anything else is decided;
+3. an actual `AUTHORIZED` decision from the real authorization seam for `USE`, the operation the rest
+   of this path performs, on an explicitly supplied grant;
+4. an actual `SELECTED` + `KEEP` decision from the real Policy Engine for `USE`, over a pinned
    bundle whose content digest is carried into the boundary;
-4. real `appendAuditEvent` calls for the authorization attempt and the policy decision, each one
+5. real `appendAuditEvent` calls for the authorization attempt and the policy decision, each one
    gated by `gateHighRiskEffect` on the result `appendAuditEvent` itself returned in the same
    process;
-5. a **second** fresh registry currency read, after the audit and before any effect;
-6. the real `openMappingPayload` call at that confirmed revision;
-7. the real resource lookup, whose success depends on the recovered identifier.
+6. a **second** fresh registry currency read, after the audit and before any effect;
+7. the real `openMappingPayload` call at that confirmed revision;
+8. the real resource lookup, whose success depends on the recovered identifier.
 
 Withhold at any gate and the counted opener and the counted effect both stay where they were. The
 path never reports `USED` without one real opener call and one real backend lookup.
@@ -69,9 +73,10 @@ production mapping data** anywhere in the file.
 ## The honest boundary: ciphertext-only mapping, one trusted resource
 
 The mapping is ciphertext-only, end to end. The registry record carries one fixed metadata key set,
-the scenario object exposes no plaintext, original or ciphertext property, the sealed record carries
-no key or scope, and every recorded event, receipt, checkpoint and serialized entry is checked for
-the planted marker.
+the scenario object's **complete** own key set is asserted, so a host that kept a decrypted value on
+it would be caught rather than merely absent from the names this file thought to check, the sealed
+record carries no key or scope, and every recorded entry, receipt, checkpoint and serialized image is
+checked for the planted marker, the planted original and the mapping reference.
 
 The single cleartext instance is the synthetic resource backend, and it is **separately provisioned
 out of band** with the handle its own resource owns. That is the boundary stated rather than hidden: a
@@ -92,10 +97,15 @@ to a caller anywhere in the file.
    `ALLOWED` decisions - `AUTHORIZATION_ATTEMPT/USE/RESOLUTION_AUTHORIZED` and
    `POLICY_DECISION/USE/POLICY_ALLOWED` - and the serialized evidence contains neither the planted
    original, nor the mapping reference, nor the resource outcome.
-2. **USE does not imply DISPLAY or EXPORT.** A `USE` grant spent as `DISPLAY` or `EXPORT` is
-   `OPERATION_NOT_GRANTED` with no opener call and no effect, a `DISPLAY` grant cannot be spent as a
-   `USE`, and each refusal is evidenced as a denial event with its own operation. A positive control
-   on the same record keeps the refusals non-vacuous.
+2. **Only a `USE` authorization precedes a `USE` effect.** A `USE` grant spent as `DISPLAY` or
+   `EXPORT`, and a `DISPLAY` or `EXPORT` grant spent as a `USE`, each withhold with no opener call
+   and no effect. The refusals differ honestly: a `DISPLAY` grant against a `USE` request is the
+   authorization seam's own `OPERATION_NOT_GRANTED`, while any request for another operation is
+   refused by this host's own operation gate as `OPERATION_NOT_SUPPORTED`, because the authorization
+   request, the policy request and the effect are all `USE`. A **matching** `DISPLAY` or `EXPORT`
+   grant therefore buys nothing here and is never reported as a missing grant; it is refused as an
+   operation this host does not perform, evidenced as a denial event under its own operation. Every
+   refusal is evidenced, and a positive `USE` control on the same record keeps them non-vacuous.
 3. **Missing, foreign, stale and misbound grants.** No grant, a grant for another mapping reference,
    a grant pinned to a superseded revision, a grant issued to another workload, a grant bound to
    another purpose or another destination, and an already-expired grant each withhold with their own
@@ -113,8 +123,11 @@ to a caller anywhere in the file.
 6. **Unaccepted or malformed audit evidence.** A real sink that cannot commit produces the shipped
    `AUDIT_UNAVAILABLE`, which the shipped gate turns into `EVIDENCE_UNAVAILABLE` and never into
    `permitted`; a `RECORDED` claim with no receipt and a value that is not an append result both
-   produce `EVIDENCE_INVALID`. In every case the opener and effect counters stay at zero and the
-   stream records nothing. The accepting sink on the identical scenario opens and spends once.
+   produce `EVIDENCE_INVALID`. The opener and effect counters stay at zero in every case. The
+   unavailable sink records nothing at all, because it committed nothing; malformed evidence arrives
+   after a real append already committed the authorization decision, so that stream keeps exactly
+   one recorded `AUTHORIZATION_ATTEMPT` and no event claiming an effect ran. The accepting sink on
+   the identical scenario opens and spends once.
 7. **Currency after the audit.** A genuine `REVOKE` injected at exactly the point between the audit
    and the second currency read is refused with zero opener and effect calls, while the audit trail
    stays honest: two `ALLOWED` decisions, verified to an anchor, and no event claiming an execution.
@@ -128,8 +141,9 @@ to a caller anywhere in the file.
    ever attempted with bytes that did not authenticate.
 9. **Scope isolation and ciphertext-only state.** Another tenant's authority reads nothing from this
    stream (`SCOPE_MISMATCH`, no entries at all) and the stream does not verify under a foreign trusted
-   context. The registry key set, the scenario object's key set, the sealed record's key set and one
-   serializable image are all asserted to be free of the original.
+   context. The registry key set, the scenario object's complete key set, the sealed record's key
+   set and one serializable image are all asserted to be free of the original; the retained
+   checkpoint and the append receipt are serialized and asserted free of it too.
 
 ### Mutants that make the denial tests load-bearing
 
@@ -138,6 +152,7 @@ test red and leaves the other eight green:
 
 | Mutant | Test that catches it |
 | --- | --- |
+| Operation gate removed, so any operation reaches the `USE` effect | 2, matching `DISPLAY` / `EXPORT` grants |
 | Post-audit currency read removed | 7, revocation between audit and effect |
 | `gateHighRiskEffect` result ignored | 6, unaccepted or malformed audit evidence |
 | Opener call treated as success regardless of the backend match | 8, identifier-dependent resource success |
