@@ -19,6 +19,7 @@ import ts from 'typescript';
 
 import {
 	FIXED_LANE_INPUT,
+	MAX_PROGRESS_BYTES,
 	MAX_PROGRESS_RECORDS,
 	SETUP_FAILURES as LANE_SETUP_FAILURES,
 	createLaneController,
@@ -34,6 +35,7 @@ import {
 	readProgress,
 	readRoleProfile,
 	runNativeLane,
+	MAX_RANGE_READ_BYTES,
 	SETUP_FAILURES,
 	validateLaneConfig,
 	verifyArtifacts,
@@ -740,6 +742,130 @@ test('the one soft warning survives the capped progress tail the CLI reads after
 		const counts = snapshots.filter((entry) => entry.event === 'progress').map((entry) => entry.toolCount);
 		assert.deepEqual(counts, [...counts].sort((a, b) => a - b), 'retained updates keep chronological order');
 		assert.equal(snapshots.at(-1).toolCount, updates - 1, 'the newest update is retained');
+	} finally {
+		cleanup();
+	}
+});
+
+test('the one soft warning survives the reader byte window that maximum-length metadata produces', async () => {
+	// The record cap and the reader's byte cap are one contract, not two. A record the writer keeps
+	// because it fits the record cap can still sit far outside the byte-bounded tail root reads after
+	// the leaf exits, and then the warning exists in the file but never reaches the reader. Long
+	// accepted metadata is the case that splits the two caps, so it is the case that must be proven.
+	const { config, configPath, cleanup } = tempConfig();
+	const clock = fakeClock();
+	const updates = MAX_PROGRESS_RECORDS + 8;
+	// The longest string the controller accepts for each bounded field, so every record here is as
+	// large as the accepted contract allows it to be.
+	const longModel = 'm'.repeat(4096);
+	const longRunId = 'r'.repeat(4096);
+	try {
+		const loaded = { ...readLaneConfig(configPath), softBudgetMs: 360_000 };
+		const { pi, emitted } = fakePi();
+		const controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		clock.fire(360_000);
+		assert.equal(softWarnings(config.progress).length, 1, 'the warning fired once before the updates');
+
+		for (let toolCount = 0; toolCount < updates; toolCount += 1) {
+			pi.events.emit(delegation.SUBAGENT_DELEGATION_UPDATE_EVENT,
+				{ ...controller.tuple, model: longModel, runId: longRunId, toolCount, durationMs: 360_000 + toolCount });
+		}
+		completeLeaf(pi, controller);
+		await controller.settle();
+		assert.equal(controller.setupFailure, null);
+		assert.equal(clock.timers[0].cancelled, true, 'the armed warning timer is drained on settlement');
+		// Retaining the warning costs root nothing: no cancel, no kill, no deletion, no reset and no
+		// approval timing changes, and the dispatch this lane owns is untouched.
+		assert.equal(emitted.filter((entry) => entry.event === delegation.SUBAGENT_DELEGATION_CANCEL_EVENT).length, 0,
+			'no retained record cancelled anything');
+		assert.equal(existsSync(config.dispatch), true, 'the lane keeps its own dispatch');
+		assert.equal(writeTerminalReceipt(loaded, receipt()).verdict, 'CHANGES REQUESTED',
+			'the warning is not an approval and never rewrites the receipt verdict');
+
+		// The persisted file is inside both halves of the one window the reader parses.
+		const bytes = statSync(config.progress).size;
+		assert.equal(bytes <= MAX_PROGRESS_BYTES, true, `${bytes} bytes exceeds the ${MAX_PROGRESS_BYTES} byte window`);
+		const persisted = readFileSync(config.progress, 'utf8').split('\n').filter((line) => line.length > 0);
+		assert.equal(persisted.length <= MAX_PROGRESS_RECORDS, true, `${persisted.length} records`);
+		assert.equal(Buffer.byteLength(readFileSync(config.progress, 'utf8'), 'utf8'), bytes,
+			'the cap is measured in the serialized UTF-8 bytes the reader reads');
+
+		// The shipped CLI reader, over the file the real controller actually wrote.
+		const fs = { exists: existsSync, size: (p) => statSync(p).size, read: (p, offset, length) => readFileSync(p).subarray(offset, offset + length) };
+		const snapshots = readProgress(config.progress, fs);
+		assert.equal(snapshots.length <= MAX_PROGRESS_RECORDS, true, `the record cap is unchanged: ${snapshots.length}`);
+		const warned = snapshots.filter((entry) => entry.event === 'soft_budget_reached');
+		assert.equal(warned.length, 1, 'exactly one warning reaches the reader');
+		assert.deepEqual(Object.keys(warned[0]).sort(), ['elapsedMs', 'event', 'model', 'runId', 'toolCount'],
+			'still one bounded snapshot with no field the reader does not bound');
+		assert.equal(Number.isFinite(warned[0].elapsedMs) && warned[0].elapsedMs >= 0, true, 'a finite elapsed count');
+		assert.equal(warned[0].elapsedMs, 360_000);
+		// Chronological order survives, and the newest update is one the reader actually has.
+		const counts = snapshots.filter((entry) => entry.event === 'progress').map((entry) => entry.toolCount);
+		assert.deepEqual(counts, [...counts].sort((a, b) => a - b), 'retained updates keep chronological order');
+		assert.equal(snapshots.at(-1).toolCount, updates - 1, 'the newest update is retained');
+		assert.equal(snapshots.at(-1).model, longModel, 'the retained update is the one that was written');
+		assert.equal(snapshots.at(-1).runId, longRunId);
+	} finally {
+		cleanup();
+	}
+});
+
+test('the byte window counts serialized UTF-8 bytes of multibyte and escaped metadata, not characters', async () => {
+	// A window measured in characters is not the window the reader reads: a JSON escape and a
+	// multibyte character each turn one accepted character into several serialized bytes, so a
+	// character-counted budget silently persists far more than the reader can ever see. Both halves
+	// of the one window come from one shared constant, and neither is raised to compensate.
+	const { config, configPath, cleanup } = tempConfig();
+	const clock = fakeClock();
+	const updates = MAX_PROGRESS_RECORDS + 8;
+	// One character of each accepted field is inflated on the way to bytes: a control character is
+	// escaped to six, a three-byte character costs three, and neither is one byte per character.
+	const escapedModel = '\u0001'.repeat(4096);
+	const multibyteRunId = '一'.repeat(4096);
+	const updateLine = JSON.stringify({
+		event: 'progress', key: config.key, model: escapedModel, runId: multibyteRunId, toolCount: 1, elapsedMs: 1,
+	});
+	assert.equal(MAX_PROGRESS_BYTES / updateLine.length >= 4, true,
+		`a character-counted budget would admit four of these records (${updateLine.length} characters each)`);
+	assert.equal(4 * Buffer.byteLength(updateLine, 'utf8') > MAX_PROGRESS_BYTES, true,
+		`four of them are ${4 * Buffer.byteLength(updateLine, 'utf8')} serialized bytes, past the byte window`);
+	assert.equal(Buffer.byteLength(updateLine, 'utf8') > updateLine.length, true,
+		'the serialized UTF-8 size exceeds the accepted character count');
+	try {
+		const loaded = { ...readLaneConfig(configPath), softBudgetMs: 360_000 };
+		const { pi } = fakePi();
+		const controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		clock.fire(360_000);
+		for (let toolCount = 0; toolCount < updates; toolCount += 1) {
+			pi.events.emit(delegation.SUBAGENT_DELEGATION_UPDATE_EVENT,
+				{ ...controller.tuple, model: escapedModel, runId: multibyteRunId, toolCount, durationMs: 360_000 + toolCount });
+		}
+		completeLeaf(pi, controller);
+		await controller.settle();
+		assert.equal(controller.setupFailure, null);
+
+		const bytes = statSync(config.progress).size;
+		assert.equal(bytes <= MAX_PROGRESS_BYTES, true, `${bytes} bytes exceeds the ${MAX_PROGRESS_BYTES} byte window`);
+		const persisted = readFileSync(config.progress, 'utf8').split('\n').filter((line) => line.length > 0);
+		assert.equal(persisted.length <= MAX_PROGRESS_RECORDS, true, `${persisted.length} records`);
+
+		const fs = { exists: existsSync, size: (p) => statSync(p).size, read: (p, offset, length) => readFileSync(p).subarray(offset, offset + length) };
+		const snapshots = readProgress(config.progress, fs);
+		assert.equal(snapshots.filter((entry) => entry.event === 'soft_budget_reached').length, 1,
+			'exactly one warning reaches the reader through a byte-counted window');
+		assert.equal(snapshots.at(-1).toolCount, updates - 1, 'the newest update is retained');
+		assert.equal(snapshots.at(-1).model, escapedModel, 'escaped metadata round-trips through the bounded read');
+		assert.equal(snapshots.at(-1).runId, multibyteRunId, 'multibyte metadata round-trips through the bounded read');
+
+		// One window, not two coincidentally equal numbers: the reader clamps its positional read to
+		// the same constant the writer persists inside, and neither bound was raised.
+		assert.equal(MAX_PROGRESS_BYTES, MAX_PROGRESS_RECORDS * 512, 'the byte window is the existing one');
+		assert.equal(MAX_RANGE_READ_BYTES, MAX_PROGRESS_BYTES, 'the reader and the writer share one window');
 	} finally {
 		cleanup();
 	}

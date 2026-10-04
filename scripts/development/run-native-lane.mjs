@@ -31,6 +31,7 @@ import {
 	LANE_ROLES,
 	LANE_SUBAGENTS_ENV,
 	LANE_VERDICTS,
+	MAX_PROGRESS_BYTES,
 	MAX_PROGRESS_RECORDS,
 	resolveInstalledModules,
 } from '../../.pi/lib/hylja-native-lane.ts';
@@ -45,8 +46,12 @@ export const WATCHDOG_GRACE_MS = 60_000;
 export const KILL_GRACE_MS = 10_000;
 /** Final finite wait for `close` after SIGKILL. Never an indefinite wait. */
 export const CLOSE_WAIT_MS = 10_000;
-/** Hard ceiling on one positional read of the default platform, whatever a caller asks for. */
-export const MAX_RANGE_READ_BYTES = MAX_PROGRESS_RECORDS * 512;
+/**
+ * Hard ceiling on one positional read of the default platform, whatever a caller asks for. It is the
+ * writer's own byte window, not a second number beside it: a read clamped below the window the
+ * progress parser must cover would silently hide the records the writer retained.
+ */
+export const MAX_RANGE_READ_BYTES = MAX_PROGRESS_BYTES;
 
 export const SETUP_FAILURES = {
 	argv: 'SETUP_FAILED_ARGUMENTS',
@@ -449,7 +454,11 @@ function launch(config, deps) {
 	});
 }
 
-/** Reads the bounded numeric progress snapshots from the tail of a capped-size file. */
+/**
+ * Reads the bounded numeric progress snapshots from the tail of the file the controller persisted. The
+ * window is the writer's own: this reader parses exactly the bytes the writer bounded itself to, so a
+ * record the writer retained is one this read can still reach.
+ */
 export function readProgress(path, fs) {
 	if (!fs.exists(path)) return [];
 	let size;
@@ -458,7 +467,7 @@ export function readProgress(path, fs) {
 	} catch {
 		return [];
 	}
-	const cap = MAX_PROGRESS_RECORDS * 512;
+	const cap = MAX_PROGRESS_BYTES;
 	const offset = Math.max(0, size - cap);
 	let text;
 	try {

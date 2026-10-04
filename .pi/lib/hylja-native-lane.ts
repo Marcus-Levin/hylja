@@ -22,10 +22,10 @@
  * A root may configure one optional `softBudgetMs`, strictly below the finite hard `timeoutMs`. It
  * adds exactly two things: a numeric soft/hard timing paragraph to the child's own initial task, and
  * one bounded `soft_budget_reached` progress snapshot at the soft budget. That snapshot is a warning
- * for root and the progress file only: it is retained inside the same progress cap, so later updates
- * cannot push it out of the tail root reads after the child exits. It is never delivered to the
- * running child, and it never cancels, kills, deletes, resets or approves anything. Without it the
- * lane behaves exactly as before and arms no timer.
+ * for root and the progress file only: it is pinned inside both halves of the progress window, so the
+ * leaf's own later updates cannot push it out of the tail root reads after the child exits. It is
+ * never delivered to the running child, and it never cancels, kills, deletes, resets or approves
+ * anything. Without it the lane behaves exactly as before and arms no timer.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -50,6 +50,15 @@ export const LANE_VERDICTS = ['APPROVED', 'CHANGES REQUESTED', 'INCOMPLETE'];
 
 /** Hard cap on persisted progress records. The file is rewritten, never appended without bound. */
 export const MAX_PROGRESS_RECORDS = 256;
+
+/**
+ * Hard cap on the serialized UTF-8 bytes the persisted progress file may occupy. This is the same
+ * window the CLI reader parses its tail through, so a record this writer retains is a record the
+ * reader can actually see: the record cap and this byte cap are two halves of one end-to-end
+ * contract, not two independent caps that happen to disagree. The CLI imports this exact constant
+ * rather than deriving a second number that could drift from the writer's.
+ */
+export const MAX_PROGRESS_BYTES = MAX_PROGRESS_RECORDS * 512;
 
 /** The raw cap on one task, and the cap the effective task must also stay inside. */
 export const MAX_TASK_CHARS = 1_048_576;
@@ -324,18 +333,65 @@ function readCount(value: unknown): number | null {
 /** The one warning snapshot a configured soft budget adds, and the one record the cap retains. */
 const SOFT_BUDGET_EVENT = 'soft_budget_reached';
 
-/** Persists at most `MAX_PROGRESS_RECORDS` records; the newest snapshot replaces the older tail. */
+/** One UTF-8 encoder for the serialized size of the exact bytes the progress file carries. */
+const UTF8 = new TextEncoder();
+
+/**
+ * The serialized cost of one progress line inside the file: its UTF-8 bytes plus the one newline that
+ * separates it from the next. N such lines, joined and terminated, are exactly the sum of their costs,
+ * so this is the file's size and not an estimate of it. Measured after JSON escaping and in UTF-8,
+ * because that is what is persisted and what the reader's bounded positional read counts.
+ */
+const progressLineBytes = (line: string): number => UTF8.encode(line).length + 1;
+
+/**
+ * The bounded tail this writer persists: inside the record cap and the byte window at the same time,
+ * so a record the writer retains is a record the reader's own window can still reach. Retention at
+ * the writer is only meaningful if it implies availability at the reader, and a record count alone
+ * never established that: a leaf whose accepted metadata is long fills the byte window long before it
+ * fills the record cap, which drops the records root reads after exit without ever writing past the
+ * count cap. The one soft warning is pinned inside that window and the newest ordinary updates fill
+ * what it leaves, oldest survivor first; when the window binds, ordinary records are what is evicted.
+ */
+function retainedProgress(records: readonly LaneProgressRecord[]): LaneProgressRecord[] {
+	// The newest ordinary updates fill the window first, against the count cap and the byte cap at the
+	// same time, so the survivors are one chronological tail rather than two independently chosen sets.
+	const windowed = records.slice(-MAX_PROGRESS_RECORDS);
+	let used = 0;
+	const kept: LaneProgressRecord[] = [];
+	for (let index = windowed.length - 1; index >= 0; index -= 1) {
+		const item = windowed[index];
+		if (item === undefined) break;
+		const cost = progressLineBytes(JSON.stringify(item));
+		// The newest update is never the one dropped: every persisted field is bounded far below the
+		// window, so one record always fits it. Everything older stops at the first that no longer does.
+		if (kept.length > 0 && used + cost > MAX_PROGRESS_BYTES) break;
+		kept.unshift(item);
+		used += cost;
+	}
+	// The warning is looked for across the whole history and not only this tail, because the leaf's own
+	// later updates are exactly what can have pushed it out of the window. It joins as the oldest
+	// survivor and the ordinary records it displaces are dropped from the oldest end, so pinning it
+	// costs the window neither a record nor a byte it was already allowed to keep.
+	const warned = records.find((item) => item.event === SOFT_BUDGET_EVENT);
+	if (warned === undefined || kept.includes(warned)) return kept;
+	kept.unshift(warned);
+	used += progressLineBytes(JSON.stringify(warned));
+	// `used` stays the exact file size here: the sum of the kept records' serialized costs.
+	while (kept.length > 1 && (kept.length > MAX_PROGRESS_RECORDS || used > MAX_PROGRESS_BYTES)) {
+		const dropped = kept.splice(1, 1)[0];
+		used -= dropped === undefined ? 0 : progressLineBytes(JSON.stringify(dropped));
+	}
+	return kept;
+}
+
+/**
+ * Persists inside both halves of the one progress window: at most `MAX_PROGRESS_RECORDS` records and
+ * at most `MAX_PROGRESS_BYTES` serialized UTF-8 bytes. The file is rewritten, never appended.
+ */
 function pushProgress(path: string, key: string, records: LaneProgressRecord[], entry: LaneProgressRecord): void {
 	records.push(entry);
-	const kept = records.slice(-MAX_PROGRESS_RECORDS);
-	// Only a full window evicts anything, and only the soft warning is ever put back: root reads this
-	// tail after the leaf has exited, so a warning that the leaf's own later updates push out of the
-	// cap is a warning nobody ever reads. It replaces the oldest retained record instead, leaving the
-	// numeric cap, the newest-first eviction and the chronological order of what survives unchanged.
-	if (records.length > MAX_PROGRESS_RECORDS) {
-		const evicted = records.find((item) => item.event === SOFT_BUDGET_EVENT && !kept.includes(item));
-		if (evicted !== undefined) kept.splice(0, 1, evicted);
-	}
+	const kept = retainedProgress(records);
 	records.length = 0;
 	records.push(...kept);
 	writeFileSync(path, `${kept.map((item) => JSON.stringify(item)).join('\n')}\n`, { mode: 0o600 });
