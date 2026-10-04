@@ -865,6 +865,73 @@ test('a Proxy over bytes, and any non-byte view, is refused without one reflecti
   assert.equal(snapshotSentinelRequest(request({ bytes: new Int8Array([1, 2, 3]) }), 'r-int8').code, 'INVALID_REQUEST');
 });
 
+test('a species-producing brand check is gone: a constructor or Symbol.species getter is never invoked', () => {
+  // `TypedArray.prototype.slice` and `subarray` are SPECIES producers: validating with either reads
+  // caller-owned `constructor[Symbol.species]` and can construct a replacement array from user code.
+  // That dispatch runs before any restriction exists, and catching its exception cannot retract what
+  // it already disclosed. Admission must read internal slots only.
+  let invoked = 0;
+  const plant = (label) => () => { invoked += 1; throw new Error(`planted ${label} ${PLANTED_ORIGINAL}`); };
+  const payload = text(`{"email":"${PLANTED_ORIGINAL}"}`);
+  const key = Uint8Array.from(KEY);
+  for (const target of [payload, key]) {
+    const speciesConstructor = Object.create(Uint8Array);
+    Object.defineProperty(speciesConstructor, Symbol.species, {
+      configurable: true,
+      get() { invoked += 1; throw new Error(`planted species ${PLANTED_ORIGINAL}`); },
+    });
+    Object.defineProperty(target, 'constructor', {
+      configurable: true,
+      get() { invoked += 1; return speciesConstructor; },
+    });
+    Object.defineProperty(target, Symbol.species, {
+      configurable: true,
+      get() { invoked += 1; throw new Error(`planted own species ${PLANTED_ORIGINAL}`); },
+    });
+  }
+  const entries = [{ kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'ref-original-email' }];
+  const snapshot = snapshotSentinelRequest(
+    request({ bytes: payload, known: registration(SCOPE, entries, key) }), 'r-species',
+  );
+
+  assert.equal(invoked, 0, `admission dispatched ${invoked} caller getter(s)`);
+  assert.equal(snapshot.ok, true, 'a genuine byte array stays admissible under a species trap');
+  const clean = snapshotSentinelRequest(
+    request({ bytes: text(`{"email":"${PLANTED_ORIGINAL}"}`), known: registration(SCOPE, entries) }), 'r-species',
+  );
+  assert.deepEqual(Buffer.from(snapshot.value.payload), Buffer.from(clean.value.payload));
+  assert.equal(snapshot.value.payloadDigest, clean.value.payloadDigest);
+  assert.deepEqual(Buffer.from(snapshot.value.known.key), Buffer.from(clean.value.known.key));
+  assert.notEqual(snapshot.value.payload, payload, 'the payload must still be a private copy');
+  assert.notEqual(snapshot.value.known.key, key, 'the key must still be a private copy');
+  assert.doesNotMatch(
+    JSON.stringify(snapshot.value), /planted (species|own species|constructor)/,
+    'no planted diagnostic from a getter may surface in the snapshot',
+  );
+});
+
+test('a re-prototyped non-byte view is refused on its native element kind, not its prototype identity', () => {
+  // Prototype identity is mutable caller state and proves nothing about the internal element kind.
+  // A genuine `Int8Array` wearing `Uint8Array.prototype` must still be refused; a real `Buffer`, whose
+  // intrinsic kind is `Uint8Array`, must still be admitted.
+  const entries = [{ kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'ref-original-email' }];
+  const disguised = new Int8Array([1, 2, 3]);
+  Object.setPrototypeOf(disguised, Uint8Array.prototype);
+  assert.equal(Object.getPrototypeOf(disguised) === Uint8Array.prototype, true);
+  assert.equal(snapshotSentinelRequest(request({ bytes: disguised }), 'r-reprototype').code, 'INVALID_REQUEST');
+  assert.equal(
+    snapshotSentinelRequest(request({ known: registration(SCOPE, entries, disguised) }), 'r-reprototype-key').code,
+    'INVALID_REQUEST',
+  );
+
+  const fromBuffer = Buffer.from(`{"email":"${PLANTED_ORIGINAL}"}`);
+  const admitted = snapshotSentinelRequest(
+    request({ bytes: fromBuffer, known: registration(SCOPE, entries, Buffer.from(KEY)) }), 'r-buffer-kind',
+  );
+  assert.equal(admitted.ok, true, 'a Buffer is a genuine Uint8Array and stays admissible');
+  assert.deepEqual(Buffer.from(admitted.value.payload), Buffer.from(`{"email":"${PLANTED_ORIGINAL}"}`));
+});
+
 test('admission is busy before any caller inspection, so a reentrant check cannot start a second child', async () => {
   const runner = createSentinelProcessRunner({ deadlineMs: 5_000 });
   let reentrant = null;

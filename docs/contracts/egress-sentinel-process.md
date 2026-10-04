@@ -51,12 +51,19 @@ descriptors**: an own accessor with a matching name is refused without being inv
 `Proxy` trap that throws is contained and reported as the same `INVALID_REQUEST` rather than escaping
 `snapshotSentinelRequest` or `check()`. Caller byte and key buffers are admitted and copied through
 captured standard intrinsics only: byte identity and length are read from the typed array's own
-internal slots, so an own `byteLength`, `set` or `Symbol.iterator` accessor on an otherwise genuine
-`Uint8Array` is **ignored, never invoked**, and the copy is written into a buffer this code allocates.
-Anything that is not a genuine `Uint8Array` - an array-like object, a narrow view, a subclass instance,
-a re-prototyped array, or a `Proxy` over one - is refused by the native brand check, which fails on the
-absent internal slots **before** any `get`, `has`, `ownKeys`, `getOwnPropertyDescriptor` or
-`getPrototypeOf` trap can run. `entries` is snapshotted by index descriptor, so a caller iterator, a
+internal slots, so an own `byteLength`, `set`, `constructor`, `Symbol.species` or `Symbol.iterator`
+accessor on an otherwise genuine `Uint8Array` is **ignored, never invoked**, and the copy is written
+into a buffer this code allocates. Identity is decided from internal slots alone: the captured
+`ArrayBuffer.isView` refuses a `Proxy` or any non-view on the [[ViewedArrayBuffer]] slot **before**
+any `get`, `has`, `ownKeys`, `getOwnPropertyDescriptor` or `getPrototypeOf` trap can run, and the
+captured intrinsic `Symbol.toStringTag` accessor then requires the real [[TypedArrayName]] to be
+`Uint8Array`, so a narrow view, a subclass instance and a re-prototyped non-byte view are refused while
+a `Buffer` is admitted. No species-producing method (`slice`, `subarray`, `filter`) and no prototype
+identity comparison is used: the first dispatches caller `constructor[Symbol.species]` before any
+restriction exists, and the second is mutable caller state that proves no element kind. The copy uses
+the captured shared `%TypedArray%.prototype.set`, which reads internal slots. This is a local wrapper
+boundary, not a sandbox: a caller `Proxy` record side effect outside these calls, and tampering with
+the global builtins captured at module initialization, stay outside the guarantee. `entries` is snapshotted by index descriptor, so a caller iterator, a
 sparse hole or an accessor element is refused, not executed.
 
 Admission is claimed before any of this caller-observable inspection begins, so a re-entrant

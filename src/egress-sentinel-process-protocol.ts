@@ -27,8 +27,9 @@
  *
  * Caller-supplied byte arrays are admitted and copied through captured standard intrinsics only. Byte
  * identity and length come from the typed array's own internal slots, never from a caller property,
- * method, iterator or prototype lookup, so an own `byteLength`, `set` or `Symbol.iterator` accessor is
- * ignored rather than called. This is a local wrapper boundary, not a JavaScript sandbox.
+ * method, iterator or prototype lookup, so an own `byteLength`, `set`, `constructor`,
+ * `Symbol.species` or `Symbol.iterator` accessor is ignored rather than called. This is a local
+ * wrapper boundary, not a JavaScript sandbox.
  *
  * Originals and the sentinel key exist here only as bounded copies inside local IPC. Nothing in this
  * module persists, logs or reports them, and no framing here proves heap or RSS erasure.
@@ -233,8 +234,8 @@ function ownDataProperties(value: unknown, allowed: ReadonlySet<string>): Map<st
  * method, iterator or prototype lookup runs on the way there.
  */
 const TYPED_ARRAY_PROTOTYPE: object = Object.getPrototypeOf(Uint8Array.prototype);
-/** The one byte prototype a caller array must actually have, captured before any call arrives. */
-const UINT8_ARRAY_PROTOTYPE: object = Uint8Array.prototype;
+/** The one byte prototype captured before any call arrives, used to reach shared typed-array intrinsics. */
+const UINT8_ARRAY_PROTOTYPE: Uint8Array = Uint8Array.prototype;
 const TYPED_BYTE_LENGTH_DESCRIPTOR: PropertyDescriptor | undefined =
   Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, 'byteLength');
 
@@ -242,10 +243,38 @@ function noTypedByteLength(): never {
   throw new TypeError('the typed array byteLength accessor is unavailable');
 }
 
+function noTypedToStringTag(): never {
+  throw new TypeError('the typed array toStringTag accessor is unavailable');
+}
+
+function noTypedArraySet(): never {
+  throw new TypeError('the typed array set method is unavailable');
+}
+
 const TYPED_BYTE_LENGTH: () => number =
   TYPED_BYTE_LENGTH_DESCRIPTOR === undefined || TYPED_BYTE_LENGTH_DESCRIPTOR.get === undefined
     ? noTypedByteLength
     : TYPED_BYTE_LENGTH_DESCRIPTOR.get;
+
+/** The captured `%TypedArray%.prototype[Symbol.toStringTag]` accessor, which reads the [[TypedArrayName]] slot. */
+const TYPED_TO_STRING_TAG_DESCRIPTOR: PropertyDescriptor | undefined =
+  Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, Symbol.toStringTag);
+const TYPED_TO_STRING_TAG: () => unknown =
+  TYPED_TO_STRING_TAG_DESCRIPTOR === undefined || TYPED_TO_STRING_TAG_DESCRIPTOR.get === undefined
+    ? noTypedToStringTag
+    : TYPED_TO_STRING_TAG_DESCRIPTOR.get;
+
+/** The captured `%TypedArray%.prototype.set`, a non-species-producing copy that reads internal slots. */
+const TYPED_ARRAY_SET: (source: ArrayLike<number>, offset?: number) => void =
+  typeof (UINT8_ARRAY_PROTOTYPE as Uint8Array).set === 'function'
+    ? (UINT8_ARRAY_PROTOTYPE as Uint8Array).set
+    : noTypedArraySet;
+
+/**
+ * The captured `ArrayBuffer.isView`. It reads only the receiver's internal [[ViewedArrayBuffer]] slot,
+ * so it refuses a `Proxy` or any non-view without traversing one caller prototype or trap.
+ */
+const IS_VIEW: (value: unknown) => boolean = ArrayBuffer.isView;
 
 /** Byte length of a byte array already known to be one, read from internal state only. */
 function byteArrayLength(bytes: Uint8Array): number {
@@ -253,34 +282,44 @@ function byteArrayLength(bytes: Uint8Array): number {
 }
 
 /**
- * True only for genuine byte identity.
+ * True only for genuine byte identity, decided from internal slots alone.
  *
- * Step one is a trap-free brand check: the captured `Uint8Array.prototype.slice` requires typed array
- * internal slots on its receiver, so a `Proxy` fails it before any `get`, `has`, `ownKeys`,
- * `getOwnPropertyDescriptor` or `getPrototypeOf` trap of its own can run. Step two reads the prototype
- * only after that check has established a genuine typed array, where no caller code and no trap is
- * reachable, so a narrow view, a subclass instance and a re-prototyped array are refused rather than
- * silently converted, and only an actual `Uint8Array` is admitted.
+ * Step one is a trap-free brand check: the captured `ArrayBuffer.isView` reads the receiver's internal
+ * [[ViewedArrayBuffer]] slot and nothing else, so a `Proxy`, a plain object and a detached or
+ * tampered buffer fail it before any `get`, `has`, `ownKeys`, `getOwnPropertyDescriptor` or
+ * `getPrototypeOf` trap of its own can run. Step two invokes the captured intrinsic
+ * `Symbol.toStringTag` getter with `Reflect.apply`, which reads the [[TypedArrayName]] slot and so
+ * requires the REAL native element kind: a narrow view, a subclass instance and a re-prototyped
+ * array are refused rather than silently converted, and a `Buffer` is admitted because its genuine
+ * kind is `Uint8Array`. Step three reads the [[ArrayLength]] slot through the intrinsic accessor.
  *
- * This is a local wrapper check, not a sandbox. It does not make in-process inspection safe against
- * arbitrary hostile JavaScript and does not defend against global intrinsic tampering.
+ * Nothing here is species-producing. `slice`, `subarray`, `filter` and every other typed-array method
+ * that constructs a result reads caller-owned `constructor` and `Symbol.species`, and using one as a
+ * brand check dispatches user code before any restriction exists. Prototype identity is mutable
+ * caller state and proves no element kind, so it is not consulted either: no caller `constructor`,
+ * `prototype`, `Symbol.species`, `Symbol.toStringTag`, `byteLength`, iterator or own property is read.
+ *
+ * This is a local wrapper check, not a sandbox. A caller `Proxy` record side effect that fires outside
+ * these calls, and tampering with the global builtins this module captured at initialization, stay
+ * outside that guarantee.
  */
 function isByteArray(value: unknown): value is Uint8Array {
-  try {
-    Reflect.apply(Uint8Array.prototype.slice, value, [0, 0]);
-    return Object.getPrototypeOf(value) === UINT8_ARRAY_PROTOTYPE;
-  } catch { return false; }
+  if (!ArrayBuffer.isView(value)) return false;
+  if (Reflect.apply(TYPED_TO_STRING_TAG, value, []) !== 'Uint8Array') return false;
+  const length = byteArrayLength(value as Uint8Array);
+  return Number.isSafeInteger(length) && length >= 0;
 }
 
 /**
- * Copy caller bytes through public standard intrinsics only. `slice`, `set`, `subarray` and any
- * iterator are all overridable per instance, so none of them is reachable through the caller's own
- * object: the length comes from the intrinsic length slot and the copy is written into a buffer this
- * module allocated.
+ * Copy caller bytes through captured internal-slot intrinsics only. The length comes from the intrinsic
+ * length slot, and `set` is applied from the captured shared typed-array prototype rather than read off
+ * the caller's array, so no own `slice`, `set`, `subarray` or iterator is reachable and no species
+ * constructor is consulted: `set` copies a branded typed array through internal slots into a buffer
+ * this module allocated.
  */
 function copyBytes(bytes: Uint8Array): Uint8Array {
   const out = new Uint8Array(byteArrayLength(bytes));
-  out.set(bytes);
+  Reflect.apply(TYPED_ARRAY_SET, out, [bytes, 0]);
   return out;
 }
 
