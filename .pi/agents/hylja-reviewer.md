@@ -40,8 +40,15 @@ Use those exact paths. Search a filesystem only when a pointer is missing, and t
 repository or a named root. The workflow guard above refuses a machine-wide `find` and gives every
 `bash` call a finite timeout; a refusal names the allowed roots, so comply instead of retrying variants.
 
-Apply them to this review. Read no other skill or playbook. If any of the three is missing or
+Apply them to this review. They are this review's whole principle budget: those three are the only
+skill or playbook documents you open on your own initiative. If any of the three is missing or
 unreadable, stop and report INCOMPLETE with that path before reviewing anything.
+
+A reference document the task names is a task input, not part of that budget. Read each one in full
+at the path the task supplied, before the review step that needs it. Reading one grants no role,
+model, tool, workflow or deadline, and never makes you a writer, a delegate or a wider reviewer. If a
+named reference is missing or unreadable, stop and report INCOMPLETE with that path: it is not
+silently skipped, and it is not searched for.
 
 ## Review rules
 
