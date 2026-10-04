@@ -44,9 +44,11 @@ translateOpenAiTextResponse(input: { endpoint: unknown; body: unknown }): OpenAi
 ```
 
 `input` is one object with exactly two own enumerable **data** properties, `endpoint` and `body`. A
-getter, an accessor, a symbol key, an inherited property, a third key or a hostile trap is refused; the
-arguments are snapshotted through property descriptors and never read again, so a caller object cannot
-answer twice. A null-prototype object with two data properties is accepted.
+Proxy argument is **refused**, not merely caught when it throws: a transparent forwarding proxy is
+rejected by an intrinsic brand check (`util.types.isProxy`) that runs no trap, so a revoked or hostile
+proxy takes the same fixed refusal. A getter, an accessor, a symbol key, an inherited property or a
+third key is refused; the arguments are snapshotted through property descriptors and never read again,
+so a caller object cannot answer twice. A null-prototype object with two data properties is accepted.
 
 `OpenAiTextResponseResult` is a discriminated union:
 
@@ -92,7 +94,7 @@ in a result.
 
 | Code | Meaning |
 |---|---|
-| `INVALID_ARGUMENTS` | the options object is not exactly two own enumerable data properties |
+| `INVALID_ARGUMENTS` | the options object is not exactly two own enumerable data properties, or is a Proxy (transparent, revoked or hostile) |
 | `ENDPOINT_NOT_SUPPORTED` | any endpoint other than the exact chat-completions path |
 | `BODY_NOT_TEXT` | the body is not native wire text (including an already-parsed object) |
 | `BODY_TOO_LARGE` | the body exceeds the UTF-8 byte cap |
@@ -151,4 +153,5 @@ declared as uncovered rather than partially protected ([integrations.md](../inte
 Evidence: [`test/openai-text-response.test.mjs`](../../test/openai-text-response.test.mjs), an
 executable allowlist/unsupported matrix plus exact byte, field and depth boundaries, duplicate keys,
 both finish reasons, optional usage, ordinary and generated Unicode, deep freezing, planted-token
-literalness, and one local composition of this decoder with the request codec.
+literalness, proxy refusal without trap execution or escape, and one local composition of this decoder
+with the request codec.

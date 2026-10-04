@@ -71,6 +71,8 @@ const ALLOWLIST_MATRIX = [
   ['arguments: symbol key', { endpoint: ENDPOINT, body: wire(completion()), [Symbol('extra')]: 1 }, 'INVALID_ARGUMENTS'],
   ['arguments: getter body', { endpoint: ENDPOINT, get body() { throw new TypeError('synthetic getter'); } }, 'INVALID_ARGUMENTS'],
   ['arguments: throwing proxy', new Proxy({ endpoint: ENDPOINT, body: '{}' }, { ownKeys() { throw new TypeError('synthetic trap'); } }), 'INVALID_ARGUMENTS'],
+  ['arguments: transparent forwarding proxy', new Proxy(request(), {}), 'INVALID_ARGUMENTS'],
+  ['arguments: revoked proxy', (() => { const revocable = Proxy.revocable(request(), {}); revocable.revoke(); return revocable.proxy; })(), 'INVALID_ARGUMENTS'],
   ['arguments: prototype-inherited', Object.assign(Object.create({ endpoint: ENDPOINT }), { body: wire(completion()) }), 'INVALID_ARGUMENTS'],
 
   // Body: complete native wire text only, well formed and complete.
@@ -346,19 +348,46 @@ test('a null-prototype argument object with own data properties is accepted', ()
   assert.equal(translateOpenAiTextResponse(source).status, 'TRANSLATED');
 });
 
-test('caller properties are read only through descriptors, never through a getter or a proxy get', () => {
+test('caller properties are read only through descriptors, never through an invoked getter', () => {
   let accessorRan = false;
   refuse(translateOpenAiTextResponse({
     endpoint: ENDPOINT,
     get body() { accessorRan = true; return wire(completion()); },
   }), 'INVALID_ARGUMENTS');
   assert.equal(accessorRan, false, 'an accessor argument must be refused without being invoked');
-  const reads = { get: 0 };
-  const proxied = new Proxy({ endpoint: ENDPOINT, body: wire(completion()) }, {
-    get(target, key, receiver) { reads.get += 1; return Reflect.get(target, key, receiver); },
+  assert.equal(translateOpenAiTextResponse(request()).status, 'TRANSLATED',
+    'ordinary data properties must still translate after the accessor refusal');
+});
+
+test('a transparent proxy argument is refused with the fixed refusal and runs no trap', () => {
+  // The original acceptance criterion is that caller proxies refuse, not merely that a hostile proxy
+  // throws: a forwarding proxy that presents the right prototype, keys and descriptors must never
+  // reach TRANSLATED, because it can answer a second, different answer to any later reader of the
+  // same object. Detection has to be an intrinsic brand check, so no prototype, key or descriptor
+  // read can run a trap first, and a revoked proxy is refused by the same fixed code path.
+  const traps = { get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0, getPrototypeOf: 0 };
+  const count = (name) => (target, ...rest) => { traps[name] += 1; return Reflect[name](target, ...rest); };
+  const forwarding = new Proxy({ endpoint: ENDPOINT, body: wire(completion()) }, {
+    get: count('get'),
+    ownKeys: count('ownKeys'),
+    getOwnPropertyDescriptor: count('getOwnPropertyDescriptor'),
+    getPrototypeOf: count('getPrototypeOf'),
   });
-  assert.equal(translateOpenAiTextResponse(proxied).status, 'TRANSLATED');
-  assert.equal(reads.get, 0, 'validated arguments must be snapshotted through descriptors, not read again');
+  refuse(translateOpenAiTextResponse(forwarding), 'INVALID_ARGUMENTS');
+  assert.deepEqual(traps, { get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0, getPrototypeOf: 0 },
+    'a proxy argument must be refused before any reflective read can run one of its traps');
+  const revocable = Proxy.revocable({ endpoint: ENDPOINT, body: wire(completion()) }, {});
+  revocable.revoke();
+  let escaped = true;
+  let outcome = null;
+  try {
+    outcome = translateOpenAiTextResponse(revocable.proxy);
+    escaped = false;
+  } catch (unused) {
+    outcome = null;
+  }
+  assert.equal(escaped, false, 'a revoked proxy argument must return a fixed refusal, never throw');
+  refuse(outcome, 'INVALID_ARGUMENTS');
 });
 
 test('a value thrown while reading arguments is discarded without inspection and cannot escape', () => {

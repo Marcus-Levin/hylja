@@ -29,6 +29,7 @@
  * is the validated text decoded with the platform parser, which is the same reader the rest of this
  * repository uses.
  */
+import { types as nodeUtilTypes } from 'node:util';
 import { parseStructured } from './structured-parsers.js';
 import type { InteractionDraft, JsonValue } from './interaction-envelope.js';
 
@@ -149,12 +150,16 @@ function keysOf(value: object): readonly string[] {
 function utf8Bytes(value: string): number { return new TextEncoder().encode(value).byteLength; }
 
 /**
- * Reads the caller's options object once. Only own enumerable **data** properties count: a getter, an
- * accessor, a symbol key, an inherited `endpoint`, an extra key or a hostile trap is refused rather than
- * executed twice or read through the prototype chain.
+ * Reads the caller's options object once. A Proxy is refused outright by an intrinsic brand check, so
+ * a forwarding, revoked or hostile proxy never reaches the prototype, key or descriptor reads below and
+ * no trap of its own can run. Among the remaining plain objects only own enumerable **data** properties
+ * count: a getter, an accessor, a symbol key, an inherited `endpoint` or an extra key is refused rather
+ * than executed twice or read through the prototype chain.
  */
 function readArguments(input: unknown): Arguments {
-  if (input === null || typeof input !== 'object' || Array.isArray(input)) refuse('INVALID_ARGUMENTS');
+  if (input === null || typeof input !== 'object') refuse('INVALID_ARGUMENTS');
+  if (nodeUtilTypes.isProxy(input)) refuse('INVALID_ARGUMENTS');
+  if (Array.isArray(input)) refuse('INVALID_ARGUMENTS');
   const prototype: unknown = Object.getPrototypeOf(input);
   if (prototype !== Object.prototype && prototype !== null) refuse('INVALID_ARGUMENTS');
   const keys = Reflect.ownKeys(input);
