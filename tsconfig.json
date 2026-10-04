@@ -9,6 +9,7 @@
     "noEmitOnError": true,
     "forceConsistentCasingInFileNames": true,
     "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
     "noImplicitOverride": true,
     "verbatimModuleSyntax": true,
     "declaration": true,

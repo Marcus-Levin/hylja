@@ -76,7 +76,7 @@ import { composeClassification, SCOPES, SENSITIVITIES, TRUST_LEVELS, type Classi
 import { CONTACT_SUBTYPES, type CandidateScope } from './contact-candidates.js';
 import { ENCODINGS, type Encoding } from './normalization.js';
 import { FORMATS, type Format } from './structured-parsers.js';
-import type { NormalizedCandidate, NormalizedDetectionResult, OpaqueLocation, OriginalLocation,
+import type { NormalizedCandidate, OpaqueLocation, OriginalLocation,
   ParsedFieldLocation, ViewLocation } from './normalized-detection.js';
 
 /** Trusted configuration producer for configured contact sensitivity. Detector evidence, never model output. */

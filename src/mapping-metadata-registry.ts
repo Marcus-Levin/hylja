@@ -41,8 +41,7 @@
  *   throw out of this module, never exception text and never an echo of a planted value. Nothing is
  *   logged.
  */
-import { MAPPING_LIFECYCLE_ACTIONS, MAPPING_LIFECYCLE_STATES, applyMappingLifecycleCommand }
-  from './mapping-lifecycle.js';
+import { MAPPING_LIFECYCLE_ACTIONS, applyMappingLifecycleCommand } from './mapping-lifecycle.js';
 import type { MappingLifecycleAction, MappingLifecycleRecord, MappingLifecycleReason, MappingLifecycleScope,
   MappingLifecycleState } from './mapping-lifecycle.js';
 
