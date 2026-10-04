@@ -37,7 +37,9 @@ missing. **Explicit reading is the mechanism; automatic injection is neither fix
 4. **Dispatch.** `subagent({ agent: "hylja-implementer", task: <brief>, cwd: <worktree>, async: false })`
    in a fresh branch and worktree per issue, never reused with unreviewed work. Run admitted lanes
    concurrently where the host supports concurrent native sessions; gated work runs one lane at a
-   time, and parallelism is never faked. One branch and worktree per issue keeps lanes isolated.
+   time, and parallelism is never faked. One branch and worktree per issue keeps lanes isolated. The
+   implementer lane ends only with a green run of every brief-specified command plus a commit; a known
+   failure, a partial build or a missing prerequisite ends it INCOMPLETE with its reason.
 5. **Review.** After the implementer commit exists, one independent review of that exact SHA:
    `subagent({ agent: "hylja-reviewer", task: <SHA, brief, changed surface>, cwd: <worktree>, async: false })`.
    It confirms `git rev-parse HEAD`, reads the diff and changed sources, trusts source over the
@@ -55,8 +57,12 @@ missing. **Explicit reading is the mechanism; automatic injection is neither fix
    no fallback; record an unresolved failure with its message. Root owns the wall clock and stops a
    command that passes its named budget. A user pause cancels owned work and preserves evidence and
    worktrees; setup never resumes product work.
-8. **Publish and close.** Root publishes alone, after the user's explicit authorization, approval of
-   the exact head and green CI at that head. Close an issue only against its acceptance criteria.
+8. **Publish and close.** Root publishes alone. An authorized reviewable draft pull request is created
+   and published for review before approval and CI; merging or releasing it still requires the user's
+   explicit authorization, approval of the exact head and green CI at that head. Close an issue only when
+   its acceptance criteria are satisfied. After the merged content is verified to have landed, root
+   removes only the branches and worktrees it owns, preserving commits, evidence and needed commit
+   references, and leaving unmerged work in place.
 9. **Report.** Record in the pull request evidence: author and reviewer minutes, command durations,
    retries, rounds and per-round states; the model that ran, read from the run metadata's `model`
    field rather than a requested model or a frontmatter intent; and usage counters kept apart from a

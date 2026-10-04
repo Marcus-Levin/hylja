@@ -49,6 +49,8 @@ inherited `AGENTS.md` binds you. Comply with a workflow-guard refusal instead of
   Prose-only needs no test; never test by grepping prose.
 - Run only the brief's verification commands, at the worktree root: no network, no provider calls, no
   unapproved dependency or lockfile change.
+- The lane ends only with a green run of every brief-specified command plus a commit. A known failure, a
+  partial build or a missing prerequisite ends it INCOMPLETE with its reason.
 - Never weaken an accepted contract, security invariant, evaluation protocol, or a proposed or human
   gate to fit a draft. Add only obviously synthetic, non-routable example data.
 - Never push, open, merge or close a pull request or issue, and never touch another session's work.
