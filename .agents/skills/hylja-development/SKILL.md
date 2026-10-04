@@ -85,10 +85,8 @@ promised for it.
 
 ## Evidence, pause, reporting
 
-Evidence lookup: name the launch's session directory or the returned `artifactPaths` in the handoff, read
-the public output and `_meta.json` under `{sessionDir}/subagent-artifacts/`, and report a missing one as
-unavailable. Its resolved model is the model that ran, not a profile's declared `model:`; its counters are
-cumulative usage, not context size. [pipeline.md](../../../docs/development/pipeline.md#evidence-lookup).
+Evidence for a finished lane, or the record a review handoff needs: which paths to read, and what the
+handoff must name. [pipeline.md](../../../docs/development/pipeline.md#evidence-lookup).
 
 Keep author and reviewer minutes, context size, command durations, retries, rounds and states in the
 pull request evidence. A user pause cancels owned work, preserving evidence and worktrees; setup never
