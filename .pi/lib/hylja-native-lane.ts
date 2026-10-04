@@ -18,11 +18,19 @@
  * expectation, status, model, elapsed milliseconds, tool count and the leaf's own literal public
  * result. `recentOutput`, `currentToolArgs`, `recentTools`, raw session transcripts and provider
  * reasoning are never read.
+ *
+ * A root may configure one optional `softBudgetMs`, strictly below the finite hard `timeoutMs`. It
+ * adds exactly two things: a numeric soft/hard timing paragraph to the child's own initial task, and
+ * one bounded `soft_budget_reached` progress snapshot at the soft budget. That snapshot is a warning
+ * for root and the progress file only: it is never delivered to the running child, and it never
+ * cancels, kills, deletes, resets or approves anything. Without it the lane behaves exactly as
+ * before and arms no timer.
  */
 
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { clearTimeout as cancelTimer, setTimeout as startTimer } from 'node:timers';
 import { pathToFileURL } from 'node:url';
 
 /** The one input this controller runs a lane for. */
@@ -42,7 +50,8 @@ export const LANE_VERDICTS = ['APPROVED', 'CHANGES REQUESTED', 'INCOMPLETE'];
 /** Hard cap on persisted progress records. The file is rewritten, never appended without bound. */
 export const MAX_PROGRESS_RECORDS = 256;
 
-const MAX_TASK_CHARS = 1_048_576;
+/** The raw cap on one task, and the cap the effective task must also stay inside. */
+export const MAX_TASK_CHARS = 1_048_576;
 
 /**
  * The one bridge value used for both the preflight and the request it is compared against: a lane leaf
@@ -70,6 +79,8 @@ export interface LaneConfig {
 	readonly task: string;
 	readonly cwd: string;
 	readonly timeoutMs: number;
+	/** Optional soft budget. Absent means no warning timer and no timing guide. */
+	readonly softBudgetMs?: number;
 	readonly sessionDir: string;
 	readonly receipt: string;
 	readonly dispatch: string;
@@ -181,6 +192,8 @@ export interface LaneTerminalReceipt {
 export interface LaneControllerDeps {
 	readonly addSignalListener?: (name: string, handler: () => void) => () => void;
 	readonly now?: () => number;
+	/** Arms one bounded warning timer and returns the closure that cancels exactly that timer. */
+	readonly arm?: (handler: () => void, delayMs: number) => () => void;
 }
 
 export interface LaneController {
@@ -222,6 +235,14 @@ export function readLaneConfig(path: string): LaneConfig {
 	const task = text('task');
 	if (task.length > MAX_TASK_CHARS) throw new Error(SETUP_FAILURES.config);
 	if (!isCount(value.timeoutMs) || !Number.isInteger(value.timeoutMs)) throw new Error(SETUP_FAILURES.config);
+	// Optional soft budget. Present means a positive integer strictly below the finite hard timeout;
+	// anything else is the fixed config refusal. Absent keeps the previous behaviour exactly.
+	let softBudgetMs: number | undefined;
+	if ('softBudgetMs' in value) {
+		const soft = value.softBudgetMs;
+		if (typeof soft !== 'number' || !Number.isInteger(soft) || soft <= 0 || soft >= value.timeoutMs) throw new Error(SETUP_FAILURES.config);
+		softBudgetMs = soft;
+	}
 	if (typeof value.pid !== 'undefined') throw new Error(SETUP_FAILURES.config);
 	const paths = {} as Record<'cwd' | 'sessionDir' | 'receipt' | 'dispatch' | 'progress' | 'guard', string>;
 	for (const field of ['cwd', 'sessionDir', 'receipt', 'dispatch', 'progress', 'guard'] as const) {
@@ -234,8 +255,37 @@ export function readLaneConfig(path: string): LaneConfig {
 		agent: value.agent,
 		task,
 		timeoutMs: value.timeoutMs,
+		...(softBudgetMs === undefined ? {} : { softBudgetMs }),
 		...paths,
 	};
+}
+
+/**
+ * The one paragraph a configured soft budget adds to the child's task: the two numbers it will be
+ * measured against, that role's own closing move, and an explicit statement that the guide carries no
+ * authority the role body does not already have. An unconfigured lane gets its task back unchanged.
+ */
+const TIMING_GUIDE: Record<string, string> = {
+	'hylja-implementer': 'Finish the scoped checks, commit the scoped paths, then report.',
+	'hylja-reviewer': 'Report one literal verdict line (APPROVED, CHANGES REQUESTED or INCOMPLETE) and stay read-only.',
+};
+
+/**
+ * The exact string the launch contract is resolved for and the exact string that is dispatched. The
+ * raw cap still binds it: an effective task past the cap fails restrictively instead of losing its
+ * tail, because a truncated task would dispatch a leaf whose digest covers different bytes than the
+ * task it was given.
+ */
+export function buildEffectiveTask(config: LaneConfig): string {
+	if (config.softBudgetMs === undefined) return config.task;
+	const role = TIMING_GUIDE[config.agent];
+	if (role === undefined) throw new Error(SETUP_FAILURES.config);
+	const effective = `${config.task}\n\n[Lane timing] Soft budget ${config.softBudgetMs} ms, hard deadline ${config.timeoutMs} ms,`
+		+ ' both counted from dispatch. Root is warned once at the soft budget; that warning is not sent to you,'
+		+ ' cancels nothing and approves nothing. '
+		+ `${role} This guide grants no authority beyond your role body.`;
+	if (effective.length > MAX_TASK_CHARS) throw new Error(SETUP_FAILURES.config);
+	return effective;
 }
 
 /**
@@ -331,12 +381,13 @@ const ownsTuple = (value: unknown, tuple: LaneTuple): boolean => {
 async function resolveExpectation(
 	pi: LanePiHost,
 	config: LaneConfig,
+	effectiveTask: string,
 	preflight: LanePreflightModule,
 ): Promise<LaneExpectation> {
 	const availableModels = typeof pi.modelRegistry?.getAvailable === 'function' ? pi.modelRegistry.getAvailable() : undefined;
 	const result = await preflight.resolveSubagentLaunchContract({
 		agent: config.agent,
-		task: config.task,
+		task: effectiveTask,
 		context: 'fresh',
 		cwd: config.cwd,
 		sessionRoot: config.sessionDir,
@@ -385,6 +436,7 @@ export async function createLaneController(
 ): Promise<LaneController> {
 	const addSignalListener = deps.addSignalListener ?? defaultSignalListener;
 	const now = deps.now ?? (() => Date.now());
+	const arm = deps.arm ?? defaultArm;
 	const request: Record<string, unknown> = {
 		requestId: randomUUID(),
 		ownerRunId: randomUUID(),
@@ -406,10 +458,12 @@ export async function createLaneController(
 	const records: LaneProgressRecord[] = [];
 	let settled = false;
 	let cancelled = false;
+	let warned = false;
 	let expectation: LaneExpectation | null = null;
 	let setupFailure: LaneSetupFailure | null = null;
 	const offs: Array<() => void> = [];
-	const signals: Array<() => void> = [];
+	/** Everything this lane owns and must drain: the two signal hooks and any armed warning timer. */
+	const cleanups: Array<() => void> = [];
 
 	/** Bounded progress: an event token, the lane key, a model and runId string, finite counters. */
 	const progress = (event: string, fields: {
@@ -478,11 +532,11 @@ export async function createLaneController(
 				// A listener that refuses to drain cannot be retried; the lane is reported below.
 			}
 		}
-		for (const off of signals.splice(0)) {
+		for (const off of cleanups.splice(0)) {
 			try {
 				off();
 			} catch {
-				// Same: cleanup uncertainty is recorded, never awaited indefinitely.
+				// A cleanup that refuses to drain cannot be retried; the lane is reported below.
 			}
 		}
 	};
@@ -506,7 +560,11 @@ export async function createLaneController(
 	};
 
 	try {
-		expectation = await resolveExpectation(pi, config, modules.preflight);
+		// One effective task, bound to both the launch contract and the dispatched request, so the
+		// expected digest always covers exactly the bytes the child is given.
+		const effectiveTask = buildEffectiveTask(config);
+		request.task = effectiveTask;
+		expectation = await resolveExpectation(pi, config, effectiveTask, modules.preflight);
 		const dispatch: LaneDispatchRecord = {
 			...tuple,
 			agent: config.agent,
@@ -516,8 +574,18 @@ export async function createLaneController(
 		};
 		writeJson(config.dispatch, dispatch);
 		progress('dispatch', { model: expectation.model });
-		signals.push(addSignalListener('SIGINT', cancel));
-		signals.push(addSignalListener('SIGTERM', cancel));
+		cleanups.push(addSignalListener('SIGINT', cancel));
+		cleanups.push(addSignalListener('SIGTERM', cancel));
+		if (config.softBudgetMs !== undefined) {
+			cleanups.push(arm(() => {
+				// Root's warning and nothing more. The running child keeps only the numbers it was
+				// given in its initial task: no cancel event, no kill, no deletion, no reset, and no
+				// approval is produced here. One warning per dispatch, or none at all.
+				if (warned || settled || cancelled || setupFailure !== null) return;
+				warned = true;
+				progress('soft_budget_reached');
+			}, config.softBudgetMs));
+		}
 		pi.events.emit(modules.delegation.SUBAGENT_DELEGATION_REQUEST_EVENT, request);
 	} catch (error: unknown) {
 		settled = true;
@@ -537,6 +605,14 @@ function defaultSignalListener(name: string, handler: () => void): () => void {
 	process.once(name, wrapped);
 	return () => {
 		process.removeListener(name, wrapped);
+	};
+}
+
+/** The shipped arm: one real bounded timer, and the closure that cancels exactly that timer. */
+function defaultArm(handler: () => void, delayMs: number): () => void {
+	const timer = startTimer(handler, delayMs);
+	return () => {
+		cancelTimer(timer);
 	};
 }
 

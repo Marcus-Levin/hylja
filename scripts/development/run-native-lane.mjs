@@ -134,6 +134,17 @@ export function validateLaneConfig(value, profile) {
 	if (!Number.isInteger(value.timeoutMs) || value.timeoutMs <= 0 || value.timeoutMs > profile.timeoutMs) {
 		return fail(SETUP_FAILURES.config);
 	}
+	// Optional soft budget: a positive integer strictly below the finite hard timeout. Absent keeps
+	// the lane's previous behaviour; present but invalid is a refusal, never a repaired value. It
+	// arms one warning timer in the child and grants the child no authority, so root still owns the
+	// hard clock, the watchdog and every verdict.
+	let softBudgetMs;
+	if ('softBudgetMs' in value) {
+		if (!Number.isInteger(value.softBudgetMs) || value.softBudgetMs <= 0 || value.softBudgetMs >= value.timeoutMs) {
+			return fail(SETUP_FAILURES.config);
+		}
+		softBudgetMs = value.softBudgetMs;
+	}
 	const paths = ['cwd', 'sessionDir', 'receipt', 'verification', 'progress', 'dispatch', 'pi', 'subagents', 'guard', 'controller'];
 	for (const field of paths) {
 		if (typeof value[field] !== 'string' || !value[field].startsWith('/')) return fail(SETUP_FAILURES.config);
@@ -147,6 +158,7 @@ export function validateLaneConfig(value, profile) {
 			task: value.task,
 			cwd: value.cwd,
 			timeoutMs: value.timeoutMs,
+			...(softBudgetMs === undefined ? {} : { softBudgetMs }),
 			sessionDir: value.sessionDir,
 			receipt: value.receipt,
 			verification: value.verification,

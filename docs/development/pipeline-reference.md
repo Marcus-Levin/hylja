@@ -103,8 +103,9 @@ nesting, and no child that launches another lane.
 
 The config is root-owned, bounded and absolute. Every path field must start with `/`; `key` and `task`
 are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer` or `hylja-reviewer`;
-`timeoutMs` is a positive integer no greater than that role profile's own frontmatter deadline; a
-`model` key is refused rather than ignored.
+`timeoutMs` is a positive integer no greater than that role profile's own frontmatter deadline; an
+optional `softBudgetMs` is a positive integer strictly below `timeoutMs`; a `model` key is refused
+rather than ignored.
 
 ```json
 {
@@ -113,6 +114,7 @@ are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer` or `
   "task": "<the full handoff brief>",
   "cwd": "/abs/path/to/worktree",
   "timeoutMs": 900000,
+  "softBudgetMs": 360000,
   "sessionDir": "/abs/fresh/dir/sessions",
   "receipt": "/abs/fresh/dir/receipt.json",
   "verification": "/abs/fresh/dir/verification.json",
@@ -184,16 +186,34 @@ Owned shutdown is finite: the watchdog latches the deadline and stops the CLI's 
 past the native request timeout, sends SIGTERM, then SIGKILL after 10 s, then waits at most 10 s more
 for `close` — never an indefinite wait.
 
+**When `softBudgetMs` is configured** (and only then): the child learns the two numbers once, in its
+initial task, as one role-aware paragraph — reviewer: report a literal verdict and stay read-only;
+writer: finish the checks, commit, then report — and that paragraph grants no authority the role body
+does not already carry. Root receives exactly one bounded numeric `soft_budget_reached` progress
+snapshot at the soft budget, which appears in the verification record's `progress` array. That
+snapshot is a warning for the reader and nothing more: it is never delivered to the running child, and
+it never cancels, kills, deletes, resets or approves anything. The hard path is unchanged and finite —
+native request timeout, plus the one-minute watchdog, SIGTERM, SIGKILL after 10 s, at most 10 s more
+for `close`. A lane that reaches it reports INCOMPLETE with `deadlineExceeded: true`, keeps its
+worktree, receipt, dispatch, progress and artifact files for recovery, and is never an approval; a
+recovery handoff must name the exact source SHA whose tree the resumed lane runs, so a resumed lane is
+provably the same code and not a re-implementation of it.
+
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (34 tests, 24 of them in the lane file). Two of them
+platform (41 tests, 31 of them in the lane file). Two of them
 fake only the child transport, so the shipped default platform is what runs: the default filesystem
 must read the progress tail with bounded positional descriptor reads and close every descriptor it
 opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
 removed on completion. Faking those two adapters had passed while the defaults read the whole progress
 file and registered no listener at all. One case injects only the clock, so the real watchdog is fired
 by its recorded timer rather than by waiting out a ten-minute budget, and proves that identical
-completed approval evidence is refused after expiry and verified without it. A read-only
+completed approval evidence is refused after expiry and verified without it. The optional soft budget
+is driven by an injected `now` and `arm` pair whose cancel closure is recorded, so a case can fire,
+repeat, refuse and drain a soft budget deterministically; the shipped default `arm` has its own case
+so the fake clock is not the only path that can warn. The lane file keeps a planted candidate note and
+the leaf's own evidence and proves a hard deadline leaves both untouched, reports INCOMPLETE and arms
+no surviving timer. A read-only
 smoke on root's own installed Pi ran from
 `/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and
 verification records beside it). It exercised launch and evidence plumbing on a reviewer lane, and its
