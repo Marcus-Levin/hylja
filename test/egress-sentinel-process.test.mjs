@@ -932,6 +932,51 @@ test('a re-prototyped non-byte view is refused on its native element kind, not i
   assert.deepEqual(Buffer.from(admitted.value.payload), Buffer.from(`{"email":"${PLANTED_ORIGINAL}"}`));
 });
 
+test('a genuine Uint8Array subclass is admitted exactly like a Buffer, and its own getters are never invoked', () => {
+  // Subclassing changes the prototype chain, not the internal element kind. Admission reads internal
+  // slots only, so an ordinary `class SyntheticBytes extends Uint8Array {}` instance IS byte identity
+  // here and must not be refused for what it is; what must never happen is reading any of its getters.
+  let invoked = 0;
+  const plant = (label) => () => { invoked += 1; throw new Error(`planted ${label}`); };
+  class SyntheticBytes extends Uint8Array {}
+  const payload = SyntheticBytes.from(text(`{"email":"${PLANTED_ORIGINAL}"}`));
+  const key = SyntheticBytes.from(KEY);
+  for (const target of [payload, key]) {
+    Object.defineProperty(target, 'constructor', { configurable: true, get: plant('constructor') });
+    Object.defineProperty(target, Symbol.species, { configurable: true, get: plant('species') });
+    Object.defineProperty(target, Symbol.iterator, { configurable: true, get: plant('iterator') });
+    Object.defineProperty(target, Symbol.toStringTag, { configurable: true, get: plant('tag') });
+    Object.defineProperty(target, 'length', { configurable: true, get: plant('length') });
+  }
+  const entries = [{ kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'ref-original-email' }];
+  const snapshot = snapshotSentinelRequest(
+    request({ bytes: payload, known: registration(SCOPE, entries, key) }), 'r-subclass-kind',
+  );
+
+  assert.equal(invoked, 0, `admission dispatched ${invoked} caller getter(s)`);
+  assert.equal(snapshot.ok, true, 'a genuine Uint8Array subclass is byte identity, exactly like a Buffer');
+
+  // The independent control is the same request built from plain arrays: byte identity, the digest, the
+  // private key copy and the entry copies must be indistinguishable, so admitting the subclass changed
+  // no effect, and the caller buffers must still be copied rather than retained.
+  const clean = snapshotSentinelRequest(
+    request({ bytes: text(`{"email":"${PLANTED_ORIGINAL}"}`), known: registration(SCOPE, entries) }), 'r-subclass-kind',
+  );
+  assert.equal(clean.ok, true);
+  assert.deepEqual(Buffer.from(snapshot.value.payload), Buffer.from(`{"email":"${PLANTED_ORIGINAL}"}`));
+  assert.deepEqual(Buffer.from(snapshot.value.payload), Buffer.from(clean.value.payload));
+  assert.equal(snapshot.value.payloadDigest, clean.value.payloadDigest);
+  assert.deepEqual(Buffer.from(snapshot.value.known.key), Buffer.from(KEY));
+  assert.deepEqual(Buffer.from(snapshot.value.known.key), Buffer.from(clean.value.known.key));
+  assert.deepEqual(snapshot.value.known.entries, clean.value.known.entries);
+  assert.notEqual(snapshot.value.payload, payload, 'the payload must be a private copy, not the caller subclass');
+  assert.notEqual(snapshot.value.known.key, key, 'the key must be a private copy, not the caller subclass');
+  assert.notEqual(
+    Object.getPrototypeOf(snapshot.value.payload), SyntheticBytes.prototype,
+    'the private copy is an ordinary byte array, not the caller subclass',
+  );
+});
+
 test('admission is busy before any caller inspection, so a reentrant check cannot start a second child', async () => {
   const runner = createSentinelProcessRunner({ deadlineMs: 5_000 });
   let reentrant = null;

@@ -229,9 +229,10 @@ function ownDataProperties(value: unknown, allowed: ReadonlySet<string>): Map<st
  * `byteLength` is an ordinary prototype accessor, so `bytes.byteLength` executes any own accessor a
  * caller defined on an otherwise genuine array - and that code runs BEFORE any restriction exists,
  * where containment cannot retract what it already disclosed. Calling the intrinsic accessor with the
- * value as `this` reads the typed array's own length slot instead: a `Proxy`, a plain object and a
- * detached or tampered buffer have no such slot and raise a TypeError, and no caller property,
- * method, iterator or prototype lookup runs on the way there.
+ * value as `this` reads the typed array's own length slot instead: a `Proxy` and a plain object have no
+ * such slot and raise a TypeError, and no caller property, method, iterator or prototype lookup runs
+ * on the way there. A detached view does keep the slot and reads 0 here, so this step bounds a length,
+ * it does not decide attachment.
  */
 const TYPED_ARRAY_PROTOTYPE: object = Object.getPrototypeOf(Uint8Array.prototype);
 /** The one byte prototype captured before any call arrives, used to reach shared typed-array intrinsics. */
@@ -272,7 +273,8 @@ const TYPED_ARRAY_SET: (source: ArrayLike<number>, offset?: number) => void =
 
 /**
  * The captured `ArrayBuffer.isView`. It reads only the receiver's internal [[ViewedArrayBuffer]] slot,
- * so it refuses a `Proxy` or any non-view without traversing one caller prototype or trap.
+ * so it refuses a `Proxy` or any non-view without traversing one caller prototype or trap. It proves
+ * view identity, NOT attachment: a detached view is still a view and passes it.
  */
 const IS_VIEW: (value: unknown) => boolean = ArrayBuffer.isView;
 
@@ -284,27 +286,32 @@ function byteArrayLength(bytes: Uint8Array): number {
 /**
  * True only for genuine byte identity, decided from internal slots alone.
  *
- * Step one is a trap-free brand check: the captured `ArrayBuffer.isView` reads the receiver's internal
- * [[ViewedArrayBuffer]] slot and nothing else, so a `Proxy`, a plain object and a detached or
- * tampered buffer fail it before any `get`, `has`, `ownKeys`, `getOwnPropertyDescriptor` or
- * `getPrototypeOf` trap of its own can run. Step two invokes the captured intrinsic
- * `Symbol.toStringTag` getter with `Reflect.apply`, which reads the [[TypedArrayName]] slot and so
- * requires the REAL native element kind: a narrow view, a subclass instance and a re-prototyped
- * array are refused rather than silently converted, and a `Buffer` is admitted because its genuine
- * kind is `Uint8Array`. Step three reads the [[ArrayLength]] slot through the intrinsic accessor.
+ * Step one is a trap-free view check: the CAPTURED `ArrayBuffer.isView` reads the receiver's internal
+ * [[ViewedArrayBuffer]] slot and nothing else, so a `Proxy` and a plain object fail it before any
+ * `get`, `has`, `ownKeys`, `getOwnPropertyDescriptor` or `getPrototypeOf` trap of its own can run. It
+ * proves view identity, not attachment, so a detached view passes it. Step two invokes the captured
+ * intrinsic `Symbol.toStringTag` getter with `Reflect.apply`, which reads the [[TypedArrayName]] slot
+ * and so requires the REAL native element kind: a narrow view and a re-prototyped non-byte view are
+ * refused rather than silently converted, while a `Buffer` and a genuine `Uint8Array` subclass are
+ * admitted exactly the same way, because their internal element kind is `Uint8Array`. Subclassing is
+ * not a security defect here: it changes the prototype chain, which nothing below consults, and not the
+ * element kind this reads. Step three reads the [[ArrayLength]] slot through the intrinsic accessor,
+ * where a detached view reads 0; the caller's payload and key caps, and the copy that follows, apply
+ * unchanged.
  *
  * Nothing here is species-producing. `slice`, `subarray`, `filter` and every other typed-array method
  * that constructs a result reads caller-owned `constructor` and `Symbol.species`, and using one as a
  * brand check dispatches user code before any restriction exists. Prototype identity is mutable
  * caller state and proves no element kind, so it is not consulted either: no caller `constructor`,
- * `prototype`, `Symbol.species`, `Symbol.toStringTag`, `byteLength`, iterator or own property is read.
+ * `prototype`, `Symbol.species`, `Symbol.toStringTag`, `byteLength`, `length`, iterator or own property
+ * is read.
  *
  * This is a local wrapper check, not a sandbox. A caller `Proxy` record side effect that fires outside
  * these calls, and tampering with the global builtins this module captured at initialization, stay
  * outside that guarantee.
  */
 function isByteArray(value: unknown): value is Uint8Array {
-  if (!ArrayBuffer.isView(value)) return false;
+  if (!IS_VIEW(value)) return false;
   if (Reflect.apply(TYPED_TO_STRING_TAG, value, []) !== 'Uint8Array') return false;
   const length = byteArrayLength(value as Uint8Array);
   return Number.isSafeInteger(length) && length >= 0;
