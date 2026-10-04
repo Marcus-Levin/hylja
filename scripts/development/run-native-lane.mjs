@@ -12,8 +12,9 @@
  * Every evidence path must be fresh, so a previous run's receipt, dispatch tuple, progress file or
  * verification record can never be reused as this run's evidence. The dispatch tuple the controller
  * persisted before emitting its request is mandatory: a receipt from a different attempt, a nonzero
- * native exit, an unresolved launch contract or a metadata record that does not match the guard
- * identity and bound digest the preflight declared is a setup failure, never a completed lane.
+ * native exit, a fired terminal deadline, an unbound verdict, an unresolved launch contract or a
+ * metadata record that does not match the guard identity and bound digest the preflight declared is a
+ * setup failure, never a completed lane.
  *
  * Exit codes: 0 verified completed lane, 2 setup or evidence failure (INCOMPLETE), 3 the native leaf
  * finished in a non-completed state.
@@ -78,6 +79,10 @@ const ACCEPTED_RUNTIME_ACCEPTANCE = ['not-required', 'checked'];
 
 const TUPLE_FIELDS = ['requestId', 'ownerRunId', 'nodeId'];
 const USAGE_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'cost', 'turns', 'toolCalls', 'durationMs'];
+/** The launch-resolved extension record the installed extension actually writes, per the retained smoke. */
+const RESOLVED_EXTENSION_VERSION = 1;
+const RESOLVED_EXTENSION_SOURCE = 'launch-resolved';
+const RESOLVED_EXTENSION_LISTS = ['runtime', 'configured', 'required', 'effective'];
 
 const fail = (code, detail) => ({ ok: false, verdict: 'INCOMPLETE', reason: code, ...(detail ? { detail } : {}) });
 
@@ -204,6 +209,10 @@ export function discoverPublicArtifacts(config, runId, agent, fs) {
 	const metas = names.filter((name) => name.endsWith('_meta.json'));
 	const outputs = names.filter((name) => name.endsWith('_output.md'));
 	if (metas.length !== 1 || outputs.length !== 1) return fail(SETUP_FAILURES.artifacts);
+	// One pair means one attempt: the metadata and the public output must be the same artifact, so
+	// `_0_meta.json` beside `_1_output.md` is two runs' files, never one lane's evidence.
+	const stem = (name, suffix) => name.slice(0, -suffix.length);
+	if (stem(metas[0], '_meta.json') !== stem(outputs[0], '_output.md')) return fail(SETUP_FAILURES.artifacts);
 	return { ok: true, artifacts: { meta: join(dir, metas[0]), output: join(dir, outputs[0]) } };
 }
 
@@ -221,14 +230,31 @@ function readDispatchTuple(value) {
 }
 
 /**
+ * Binds the receipt's verdict field to the literal first line of its result text, exactly the way the
+ * controller derived it: a declared verdict line must equal the field, and a result carrying no
+ * declared verdict line may only resolve to the `INCOMPLETE` fallback the controller assigns it. Empty
+ * text, an unbound field and a contradiction are refused, so no result can carry an approval its own
+ * text never declared.
+ */
+function verdictAgreesWithResult(verdict, text) {
+	const first = text.split('\n', 1)[0].trim();
+	return LANE_VERDICTS.includes(first) ? first === verdict : verdict === 'INCOMPLETE';
+}
+
+/** The first non-empty line of a public artifact, compared literally and never by containment. */
+function leadingLine(text) {
+	return text.split('\n').map((line) => line.trim()).find((line) => line.length > 0) ?? '';
+}
+
+/**
  * Schema check for the public receipt, run before anything is compared: a mistyped verdict, a
- * non-numeric usage field, a missing tuple field or a nonzero exit is malformed evidence, never a
- * partially valid lane.
+ * non-numeric usage field, a missing tuple field, an unbound verdict or a nonzero exit is malformed
+ * evidence, never a partially valid lane.
  */
 export function isValidReceipt(value) {
 	if (!isObject(value) || !LANE_VERDICTS.includes(value.verdict)) return false;
 	if (!isText(value.status) || !isText(value.runId) || typeof value.agent !== 'string') return false;
-	if (!isObject(value.result) || value.result.kind !== 'text' || typeof value.result.text !== 'string') return false;
+	if (!isObject(value.result) || value.result.kind !== 'text' || !isText(value.result.text)) return false;
 	if (!isObject(value.usage)) return false;
 	for (const field of USAGE_FIELDS) {
 		if (!isCount(value.usage[field])) return false;
@@ -237,6 +263,7 @@ export function isValidReceipt(value) {
 		if (typeof value[field] !== 'string' || value[field].length === 0) return false;
 	}
 	if (value.exitCode !== 0) return false;
+	if (!verdictAgreesWithResult(value.verdict, value.result.text)) return false;
 	return isText(value.model) && isText(value.thinking) && isText(value.launchContractDigest);
 }
 
@@ -282,10 +309,16 @@ export function verifyArtifacts(config, profile, dispatch, receipt, artifacts, f
 	const resolved = isObject(meta.launchResolvedExtensions) ? meta.launchResolvedExtensions : null;
 	const configured = isDigestList(resolved?.configured) ? resolved.configured : [];
 	const runtime = isDigestList(resolved?.runtime) ? resolved.runtime : [];
+	const required = isDigestList(resolved?.required) ? resolved.required : null;
 	const effective = isDigestList(resolved?.effective) ? resolved.effective : [];
 	const omitted = isObject(resolved?.omitted) ? resolved.omitted : null;
 	if (
-		resolved?.disableAmbientExtensions !== true
+		// Only the launch-resolved schema the installed extension actually writes is evidence here:
+		// another version or another source is refused, never read as a weaker field it happens to hold.
+		resolved?.version !== RESOLVED_EXTENSION_VERSION
+		|| resolved?.source !== RESOLVED_EXTENSION_SOURCE
+		|| required === null
+		|| resolved?.disableAmbientExtensions !== true
 		|| expected.disableAmbientExtensions !== true
 		|| expected.guardExtension !== config.guard
 		// The metadata reports opaque extension digests while preflight reports paths, so identity is
@@ -295,6 +328,7 @@ export function verifyArtifacts(config, profile, dispatch, receipt, artifacts, f
 		|| configured.length !== expected.configuredExtensions.length
 		|| omitted === null
 		|| Object.values(omitted).some((count) => count !== 0)
+		|| RESOLVED_EXTENSION_LISTS.some((name) => omitted[name] !== 0)
 		|| !configured.every((digest) => effective.includes(digest))
 		|| !runtime.every((digest) => effective.includes(digest))
 	) {
@@ -309,6 +343,9 @@ export function verifyArtifacts(config, profile, dispatch, receipt, artifacts, f
 		return fail(SETUP_FAILURES.artifacts);
 	}
 	if (!output.includes(Buffer.from(receipt.result.text, 'utf8'))) return fail(SETUP_FAILURES.artifacts);
+	// The public artifact must lead with the literal line the receipt binds. Finding the terminal text
+	// somewhere inside the output is not on its own proof that the leaf declared that verdict.
+	if (leadingLine(output) !== receipt.result.text.split('\n', 1)[0].trim()) return fail(SETUP_FAILURES.artifacts);
 	return {
 		ok: true,
 		verdict: receipt.verdict,
@@ -378,7 +415,12 @@ function launch(config, deps) {
 			deps.addSignalListener('SIGINT', stop),
 			deps.addSignalListener('SIGTERM', stop),
 		];
-		arm(stop, config.timeoutMs + WATCHDOG_GRACE_MS);
+		arm(() => {
+			// The deadline is latched before the stop, never after: evidence that arrives after expiry
+			// cannot present itself as a lane that finished inside the budget it was launched with.
+			deadline = true;
+			stop();
+		}, config.timeoutMs + WATCHDOG_GRACE_MS);
 		child.stderr.on('data', (chunk) => {
 			// Only a bounded byte count is retained; a child message is never echoed into the receipt.
 			stderrBytes = Math.min(stderrBytes + chunk.length, 65_536);
@@ -411,6 +453,11 @@ export function readProgress(path, fs) {
 		try {
 			value = JSON.parse(line);
 		} catch {
+			value = null;
+		}
+		// A parsed record that is not a plain object is bounded malformed evidence. No field of it is
+		// read, so a `null` or primitive line cannot escape as a thrown property access.
+		if (!isObject(value)) {
 			snapshots.push({ event: 'malformed' });
 			continue;
 		}

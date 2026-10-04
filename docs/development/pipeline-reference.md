@@ -143,13 +143,27 @@ the declared guard identity, the effective model and the dispatch tuple, and onl
 Before the CLI reports a lane it binds that persisted tuple to the leaf's public terminal receipt
 (literal result, cumulative usage, actual model, thinking and status), to one listing of
 `{sessionDir}/subagent-artifacts/` for `*_meta.json` and `*_output.md` only, and to a runtime record
-whose `runId`, `agent`, model and `launchContractDigest` match, whose `launchResolvedExtensions` shows
-`disableAmbientExtensions: true`, the declared guard path, the declared number of configured
-extensions, and nothing omitted from the effective set. Any missing, reused or mismatched part is a
-setup failure with a fixed code, never an inferred pass. Exit codes: `0` verified completed lane, `2`
-setup or evidence failure (INCOMPLETE), `3` the leaf finished non-completed. A `completed` leaf is not
-approval: the verdict is only the leaf's own literal `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE`
-line.
+whose `runId`, `agent`, model and `launchContractDigest` match, whose `launchResolvedExtensions` is the
+installed launch-resolved schema (`version: 1`, `source: "launch-resolved"`, ambient extensions off,
+the declared guard path, the declared number of configured extensions, and every `omitted` ledger
+entry present and zero). Any missing, reused or mismatched part is a setup failure with a fixed code,
+never an inferred pass. Exit codes: `0` verified completed lane, `2` setup or evidence failure
+(INCOMPLETE), `3` the leaf finished non-completed. A `completed` leaf is not approval: the verdict is
+only the leaf's own literal `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE` line.
+
+Four bindings carry that last rule, each refused rather than inferred:
+
+| Pair | Refused |
+|---|---|
+| the fired terminal deadline and the native close | the deadline is latched before the stop, so a child that closes zero after the watchdog fired is `SETUP_FAILED_NON_COMPLETED_STATUS` with `deadlineExceeded: true`, never a verified lane |
+| the receipt's `verdict` field and the literal first line of `result.text` | the field must equal that line, or the text carries no declared verdict and the field is the `INCOMPLETE` fallback the controller assigns it. Empty text, an unbound field and a contradiction are malformed |
+| the discovered `_meta.json` and `_output.md` | both must be the same artifact stem, so `_0_meta.json` beside `_1_output.md` is two attempts, never one pair |
+| the public output and the bound verdict line | the output must lead with the literal line the receipt binds; the terminal text appearing somewhere inside it is not proof of a verdict |
+
+Author results are covered by that second row: an author's result that declares no reviewer verdict
+stays `INCOMPLETE`, and can never resolve to an approval. Progress records are parsed, not trusted: a
+line that is not a plain object becomes a fixed `{"event": "malformed"}` snapshot rather than a thrown
+property read.
 
 Acceptance is reported, never assumed. A direct-API run of either role resolves `not-required`, because
 each role profile disables the native writer gate through the deprecated `false` shorthand, so the
@@ -161,22 +175,26 @@ scoped paths and its evidence, before any approval.
 Bounds: progress records carry model, runId, elapsed milliseconds and tool count only, and
 `recentOutput`, tool arguments, raw sessions and provider reasoning are never read or written.
 Cancellation reaches only the exact owned tuple persisted at dispatch, inside the running process.
-Owned shutdown is finite: the watchdog stops the CLI's own child one minute past the native request
-timeout, sends SIGTERM, then SIGKILL after 10 s, then waits at most 10 s more for `close` — never an
-indefinite wait.
+Owned shutdown is finite: the watchdog latches the deadline and stops the CLI's own child one minute
+past the native request timeout, sends SIGTERM, then SIGKILL after 10 s, then waits at most 10 s more
+for `close` — never an indefinite wait.
 
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (30 tests, 20 of them in the lane file). Two of them
+platform (34 tests, 24 of them in the lane file). Two of them
 fake only the child transport, so the shipped default platform is what runs: the default filesystem
 must read the progress tail with bounded positional descriptor reads and close every descriptor it
 opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
 removed on completion. Faking those two adapters had passed while the defaults read the whole progress
-file and registered no listener at all. A read-only
+file and registered no listener at all. One case injects only the clock, so the real watchdog is fired
+by its recorded timer rather than by waiting out a ten-minute budget, and proves that identical
+completed approval evidence is refused after expiry and verified without it. A read-only
 smoke on root's own installed Pi ran from
 `/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and
-verification records beside it). It exercised launch and evidence plumbing on a reviewer lane; it is not
-code approval, and independent review of this helper is still pending. No throughput claim has been
+verification records beside it). It exercised launch and evidence plumbing on a reviewer lane, and its
+`receipt.json`, `verification.json`, and the `subagent-artifacts/` `*_0_meta.json` and `*_output.md`
+next to them are the public schema those fixtures and refusals are written against. It is not code
+approval, and independent review of this helper is still pending. No throughput claim has been
 measured.
 
 ## Evidence lookup

@@ -37,6 +37,7 @@ import {
 	SETUP_FAILURES,
 	validateLaneConfig,
 	verifyArtifacts,
+	WATCHDOG_GRACE_MS,
 } from '../scripts/development/run-native-lane.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -546,6 +547,53 @@ test('public artifacts are found with one listing, need exactly one pair, and op
 	}
 });
 
+test('discovered artifacts must share one stem, and the resolved extension record must carry supported provenance', () => {
+	const { config, cleanup } = tempConfig();
+	const profile = { model: REVIEWER_MODEL, timeoutMs: 900_000 };
+	const artifactsDir = join(config.sessionDir, 'subagent-artifacts');
+	mkdirSync(artifactsDir, { recursive: true });
+	const fs = { exists: existsSync, readdir: (p) => readdirSync(p), readFile: (p) => readFileSync(p, 'utf8') };
+	const write = (suffix, body) => writeFileSync(join(artifactsDir, `${RUN_ID}_hylja-reviewer_${suffix}`), body);
+	try {
+		// Two individually plausible files from two different attempts are not one artifact pair.
+		write('0_meta.json', JSON.stringify(meta()));
+		write('1_output.md', 'CHANGES REQUESTED\n\nBody.');
+		assert.equal(discoverPublicArtifacts(config, RUN_ID, 'hylja-reviewer', fs).reason, SETUP_FAILURES.artifacts);
+		rmSync(join(artifactsDir, `${RUN_ID}_hylja-reviewer_1_output.md`));
+		write('0_output.md', 'CHANGES REQUESTED\n\nBody.');
+		const found = discoverPublicArtifacts(config, RUN_ID, 'hylja-reviewer', fs);
+		assert.equal(found.ok, true, JSON.stringify(found));
+		assert.equal(found.artifacts.meta.endsWith(`${RUN_ID}_hylja-reviewer_0_meta.json`), true, found.artifacts.meta);
+		assert.equal(found.artifacts.output.endsWith(`${RUN_ID}_hylja-reviewer_0_output.md`), true, found.artifacts.output);
+
+		// The positive record is the installed launch-resolved shape the retained smoke actually wrote.
+		const dispatch = dispatchRecord(config);
+		const check = (value) => verifyArtifacts(config, profile, dispatch, receipt(), found.artifacts, {
+			exists: () => true,
+			readdir: () => [],
+			readFile: (p) => (p === found.artifacts.meta ? JSON.stringify(value) : 'CHANGES REQUESTED\n\nBody.'),
+		});
+		assert.equal(check(meta()).ok, true, JSON.stringify(check(meta())));
+		const resolved = meta().launchResolvedExtensions;
+		// An unsupported schema version, a source that is not the launch-resolved one, an absent key
+		// and an incomplete omitted ledger are refused, never read as proven extension provenance.
+		for (const launchResolvedExtensions of [
+			{ ...resolved, version: 2 },
+			{ ...resolved, source: 'declared' },
+			{ ...resolved, source: undefined },
+			{ ...resolved, version: undefined },
+			{ ...resolved, required: 'sha256:synthetic-required' },
+			{ ...resolved, omitted: { runtime: 0, configured: 0, required: 0 } },
+			{ ...resolved, omitted: { runtime: 0, configured: 0, required: 0, effective: '0' } },
+		]) {
+			const refused = check(meta({ launchResolvedExtensions }));
+			assert.equal(refused.reason, SETUP_FAILURES.guard, JSON.stringify(launchResolvedExtensions));
+		}
+	} finally {
+		cleanup();
+	}
+});
+
 test('the runtime record is bound to the preflight contract, and mismatched evidence is refused', () => {
 	const { config, cleanup } = tempConfig();
 	const profile = { model: REVIEWER_MODEL, timeoutMs: 900_000 };
@@ -589,6 +637,53 @@ test('the runtime record is bound to the preflight contract, and mismatched evid
 		assert.equal(check(meta(), receipt(), dispatch, profile).ok, true);
 		assert.equal(verifyArtifacts(config, profile, dispatch, receipt(), artifacts, withMeta(meta(), 'unrelated public text')).reason,
 			SETUP_FAILURES.artifacts);
+	} finally {
+		cleanup();
+	}
+});
+
+test('the receipt verdict is bound to its literal first line, and empty text cannot approve', () => {
+	const { config, cleanup } = tempConfig();
+	const profile = { model: REVIEWER_MODEL, timeoutMs: 900_000 };
+	const artifacts = { meta: join(config.sessionDir, 'meta.json'), output: join(config.sessionDir, 'output.md') };
+	try {
+		const dispatch = dispatchRecord(config);
+		const check = (value, output) => verifyArtifacts(config, profile, dispatch, value, artifacts, {
+			exists: () => true,
+			readdir: () => [],
+			readFile: (p) => (p === artifacts.meta ? JSON.stringify(meta()) : output),
+		});
+		// The two bound shapes the installed controller actually writes: a reviewer verdict and an
+		// author's unlabelled result, which the controller resolves to INCOMPLETE and never to approval.
+		assert.equal(check(receipt(), 'CHANGES REQUESTED\n\nBody.').verdict, 'CHANGES REQUESTED');
+		assert.equal(check(receipt({ verdict: 'APPROVED', result: { kind: 'text', text: 'APPROVED\n\nBody.' } }), 'APPROVED\n\nBody.').verdict, 'APPROVED');
+		const author = check(receipt({ verdict: 'INCOMPLETE', result: { kind: 'text', text: 'Implemented the correction.\n' } }),
+			'Implemented the correction.\n');
+		assert.equal(author.ok, true, JSON.stringify(author));
+		assert.equal(author.verdict, 'INCOMPLETE');
+
+		// An unbound field, vacuous text or a contradiction is malformed evidence, never an approval.
+		for (const value of [
+			receipt({ verdict: 'APPROVED', result: { kind: 'text', text: '' } }),
+			receipt({ verdict: 'APPROVED', result: { kind: 'text', text: '   \n' } }),
+			receipt({ verdict: 'APPROVED', result: { kind: 'text', text: 'CHANGES REQUESTED\n\nBody.' } }),
+			receipt({ verdict: 'APPROVED', result: { kind: 'text', text: 'All good to me.\n' } }),
+			receipt({ verdict: 'APPROVED', result: { kind: 'text', text: '\n\nAPPROVED\n' } }),
+			receipt({ verdict: 'CHANGES REQUESTED', result: { kind: 'text', text: 'APPROVED\n' } }),
+			receipt({ verdict: 'INCOMPLETE', result: { kind: 'text', text: 'APPROVED\n' } }),
+			receipt({ verdict: 'INCOMPLETE', result: { kind: 'text', text: '' } }),
+		]) {
+			const refused = check(value, 'APPROVED\n\nBody.');
+			assert.equal(refused.reason, SETUP_FAILURES.malformed, JSON.stringify(value.result));
+			assert.notEqual(refused.verdict, 'APPROVED', JSON.stringify(value.result));
+		}
+
+		// The public output carrying the literal text is not proof by itself: its leading line must be
+		// the same literal line the receipt binds, so a planted match cannot carry a verdict.
+		const bound = receipt({ verdict: 'APPROVED', result: { kind: 'text', text: 'APPROVED\n\nBody.' } });
+		assert.equal(check(bound, 'APPROVED\n\nBody.').ok, true);
+		assert.equal(check(bound, '\n\nAPPROVED\n\nBody.').ok, true);
+		assert.equal(check(bound, 'Synthetic run log\n\nAPPROVED\n\nBody.').reason, SETUP_FAILURES.artifacts);
 	} finally {
 		cleanup();
 	}
@@ -749,6 +844,57 @@ test('a failed, timed-out or malformed receipt is explicit, and no watchdog time
 	}
 });
 
+test('a fired watchdog is latched before the stop and refuses late zero-exit completed approval evidence', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	const artifactsDir = join(config.sessionDir, 'subagent-artifacts');
+	mkdirSync(artifactsDir, { recursive: true });
+	writeFileSync(join(artifactsDir, `${RUN_ID}_hylja-reviewer_0_meta.json`), JSON.stringify(meta()));
+	writeFileSync(join(artifactsDir, `${RUN_ID}_hylja-reviewer_0_output.md`), 'APPROVED\n\nBody.');
+	const approved = receipt({ verdict: 'APPROVED', result: { kind: 'text', text: 'APPROVED\n\nBody.' } });
+	// Only the clock is injected, so the watchdog is the real one; it is fired by the recorded timer
+	// instead of by waiting out a ten-minute budget.
+	const timers = [];
+	const clock = () => ({ setTimeout: (fn, ms) => timers.push({ fn, ms }) && timers.length, clearTimeout: () => {}, addSignalListener: () => () => {} });
+	const evidence = () => {
+		writeFileSync(config.receipt, JSON.stringify(approved));
+		writeFileSync(config.dispatch, JSON.stringify(dispatchRecord(config)));
+		writeFileSync(config.progress, `${JSON.stringify({ event: 'progress', key: config.key, runId: RUN_ID, model: REVIEWER_MODEL, toolCount: 53, elapsedMs: 296_680 })}\n`);
+	};
+	try {
+		const fired = await runNativeLane(['--config', configPath], {
+			...clock(),
+			spawn: fakeSpawn({ hang: true, onLaunch: (_options, child) => {
+				evidence();
+				const watchdog = timers.find((timer) => timer.ms === config.timeoutMs + WATCHDOG_GRACE_MS);
+				assert.notEqual(watchdog, undefined, 'the watchdog is armed one grace past the request timeout');
+				watchdog.fn();
+				assert.deepEqual(child.signals, ['SIGTERM'], 'a fired deadline stops the owned child');
+				child.emit('close', 0); // the late zero exit of a child the deadline already stopped
+			} }),
+		});
+		assert.equal(fired.ok, false, 'expiry is not carried away by late completed evidence');
+		assert.equal(fired.reason, SETUP_FAILURES.status);
+		assert.equal(fired.detail, 'deadline');
+		assert.equal(fired.record.deadlineExceeded, true);
+		assert.equal(fired.record.verdict, 'INCOMPLETE');
+		assert.equal(fired.record.nativeExitCode, 0);
+		assert.equal(fired.record.status, 'completed');
+		assert.equal(JSON.parse(readFileSync(config.verification, 'utf8')).verdict, 'INCOMPLETE');
+
+		// The control: byte-identical evidence, same platform, no fired deadline, is the verified lane.
+		for (const path of [config.receipt, config.dispatch, config.verification, config.progress]) rmSync(path, { force: true });
+		const control = await runNativeLane(['--config', configPath], {
+			...clock(),
+			spawn: fakeSpawn({ onLaunch: () => { evidence(); } }),
+		});
+		assert.equal(control.ok, true, JSON.stringify(control));
+		assert.equal(control.record.verdict, 'APPROVED');
+		assert.equal(control.record.deadlineExceeded, false);
+	} finally {
+		cleanup();
+	}
+});
+
 test('progress is read from a bounded file, not an unbounded one', () => {
 	const { config, cleanup } = tempConfig();
 	try {
@@ -760,6 +906,33 @@ test('progress is read from a bounded file, not an unbounded one', () => {
 		assert.equal(snapshots.length <= MAX_PROGRESS_RECORDS, true, `${snapshots.length}`);
 		assert.equal(snapshots.at(-1).toolCount, MAX_PROGRESS_RECORDS + 399);
 		assert.equal(readProgress(join(config.sessionDir, 'absent.ndjson'), fs).length, 0);
+	} finally {
+		cleanup();
+	}
+});
+
+test('a null or primitive progress record is bounded malformed evidence, never a thrown error', () => {
+	const { config, cleanup } = tempConfig();
+	try {
+		const lines = ['null', '42', 'true', '"synthetic-planted-record.invalid"', '[1,2]',
+			JSON.stringify({ event: 'progress', key: config.key, runId: RUN_ID, model: REVIEWER_MODEL, toolCount: 53, elapsedMs: 296_680 })];
+		writeFileSync(config.progress, `${lines.join('\n')}\n`);
+		const fs = { exists: () => true, size: (p) => readFileSync(p).length, read: (p, offset, length) => readFileSync(p).subarray(offset, offset + length) };
+		const snapshots = readProgress(config.progress, fs);
+		assert.equal(snapshots.length, lines.length, 'every parsed record yields exactly one bounded snapshot');
+		for (const snapshot of snapshots.slice(0, lines.length - 1)) {
+			assert.deepEqual(snapshot, { event: 'malformed' }, 'a record that is not an object is malformed evidence');
+		}
+		assert.equal(snapshots.at(-1).toolCount, 53, 'a well-formed record in the same file still survives');
+		// The bounded evidence carries no planted value and no non-scalar field.
+		const publicText = JSON.stringify(snapshots);
+		assert.equal(publicText.includes('synthetic-planted-record.invalid'), false);
+		for (const snapshot of snapshots) {
+			for (const [field, value] of Object.entries(snapshot)) {
+				assert.equal(['event', 'model', 'runId', 'toolCount', 'elapsedMs'].includes(field), true, field);
+				assert.equal(['string', 'number'].includes(typeof value), true, `${field} ${typeof value}`);
+			}
+		}
 	} finally {
 		cleanup();
 	}
