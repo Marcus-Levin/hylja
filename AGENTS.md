@@ -96,6 +96,7 @@ Multiple sessions may work on this repository at once, each in its own branch an
 ## Delegation, review, merge, and issues
 
 - Keep implementation and review separate. When review is delegated, it must be a different agent working from the pushed or shared state, not the author's own summary.
+- The delegated implementer/reviewer lanes for this repository are documented in [docs/development/pipeline.md](docs/development/pipeline.md), entered through [.agents/skills/hylja-development/SKILL.md](.agents/skills/hylja-development/SKILL.md) and the two role agents in [.pi/agents/](.pi/agents/hylja-implementer.md). That path adds process only: it changes no rule in this file and no contract.
 - Review and approve an exact head SHA. A reviewed SHA that has since changed is not a review of the current head.
 - Report the exact SHA, the commands you actually ran with their results, and the honest remaining limits. Never manufacture approval, and never present AI review as the human design gate.
 - Merge only with the user's explicit authorization, exact-head approval, and green CI at that head. Proposed design (decision records, drafts, contracts, taxonomies) needs human review before it is wired in.
