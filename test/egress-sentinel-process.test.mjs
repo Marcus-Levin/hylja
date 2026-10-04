@@ -801,6 +801,70 @@ test('a caller-overridden typed-array method cannot break or steer the private c
   assert.equal(runner.state, 'IDLE');
 });
 
+test('a shadowed payload or key byteLength, set or iterator is never invoked and the snapshot stays exact', () => {
+  let invoked = 0;
+  const payload = text(`{"email":"${PLANTED_ORIGINAL}"}`);
+  const key = Uint8Array.from(KEY);
+  for (const target of [payload, key]) {
+    Object.defineProperty(target, 'byteLength', { configurable: true, get() { invoked += 1; return 32; } });
+    Object.defineProperty(target, 'set', { configurable: true, value() { invoked += 1; throw new Error('planted set'); } });
+    Object.defineProperty(target, Symbol.iterator, {
+      configurable: true,
+      value() { invoked += 1; throw new Error('planted iterator'); },
+    });
+  }
+  const entries = [{ kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'ref-original-email' }];
+  const shadowed = snapshotSentinelRequest(
+    request({ bytes: payload, known: registration(SCOPE, entries, key) }), 'r-shadow-getters',
+  );
+
+  assert.equal(invoked, 0, 'a shadowed payload or key property must never be invoked');
+  assert.equal(shadowed.ok, true, 'a genuine byte array stays admissible');
+
+  // The positive control is the same request with no shadow at all: byte identity, the digest and the
+  // private key copy must be indistinguishable, so ignoring the shadow changed no effect.
+  const clean = snapshotSentinelRequest(
+    request({ bytes: text(`{"email":"${PLANTED_ORIGINAL}"}`), known: registration(SCOPE, entries) }), 'r-shadow-getters',
+  );
+  assert.equal(clean.ok, true);
+  assert.deepEqual(Buffer.from(shadowed.value.payload), Buffer.from(clean.value.payload));
+  assert.equal(shadowed.value.payloadDigest, clean.value.payloadDigest);
+  assert.deepEqual(Buffer.from(shadowed.value.known.key), Buffer.from(clean.value.known.key));
+  assert.notEqual(shadowed.value.payload, payload, 'the payload must still be a private copy');
+  assert.notEqual(shadowed.value.known.key, key, 'the key must still be a private copy');
+});
+
+test('a Proxy over bytes, and any non-byte view, is refused without one reflection trap', () => {
+  let traps = 0;
+  const count = (apply) => (target, property, receiver) => {
+    traps += 1;
+    return apply(target, property, receiver);
+  };
+  const proxiedBytes = new Proxy(text(`{"email":"${PLANTED_ORIGINAL}"}`), {
+    get: count((target, property, receiver) => Reflect.get(target, property, receiver)),
+    getOwnPropertyDescriptor: count((target, property) => Reflect.getOwnPropertyDescriptor(target, property)),
+    has: count((target, property) => Reflect.has(target, property)),
+    ownKeys: count((target) => Reflect.ownKeys(target)),
+    getPrototypeOf: count((target) => Reflect.getPrototypeOf(target)),
+  });
+  const entries = [{ kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'ref-original-email' }];
+
+  const asPayload = snapshotSentinelRequest(request({ bytes: proxiedBytes }), 'r-proxy-bytes');
+  assert.equal(asPayload.ok, false);
+  assert.equal(asPayload.code, 'INVALID_REQUEST');
+  const afterPayload = traps;
+
+  const asKey = snapshotSentinelRequest(
+    request({ known: registration(SCOPE, entries, proxiedBytes) }), 'r-proxy-key',
+  );
+  assert.equal(asKey.code, 'INVALID_REQUEST');
+  assert.equal(traps, afterPayload, `a refused registration key dispatched ${traps - afterPayload} trap(s)`);
+  assert.equal(afterPayload, 0, `a refused payload dispatched ${afterPayload} reflection trap(s)`);
+
+  // A narrow typed array shares the typed-array brand but is not byte identity.
+  assert.equal(snapshotSentinelRequest(request({ bytes: new Int8Array([1, 2, 3]) }), 'r-int8').code, 'INVALID_REQUEST');
+});
+
 test('admission is busy before any caller inspection, so a reentrant check cannot start a second child', async () => {
   const runner = createSentinelProcessRunner({ deadlineMs: 5_000 });
   let reentrant = null;
@@ -899,8 +963,19 @@ const wrapper = await import(pathToFileURL(HERE + 'egress-sentinel-process.js').
 const scope = { tenantRef: 'tenant-synthetic-01', projectRef: 'project-synthetic-01' };
 const destination = { id: 'DEST-SYNTHETIC-LOCAL', profileDigest: 'sha256:0f1e2d3c4b5a6978' };
 const key = Uint8Array.from(Array.from({ length: 32 }, (unused, index) => (index * 7 + 3) & 0xff));
+const bytes = new TextEncoder().encode('synthetic payload for ' + control.marker);
+// A shadowed byteLength is an ordinary own accessor on an otherwise genuine byte array: if admission
+// or copying reads it as a property, caller code runs and can disclose through stderr right there.
+if (control.shadowGetter) {
+  for (const target of [bytes, key]) {
+    const disclose = (label) => { process.stderr.write('SHADOW-GETTER ' + label + ' ' + control.marker + '\n'); };
+    Object.defineProperty(target, 'byteLength', { configurable: true, get() { disclose('byteLength'); return 32; } });
+    Object.defineProperty(target, 'set', { configurable: true, value() { disclose('set'); } });
+    Object.defineProperty(target, Symbol.iterator, { configurable: true, value() { disclose('iterator'); return [][Symbol.iterator](); } });
+  }
+}
 const outcome = await wrapper.createSentinelProcessRunner({ deadlineMs: 400 }).check({
-  bytes: new TextEncoder().encode('synthetic payload for ' + control.marker),
+  bytes,
   scope, destination, authorized: destination,
   known: { scope, key, entries: [{ kind: 'ORIGINAL', value: control.marker, ref: 'ref-original-email' }] },
 });
@@ -948,6 +1023,15 @@ test('the same capture detects a deliberate leak, so the withholding result is n
   assert.match(captured.stdout, /OUTCOME BLOCK SENTINEL_BLOCK|DEADLINE_EXCEEDED/);
   assert.ok(captured.stdout.includes(PLANTED_ORIGINAL), 'the capture missed a known stdout disclosure');
   assert.ok(captured.stderr.includes(PLANTED_ORIGINAL), 'the capture missed a known stderr disclosure');
+});
+
+test('a shadowed payload or key getter cannot disclose through the caller diagnostic channels', async () => {
+  const captured = await bounded(runDiagnosticDriver({ leak: false, shadowGetter: true }), 20_000, 'shadow-getter driver');
+
+  assert.match(captured.stdout, /OUTCOME BLOCK SENTINEL_BLOCK|DEADLINE_EXCEEDED/, 'the driver must still reach a real outcome');
+  assert.equal(captured.stderr.includes('SHADOW-GETTER'), false, `a shadow getter ran: ${captured.stderr}`);
+  assert.equal(captured.stderr.includes(PLANTED_ORIGINAL), false, `getter disclosure: ${captured.stderr}`);
+  assert.equal(captured.stdout.includes(PLANTED_ORIGINAL), false, `stdout disclosure: ${captured.stdout}`);
 });
 
 test('the pure reply decoder refuses a binding difference, a foreign ref and an inconsistent decision', () => {

@@ -49,10 +49,15 @@ Exported values: `EGRESS_SENTINEL_PROCESS_WORKER`, `EGRESS_SENTINEL_PROCESS_LIMI
 The request object must have **exactly** these five own properties, read from their own **data
 descriptors**: an own accessor with a matching name is refused without being invoked, and a bounded
 `Proxy` trap that throws is contained and reported as the same `INVALID_REQUEST` rather than escaping
-`snapshotSentinelRequest` or `check()`. Caller byte and key buffers are copied through public standard
-intrinsics into buffers this code allocates, so an overridden `slice`, `set`, `subarray` or
-`Symbol.iterator` on a caller object is neither reached nor needed; `entries` is snapshotted by index
-descriptor, so a caller iterator, a sparse hole or an accessor element is refused, not executed.
+`snapshotSentinelRequest` or `check()`. Caller byte and key buffers are admitted and copied through
+captured standard intrinsics only: byte identity and length are read from the typed array's own
+internal slots, so an own `byteLength`, `set` or `Symbol.iterator` accessor on an otherwise genuine
+`Uint8Array` is **ignored, never invoked**, and the copy is written into a buffer this code allocates.
+Anything that is not a genuine `Uint8Array` - an array-like object, a narrow view, a subclass instance,
+a re-prototyped array, or a `Proxy` over one - is refused by the native brand check, which fails on the
+absent internal slots **before** any `get`, `has`, `ownKeys`, `getOwnPropertyDescriptor` or
+`getPrototypeOf` trap can run. `entries` is snapshotted by index descriptor, so a caller iterator, a
+sparse hole or an accessor element is refused, not executed.
 
 Admission is claimed before any of this caller-observable inspection begins, so a re-entrant
 `check()` from inside it observes `RUNNER_BUSY` and cannot start a second child. An invalid
@@ -168,6 +173,13 @@ Every outcome other than `ALLOW` is restrictive. Transport and lifecycle codes c
 - **Reason-code coupling.** The allowlist of sentinel reason codes in the protocol module must be
   updated when `checkEgress` gains one. That is intentional coupling, not drift: an unlisted reason is
   refused rather than passed through.
+- **Not a JavaScript sandbox.** The byte-array boundary reads native internal state through captured
+  intrinsics, so a shadowed caller property is never called and a `Proxy` over bytes is refused without
+  running one trap. That is a local wrapper guarantee, not isolation: it says nothing about arbitrary
+  hostile JavaScript running in the same realm, about caller code already executed elsewhere, or about
+  a caller who has tampered with the global intrinsics themselves. Reflecting a caller `Proxy` around
+  the **record** fields (scope, destination, entries) still runs that proxy's traps, contained by the
+  try/catch and reported as `INVALID_REQUEST`.
 
 ## Verification
 

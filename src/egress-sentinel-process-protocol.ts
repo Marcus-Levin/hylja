@@ -25,6 +25,11 @@
  * codes and finding refs. A reason that is not a fixed sentinel code, or a ref that is not one the
  * parent itself registered, is a malformed reply: no child-selected string reaches an ordinary result.
  *
+ * Caller-supplied byte arrays are admitted and copied through captured standard intrinsics only. Byte
+ * identity and length come from the typed array's own internal slots, never from a caller property,
+ * method, iterator or prototype lookup, so an own `byteLength`, `set` or `Symbol.iterator` accessor is
+ * ignored rather than called. This is a local wrapper boundary, not a JavaScript sandbox.
+ *
  * Originals and the sentinel key exist here only as bounded copies inside local IPC. Nothing in this
  * module persists, logs or reports them, and no framing here proves heap or RSS erasure.
  */
@@ -218,12 +223,63 @@ function ownDataProperties(value: unknown, allowed: ReadonlySet<string>): Map<st
 }
 
 /**
+ * The captured `%TypedArray%.prototype.byteLength` accessor.
+ *
+ * `byteLength` is an ordinary prototype accessor, so `bytes.byteLength` executes any own accessor a
+ * caller defined on an otherwise genuine array - and that code runs BEFORE any restriction exists,
+ * where containment cannot retract what it already disclosed. Calling the intrinsic accessor with the
+ * value as `this` reads the typed array's own length slot instead: a `Proxy`, a plain object and a
+ * detached or tampered buffer have no such slot and raise a TypeError, and no caller property,
+ * method, iterator or prototype lookup runs on the way there.
+ */
+const TYPED_ARRAY_PROTOTYPE: object = Object.getPrototypeOf(Uint8Array.prototype);
+/** The one byte prototype a caller array must actually have, captured before any call arrives. */
+const UINT8_ARRAY_PROTOTYPE: object = Uint8Array.prototype;
+const TYPED_BYTE_LENGTH_DESCRIPTOR: PropertyDescriptor | undefined =
+  Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, 'byteLength');
+
+function noTypedByteLength(): never {
+  throw new TypeError('the typed array byteLength accessor is unavailable');
+}
+
+const TYPED_BYTE_LENGTH: () => number =
+  TYPED_BYTE_LENGTH_DESCRIPTOR === undefined || TYPED_BYTE_LENGTH_DESCRIPTOR.get === undefined
+    ? noTypedByteLength
+    : TYPED_BYTE_LENGTH_DESCRIPTOR.get;
+
+/** Byte length of a byte array already known to be one, read from internal state only. */
+function byteArrayLength(bytes: Uint8Array): number {
+  return Reflect.apply(TYPED_BYTE_LENGTH, bytes, []);
+}
+
+/**
+ * True only for genuine byte identity.
+ *
+ * Step one is a trap-free brand check: the captured `Uint8Array.prototype.slice` requires typed array
+ * internal slots on its receiver, so a `Proxy` fails it before any `get`, `has`, `ownKeys`,
+ * `getOwnPropertyDescriptor` or `getPrototypeOf` trap of its own can run. Step two reads the prototype
+ * only after that check has established a genuine typed array, where no caller code and no trap is
+ * reachable, so a narrow view, a subclass instance and a re-prototyped array are refused rather than
+ * silently converted, and only an actual `Uint8Array` is admitted.
+ *
+ * This is a local wrapper check, not a sandbox. It does not make in-process inspection safe against
+ * arbitrary hostile JavaScript and does not defend against global intrinsic tampering.
+ */
+function isByteArray(value: unknown): value is Uint8Array {
+  try {
+    Reflect.apply(Uint8Array.prototype.slice, value, [0, 0]);
+    return Object.getPrototypeOf(value) === UINT8_ARRAY_PROTOTYPE;
+  } catch { return false; }
+}
+
+/**
  * Copy caller bytes through public standard intrinsics only. `slice`, `set`, `subarray` and any
  * iterator are all overridable per instance, so none of them is reachable through the caller's own
- * object: the copy is written into a buffer this module allocated.
+ * object: the length comes from the intrinsic length slot and the copy is written into a buffer this
+ * module allocated.
  */
 function copyBytes(bytes: Uint8Array): Uint8Array {
-  const out = new Uint8Array(bytes.byteLength);
+  const out = new Uint8Array(byteArrayLength(bytes));
   out.set(bytes);
   return out;
 }
@@ -289,10 +345,11 @@ function snapshotRegistration(
   if (!ownScope || !sameScope(ownScope, scope)) return 'invalid';
   const key = record.get('key');
   // The key is capped here, before any child exists, so an undersized key cannot reach the child and
-  // be reported as a crash instead of a refusal.
-  if (!(key instanceof Uint8Array) || key.byteLength < limits.minKeyBytes || key.byteLength > limits.maxKeyBytes) {
-    return 'invalid';
-  }
+  // be reported as a crash instead of a refusal. The cap reads the intrinsic length slot, so a caller
+  // accessor named `byteLength` is not invoked to make this decision.
+  if (!isByteArray(key)) return 'invalid';
+  const keyLength = byteArrayLength(key);
+  if (keyLength < limits.minKeyBytes || keyLength > limits.maxKeyBytes) return 'invalid';
   const items = ownIndexedItems(record.get('entries'), limits.maxKnownEntries);
   if (items === null) return 'invalid';
   const entries: SentinelProcessKnownEntry[] = [];
@@ -351,7 +408,10 @@ function snapshotSentinelRequestRefused(
   if (record === null) return failed('INVALID_REQUEST');
   if (!isLabel(requestId, 64)) return failed('INVALID_REQUEST');
   const bytes = record.get('bytes');
-  if (!(bytes instanceof Uint8Array) || bytes.byteLength > limits.maxPayloadBytes) return failed('INVALID_REQUEST');
+  // Admitted by native brand, never by a caller property: `instanceof` would walk a `Proxy`'s
+  // prototype trap and `bytes.byteLength` would run a caller accessor.
+  if (!isByteArray(bytes)) return failed('INVALID_REQUEST');
+  if (byteArrayLength(bytes) > limits.maxPayloadBytes) return failed('INVALID_REQUEST');
   const scope = snapshotScope(record.get('scope'));
   if (!scope) return failed('INVALID_REQUEST');
   const observed = snapshotDestination(record.get('destination'));
