@@ -190,8 +190,11 @@ for `close` — never an indefinite wait.
 initial task, as one role-aware paragraph — reviewer: report a literal verdict and stay read-only;
 writer: finish the checks, commit, then report — and that paragraph grants no authority the role body
 does not already carry. Root receives exactly one bounded numeric `soft_budget_reached` progress
-snapshot at the soft budget, which appears in the verification record's `progress` array. That
-snapshot is a warning for the reader and nothing more: it is never delivered to the running child, and
+snapshot at the soft budget, which appears in the verification record's `progress` array. That snapshot
+is retained inside that same cap: when a busy leaf's own later updates would push it out of the tail
+root reads after the child exits, it replaces the oldest retained record instead, so the cap is never
+raised, the surviving records keep their chronological order and the newest updates are the ones
+kept. It is a warning for the reader and nothing more: it is never delivered to the running child, and
 it never cancels, kills, deletes, resets or approves anything. The hard path is unchanged and finite —
 native request timeout, plus the one-minute watchdog, SIGTERM, SIGKILL after 10 s, at most 10 s more
 for `close`. A lane that reaches it reports INCOMPLETE with `deadlineExceeded: true`, keeps its
@@ -201,7 +204,7 @@ provably the same code and not a re-implementation of it.
 
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (41 tests, 31 of them in the lane file). Two of them
+platform (42 tests, 32 of them in the lane file). Two of them
 fake only the child transport, so the shipped default platform is what runs: the default filesystem
 must read the progress tail with bounded positional descriptor reads and close every descriptor it
 opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
@@ -211,7 +214,10 @@ by its recorded timer rather than by waiting out a ten-minute budget, and proves
 completed approval evidence is refused after expiry and verified without it. The optional soft budget
 is driven by an injected `now` and `arm` pair whose cancel closure is recorded, so a case can fire,
 repeat, refuse and drain a soft budget deterministically; the shipped default `arm` has its own case
-so the fake clock is not the only path that can warn. The lane file keeps a planted candidate note and
+so the fake clock is not the only path that can warn. One case fires that warning and then pushes more
+owned updates than the file keeps, settles, and reads the file back through the shipped `readProgress`,
+because the warning only matters if root's own reader still finds exactly one of it. The lane file
+keeps a planted candidate note and
 the leaf's own evidence and proves a hard deadline leaves both untouched, reports INCOMPLETE and arms
 no surviving timer. A read-only
 smoke on root's own installed Pi ran from

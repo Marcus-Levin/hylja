@@ -22,9 +22,10 @@
  * A root may configure one optional `softBudgetMs`, strictly below the finite hard `timeoutMs`. It
  * adds exactly two things: a numeric soft/hard timing paragraph to the child's own initial task, and
  * one bounded `soft_budget_reached` progress snapshot at the soft budget. That snapshot is a warning
- * for root and the progress file only: it is never delivered to the running child, and it never
- * cancels, kills, deletes, resets or approves anything. Without it the lane behaves exactly as
- * before and arms no timer.
+ * for root and the progress file only: it is retained inside the same progress cap, so later updates
+ * cannot push it out of the tail root reads after the child exits. It is never delivered to the
+ * running child, and it never cancels, kills, deletes, resets or approves anything. Without it the
+ * lane behaves exactly as before and arms no timer.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -320,10 +321,21 @@ function readCount(value: unknown): number | null {
 	return isCount(value) ? value : null;
 }
 
+/** The one warning snapshot a configured soft budget adds, and the one record the cap retains. */
+const SOFT_BUDGET_EVENT = 'soft_budget_reached';
+
 /** Persists at most `MAX_PROGRESS_RECORDS` records; the newest snapshot replaces the older tail. */
 function pushProgress(path: string, key: string, records: LaneProgressRecord[], entry: LaneProgressRecord): void {
 	records.push(entry);
 	const kept = records.slice(-MAX_PROGRESS_RECORDS);
+	// Only a full window evicts anything, and only the soft warning is ever put back: root reads this
+	// tail after the leaf has exited, so a warning that the leaf's own later updates push out of the
+	// cap is a warning nobody ever reads. It replaces the oldest retained record instead, leaving the
+	// numeric cap, the newest-first eviction and the chronological order of what survives unchanged.
+	if (records.length > MAX_PROGRESS_RECORDS) {
+		const evicted = records.find((item) => item.event === SOFT_BUDGET_EVENT && !kept.includes(item));
+		if (evicted !== undefined) kept.splice(0, 1, evicted);
+	}
 	records.length = 0;
 	records.push(...kept);
 	writeFileSync(path, `${kept.map((item) => JSON.stringify(item)).join('\n')}\n`, { mode: 0o600 });
@@ -583,7 +595,7 @@ export async function createLaneController(
 				// approval is produced here. One warning per dispatch, or none at all.
 				if (warned || settled || cancelled || setupFailure !== null) return;
 				warned = true;
-				progress('soft_budget_reached');
+				progress(SOFT_BUDGET_EVENT);
 			}, config.softBudgetMs));
 		}
 		pi.events.emit(modules.delegation.SUBAGENT_DELEGATION_REQUEST_EVENT, request);

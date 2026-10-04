@@ -697,6 +697,54 @@ test('the soft budget warns root exactly once and cancels nothing before the har
 	}
 });
 
+test('the one soft warning survives the capped progress tail the CLI reads after the child exits', async () => {
+	// Root reads the tail of this file only after the leaf is gone, so a warning a busy child's own
+	// updates push out of the cap is a warning nobody ever sees. More owned updates than the file
+	// keeps, all fired after the warning, and the warning must still be exactly one numeric snapshot.
+	const { config, configPath, cleanup } = tempConfig();
+	const clock = fakeClock();
+	const updates = MAX_PROGRESS_RECORDS + 8;
+	try {
+		const loaded = { ...readLaneConfig(configPath), softBudgetMs: 360_000 };
+		const { pi, emitted } = fakePi();
+		const controller = await createLaneController(pi, loaded,
+			{ delegation, preflight: fakePreflight({ guard: config.guard, model: REVIEWER_MODEL }) },
+			{ now: clock.now, arm: clock.arm, addSignalListener: noSignals });
+		clock.fire(360_000);
+		assert.equal(softWarnings(config.progress).length, 1, 'the warning fired once before the updates');
+
+		for (let toolCount = 0; toolCount < updates; toolCount += 1) {
+			pi.events.emit(delegation.SUBAGENT_DELEGATION_UPDATE_EVENT,
+				{ ...controller.tuple, model: REVIEWER_MODEL, runId: RUN_ID, toolCount, durationMs: 360_000 + toolCount });
+		}
+		completeLeaf(pi, controller);
+		await controller.settle();
+		assert.equal(controller.setupFailure, null);
+		assert.equal(clock.timers[0].cancelled, true, 'the armed warning timer is drained on settlement');
+		assert.equal(emitted.filter((entry) => entry.event === delegation.SUBAGENT_DELEGATION_CANCEL_EVENT).length, 0,
+			'no retained record cancelled anything');
+
+		// The shipped CLI reader, over the file the real controller actually wrote.
+		const fs = { exists: existsSync, size: (p) => statSync(p).size, read: (p, offset, length) => readFileSync(p).subarray(offset, offset + length) };
+		const snapshots = readProgress(config.progress, fs);
+		assert.equal(snapshots.length <= MAX_PROGRESS_RECORDS, true, `the cap is unchanged: ${snapshots.length}`);
+		const warned = snapshots.filter((entry) => entry.event === 'soft_budget_reached');
+		assert.equal(warned.length, 1, 'exactly one warning survives the cap');
+		assert.deepEqual(Object.keys(warned[0]).sort(), ['elapsedMs', 'event', 'model', 'runId', 'toolCount'],
+			'still one bounded numeric snapshot with no field the reader does not bound');
+		assert.equal(Number.isFinite(warned[0].elapsedMs) && warned[0].elapsedMs >= 0, true, 'a finite elapsed count');
+		assert.equal(warned[0].elapsedMs, 360_000);
+		// Chronological order is kept: the warning stays where it fired, ahead of every update that
+		// followed it, and the newest updates are the ones the cap keeps.
+		assert.equal(snapshots[0].event, 'soft_budget_reached');
+		const counts = snapshots.filter((entry) => entry.event === 'progress').map((entry) => entry.toolCount);
+		assert.deepEqual(counts, [...counts].sort((a, b) => a - b), 'retained updates keep chronological order');
+		assert.equal(snapshots.at(-1).toolCount, updates - 1, 'the newest update is retained');
+	} finally {
+		cleanup();
+	}
+});
+
 test('settling, failing or overflowing before the soft budget leaves no timer behind', async () => {
 	const settledCase = tempConfig();
 	const clock = fakeClock();

@@ -77,7 +77,8 @@ export type FindingSource = NormalizedCandidate['source'];
 type UnlistedFindingSource = Exclude<FindingSource, (typeof FINDING_SOURCES)[number]>;
 type AssertNever<T extends never> = T;
 type UnlistedFindingSourceIsNever = AssertNever<UnlistedFindingSource>;
-const SOURCES: readonly FindingSource[] = FINDING_SOURCES;
+/** The assertion is part of this annotation, so the exhaustiveness check is a read rather than dead code. */
+const SOURCES: readonly (FindingSource | UnlistedFindingSourceIsNever)[] = FINDING_SOURCES;
 const CONTROL = /[\u0000-\u001f\u007f]/u;
 /**
  * Original-location families. `EXACT` and `COVER` differ in precision, not in coordinate space: a #6
