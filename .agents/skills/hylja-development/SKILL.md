@@ -58,10 +58,15 @@ guard and the opt-in controller `.pi/lib/hylja-native-lane.ts`, and the controll
 fixed input `hylja-native-lane` through the documented foreground delegation API. Give it the role,
 worktree, task, a deadline no greater than that profile's, the session and evidence paths, and the exact
 `pi`, `subagents`, `guard` and `controller` paths. There is no model override (a `model` key is refused),
-no background mode, no role fallback and no nesting. Read
+no background mode, no role fallback and no nesting. The controller resolves the launch contract and
+persists the expected digest, guard identity and dispatch tuple before it dispatches, refuses every
+unexpected input and every setup, settlement or write error rather than letting it reach a parent model,
+and settles as INCOMPLETE. Read
 [pipeline.md](../../../docs/development/pipeline.md#native-lane-controller-no-coordinator-model-turn) for
-the evidence it requires and for its stated limits: completed is not approved, missing or mismatched
-runtime evidence is a setup failure, and no speedup has been measured.
+the evidence it requires and for its stated limits: completed is not approved, the native writer
+acceptance gate reports `not-required` rather than a passed check, mismatched runtime evidence is a setup
+failure, no speedup has been measured, and the read-only smoke on root's own installed Pi is still
+pending.
 
 ## Admit
 

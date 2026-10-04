@@ -87,8 +87,8 @@ allowed on purpose, so the guard cannot block scoped repository discovery or the
 Evidence: `node --test test/hylja-workflow-guard.test.mjs` exercises the helper and the adapter
 directly, including the exact command shape that failed, quoted and absolute-executable variants, scoped
 discovery, the timeout default, preservation, clamp and refusal, that no other tool is mutated, and that
-each role profile's declared path resolves to an existing file. The load path itself is proven by a
-native smoke run, not by this document.
+each role profile's declared path resolves to an existing file. A load against the operator's installed
+Pi is root's own smoke, reported with the run it came from, not a claim this document makes.
 
 ## Native lane controller (no coordinator-model turn)
 
@@ -107,24 +107,37 @@ The root-owned config is bounded and explicit: `key`, `agent` (`hylja-implemente
 override exists. Paths are never discovered, the guard is always loaded, and no background mode, role
 fallback or nesting is available.
 
+The controller resolves the exported `resolveSubagentLaunchContract` for this exact task, cwd, fresh
+context, parent model registry and bridge input before it emits anything, then persists the canonical
+expected digest, the declared guard identity and the dispatch tuple, and only then dispatches.
+
 Evidence the CLI requires before it reports a lane: the controller's public terminal receipt with the
-literal public result, authoritative cumulative usage and the actual model, thinking level and status;
-one listing of `{sessionDir}/subagent-artifacts/` for `*_meta.json` and `*_output.md` only; and a
-runtime record whose `runId` and `agent` match, whose effective `model` equals the role profile's `:max`
-model, whose `launchContractDigest` equals the terminal response's, whose
-`launchResolvedExtensions` shows `disableAmbientExtensions: true` with the declared allowlist present in
-the effective set, and whose `acceptance` is explicit. Absent or mismatched evidence is a setup failure,
-never an inferred pass. A `completed` leaf is never approval: the verdict is only the leaf's own literal
-`APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE` line.
+literal public result, authoritative cumulative usage and the actual model, thinking level and status,
+bound to the dispatch tuple the controller persisted before it emitted the request; one listing of
+`{sessionDir}/subagent-artifacts/` for `*_meta.json` and `*_output.md` only; and a runtime record whose
+`runId` and `agent` match, whose effective `model` equals the role profile's `:max` model, whose
+`launchContractDigest` equals the terminal response's, whose `launchResolvedExtensions` shows
+`disableAmbientExtensions: true` with every declared extension present in the effective set, and whose
+`acceptance` status the installed extension actually reports. A missing, reused or mismatched pair is a
+setup failure, never an inferred pass. A `completed` leaf is never approval: the verdict is only the
+leaf's own literal `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE` line.
+
+Acceptance is reported, never assumed. A direct-API run of either role resolves `not-required` with the
+reason that the profile disables the native gate through the deprecated false shorthand, so the record
+carries no native writer acceptance evidence and `writerAcceptanceGate` says so; a run that did resolve
+the gate reports `checked`; an actual acceptance failure is refused. Root admits a writer lane
+separately, by verifying its clean committed scoped paths and evidence, before any approval.
 
 Bounds, stated so no one reads more into it: progress lines carry model, runId, elapsed milliseconds and
 tool count only, and `recentOutput`, tool arguments, raw sessions and provider reasoning are never read
 or written. Cancellation reaches only the exact owned tuple that `dispatch` persists, and only inside
-the running process, so cancelling a lane root no longer owns is out of scope here. The CLI kills its
-own child one minute past the native request timeout. The role profile remains the only place a model is
-configured, the launch path is proven by the behaviour tests plus a native smoke run, and this is
-developer tooling, not a shell sandbox, an authorization point or an enforcement boundary. No throughput
-claim has been measured.
+the running process, so cancelling a lane root no longer owns is out of scope here. The CLI stops its own
+child with a bounded SIGTERM, then SIGKILL, then a finite close wait. The role profile remains the only
+place a model is configured, the behaviour tests drive the real controller and CLI exports against a
+fake event API, a fake preflight and a synthetic temporary platform with no local Pi installation, and a
+read-only smoke on root's own installed Pi is still to be run on this exact helper. This is developer
+tooling, not a shell sandbox, an authorization point or an enforcement boundary. No throughput claim has
+been measured.
 
 ## Admission and concurrency
 
