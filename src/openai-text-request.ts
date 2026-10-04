@@ -251,8 +251,13 @@ export function translateOpenAiTextRequest(input: unknown): OpenAiTextRequestRes
   let args: Arguments;
   try {
     args = readArguments(input);
-  } catch (error) {
-    return refusal(error instanceof Refused ? error.reason : 'INVALID_ARGUMENTS');
+  } catch {
+    // The caught value is discarded without being inspected. `readArguments` reports every one of its
+    // own refusals as `INVALID_ARGUMENTS`, so the mapping is lossless, and any other thrown value is a
+    // caller-controlled object whose prototype chain can throw again: an `instanceof`, a property read
+    // or any other reflective inspection inside this catch would leave the fixed-refusal boundary from
+    // inside the handler, propagating a planted message and stack out of the function.
+    return refusal('INVALID_ARGUMENTS');
   }
   try {
     return translate(args);

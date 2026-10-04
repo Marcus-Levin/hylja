@@ -271,6 +271,29 @@ test('caller properties are read only through descriptors, never through a gette
   assert.equal(reads.get, 0, 'validated arguments must be snapshotted through descriptors, not read again');
 });
 
+test('a value thrown while reading arguments is discarded without inspection and cannot escape', () => {
+  // The argument proxy throws a value whose own prototype trap throws as well, so *inspecting* the
+  // thrown value (an `instanceof` prototype walk, a property read, anything reflective) throws again
+  // and would leave the fixed-refusal boundary from inside the catch. The catch must therefore
+  // discard the caught value unconditionally. An escaping baseline is caught here and reduced to a
+  // boolean, so no planted message or stack can ever reach the TAP report.
+  const planted = 'synthetic-throwing-proxy.invalid';
+  const hostile = new Proxy({ endpoint: ENDPOINT, body: wire({ model: MODEL, messages: [] }) }, {
+    ownKeys() { throw new Proxy({}, { getPrototypeOf() { throw new Error(planted); } }); },
+  });
+  let escaped = true;
+  let outcome = null;
+  try {
+    outcome = translateOpenAiTextRequest(hostile);
+    escaped = false;
+  } catch (unused) {
+    outcome = null;
+  }
+  assert.equal(escaped, false, 'argument validation must not let a thrown value escape as a fixed refusal');
+  refuse(outcome, 'INVALID_ARGUMENTS');
+  assert.equal(Object.isFrozen(outcome), true);
+});
+
 test('stream:false is accepted and still translates to a complete non-streaming draft', () => {
   const translated = draft(translateOpenAiTextRequest(ask('a', { stream: false })));
   assert.deepEqual(translated.stream, { mode: 'complete' });
