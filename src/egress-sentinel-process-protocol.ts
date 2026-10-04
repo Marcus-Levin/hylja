@@ -5,9 +5,12 @@
  * One check is one frame in each direction over the child's stdin/stdout. The frame is a fixed magic,
  * a kind byte, a big-endian body length and a sequence of `tag | length | bytes` fields that must
  * appear in exactly the documented order. Positions rather than names carry the structure, so a
- * duplicate, reordered, unknown or truncated field cannot be represented: the decoder refuses it. A
- * missing final newline is a truncated reply and a second newline is a duplicate reply, and both are
- * separate outcomes rather than one generic parse error.
+ * duplicate, reordered, unknown or truncated field cannot be represented: the decoder refuses it. The
+ * frame is BINARY and length-delimited, not newline-delimited text: only the single trailing byte
+ * after the declared body is a newline, so a length field, an id or a payload byte that happens to be
+ * `0x0a` is ordinary data. A body shorter than the declared length, or a missing trailing newline, is
+ * a truncated reply; bytes past one complete frame are a duplicate reply or extra trailing output,
+ * and all three are separate restrictive outcomes rather than one generic parse error.
  *
  * The request carries the exact bytes to check plus an EXPLICIT known-original registration: either
  * `null` (no known originals to protect) or a bounded registration with its own tenant/project scope.
@@ -185,33 +188,87 @@ function isLabel(value: unknown, maxChars: number): value is string {
     !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
-function exactKeys(value: object, allowed: ReadonlySet<string>): boolean {
+/**
+ * Copy the exact own DATA properties of a caller object into a bounded map.
+ *
+ * Names alone are not a sufficient check: an accessor can be an own enumerable property whose name
+ * matches and whose value only exists if it is invoked. So each accepted property is copied through
+ * `getOwnPropertyDescriptor`, an accessor or a symbol is refused without being read, and every
+ * reflection call is contained - a `Proxy` trap that throws produces a refusal, never an exception
+ * that escapes into the caller.
+ */
+function ownDataProperties(value: unknown, allowed: ReadonlySet<string>): Map<string, unknown> | null {
+  if (typeof value !== 'object' || value === null) return null;
   let names: string[];
   let symbols: symbol[];
   try {
     names = Object.getOwnPropertyNames(value);
     symbols = Object.getOwnPropertySymbols(value);
-  } catch { return false; }
-  if (symbols.length !== 0 || names.length !== allowed.size) return false;
-  for (const name of names) if (!allowed.has(name)) return false;
-  return true;
+  } catch { return null; }
+  if (symbols.length !== 0 || names.length !== allowed.size) return null;
+  const out = new Map<string, unknown>();
+  for (const name of names) {
+    if (!allowed.has(name)) return null;
+    let descriptor: PropertyDescriptor | undefined;
+    try { descriptor = Object.getOwnPropertyDescriptor(value, name); } catch { return null; }
+    if (descriptor === undefined || !('value' in descriptor)) return null;
+    out.set(name, descriptor.value);
+  }
+  return out;
+}
+
+/**
+ * Copy caller bytes through public standard intrinsics only. `slice`, `set`, `subarray` and any
+ * iterator are all overridable per instance, so none of them is reachable through the caller's own
+ * object: the copy is written into a buffer this module allocated.
+ */
+function copyBytes(bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(bytes.byteLength);
+  out.set(bytes);
+  return out;
+}
+
+/**
+ * Indexed, bounded snapshot of a caller array. Reading `length` and then each index descriptor avoids
+ * a caller iterator, a caller `Symbol.iterator`, an accessor element and a sparse hole: any of those
+ * is refused here rather than executed.
+ */
+function ownIndexedItems(value: unknown, maxEntries: number): unknown[] | null {
+  if (!Array.isArray(value)) return null;
+  let length: number;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    if (descriptor === undefined || !('value' in descriptor) || typeof descriptor.value !== 'number') return null;
+    length = descriptor.value;
+    if (!Number.isSafeInteger(length) || length < 0 || length > maxEntries) return null;
+    if (Object.getOwnPropertyNames(value).length !== length + 1) return null;
+  } catch { return null; }
+  const items: unknown[] = [];
+  try {
+    for (let index = 0; index < length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor === undefined || !('value' in descriptor)) return null;
+      items.push(descriptor.value);
+    }
+  } catch { return null; }
+  return items;
 }
 
 function snapshotScope(value: unknown): SentinelProcessScope | null {
-  if (typeof value !== 'object' || value === null || !exactKeys(value, SCOPE_KEYS)) return null;
-  const record = value as Record<string, unknown>;
-  const tenantRef = record.tenantRef;
-  const projectRef = record.projectRef;
+  const record = ownDataProperties(value, SCOPE_KEYS);
+  if (record === null) return null;
+  const tenantRef = record.get('tenantRef');
+  const projectRef = record.get('projectRef');
   if (!isLabel(tenantRef, EGRESS_SENTINEL_PROCESS_LIMITS.maxLabelChars) ||
     !isLabel(projectRef, EGRESS_SENTINEL_PROCESS_LIMITS.maxLabelChars)) return null;
   return Object.freeze({ tenantRef, projectRef });
 }
 
 function snapshotDestination(value: unknown): SentinelProcessDestination | null {
-  if (typeof value !== 'object' || value === null || !exactKeys(value, DESTINATION_KEYS)) return null;
-  const record = value as Record<string, unknown>;
-  const id = record.id;
-  const profileDigest = record.profileDigest;
+  const record = ownDataProperties(value, DESTINATION_KEYS);
+  if (record === null) return null;
+  const id = record.get('id');
+  const profileDigest = record.get('profileDigest');
   if (!isLabel(id, EGRESS_SENTINEL_PROCESS_LIMITS.maxLabelChars) ||
     !isLabel(profileDigest, EGRESS_SENTINEL_PROCESS_LIMITS.maxProfileDigestChars)) return null;
   return Object.freeze({ id, profileDigest });
@@ -226,28 +283,28 @@ function snapshotRegistration(
   scope: SentinelProcessScope,
 ): SentinelProcessKnownRegistration | null | 'invalid' {
   const limits = EGRESS_SENTINEL_PROCESS_LIMITS;
-  if (typeof value !== 'object' || value === null || !exactKeys(value, REGISTRATION_KEYS)) return 'invalid';
-  const record = value as Record<string, unknown>;
-  const ownScope = snapshotScope(record.scope);
+  const record = ownDataProperties(value, REGISTRATION_KEYS);
+  if (record === null) return 'invalid';
+  const ownScope = snapshotScope(record.get('scope'));
   if (!ownScope || !sameScope(ownScope, scope)) return 'invalid';
-  const key = record.key;
+  const key = record.get('key');
   // The key is capped here, before any child exists, so an undersized key cannot reach the child and
   // be reported as a crash instead of a refusal.
   if (!(key instanceof Uint8Array) || key.byteLength < limits.minKeyBytes || key.byteLength > limits.maxKeyBytes) {
     return 'invalid';
   }
-  const entriesValue = record.entries;
-  if (!Array.isArray(entriesValue) || entriesValue.length > limits.maxKnownEntries) {
-    return 'invalid';
-  }
+  const items = ownIndexedItems(record.get('entries'), limits.maxKnownEntries);
+  if (items === null) return 'invalid';
   const entries: SentinelProcessKnownEntry[] = [];
   const refs = new Set<string>();
-  for (const item of entriesValue as unknown[]) {
-    if (typeof item !== 'object' || item === null || !exactKeys(item as object, ENTRY_KEYS)) return 'invalid';
-    const entry = item as Record<string, unknown>;
-    const kind = entry.kind;
-    const ref = entry.ref;
-    const text = entry.value;
+  for (const item of items) {
+    const entry = ownDataProperties(item, ENTRY_KEYS);
+    if (entry === null) return 'invalid';
+    const kind = entry.get('kind');
+    const ref = entry.get('ref');
+    // An original value is CONTENT, not an identifier: bounded, non-empty UTF-8 text whose newlines,
+    // spaces and tabs are ordinary data. Only labels and refs are restricted to identifier shape.
+    const text = entry.get('value');
     if (kind !== 'ORIGINAL' && kind !== 'CANARY') return 'invalid';
     if (!isLabel(ref, 128) || refs.has(ref)) return 'invalid';
     if (typeof text !== 'string' || text.length === 0 || text.length > limits.maxKnownValueChars) {
@@ -259,7 +316,7 @@ function snapshotRegistration(
   return Object.freeze({
     scope: ownScope,
     // A private copy: later caller mutation of the submitted key cannot reach the frame.
-    key: Uint8Array.from(key),
+    key: copyBytes(key),
     entries: Object.freeze(entries),
   });
 }
@@ -277,22 +334,32 @@ export function newSentinelRequestId(random: Uint32Array): string {
  * handle, a getter, a proxy or a nested mismatch - is refused here, before any child process exists.
  */
 export function snapshotSentinelRequest(request: unknown, requestId: string): SentinelProtocolResult<SentinelProcessSnapshot> {
+  // Every reflection step above is already bounded, but this boundary is caller-supplied and therefore
+  // hostile by assumption: a planted exception anywhere in the inspection is contained here and
+  // reported as the same fixed refusal, never propagated into a synchronous throw out of `check`.
+  try {
+    return snapshotSentinelRequestRefused(request, requestId);
+  } catch { return failed('INVALID_REQUEST'); }
+}
+
+function snapshotSentinelRequestRefused(
+  request: unknown,
+  requestId: string,
+): SentinelProtocolResult<SentinelProcessSnapshot> {
   const limits = EGRESS_SENTINEL_PROCESS_LIMITS;
-  if (typeof request !== 'object' || request === null || !exactKeys(request, REQUEST_KEYS)) {
-    return failed('INVALID_REQUEST');
-  }
-  const record = request as Record<string, unknown>;
+  const record = ownDataProperties(request, REQUEST_KEYS);
+  if (record === null) return failed('INVALID_REQUEST');
   if (!isLabel(requestId, 64)) return failed('INVALID_REQUEST');
-  const bytes = record.bytes;
+  const bytes = record.get('bytes');
   if (!(bytes instanceof Uint8Array) || bytes.byteLength > limits.maxPayloadBytes) return failed('INVALID_REQUEST');
-  const scope = snapshotScope(record.scope);
+  const scope = snapshotScope(record.get('scope'));
   if (!scope) return failed('INVALID_REQUEST');
-  const observed = snapshotDestination(record.destination);
-  const authorized = snapshotDestination(record.authorized);
+  const observed = snapshotDestination(record.get('destination'));
+  const authorized = snapshotDestination(record.get('authorized'));
   if (!observed || !authorized) return failed('INVALID_REQUEST');
   // An explicit `null` means "no known originals to protect". Omission, a handle, a string or any
   // other shape is refused rather than silently treated as `null`.
-  const knownValue = record.known;
+  const knownValue = record.get('known');
   let known: SentinelProcessKnownRegistration | null;
   if (knownValue === null) known = null;
   else {
@@ -300,8 +367,8 @@ export function snapshotSentinelRequest(request: unknown, requestId: string): Se
     if (registration === 'invalid' || registration === null) return failed('INVALID_REQUEST');
     known = registration;
   }
-  // The copy is taken from the underlying buffer, never through an overridable iterator.
-  const payload = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength).slice();
+  // Copied through public intrinsics, never through a caller-overridable method or iterator.
+  const payload = copyBytes(bytes);
   const registeredRefs = known === null
     ? Object.freeze([])
     : Object.freeze(known.entries.map((entry) => entry.ref));
@@ -421,6 +488,21 @@ function fieldByte(step: FrameStep, tag: number): number | null {
   return bytes[0] as number;
 }
 
+/**
+ * Original and canary VALUE text, decoded separately from every identifier.
+ *
+ * A value is content: strict UTF-8, non-empty and bounded, but newlines, spaces and tabs are ordinary
+ * data and are preserved byte for byte. Only labels, refs, digests and reason codes go through
+ * `isLabel`; applying an identifier restriction here made a valid multiline original fail to decode.
+ */
+function fieldContent(step: FrameStep, tag: number, maxChars: number): string | null {
+  const bytes = fieldBytes(step, tag);
+  if (bytes === null || bytes.byteLength === 0 || bytes.byteLength > maxChars * 4) return null;
+  let text: string;
+  try { text = decoder.decode(bytes); } catch { return null; }
+  return text.length > 0 && text.length <= maxChars ? text : null;
+}
+
 /** Encode the request frame, trailing newline included. Null means it exceeded `maxRequestBytes`. */
 export function encodeRequestFrame(snapshot: SentinelProcessSnapshot): Uint8Array | null {
   const writer = new FrameWriter();
@@ -485,7 +567,7 @@ export function decodeRequestFrame(bytes: Uint8Array): SentinelProtocolResult<Se
       const kindByte = fieldByte(kindStep, F_ENTRY_KIND);
       const ref = fieldText(reader.step(), F_ENTRY_REF, 128);
       const valueStep = reader.step();
-      const value = fieldText(valueStep, F_ENTRY_VALUE, limits.maxKnownValueChars);
+      const value = fieldContent(valueStep, F_ENTRY_VALUE, limits.maxKnownValueChars);
       if ((kindByte !== KIND_ORIGINAL && kindByte !== KIND_CANARY) || ref === null || value === null) {
         return failed('INVALID_REQUEST');
       }
@@ -494,7 +576,7 @@ export function decodeRequestFrame(bytes: Uint8Array): SentinelProtocolResult<Se
     }
     known = Object.freeze({
       scope,
-      key: Uint8Array.from(key),
+      key: copyBytes(key),
       entries: Object.freeze(entries),
     });
   } else if (step.kind !== 'done') {
@@ -625,13 +707,27 @@ export function decodeResponseFrame(
 }
 
 /**
- * Classify raw child stdout before parsing. A missing final newline is truncation; a second newline is
- * a duplicate reply; the two are distinct outcomes so neither hides the other.
+ * Classify raw child stdout before parsing, using the declared frame length rather than a content
+ * scan. This is a binary frame: a length field, a request id or a payload byte may legitimately be
+ * `0x0a`, and scanning for that byte misclassifies a perfectly valid reply as a duplicate one. A
+ * missing trailing newline or a short body is truncation; bytes past the first complete frame are
+ * either a second frame (duplicate reply) or trailing output; both stay restrictive and distinct.
  */
 export function classifyReplyFraming(bytes: Uint8Array): 'OK' | 'REPLY_MALFORMED' | 'REPLY_DUPLICATE' {
-  if (bytes.byteLength === 0) return 'REPLY_MALFORMED';
-  if (bytes[bytes.byteLength - 1] !== NEWLINE) return 'REPLY_MALFORMED';
-  const body = bytes.byteLength - 1;
-  for (let index = 0; index < body; index++) if (bytes[index] === NEWLINE) return 'REPLY_DUPLICATE';
-  return 'OK';
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < HEADER_BYTES + 1) return 'REPLY_MALFORMED';
+  let frameEnd: number;
+  try {
+    for (let index = 0; index < MAGIC.byteLength; index++) if (bytes[index] !== MAGIC[index]) return 'REPLY_MALFORMED';
+    if (bytes[4] !== KIND_RESPONSE) return 'REPLY_MALFORMED';
+    const declared = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(5, false);
+    if (declared + HEADER_BYTES + 1 > bytes.byteLength) return 'REPLY_MALFORMED';
+    frameEnd = HEADER_BYTES + declared + 1;
+    if (bytes[frameEnd - 1] !== NEWLINE) return 'REPLY_MALFORMED';
+  } catch { return 'REPLY_MALFORMED'; }
+  if (frameEnd === bytes.byteLength) return 'OK';
+  // A concatenated second frame is a duplicate reply. Anything else after one complete frame is
+  // extra trailing output. Neither is found by looking for `0x0a` inside the first frame.
+  const extra = bytes.subarray(frameEnd);
+  for (let index = 0; index < MAGIC.byteLength; index++) if (extra[index] !== MAGIC[index]) return 'REPLY_MALFORMED';
+  return 'REPLY_DUPLICATE';
 }

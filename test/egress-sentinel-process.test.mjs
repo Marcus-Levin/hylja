@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -46,6 +47,8 @@ const PLANTED_ORIGINAL = 'orla.vance@synthetic-planted.invalid';
 const PLANTED_CANARY = 'synthetic-canary-7f3a.invalid';
 const PLANTED_SECRET = 'sk-synthetic-0000000000000000000000';
 const NEVER = Symbol('never-settled');
+/** Bounded capture for the instrumented child's public TAP counts; never the whole stream. */
+const COVERAGE_TAP_CAPTURE_BYTES = 64_000;
 
 const DIST = fileURLToPath(new URL('../dist/', import.meta.url));
 
@@ -59,8 +62,9 @@ async function bounded(promise, ms, label) {
   return outcome;
 }
 
-function registration(scope, entries) {
-  return { scope, key: KEY, entries };
+/** `key` is a parameter so a mutation test can submit the exact buffer it then mutates. */
+function registration(scope, entries, key = KEY) {
+  return { scope, key, entries };
 }
 
 function request(overrides = {}) {
@@ -160,12 +164,77 @@ test('the child runs with a replaced minimal environment and a fixed single-elem
   // The synthetic child reports and exits without a reply, which is itself a restrictive outcome.
   assert.equal(outcome.status, 'BLOCK');
   const report = JSON.parse(readFileSync(join(fake.installation, 'fake-report.json'), 'utf8'));
-  assert.deepEqual(Object.keys(report.env).sort(), ['LANG', 'LC_ALL', 'NODE_NO_WARNINGS', 'PATH']);
+  // Nothing from this process is inherited; the only addition the runtime itself may make to a spawn
+  // is NODE_V8_COVERAGE, and only when this very process is instrumented for coverage.
+  const expectedKeys = ['LANG', 'LC_ALL', 'NODE_NO_WARNINGS', 'PATH'];
+  if (process.env.NODE_V8_COVERAGE !== undefined) expectedKeys.push('NODE_V8_COVERAGE');
+  expectedKeys.sort();
+  assert.deepEqual(Object.keys(report.env).sort(), expectedKeys);
   assert.equal(report.env.NODE_OPTIONS, undefined);
   assert.equal(report.env.HOME, undefined);
   assert.equal(report.argv.length, 1);
   assert.ok(report.argv[0].endsWith('/egress-sentinel-process-worker.js'));
   assert.equal(report.execPath, process.execPath);
+});
+
+test('under an instrumented test child a healthy fixed-worker check still returns ALLOW', async () => {
+  // CI runs this suite with coverage. The stdlib spawn then writes NODE_V8_COVERAGE into the
+  // environment object it was handed, so an environment the runner cannot write to throws before the
+  // child exists and the check reports SPAWN_FAILED. Coverage is only real when the test runner is
+  // active, so the driver registers one node:test case and is invoked with `--test` AND
+  // `--experimental-test-coverage`: instrumentation must not change the verdict.
+  const directory = mkdtempSync(join(tmpdir(), 'sentinel-coverage-'));
+  const driver = join(directory, 'driver.test.mjs');
+  const runnerUrl = pathToFileURL(join(DIST, 'egress-sentinel-process.js')).href;
+  writeFileSync(driver, [
+    "import assert from 'node:assert/strict';",
+    "import { test } from 'node:test';",
+    `import { createSentinelProcessRunner } from ${JSON.stringify(runnerUrl)};`,
+    "test('an instrumented check of the fixed worker returns ALLOW', async () => {",
+    '  const runner = createSentinelProcessRunner({ deadlineMs: 10_000 });',
+    '  const outcome = await runner.check({',
+    "    bytes: new TextEncoder().encode('{\"status\":\"synthetic-ok\"}'),",
+    "    scope: { tenantRef: 'tenant-synthetic-01', projectRef: 'project-synthetic-01' },",
+    "    destination: { id: 'DEST-SYNTHETIC-LOCAL', profileDigest: 'sha256:0f1e2d3c4b5a6978' },",
+    "    authorized: { id: 'DEST-SYNTHETIC-LOCAL', profileDigest: 'sha256:0f1e2d3c4b5a6978' },",
+    '    known: null,',
+    '  });',
+    "  assert.equal(outcome.status, 'ALLOW');",
+    '});',
+    '',
+  ].join('\n'));
+  try {
+    // `NODE_TEST_CONTEXT` is what makes a nested `node --test` report through the run IPC channel
+    // instead of stdout; a driver started with it inherits a context that never reports, so its exit
+    // code and TAP cannot be read. Everything else is inherited so the driver really runs instrumented.
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    delete env.NODE_TEST_WORKER_ID;
+    const child = spawn(process.execPath, ['--test', '--experimental-test-coverage', driver], {
+      stdio: ['ignore', 'pipe', 'ignore'], env,
+    });
+    let out = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { if (out.length < COVERAGE_TAP_CAPTURE_BYTES) out += chunk; });
+    // Finite wall-clock bound owned here: the timer is always cleared and, when it fires, the child is
+    // killed so the awaited value can only come from a kill-confirmed close.
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already closed */ } }, 30_000);
+    let code;
+    try {
+      code = await new Promise((resolve, reject) => {
+        child.on('error', reject);
+        child.on('close', (exitCode) => resolve(exitCode));
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(code, 0, `instrumented driver exited ${code}: ${out.slice(0, 2_000)}`);
+    // Bounded public TAP counts only: no JSON parse of the whole stream.
+    assert.match(out, /^# fail 0$/m);
+    assert.match(out, /^# pass 1$/m);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('a second concurrent check is refused rather than queued, pooled or run in thread', async () => {
@@ -272,7 +341,7 @@ test('a caller-mutated input cannot change the private image that is checked and
   const bytes = text(`{"email":"${PLANTED_ORIGINAL}"}`);
   const pending = runner.check({ bytes, scope, destination, authorized, known: registration(scope, [
     { kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'ref-original-email' },
-  ]) });
+  ], key) });
   // Every caller-owned object is mutated the instant the check is in flight.
   bytes.fill(0x41);
   scope.tenantRef = 'tenant-synthetic-mutated';
@@ -387,8 +456,20 @@ process.stdin.on('end', () => {
       process.stdout.write(Buffer.from(control.stdoutBase64, 'base64'));
       process.exit(control.code ?? 0);
       return;
+    case 'duplicate-reply':
+      process.stdout.write(reply(request, control.override ?? {}));
+      process.stdout.write(reply(request, control.override ?? {}));
+      process.exitCode = 0;
+      return;
     case 'stderr-flood':
       process.stderr.write(Buffer.alloc(control.bytes ?? 200000, 0x79));
+      setInterval(() => {}, 1000);
+      return;
+    case 'leak-diagnostics':
+      // A hostile synthetic child that writes the planted protected marker on BOTH of its ordinary
+      // diagnostic channels. The wrapper must withhold both from anything it can reach.
+      process.stdout.write('STDOUT-LEAK ' + control.marker + '\n');
+      process.stderr.write('STDERR-LEAK ' + control.marker + '\n');
       setInterval(() => {}, 1000);
       return;
     case 'grandchild': {
@@ -526,12 +607,7 @@ test('a crashing child, a missing reply and a truncated reply are each distinct 
 });
 
 test('a duplicated reply, a garbage reply and an oversized reply are each restrictive', async () => {
-  const duplicate = await fakeRunner({
-    mode: 'raw-stdout',
-    stdoutBase64: Buffer.concat([
-      Buffer.from('HSPP\nHSPP\n', 'ascii'),
-    ]).toString('base64'),
-  }, { deadlineMs: 5_000 });
+  const duplicate = await fakeRunner({ mode: 'duplicate-reply' }, { deadlineMs: 5_000 });
   assert.equal((await bounded(duplicate.runner.check(request()), 5_000, 'duplicate reply check')).code, 'REPLY_DUPLICATE');
 
   const garbage = await fakeRunner({
@@ -622,7 +698,7 @@ test('a snapshot is a private copy: mutating the submitted key, entries and byte
   const key = Uint8Array.from(KEY);
   const bytes = text('{"a":1}');
   const entries = [{ kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'ref-original-email' }];
-  const snap = snapshotSentinelRequest(request({ bytes, known: registration(SCOPE, entries) }), 'r0000000000000001');
+  const snap = snapshotSentinelRequest(request({ bytes, known: registration(SCOPE, entries, key) }), 'r0000000000000001');
   assert.equal(snap.ok, true);
 
   key.fill(9);
@@ -661,13 +737,217 @@ test('a request frame round-trips the exact bytes and a truncated or altered one
   assert.equal(decodeRequestFrame(extended).ok, false);
 });
 
-test('reply framing distinguishes a truncated reply from a duplicated one', () => {
-  const single = new TextEncoder().encode('one-frame\n');
-  assert.equal(classifyReplyFraming(single), 'OK');
-  assert.equal(classifyReplyFraming(single.subarray(0, single.byteLength - 1)), 'REPLY_MALFORMED');
-  assert.equal(classifyReplyFraming(new TextEncoder().encode('one-frame\ntwo-frame\n')), 'REPLY_DUPLICATE');
+test('reply framing follows the declared length, not a newline scan', () => {
+  const reply = encodeResponseFrame({
+    requestId: 'r0000000000000001', tenantRef: 'tenant-001', projectRef: 'project-001',
+    observedId: 'DEST-SYNTHETIC-LOCAL', observedProfileDigest: 'sha256:0f1e2d3c4b5a6978',
+    authorizedId: 'DEST-SYNTHETIC-LOCAL', authorizedProfileDigest: 'sha256:0f1e2d3c4b5a6978',
+    payloadDigest: 'a'.repeat(64),
+    response: { decision: 'ALLOW', reasonCodes: [], rules: [] },
+  });
+  // `tenant-001` is exactly ten bytes, so its big-endian length field ends in byte 0x0a. Inside a
+  // length-delimited frame that byte is ordinary binary data, not a second reply delimiter.
+  assert.equal(classifyReplyFraming(reply), 'OK');
+  assert.equal(classifyReplyFraming(reply.subarray(0, reply.byteLength - 1)), 'REPLY_MALFORMED');
+  assert.equal(classifyReplyFraming(Buffer.concat([reply, reply])), 'REPLY_DUPLICATE');
   assert.equal(classifyReplyFraming(new Uint8Array(0)), 'REPLY_MALFORMED');
-  assert.equal(classifyReplyFraming(new TextEncoder().encode('one-frame\ntrailing-bytes')), 'REPLY_MALFORMED');
+  assert.equal(classifyReplyFraming(new TextEncoder().encode('not a frame at all\n')), 'REPLY_MALFORMED');
+  const trailing = new Uint8Array(reply.byteLength + 4);
+  trailing.set(reply, 0);
+  trailing.set(text('junk'), reply.byteLength);
+  assert.equal(classifyReplyFraming(trailing), 'REPLY_MALFORMED');
+});
+
+/* ------------------------------------------------------------------------------------------- *
+ * Boundary correction (2026-10-04): descriptor-only snapshots, busy-before-inspection admission,
+ * an exact runner configuration, length-delimited binary frames, original values as CONTENT rather
+ * than identifiers, and an independent capture of the caller's own diagnostic channels.
+ * ------------------------------------------------------------------------------------------- */
+
+test('a caller accessor is refused without being invoked, and a planted throw never escapes check', async () => {
+  const runner = createSentinelProcessRunner({ deadlineMs: 5_000 });
+  let invoked = 0;
+  const hostileBytes = request();
+  Object.defineProperty(hostileBytes, 'bytes', {
+    enumerable: true,
+    get() { invoked += 1; throw new Error(`planted ${PLANTED_ORIGINAL}`); },
+  });
+  const thrown = await bounded(runner.check(hostileBytes), 1_000, 'throwing bytes accessor');
+  assert.equal(thrown.code, 'INVALID_REQUEST');
+  assert.equal(invoked, 0, 'a refused accessor must never be invoked');
+
+  const hostileScope = request({
+    scope: { get tenantRef() { invoked += 1; throw new Error(PLANTED_ORIGINAL); }, projectRef: 'project-001' },
+  });
+  assert.equal((await bounded(runner.check(hostileScope), 1_000, 'throwing scope accessor')).code, 'INVALID_REQUEST');
+  assert.equal(invoked, 0, 'a refused nested accessor must never be invoked');
+  assert.equal(runner.state, 'IDLE');
+});
+
+test('a caller-overridden typed-array method cannot break or steer the private copy', async () => {
+  const runner = createSentinelProcessRunner({ deadlineMs: 5_000 });
+  const bytes = text(`{"email":"${PLANTED_ORIGINAL}"}`);
+  for (const name of ['slice', 'set', 'subarray']) {
+    Object.defineProperty(bytes, name, { enumerable: false, value() { throw new Error(`planted ${name}`); } });
+  }
+  const outcome = await bounded(runner.check(request({
+    bytes,
+    known: registration(SCOPE, [{ kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'ref-original-email' }]),
+  })), 5_000, 'overridden typed array check');
+
+  assert.equal(outcome.code, 'SENTINEL_BLOCK');
+  assert.deepEqual(outcome.reasonCodes, ['KNOWN_ORIGINAL_DETECTED']);
+  assert.deepEqual(outcome.rules, ['ref-original-email']);
+  assert.equal(runner.state, 'IDLE');
+});
+
+test('admission is busy before any caller inspection, so a reentrant check cannot start a second child', async () => {
+  const runner = createSentinelProcessRunner({ deadlineMs: 5_000 });
+  let reentrant = null;
+  // A `Proxy` trap is caller-observable code that runs during the snapshot: it is the one reentry
+  // surface left once every value is read from a descriptor instead of an ordinary property read.
+  const hostile = new Proxy(request(), {
+    getOwnPropertyDescriptor(target, property) {
+      if (property !== 'bytes') return Reflect.getOwnPropertyDescriptor(target, property);
+      reentrant = runner.check(request());
+      return { configurable: true, enumerable: true, get() { throw new Error('planted'); } };
+    },
+  });
+  const outcome = await bounded(runner.check(hostile), 2_000, 'reentrant check');
+  assert.equal(outcome.code, 'INVALID_REQUEST');
+  const inner = await bounded(reentrant, 2_000, 'reentrant inner check');
+  assert.equal(inner.code, 'RUNNER_BUSY');
+  assert.equal(runner.state, 'IDLE', 'an invalid pre-spawn snapshot must release admission safely');
+});
+
+test('an unsupported runner configuration is refused before spawn without reading an accessor', async () => {
+  let invoked = 0;
+  const withSignal = {
+    deadlineMs: 5_000,
+    signal: { get aborted() { invoked += 1; return false; } },
+  };
+  const signalRunner = createSentinelProcessRunner(withSignal);
+  assert.equal((await bounded(signalRunner.check(request()), 1_000, 'runner signal config')).code, 'INVALID_REQUEST');
+  assert.equal(signalRunner.state, 'IDLE');
+
+  for (const extra of [{ worker: '/tmp/anything.mjs' }, { options: {} }, { cleanupGraceMs: 10, shell: true }]) {
+    const runner = createSentinelProcessRunner({ deadlineMs: 5_000, ...extra });
+    assert.equal((await bounded(runner.check(request()), 1_000, `runner config ${Object.keys(extra)[0]}`)).code,
+      'INVALID_REQUEST', `unsupported runner option ${Object.keys(extra)[0]} was accepted`);
+  }
+
+  const accessorConfig = { deadlineMs: 5_000 };
+  Object.defineProperty(accessorConfig, 'cleanupGraceMs', {
+    enumerable: true,
+    get() { invoked += 1; return 250; },
+  });
+  const accessorRunner = createSentinelProcessRunner(accessorConfig);
+  assert.equal((await bounded(accessorRunner.check(request()), 1_000, 'accessor runner config')).code, 'INVALID_REQUEST');
+  assert.equal(invoked, 0, 'a refused configuration accessor must never be invoked');
+});
+
+test('a supported runner configuration with only cleanupGraceMs still runs', async () => {
+  const runner = createSentinelProcessRunner({ deadlineMs: 5_000, cleanupGraceMs: 250 });
+  const outcome = await bounded(runner.check(request()), 5_000, 'supported config check');
+  assert.equal(outcome.status, 'ALLOW');
+});
+
+test('real child: a ten-byte tenant label is a healthy reply, not a duplicate', async () => {
+  const runner = createSentinelProcessRunner({ deadlineMs: 10_000 });
+  const source = text('{"status":"synthetic-ok","note":"nothing protected here"}');
+  const scope = Object.freeze({ tenantRef: 'tenant-001', projectRef: 'project-001' });
+  const outcome = await bounded(runner.check(request({ scope, bytes: source })), 10_000, 'ten byte tenant check');
+
+  assert.equal(outcome.status, 'ALLOW');
+  assert.deepEqual(Buffer.from(outcome.release), Buffer.from(source));
+});
+
+test('a known original that spans several lines is content: it round-trips and still restricts', async () => {
+  const runner = createSentinelProcessRunner({ deadlineMs: 10_000 });
+  const multiline = 'first synthetic line\n  indented second line\nthird synthetic line';
+  const detect = await bounded(runner.check(request({
+    bytes: text(`note follows\n${multiline}\nend note`),
+    known: registration(SCOPE, [{ kind: 'ORIGINAL', value: multiline, ref: 'ref-multiline-original' }]),
+  })), 10_000, 'multiline original check');
+  assert.equal(detect.code, 'SENTINEL_BLOCK');
+  assert.ok(detect.reasonCodes.includes('KNOWN_ORIGINAL_DETECTED'), JSON.stringify(detect.reasonCodes));
+  assert.ok(detect.rules.includes('ref-multiline-original'), JSON.stringify(detect.rules));
+
+  // The positive control: the same multiline registration against a payload that does not contain it
+  // must stay a normal, non-refused check. Newlines in scope and destination labels stay refused.
+  const clean = await bounded(runner.check(request({
+    scope: { tenantRef: SCOPE.tenantRef, projectRef: SCOPE.projectRef },
+    known: registration(SCOPE, [{ kind: 'ORIGINAL', value: multiline, ref: 'ref-multiline-original' }]),
+  })), 10_000, 'multiline registration positive control');
+  assert.equal(clean.status, 'ALLOW');
+
+  const labelled = await bounded(runner.check(request({
+    scope: { tenantRef: 'tenant-synthetic-01\ninjected', projectRef: SCOPE.projectRef },
+  })), 1_000, 'newline scope label check');
+  assert.equal(labelled.code, 'INVALID_REQUEST');
+});
+
+/* ---- Independent diagnostic-channel capture ---- */
+
+const DRIVER = String.raw`
+import { readFileSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const HERE = fileURLToPath(new URL('.', import.meta.url));
+const control = JSON.parse(readFileSync(HERE + 'driver-control.json', 'utf8'));
+const wrapper = await import(pathToFileURL(HERE + 'egress-sentinel-process.js').href);
+const scope = { tenantRef: 'tenant-synthetic-01', projectRef: 'project-synthetic-01' };
+const destination = { id: 'DEST-SYNTHETIC-LOCAL', profileDigest: 'sha256:0f1e2d3c4b5a6978' };
+const key = Uint8Array.from(Array.from({ length: 32 }, (unused, index) => (index * 7 + 3) & 0xff));
+const outcome = await wrapper.createSentinelProcessRunner({ deadlineMs: 400 }).check({
+  bytes: new TextEncoder().encode('synthetic payload for ' + control.marker),
+  scope, destination, authorized: destination,
+  known: { scope, key, entries: [{ kind: 'ORIGINAL', value: control.marker, ref: 'ref-original-email' }] },
+});
+if (control.leak) {
+  process.stdout.write('DRIVER-STDOUT ' + control.marker + '\n');
+  process.stderr.write('DRIVER-STDERR ' + control.marker + '\n');
+}
+process.stdout.write('OUTCOME ' + outcome.status + ' ' + (outcome.code ?? 'none') + '\n');
+`;
+
+/** Run a command and capture BOTH of its ordinary diagnostic channels to completion. */
+function captureChannels(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+    child.on('error', reject);
+    child.on('close', () => resolve({ stdout, stderr }));
+  });
+}
+
+async function runDiagnosticDriver(control) {
+  const { installation } = await fakeRunner(
+    { mode: 'leak-diagnostics', marker: PLANTED_ORIGINAL }, { deadlineMs: 400 },
+  );
+  writeFileSync(join(installation, 'driver-control.json'), JSON.stringify({ ...control, marker: PLANTED_ORIGINAL }));
+  writeFileSync(join(installation, 'driver.mjs'), DRIVER, 'utf8');
+  return captureChannels(process.execPath, [join(installation, 'driver.mjs')]);
+}
+
+test('a hostile child stdout and stderr are withheld: an independent capture sees no planted marker', async () => {
+  const captured = await bounded(runDiagnosticDriver({ leak: false }), 20_000, 'withholding driver');
+
+  assert.match(captured.stdout, /OUTCOME BLOCK SENTINEL_BLOCK|DEADLINE_EXCEEDED/, 'the driver must still reach a real outcome');
+  assert.equal(captured.stdout.includes(PLANTED_ORIGINAL), false, `child stdout leaked: ${captured.stdout}`);
+  assert.equal(captured.stderr.includes(PLANTED_ORIGINAL), false, `child stderr leaked: ${captured.stderr}`);
+  assert.equal(captured.stderr.includes('STDOUT-LEAK'), false);
+});
+
+test('the same capture detects a deliberate leak, so the withholding result is not a blind capture', async () => {
+  const captured = await bounded(runDiagnosticDriver({ leak: true }), 20_000, 'leaking control');
+
+  assert.match(captured.stdout, /OUTCOME BLOCK SENTINEL_BLOCK|DEADLINE_EXCEEDED/);
+  assert.ok(captured.stdout.includes(PLANTED_ORIGINAL), 'the capture missed a known stdout disclosure');
+  assert.ok(captured.stderr.includes(PLANTED_ORIGINAL), 'the capture missed a known stderr disclosure');
 });
 
 test('the pure reply decoder refuses a binding difference, a foreign ref and an inconsistent decision', () => {

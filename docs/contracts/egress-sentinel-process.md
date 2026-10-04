@@ -34,7 +34,7 @@ The boundary is **local lifecycle isolation and nothing more**:
 
 | Call | Meaning |
 | --- | --- |
-| `createSentinelProcessRunner({ deadlineMs, cleanupGraceMs? })` | one runner owning at most one active child |
+| `createSentinelProcessRunner({ deadlineMs, cleanupGraceMs? })` | one runner owning at most one active child. Exactly those two own **data** properties are accepted; any other own key (a caller `signal`, a `worker` path, an `options` bag, a `shell` flag) or an accessor makes a runner whose every check is `INVALID_REQUEST`, decided before any child exists and without invoking the refused accessor |
 | `runner.check(request)` | runs exactly one check in one child; resolves to `{ status: 'ALLOW', release }` or `{ status: 'BLOCK', code, reasonCodes, rules }` |
 | `runner.cancel()` | runner-owned cancellation of the sole active request; a no-op when idle |
 | `runner.state` | `'IDLE'`, `'BUSY'` or `'QUARANTINED'` |
@@ -46,7 +46,17 @@ Exported values: `EGRESS_SENTINEL_PROCESS_WORKER`, `EGRESS_SENTINEL_PROCESS_LIMI
 
 ### Accepted request
 
-The request object must have **exactly** these five own properties:
+The request object must have **exactly** these five own properties, read from their own **data
+descriptors**: an own accessor with a matching name is refused without being invoked, and a bounded
+`Proxy` trap that throws is contained and reported as the same `INVALID_REQUEST` rather than escaping
+`snapshotSentinelRequest` or `check()`. Caller byte and key buffers are copied through public standard
+intrinsics into buffers this code allocates, so an overridden `slice`, `set`, `subarray` or
+`Symbol.iterator` on a caller object is neither reached nor needed; `entries` is snapshotted by index
+descriptor, so a caller iterator, a sparse hole or an accessor element is refused, not executed.
+
+Admission is claimed before any of this caller-observable inspection begins, so a re-entrant
+`check()` from inside it observes `RUNNER_BUSY` and cannot start a second child. An invalid
+pre-spawn snapshot releases the claim immediately and leaves the runner `IDLE`.
 
 ```js
 { bytes, scope: { tenantRef, projectRef },
@@ -72,6 +82,11 @@ Anything else is refused before a child exists with `INVALID_REQUEST`. In partic
 - an unknown property is refused **without invoking its value**, so an unsupported cancellation hook,
   worker path, timeout or callback cannot run caller code at all.
 
+`value` is CONTENT, not an identifier: strict UTF-8, non-empty and bounded, with newlines, spaces and
+tabs preserved byte for byte. Only `tenantRef`, `projectRef`, destination `id`, `profileDigest`, entry
+`ref` and the digests/codes are restricted to identifier shape, and a label containing a control
+character stays refused.
+
 This is deliberate: cancellation is `runner.cancel()`, a runner-owned method over private state. There
 is no public `AbortSignal`, no custom callback, no runtime-selectable worker, no pool, no retry, no
 compatibility layer, and nothing that walks Node-private symbols, WeakMap internals or caller listener
@@ -92,9 +107,10 @@ Every outcome other than `ALLOW` is restrictive. Transport and lifecycle codes c
 | `SPAWN_FAILED` | the child could not be started, or its stdin/stdout failed |
 | `CHILD_CRASHED` | the child exited non-zero |
 | `REPLY_MISSING` | the child exited zero with no stdout |
-| `REPLY_MALFORMED` | wrong magic/kind/length, an unknown or reordered field, a trailing byte, or an inconsistent decision |
+| `REPLY_MALFORMED` | wrong magic/kind/length, an unknown or reordered field, a body shorter than the declared length, a missing trailing newline, trailing bytes after one complete frame, or an inconsistent decision |
+| `REPLY_DUPLICATE` | a second complete frame concatenated after the first. Frames are binary and length-delimited: only the single byte after the declared body is a newline, so a length field, an id or a payload byte that happens to be `0x0a` is ordinary data, never a delimiter |
 | `REPLY_TOO_LARGE` | stdout exceeded its cap |
-| `REPLY_DUPLICATE` | more than one reply frame on stdout |
+| `REPLY_DUPLICATE` | a second complete frame concatenated after the first, which `classifyReplyFraming` finds from the declared length and never from a content scan |
 | `REPLY_BINDING_MISMATCH` | the reply did not echo the request id, tenant/project, observed and authorized destination and profile, and the payload digest this parent actually sent |
 | `DIAGNOSTIC_OVERFLOW` | stderr exceeded its cap |
 | `CLEANUP_UNCONFIRMED` | the child was signalled but never confirmed gone; the runner is quarantined |
@@ -160,4 +176,10 @@ compiled worker for every sentinel-behaviour assertion, and installs generated s
 children into a private temporary copy of `dist/` for the lifecycle and framing assertions, so stall,
 trickled output, cancellation, crash, malformed, duplicate, oversize, diagnostic overflow and
 unconfirmed cleanup are each proved against a real process without a configurable product worker path.
+
+Diagnostic confidentiality is checked independently of any returned result: a finite synthetic driver
+runs the wrapper in its own process while the test captures that process's **own** stdout and stderr,
+with a hostile synthetic child writing a planted protected marker on both of the wrapper's captured
+child channels. The withholding run must show no marker on either captured channel, and a deliberately
+leaking control run must show it, so a capture that silently observed nothing cannot pass.
 Nothing in it calls a provider, uses a credential, reaches the network or reads private data.

@@ -39,7 +39,7 @@ import {
   newSentinelRequestId,
   snapshotSentinelRequest,
 } from './egress-sentinel-process-protocol.js';
-import type { SentinelReplyFailure } from './egress-sentinel-process-protocol.js';
+import type { SentinelReplyFailure, SentinelProcessSnapshot } from './egress-sentinel-process-protocol.js';
 
 /** The fixed compiled worker, resolved next to this module. There is no runtime-selectable worker. */
 export const EGRESS_SENTINEL_PROCESS_WORKER =
@@ -47,7 +47,9 @@ export const EGRESS_SENTINEL_PROCESS_WORKER =
 
 /**
  * The whole environment is replaced, so nothing is inherited: no proxy settings, no `NODE_OPTIONS`, no
- * locale surprise and no credential-bearing variable ever reaches the child.
+ * locale surprise and no credential-bearing variable ever reaches the child. Each spawn gets its own
+ * mutable private copy: the stdlib spawn writes into the object it is handed (`NODE_V8_COVERAGE` under
+ * `--experimental-test-coverage`), so a frozen object would throw before any child exists.
  */
 const WORKER_ENV: Readonly<Record<string, string>> = Object.freeze({
   PATH: '/usr/bin:/bin',
@@ -120,6 +122,13 @@ export interface SentinelProcessRunnerConfig {
   readonly cleanupGraceMs?: number;
 }
 
+/**
+ * The exact own DATA properties a runner configuration may carry. An unknown key - a caller-owned
+ * `signal`, a `worker` path, an `options` bag, a `shell` flag - is refused before any child exists,
+ * and a refused configuration accessor is never invoked to find out what it would have returned.
+ */
+const RUNNER_CONFIG_KEYS: ReadonlySet<string> = new Set(['deadlineMs', 'cleanupGraceMs']);
+
 export interface SentinelProcessRunner {
   /** One check per call; a second concurrent call is refused rather than queued or pooled. */
   check(request: SentinelProcessRequest): Promise<SentinelProcessOutcome>;
@@ -146,6 +155,35 @@ function boundedInteger(value: unknown, low: number, high: number): number | nul
   return value;
 }
 
+/**
+ * Read the runner configuration from own data descriptors only. Returns `null` for anything the exact
+ * shape does not allow; the constructor then builds a runner whose every check is restrictive instead
+ * of echoing a thrown caller value back at the caller.
+ */
+function snapshotRunnerConfig(
+  config: unknown,
+): Readonly<{ deadlineMs: unknown; cleanupGraceMs: unknown }> | null {
+  if (typeof config !== 'object' || config === null) return null;
+  let names: string[];
+  let symbols: symbol[];
+  try {
+    names = Object.getOwnPropertyNames(config);
+    symbols = Object.getOwnPropertySymbols(config);
+  } catch { return null; }
+  if (symbols.length !== 0 || names.length < 1 || names.length > RUNNER_CONFIG_KEYS.size) return null;
+  let deadlineMs: unknown = undefined;
+  let cleanupGraceMs: unknown = undefined;
+  for (const name of names) {
+    if (!RUNNER_CONFIG_KEYS.has(name)) return null;
+    let descriptor: PropertyDescriptor | undefined;
+    try { descriptor = Object.getOwnPropertyDescriptor(config, name); } catch { return null; }
+    if (descriptor === undefined || !('value' in descriptor)) return null;
+    if (name === 'deadlineMs') deadlineMs = descriptor.value;
+    else cleanupGraceMs = descriptor.value;
+  }
+  return Object.freeze({ deadlineMs, cleanupGraceMs });
+}
+
 /** Private per-check stop state. Nothing about it is reachable from a caller-supplied object. */
 interface StopState {
   reason: SentinelProcessBlockCode | null;
@@ -155,8 +193,15 @@ interface StopState {
 
 export function createSentinelProcessRunner(config: SentinelProcessRunnerConfig): SentinelProcessRunner {
   const limits = EGRESS_SENTINEL_PROCESS_LIMITS;
-  const deadlineMs = boundedInteger(config?.deadlineMs, limits.minDeadlineMs, limits.maxDeadlineMs);
-  const graceMs = boundedInteger(config?.cleanupGraceMs ?? limits.defaultCleanupGraceMs, 0, limits.maxCleanupGraceMs);
+  // An unsupported or malformed configuration yields a restrictive runner, not a thrown echo of a
+  // caller value and not a runner that silently ignores the key it did not understand.
+  const read = snapshotRunnerConfig(config);
+  const deadlineMs = read === null
+    ? null
+    : boundedInteger(read.deadlineMs, limits.minDeadlineMs, limits.maxDeadlineMs);
+  const graceMs = read === null
+    ? null
+    : boundedInteger(read.cleanupGraceMs ?? limits.defaultCleanupGraceMs, 0, limits.maxCleanupGraceMs);
   let quarantined = false;
   let busy = false;
   let active: StopState | null = null;
@@ -165,15 +210,32 @@ export function createSentinelProcessRunner(config: SentinelProcessRunnerConfig)
     // Every refusal below happens before a child exists, and none of them reads a value it refused.
     if (quarantined) return Promise.resolve(block('RUNNER_QUARANTINED'));
     if (busy) return Promise.resolve(block('RUNNER_BUSY'));
-    if (deadlineMs === null || graceMs === null) return Promise.resolve(block('INVALID_REQUEST'));
-    const random = new Uint32Array(2);
-    globalThis.crypto.getRandomValues(random);
-    const snapshot = snapshotSentinelRequest(request, newSentinelRequestId(random));
-    if (!snapshot.ok) return Promise.resolve(block('INVALID_REQUEST'));
-    const frame = encodeRequestFrame(snapshot.value);
-    if (frame === null) return Promise.resolve(block('INVALID_REQUEST'));
-
+    // Admission is claimed BEFORE any caller-observable inspection below. A caller getter that
+    // re-enters `check()` therefore sees a busy runner and cannot start a second child; an invalid
+    // snapshot releases the claim immediately and leaves the runner idle.
     busy = true;
+    if (deadlineMs === null || graceMs === null) {
+      busy = false;
+      return Promise.resolve(block('INVALID_REQUEST'));
+    }
+    let prepared: Readonly<{ snapshot: SentinelProcessSnapshot; frame: Uint8Array }> | null = null;
+    try {
+      const random = new Uint32Array(2);
+      globalThis.crypto.getRandomValues(random);
+      const taken = snapshotSentinelRequest(request, newSentinelRequestId(random));
+      if (taken.ok) {
+        const frame = encodeRequestFrame(taken.value);
+        if (frame === null) { taken.value.payload.fill(0); taken.value.known?.key.fill(0); }
+        else prepared = { snapshot: taken.value, frame };
+      }
+    } catch { prepared = null; }
+    if (prepared === null) {
+      busy = false;
+      return Promise.resolve(block('INVALID_REQUEST'));
+    }
+    const snapshot = prepared.snapshot;
+    const frame = prepared.frame;
+
     const stop: StopState = { reason: null, kill: null, cancel: () => { /* installed below */ } };
     active = stop;
     return new Promise<SentinelProcessOutcome>((resolve) => {
@@ -201,8 +263,8 @@ export function createSentinelProcessRunner(config: SentinelProcessRunnerConfig)
         active = null;
         if (quarantine) quarantined = true;
         // The release copy is already private; these erases drop the parent's remaining copies.
-        snapshot.value.payload.fill(0);
-        snapshot.value.known?.key.fill(0);
+        snapshot.payload.fill(0);
+        snapshot.known?.key.fill(0);
         resolve(outcome);
       };
       /** The first observed stop wins. Nothing observed later can override it. */
@@ -224,7 +286,7 @@ export function createSentinelProcessRunner(config: SentinelProcessRunnerConfig)
       let child;
       try {
         child = spawn(process.execPath, [EGRESS_SENTINEL_PROCESS_WORKER], {
-          stdio: ['pipe', 'pipe', 'pipe'], env: WORKER_ENV, windowsHide: true,
+          stdio: ['pipe', 'pipe', 'pipe'], env: { ...WORKER_ENV }, windowsHide: true,
         });
       } catch {
         finish(block('SPAWN_FAILED'));
@@ -255,12 +317,12 @@ export function createSentinelProcessRunner(config: SentinelProcessRunnerConfig)
         if (stdoutBytes === 0) { finish(block('REPLY_MISSING')); return; }
         const framing = classifyReplyFraming(concat(stdout, stdoutBytes));
         if (framing !== 'OK') { finish(block(framing)); return; }
-        const decoded = decodeResponseFrame(concat(stdout, stdoutBytes), snapshot.value);
+        const decoded = decodeResponseFrame(concat(stdout, stdoutBytes), snapshot);
         if (!decoded.ok) { finish(block(decoded.code)); return; }
         if (decoded.value.decision === 'ALLOW') {
           // A private copy of the bytes this parent snapshotted and that the child reported checking.
           // Never the caller's buffer, never a buffer the worker selected.
-          finish(Object.freeze({ status: 'ALLOW' as const, release: snapshot.value.payload.slice() }));
+          finish(Object.freeze({ status: 'ALLOW' as const, release: snapshot.payload.slice() }));
           return;
         }
         finish(Object.freeze({
