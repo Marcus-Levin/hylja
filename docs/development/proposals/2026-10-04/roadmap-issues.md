@@ -16,19 +16,19 @@ These are proposals, not a second status tracker. Status, priority and dependenc
 
 **#30 Add behavioral signals, abuse detection, and step-up controls** — **slice (preliminary)**.
 Five deliverables in one ticket (event model, baselines, risk signals, throttle/step-up/block, alert hooks); the restrict-only invariant is testable without the broker.
-Pointers: [security-model.md](https://github.com/Marcus-Levin/hylja/blob/main/docs/security-model.md), [threat-model.md#bulk-enumeration](https://github.com/Marcus-Levin/hylja/blob/main/docs/threat-model.md).
+Pointers: [security-model.md](https://github.com/Marcus-Levin/hylja/blob/main/docs/security-model.md), [threat-model.md#bulk-enumeration](https://github.com/Marcus-Levin/hylja/blob/main/docs/threat-model.md#bulk-enumeration).
 Effect prerequisites: #17 (unimplemented), #20 (implemented). Questions: none blocking.
 Smallest observable preparation: a tenant-partitioned behavior event record plus a property test that lowering a risk score never widens a previously denied USE/DISPLAY/EXPORT.
 
 **#31 Implement backup, disaster recovery, and incident-response operations** — **slice (preliminary)**.
 Recovery design, credential/role separation, key rotation and incident runbooks separate cleanly; #18 owns only synthetic fixture-level snapshot/deletion semantics.
-Pointers: [threat-model.md#backup-compromise](https://github.com/Marcus-Levin/hylja/blob/main/docs/threat-model.md).
+Pointers: [threat-model.md#backup-compromise](https://github.com/Marcus-Levin/hylja/blob/main/docs/threat-model.md#backup-compromise).
 Effect prerequisites: #16/#18/#29 unimplemented; #20 implemented.
 Smallest observable preparation: the issue's own written adversarial scenario (older backup after tenant-scoped key destruction cannot resurrect the mapping; unaffected tenant restores with its own keys) drafted as a `test/<name>` **template** for the production-equivalent isolated synthetic recovery environment — the scenario is **written, not verified executable**, and production-equivalent isolation stays a requirement.
 
 **#32 Enforce managed egress and bypass resistance** — **keep, with a preparatory child**.
 Acceptance is already a binary observable claim with named negatives.
-Pointers: [architecture.md#independent-egress-control](https://github.com/Marcus-Levin/hylja/blob/main/docs/architecture.md).
+Pointers: [architecture.md#independent-egress-control](https://github.com/Marcus-Levin/hylja/blob/main/docs/architecture.md#independent-egress-control).
 Effect prerequisites: #21/#23/#24/#25/#26 unimplemented. This is **not** a claim that nothing can run: [docs/evaluation.md](https://github.com/Marcus-Levin/hylja/blob/main/docs/evaluation.md) expressly permits pre-vault synthetic invariant tests.
 Smallest observable preparation: the enumerated direct-route inventory plus a synthetic invariant test for the direct-route list. Satisfies no checkbox on its own — say so rather than tick one.
 
@@ -134,7 +134,7 @@ Draft contract plus `src/information-model-draft.ts` plus [decision 010](https:/
 
 - **Issue:** [#36](https://github.com/Marcus-Levin/hylja/issues/36).
 - **One observable outcome:** #36 states its existing closure-only rule where the checklist lives, and its prose no longer repeats rules that already live in `AGENTS.md`.
-- **Pointers:** [docs/README.md](https://github.com/Marcus-Levin/hylja/blob/main/docs/README.md); `AGENTS.md`; [threat-model.md#threat-model-outputs](https://github.com/Marcus-Levin/hylja/blob/main/docs/threat-model.md) for the retained per-issue threat/attack-surface obligation.
+- **Pointers:** [docs/README.md](https://github.com/Marcus-Levin/hylja/blob/main/docs/README.md); `AGENTS.md`; [threat-model.md#threat-model-outputs](https://github.com/Marcus-Levin/hylja/blob/main/docs/threat-model.md#threat-model-outputs) for the retained per-issue threat/attack-surface obligation.
 - **Scope / non-goals:** in scope — restating the closure-only meaning already stated; pruning duplicated "Shared requirements" prose **only** where the per-issue "state threats addressed and attack surfaces introduced" obligation is retained (or linked to the specific threat-model output) alongside `AGENTS.md`. Out of scope — re-ordering, adding issues, changing any `[x]`/`[ ]` value, adding a per-row live capability cache, relocating requirements into `AGENTS.md`.
 - **Unmet prerequisites / human questions:** none; this is issue-text prose.
 - **Verification:** prose-only. No build and no `npm test`. `npm run check:docs` (if a tracked relative Markdown link changes) checks repository Markdown links, not issue URLs or external reports.

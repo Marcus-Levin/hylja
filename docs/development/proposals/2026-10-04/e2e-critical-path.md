@@ -37,7 +37,7 @@ All children below are **PRELIMINARY / NOT READY**: this document proposes them,
 
 **E1 — typed restrictive failures and structure-preserving rewrite ([#13](https://github.com/Marcus-Levin/hylja/issues/13))**
 
-- Observable: malformed/opaque parser status, stale/overlapping locations, an unavailable generator, invalid JSON/XML/**YAML** output and a mid-stream exception each return a typed restrictive failure — no partial success, no silent KEEP, no relaxed authorized action; supported formats stay valid.
+- Observable: malformed/opaque parser status, untrusted or unresolvable source locations (including unsupported overlap handling in this preparatory path), an unavailable generator, invalid JSON/XML/**YAML** output and a mid-stream exception each return a typed restrictive failure — no partial success, no silent KEEP, no relaxed authorized action; supported formats stay valid. Overlapping findings do not by themselves force failure; compatible overlaps are not automatically failures, and their composition semantics remain gated on the required [010](../../../decisions/010-separate-information-dimensions-and-task-fidelity.md) acceptance.
 - Future tests: `test/transformation-failure.test.mjs`, `test/transformation-fidelity.test.mjs`.
 - Permitted: pure in-process typed failures and rewrite. [evaluation.md](../../../evaluation.md) expressly permits pre-vault synthetic invariant and property tests, so no blanket gate applies to them.
 - Non-goals: **no integrated accepted-v1 rewrite is claimed or invented here**, and no draft is adopted. Overlap treatment (including [#114](https://github.com/Marcus-Levin/hylja/issues/114)) is **not** auto-denied; compatible overlaps are not automatically failures — their semantics await the required acceptance. Treatment semantics for integrated rewrite carry the ▲ 010/#66/#68 dependency.
@@ -81,8 +81,8 @@ node --test test/gateway-inbound.e2e.test.mjs
 | Sentinel / required-verification outage fails closed on high-risk egress | M1 (E2) | specifiable now; runs after E2 |
 | Unsupported media type, opaque/embedded binary, unknown nested field denied | M1 (E1), M3 (E4) | specifiable now; M3 runs after E4 |
 | Split streaming boundaries leak no prefix or complete secret | M3 (E4) | **planned** — needs the gateway |
-| No cross-tenant, forged or expired restoration | M2 (E3), M3 (E4) | **planned** — needs encrypted scope + broker |
-| Model-fabricated or invented token denied | M2 (E3), M3 (E4) | **planned** |
+| No cross-tenant, forged or expired restoration | M2 (E3), M3 (E3c + P4-B) | **planned** — needs encrypted scope + broker; E4 holds and denies incoming content but restores nothing |
+| Model-fabricated or invented token denied | M2 (E3), M3 (E3c + P4-B) | **planned**; E4 denies an incoming fabricated token without restoring it |
 | No plaintext in logs or audit; correlation only | every milestone | specifiable now; re-checked each milestone |
 | Holdback composes with inbound inspection before any release claim | M3 (E4) | **planned**, ordered |
 
@@ -115,8 +115,9 @@ Only criteria these children actually claim. **Every unclaimed parent obligation
 | #19 planted marker blocked before send; outage restrictive | E2 | `test/egress-sendpoint.e2e.test.mjs` over controlled sink bytes |
 | #21 denied release never reaches upstream; unsupported/opaque fails closed; hosted limits labelled | E4 (**planned**) | `test/gateway-egress.e2e.test.mjs` |
 | #21 split SSE/UTF-8/tool-delta and late-denial no-prefix; authenticated caller bound to actual sink | E4 (**planned**, needs endpoint/sink configuration) | `test/gateway-egress.e2e.test.mjs` |
-| #22 naive global replacement not used; unauthorized originals stay synthetic/redacted | E4 (**planned**) | entity-bound restoration assertion |
-| #22 replay/invented-ID/quoted-uncloak/late-suffix denial | E4 (**planned**) | denial table, fixed codes, no originals |
+| #22 naive global replacement not used; unauthorized originals stay synthetic/redacted | **E3c + P4-B later authorized restoration integration** (**planned**, after encrypted scope, broker and lifecycle) | entity-bound restoration assertion |
+| #22 replay/invented-ID/quoted-uncloak denial | **E3c + P4-B** (**planned**) | denial table, fixed codes, no originals |
+| #22 late sensitive stream suffix / incomplete-stream hold | E4 (**planned**, incoming hold and deny only, no restoration) | denied stream record |
 
 **Unclaimed and retained:** #13 item 1 (accepted #68 semantics), the #114 overlap integration and obligation-satisfying-rewrite items, #13's protocol/OS/data-type fidelity breadth, #21's destination-profile/redirect binding and backpressure bounds, and #22's held-out exactness item (held-out execution needs #39).
 
