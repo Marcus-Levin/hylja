@@ -139,6 +139,29 @@ owned work and preserves evidence and worktrees.
 installation exceeded its budget without a result, so this document promises no background lifecycle,
 ordering or timing.
 
+## Evidence lookup
+
+One run searched `~/.pi` while its launch carried an explicit `--session-dir`, then reported the model
+and run ID unavailable; the metadata was in that session's `subagent-artifacts/` all along. Evidence is
+therefore read from the paths the launch supplied:
+
+- The handoff names the session directory the launch actually used, `sessionDir` or the host
+  `--session-dir` of an external launch, or the public paths the run returned: `outputReference`,
+  `outputPathMapping`, `artifactPaths`.
+- Under `{sessionDir}/subagent-artifacts/`, `{runId}_{agent}_output.md` is the child's public final
+  artifact and `{runId}_{agent}_meta.json` its metadata: timing, usage, exit code, the resolved model
+  and the resolved acceptance ledger. Those, plus the child's returned output, are the evidence
+  surface. The raw `.jsonl` session transcript and provider reasoning blocks stay closed.
+- A supplied path that resolves to nothing is reported as unavailable, not replaced by a wider search.
+
+Three reported figures stay distinct when the metadata is written up:
+
+| Figure | Read it from |
+|---|---|
+| model that ran | the resolved model in `_meta.json`; the `model:` frontmatter of [`hylja-implementer.md`](../../.pi/agents/hylja-implementer.md) declares an intent and is not runtime evidence |
+| usage | `_meta.json` cumulative input, output and cache counters, or `/subagent-cost` for parent-plus-child totals, which Pi's footer and `/session` omit for async children |
+| context size | a live window figure read as such, never a usage counter: a cumulative total bills every turn of the run, so quoting it as the context window overstates it |
+
 ## Limits
 
 Nothing here is measured: no throughput, cost or defect-rate improvement is claimed. Pins, deadlines
