@@ -5,7 +5,9 @@
 //
 // What this proves, precisely: for this narrow public synthetic fixture, with trusted test-supplied
 // policy/sentinel bindings, a release happens only on SELECTED KEEP plus sentinel ALLOW, and what the
-// sink receives is the sentinel's private ALLOW copy of the exact post-serialization wire image.
+// sink receives is the sentinel's private ALLOW copy of the exact post-serialization wire image. The
+// send point takes the policy decision as a required argument and re-checks it itself, on the prepared
+// path and on the streaming path alike: a sentinel ALLOW alone never releases bytes.
 //
 // What it is NOT: a product adapter, a gateway, an authentication proof (the trusted boundary and the
 // sentinel key are test fixtures, not authenticated identities), a transformation engine, a production
@@ -258,6 +260,11 @@ const AUTHORIZED = Object.freeze({
   id: SINK.ref,
   profileDigest: createHash('sha256').update(JSON.stringify(PROFILE)).digest('hex'),
 });
+// The same destination bound to a different profile: the send point observes a profile the policy
+// decision did not authorize, which the sentinel must refuse on its own.
+const OTHER_PROFILE_DIGEST = createHash('sha256')
+  .update(JSON.stringify({ ...PROFILE, maxCleartextSensitivity: 'RESTRICTED' })).digest('hex');
+assert.notEqual(OTHER_PROFILE_DIGEST, AUTHORIZED.profileDigest, 'the second profile really differs');
 
 // A planted original wrapped in more encoding layers than the sentinel's bounded decode rounds reach:
 // opaque, uninspectable content is never presumed clean.
@@ -273,22 +280,42 @@ function createAdapter(sink) {
   const check = (bytes, overrides) => checkEgress({
     bytes, scope: SCOPE_A, destination: AUTHORIZED, authorized: AUTHORIZED, known, ...overrides,
   });
+  const selectedKeep = (decision) =>
+    decision?.state === 'SELECTED' && decision?.treatment === 'KEEP';
   return {
     /**
-     * The send point: refuse unless policy selected KEEP, then run the required final-byte check over the
-     * exact bytes about to go on the wire. Returns the caller's own buffer alongside the private copy.
+     * The prepared release path: refuse before the sentinel unless policy selected KEEP, then run the
+     * required final-byte check over the exact bytes about to go on the wire. Returns the caller's own
+     * buffer alongside the private copy.
      */
     prepare(wire, decision, { overrides, result } = {}) {
       const callerBytes = typeof wire === 'string' ? Buffer.from(wire, 'utf8') : wire;
-      if (decision.state !== 'SELECTED' || decision.treatment !== 'KEEP') {
+      if (!selectedKeep(decision)) {
         return { callerBytes, refused: 'policy', result: null, release: undefined };
       }
       const outcome = result ?? check(callerBytes, overrides);
       return { callerBytes, refused: undefined, result: outcome, release: outcome.release };
     },
-    /** Sends only the sentinel's ALLOW copy; every other outcome reaches the sink as zero bytes. */
-    async send(prepared) {
-      if (prepared.refused !== undefined || prepared.result?.decision !== 'ALLOW') return { requests: 0 };
+    /**
+     * The streaming release path, through the same policy gate: `createStreamGate` holds and checks
+     * bytes, but the decision to release them is still policy's, so it is required here too.
+     */
+    prepareStream(callerBytes, decision, completion) {
+      if (!selectedKeep(decision)) {
+        return { callerBytes, refused: 'policy', result: null, release: undefined };
+      }
+      return { callerBytes, refused: undefined, result: completion.result, release: completion.release };
+    },
+    /**
+     * The send point. The policy decision is a required first argument and is re-checked here rather
+     * than taken on the prepared argument's word, so a send argument built straight from a stream
+     * completion cannot release bytes under a refusing decision. A release needs SELECTED/KEEP from
+     * `decidePolicy` and ALLOW from the sentinel; every other combination is zero bytes.
+     */
+    async send(decision, prepared) {
+      const releasable = selectedKeep(decision) && prepared?.result?.decision === 'ALLOW'
+        && prepared.release instanceof Uint8Array;
+      if (!releasable) return { requests: 0 };
       await sink.send(prepared.release);
       return { requests: 1 };
     },
@@ -328,7 +355,7 @@ test('a safe fixture passes the real policy and sentinel, and the sink receives 
     const prepared = adapter.prepare(EXPECTED_SAFE_WIRE, decision);
     assert.equal(prepared.result.decision, 'ALLOW');
     assert.deepEqual(prepared.result.reasons, []);
-    const sent = await adapter.send(prepared);
+    const sent = await adapter.send(decision, prepared);
     assert.equal(sent.requests, 1);
     assert.equal(sink.connections, 1);
     assert.equal(sink.receivedBytes, Buffer.byteLength(EXPECTED_SAFE_WIRE, 'utf8'));
@@ -339,7 +366,8 @@ test('a safe fixture passes the real policy and sentinel, and the sink receives 
 test('mutating the caller buffer after the check cannot change the received ALLOW copy',
   { timeout: TEST_TIMEOUT_MS }, async (t) => {
     const { sink, adapter } = await harness(t);
-    const prepared = adapter.prepare(EXPECTED_SAFE_WIRE, decide('PUBLIC'));
+    const decision = decide('PUBLIC');
+    const prepared = adapter.prepare(EXPECTED_SAFE_WIRE, decision);
     assert.equal(prepared.result.decision, 'ALLOW');
     assert.notEqual(prepared.release, prepared.callerBytes, 'the sentinel returns its own copy');
 
@@ -350,9 +378,12 @@ test('mutating the caller buffer after the check cannot change the received ALLO
     prepared.callerBytes.fill(0x41, bodyStart);
     prepared.callerBytes.write(PLANTED_PERSON, bodyStart, 'utf8');
     assert.equal(prepared.callerBytes.subarray(0, bodyStart).includes(PLANTED_PERSON), false);
-    assert.notDeepEqual(prepared.callerBytes, prepared.release);
+    // Compared by value, not by structure: a failing deep-equal diff would print buffer contents, and
+    // this buffer now holds a planted original by construction.
+    assert.notEqual(prepared.callerBytes.equals(prepared.release), true,
+      'the caller buffer and the private copy differ');
 
-    assert.equal((await adapter.send(prepared)).requests, 1);
+    assert.equal((await adapter.send(decision, prepared)).requests, 1);
     assert.equal(sink.receivedBytes, Buffer.byteLength(EXPECTED_SAFE_WIRE, 'utf8'));
     assert.equal(sink.captures[0].includes(PLANTED_PERSON), false);
     assert.deepEqual(sink.captures[0], Buffer.from(EXPECTED_SAFE_WIRE, 'utf8'));
@@ -364,22 +395,24 @@ test('a planted original the upstream detector stack misses is caught independen
   { timeout: TEST_TIMEOUT_MS }, async (t) => {
     const { sink, adapter } = await harness(t);
     const leaky = serializeWire(`Escalate to ${PLANTED_PERSON} on ${PLANTED_HOST} before the window.`);
+    const decision = decide('PUBLIC');
 
     // The primary detector stack genuinely does not know these values. This is a deliberate upstream
     // miss and is NOT counted as candidate-recall success anywhere.
     assert.deepEqual(detectSecrets({ text: leaky, inputRef: 'fixture-wire' }).candidates, []);
 
-    const prepared = adapter.prepare(leaky, decide('PUBLIC'));
+    const prepared = adapter.prepare(leaky, decision);
     assert.equal(prepared.result.decision, 'BLOCK');
     assert.deepEqual(prepared.result.reasons, ['KNOWN_ORIGINAL_DETECTED']);
     assert.deepEqual(prepared.result.findings.map((finding) => finding.rule).sort(),
       ['planted.host.1', 'planted.person.1']);
-    assertNothingSent(sink, (await adapter.send(prepared)).requests);
+    assertNothingSent(sink, (await adapter.send(decision, prepared)).requests);
   });
 
 test('reintroduction during body or metadata serialization, and an encoded variant, produce zero received bytes',
   { timeout: TEST_TIMEOUT_MS }, async (t) => {
     const { sink, adapter } = await harness(t);
+    const decision = decide('PUBLIC');
     const encoded = Buffer.from(`note: ${PLANTED_PERSON}`, 'utf8').toString('base64');
     const cases = [
       // A later composition step reintroduces the planted original into the serialized body.
@@ -390,11 +423,11 @@ test('reintroduction during body or metadata serialization, and an encoded varia
       ['encoded', serializeWire(SAFE_MESSAGE, [['X-Hylja-Note', encoded]]), []],
     ];
     for (const [name, wire] of cases) {
-      const prepared = adapter.prepare(wire, decide('PUBLIC'));
+      const prepared = adapter.prepare(wire, decision);
       assert.equal(prepared.result.decision, 'BLOCK', name);
       assert.ok(prepared.result.reasons.includes('KNOWN_ORIGINAL_DETECTED'), name);
       assert.equal(prepared.release, undefined, name);
-      assertNothingSent(sink, (await adapter.send(prepared)).requests);
+      assertNothingSent(sink, (await adapter.send(decision, prepared)).requests);
     }
   });
 
@@ -416,7 +449,7 @@ test('policy DENIED and HELD results reach the sink as zero bytes',
       assert.equal(prepared.refused, 'policy');
       assert.equal(prepared.result, null);
       assert.equal(prepared.release, undefined);
-      assertNothingSent(sink, (await adapter.send(prepared)).requests);
+      assertNothingSent(sink, (await adapter.send(decision, prepared)).requests);
     }
   });
 
@@ -434,6 +467,11 @@ test('outage, opaque bytes, destination/profile mismatch and cross-tenant handle
       ['opaque-text', Uint8Array.from([0x7b, 0xff, 0xfe, 0x7d]), {}, 'OPAQUE_CONTENT'],
       // Content the sentinel cannot inspect through its bounded decode rounds.
       ['uninspected', serializeWire(`x=${nestedEncoding()}`), {}, 'UNINSPECTED_CONTENT'],
+      // The send point observes the authorized destination bound to a profile digest policy never
+      // authorized: the destination id is unchanged, so only the profile can refuse this.
+      ['profile', EXPECTED_SAFE_WIRE, {
+        overrides: { destination: { id: AUTHORIZED.id, profileDigest: OTHER_PROFILE_DIGEST } },
+      }, 'DESTINATION_MISMATCH'],
       // The send point observes a different destination/profile than policy authorized.
       ['destination', EXPECTED_SAFE_WIRE, {
         overrides: { destination: { id: 'other-sink.example.invalid', profileDigest: AUTHORIZED.profileDigest } },
@@ -447,7 +485,7 @@ test('outage, opaque bytes, destination/profile mismatch and cross-tenant handle
       assert.equal(prepared.result.decision, 'BLOCK', name);
       assert.deepEqual(prepared.result.reasons, [reason], name);
       assert.equal(prepared.release, undefined, name);
-      assertNothingSent(sink, (await adapter.send(prepared)).requests);
+      assertNothingSent(sink, (await adapter.send(decision, prepared)).requests);
     }
   });
 
@@ -478,11 +516,17 @@ test('no decision, error or regression evidence contains a planted original',
       regressions: [leaky.regression, opaque.regression, mismatch.regression],
       error: { name: thrown.name, message: thrown.message },
     });
-    for (const planted of [PLANTED_PERSON, PLANTED_PERSON.toLowerCase(), PLANTED_HOST,
-      PLANTED_PERSON.slice(0, 6)]) {
-      assert.equal(evidence.includes(planted), false, planted);
+    for (const [label, planted] of [
+      ['planted person', PLANTED_PERSON],
+      ['planted person, case-folded', PLANTED_PERSON.toLowerCase()],
+      ['planted host', PLANTED_HOST],
+      ['planted person, first six bytes', PLANTED_PERSON.slice(0, 6)],
+    ]) {
+      // Fixed privacy-safe labels: the assertion message must never carry a planted original, or a leak
+      // would be echoed into the TAP output and invert the invariant this test exists to prove.
+      assert.equal(evidence.includes(planted), false, label);
     }
-    assertNothingSent(sink, (await adapter.send({ result: leaky })).requests);
+    assertNothingSent(sink, (await adapter.send(decisions[0], { result: leaky })).requests);
   });
 
 /* ---------- Streaming through the real gate ---------- */
@@ -491,6 +535,8 @@ test('streaming releases nothing before completion and a split planted secret pr
   { timeout: TEST_TIMEOUT_MS }, async (t) => {
     const { sink, adapter } = await harness(t);
     const decision = decide('PUBLIC');
+    assert.equal(decision.state, 'SELECTED');
+    assert.equal(decision.treatment, 'KEEP');
     const gate = adapter.stream();
     const safeBytes = Buffer.from(EXPECTED_SAFE_WIRE, 'utf8');
     for (let at = 0; at < safeBytes.byteLength; at += 17) {
@@ -501,9 +547,8 @@ test('streaming releases nothing before completion and a split planted secret pr
     const completed = gate.end();
     assert.equal(completed.result.decision, 'ALLOW');
     assert.equal(completed.release instanceof Uint8Array, true);
-    assert.equal((await adapter.send({
-      callerBytes: safeBytes, result: completed.result, release: completed.release,
-    })).requests, 1);
+    const prepared = adapter.prepareStream(safeBytes, decision, completed);
+    assert.equal((await adapter.send(decision, prepared)).requests, 1);
     assert.deepEqual(sink.captures[0], Buffer.from(EXPECTED_SAFE_WIRE, 'utf8'));
 
     // The planted secret is split across chunk boundaries, so no single chunk spells it out.
@@ -511,23 +556,60 @@ test('streaming releases nothing before completion and a split planted secret pr
     const leakyBytes = Buffer.from(serializeWire(`Escalate to ${PLANTED_PERSON} now.`), 'utf8');
     for (let at = 0; at < leakyBytes.byteLength; at += 3) {
       assert.deepEqual(leaky.push(leakyBytes.subarray(at, at + 3)), { accepted: true });
+      // This counter only sees bytes the loopback has already delivered: the push loop is synchronous,
+      // so writes still in flight are not observable here. The cumulative assertions after the awaited
+      // send below are the ones that observe the whole exchange.
       assert.equal(sink.receivedBytes, Buffer.byteLength(EXPECTED_SAFE_WIRE, 'utf8'),
-        'the completed stream is still the only thing the sink has');
+        'no planted-stream byte has been delivered while its chunks are pushed');
     }
     const blocked = leaky.end();
     assert.equal(blocked.result.decision, 'BLOCK');
     assert.deepEqual(blocked.result.reasons, ['KNOWN_ORIGINAL_DETECTED']);
     assert.equal(blocked.release, undefined);
-    assert.equal((await adapter.send({ callerBytes: leakyBytes, result: blocked.result })).requests, 0);
-    // Cumulative counters: a chunk released early would have added connections and bytes here.
+    const refused = adapter.prepareStream(leakyBytes, decision, blocked);
+    assert.equal((await adapter.send(decision, refused)).requests, 0);
+    // Cumulative counters, observed after an awaited send: an early chunk release would have added
+    // connections and bytes here.
     assert.equal(sink.connections, 1);
     assert.equal(sink.receivedBytes, Buffer.byteLength(EXPECTED_SAFE_WIRE, 'utf8'));
     assert.equal(sink.captures.length, 1);
   });
 
+test('a stream whose real policy decision is DENIED or HELD releases zero bytes and makes no contact',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const { sink, adapter } = await harness(t);
+    for (const [sensitivity, expectedState] of [['RESTRICTED', 'DENIED'], ['CONFIDENTIAL', 'HELD']]) {
+      const decision = decide(sensitivity);
+      assert.equal(decision.state, expectedState, 'the real decision refused this candidate');
+      const safeBytes = Buffer.from(EXPECTED_SAFE_WIRE, 'utf8');
+      const gate = adapter.stream();
+      for (let at = 0; at < safeBytes.byteLength; at += 29) {
+        assert.deepEqual(gate.push(safeBytes.subarray(at, at + 29)), { accepted: true });
+      }
+      // The sentinel alone would release these bytes; only the policy decision stands in the way.
+      const completed = gate.end();
+      assert.equal(completed.result.decision, 'ALLOW');
+      assert.equal(completed.release instanceof Uint8Array, true);
+
+      const prepared = adapter.prepareStream(safeBytes, decision, completed);
+      assert.equal(prepared.refused, 'policy');
+      assert.equal(prepared.result, null);
+      assert.equal(prepared.release, undefined);
+      assert.equal((await adapter.send(decision, prepared)).requests, 0);
+      // A send argument built straight from the stream completion must not release either: the send
+      // point requires the decision itself, it does not take the argument's word for the treatment.
+      const bypass = { callerBytes: safeBytes, result: completed.result, release: completed.release };
+      assert.equal((await adapter.send(decision, bypass)).requests, 0);
+      assertNothingSent(sink, 0);
+    }
+  });
+
 test('a completed safe stream sends only its approved complete-message copy',
   { timeout: TEST_TIMEOUT_MS }, async (t) => {
     const { sink, adapter } = await harness(t);
+    const decision = decide('PUBLIC');
+    assert.equal(decision.state, 'SELECTED');
+    assert.equal(decision.treatment, 'KEEP');
     const gate = adapter.stream();
     const chunks = [
       Buffer.from(EXPECTED_SAFE_WIRE.slice(0, 60), 'utf8'),
@@ -543,7 +625,8 @@ test('a completed safe stream sends only its approved complete-message copy',
 
     const { result, release } = gate.end();
     assert.equal(result.decision, 'ALLOW');
-    assert.equal((await adapter.send({ callerBytes, result, release })).requests, 1);
+    const prepared = adapter.prepareStream(callerBytes, decision, { result, release });
+    assert.equal((await adapter.send(decision, prepared)).requests, 1);
     assert.equal(sink.connections, 1);
     assert.equal(sink.receivedBytes, Buffer.byteLength(EXPECTED_SAFE_WIRE, 'utf8'));
     assert.equal(sink.captures[0].includes(PLANTED_HOST), false);
