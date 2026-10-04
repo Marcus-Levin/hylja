@@ -28,14 +28,19 @@ relied on.**
 
 ## Install and use
 
-Prerequisite: native Pi with `pi-subagents` loaded (`pi list`). Role configuration is the frontmatter
-above; `~/.agents/pstack-models.md` is untouched.
+Prerequisite: native Pi with `pi-subagents` loaded (`pi list`). Role configuration is the frontmatter of
+[`.pi/agents/hylja-implementer.md`](../../.pi/agents/hylja-implementer.md) and
+[`.pi/agents/hylja-reviewer.md`](../../.pi/agents/hylja-reviewer.md); `~/.agents/pstack-models.md` is
+untouched. Tested installation: pi-subagents 0.75.0 on Pi 1.0.0, whose release notes record the fix for
+background children failing on Pi 1.0.0 with a missing `@earendil-works/pi-agent-core/node` export;
+0.74.0 does not work on Pi 1.0.0. Foreground children do not depend on that fix. No extra script or
+package is added to this repository.
 
 - Interactive: `/skill:hylja-development` forces the project skill; `/reload` after editing it.
 - Headless: `--no-skills --skill .agents/skills/hylja-development` loads only that skill; without
   `--no-skills`, every discovered global skill is also eligible for automatic selection.
 - Grant project trust once: `/trust`, or `--approve`.
-- Launch: `subagent({ agent: "hylja-implementer", task: <brief>, cwd: <worktree>, async: true })`.
+- Launch: `subagent({ agent: "hylja-implementer", task: <brief>, cwd: <worktree>, async: false })`. Both role profiles set `async: false`, so a lane is a foreground native child and its result returns in-session. An empty `extensions:` value in each profile disables ambient extension loading in the child; builtin tools, the providers the host registered, and host-required child extensions still load.
 
 Another checkout needs no installer: copy each `principle-*/SKILL.md` from the pinned upstream pstack
 commit into `~/.agents/skills/<name>/`, MIT license kept.
@@ -43,9 +48,11 @@ commit into `~/.agents/skills/<name>/`, MIT license kept.
 ## Admission and concurrency
 
 The coordinator admits only *ready* issues: an accepted brief and no unmet human gate on its critical
-path. It admits at most as many independent issues as it has free concurrency, never faking parallelism
-on gated work. It owns isolation, merge and closure; children never push, merge or close.
-One routine reviewer per task; a wider panel only for a concrete contested design question.
+path. Root dispatches admitted lanes as independent foreground sessions in their own worktrees,
+concurrently where its host supports concurrent native sessions; gated work runs one lane at a time, and
+parallelism is never faked. It owns isolation, merge and closure; children never push, merge or close.
+One routine reviewer per task, launched after the implementer commit exists; a wider panel only for a
+concrete contested design question.
 
 ## Issue brief contract
 
@@ -82,6 +89,10 @@ retries unchanged, same session, provider and model, with no fallback; an unreso
 with its message. The ledger belongs with the pull request evidence, not a status file: author/reviewer
 minutes, context size, command durations, retries, rounds and per-round states. A user pause cancels
 owned work and preserves evidence and worktrees.
+
+`async: true` is an optional mode, not the pipeline default: the single background run in this
+installation exceeded its budget without a result, so this document promises no background lifecycle,
+ordering or timing.
 
 ## Limits
 

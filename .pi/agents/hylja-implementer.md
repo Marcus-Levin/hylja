@@ -14,8 +14,11 @@ skills:
   - principle-prove-it-works
 allowNestedSubagents: false
 acceptanceRole: writer
-async: true
+async: false
 timeoutMs: 1200000
+# Empty value: no ambient extensions load in this foreground child. Builtin tools and the providers
+# the host registered still resolve, and host-required child extensions survive this setting.
+extensions:
 tools: read, grep, find, ls, edit, write, bash
 ---
 
