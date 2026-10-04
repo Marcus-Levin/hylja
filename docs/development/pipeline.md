@@ -139,6 +139,40 @@ owned work and preserves evidence and worktrees.
 installation exceeded its budget without a result, so this document promises no background lifecycle,
 ordering or timing.
 
+## Evidence lookup
+
+One run searched `~/.pi` while its launch carried an explicit `--session-dir`, then reported the model
+and run ID unavailable; the metadata was in that session's `subagent-artifacts/` all along. Read the
+paths the launch supplied. Never rebuild an artifact filename from a remembered pattern: a guessed one
+misses a run that exists and reads as absent evidence.
+
+- The handoff carries what the launch or the run returned: the files named by `outputReference`,
+  `outputPathMapping` or `artifactPaths`; otherwise the session directory the launch actually used,
+  `sessionDir` or an external `--session-dir`, together with the child's `runId` and agent name.
+- Given returned paths, open exactly those. Given only a session directory, list
+  `{sessionDir}/subagent-artifacts/` once and take the entries whose name starts with
+  `{runId}_{agent}`; the rest of each name comes from that listing, never from a schema. One run wrote
+  `..._hylja-implementer_0_output.md` and a sibling `_0_meta.json`, so the assumed
+  `{runId}_{agent}_output.md` names a file that does not exist.
+- The `*_output.md` entry is the child's public final artifact and the `*_meta.json` entry its
+  metadata: `runId`, `agent`, timing, usage, exit code, the resolved model and the resolved acceptance
+  ledger. Those two plus the child's returned output are the evidence surface; the `.jsonl` entry, the
+  raw native session transcript and provider reasoning blocks, stays closed.
+- A supplied path that resolves to nothing is reported as unavailable, not replaced by a wider search.
+
+A review handoff states, before the reviewer is dispatched, the exact retained paths of the RED and
+GREEN check artifacts behind each changed behaviour, and names the expected evidence that does not
+exist. The reviewer then reads those records instead of pausing to ask for them. A design or security
+question still travels to a human through root; this routes evidence only.
+
+Three reported figures stay distinct when the metadata is written up:
+
+| Figure | Read it from |
+|---|---|
+| model that ran | the `model` field of the run's `*_meta.json`; its `requestedModel` is the request, and the `model:` frontmatter of [`hylja-implementer.md`](../../.pi/agents/hylja-implementer.md) declares an intent. Neither is runtime evidence |
+| usage | the cumulative input, output and cache counters in that same metadata, or `/subagent-cost` for parent-plus-child totals |
+| context size | a live window figure read as such, never a usage counter: a cumulative total bills every turn of the run, so quoting it as the context window overstates it |
+
 ## Limits
 
 Nothing here is measured: no throughput, cost or defect-rate improvement is claimed. Pins, deadlines

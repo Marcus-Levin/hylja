@@ -85,6 +85,9 @@ promised for it.
 
 ## Evidence, pause, reporting
 
+Evidence for a finished lane, or the record a review handoff needs: which paths to read, and what the
+handoff must name. [pipeline.md](../../../docs/development/pipeline.md#evidence-lookup).
+
 Keep author and reviewer minutes, context size, command durations, retries, rounds and states in the
 pull request evidence. A user pause cancels owned work, preserving evidence and worktrees; setup never
 resumes product work. Report what ran, with real counts and the unproven surface. Claim no unmeasured
