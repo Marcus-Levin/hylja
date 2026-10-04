@@ -799,6 +799,84 @@ test('a hostile route label cannot inject a header into the image',
     assert.equal(dispatch.length, 0);
   });
 
+test('a destination label with an ordinary space refuses at the route boundary and sends nothing',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // An ordinary space is legal in a string and illegal in this label: the label is interpolated into
+    // the image's `Host` header, so it is refused where the route is read, before any image exists.
+    // The committed profile, the policy bundle and the authenticated boundary all carry this same
+    // spaced label, so on a sender that failed to refuse it the whole path would run and the spaced
+    // label would reach the transport. That is what this test refuses to allow.
+    const spacedSink = Object.freeze({ ...SINK, ref: 'model sink.example.invalid' });
+    const spacedProfile = Object.freeze({ ...PROFILE, sink: spacedSink });
+    const spacedBundle = Object.freeze({
+      ...KNOWN_POLICY_BUNDLE, profiles: [spacedProfile], rules: [BUNDLE.rules[0]],
+    });
+    const observation = Object.freeze({
+      destination: {
+        id: spacedSink.ref,
+        profileDigest: createHash('sha256').update(JSON.stringify(spacedProfile)).digest('hex'),
+      },
+      commit: Object.freeze({ ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(spacedBundle) }),
+    });
+    const boundary = Object.freeze({
+      ...BOUNDARY,
+      observed: { ...BOUNDARY.observed, destination: spacedSink, routeProof: proof('route-spaced.invalid') },
+    });
+    const point = await harness(t, {
+      boundary, policyBundle: spacedBundle, observations: [observation, observation],
+    });
+    assert.deepEqual(await bounded(point.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    }), 'spaced destination label'), { status: 'REFUSED', code: 'ROUTE_REFUSED' });
+    assertNothingSent(point.sink, point.dispatch);
+    assert.equal(point.sender.state, 'IDLE');
+
+    // Positive control: the space-free fixture label is still accepted on the same path - one real
+    // fixed-worker check, one dispatch, and the independently declared image at the sink.
+    const safe = await harness(t);
+    assert.deepEqual(await bounded(safe.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    }), 'space-free destination label'), { status: 'SENT' });
+    assert.equal(safe.dispatch.length, 1);
+    assert.equal(safe.sink.captures.length, 1);
+    assert.equal(safe.sink.captures[0].equals(expectedImage()), true);
+    assert.equal(safe.sender.state, 'IDLE');
+  });
+
+test('boundary evidence that cannot be bound refuses with INTERACTION_REFUSED and no effect',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // Independently bound evidence, not sender-owned: each boundary below is structurally an accepted
+    // host member and fails only where the envelope binds it to this interaction. Nothing here is
+    // stubbed, so these are the real bindings the real envelope refuses.
+    for (const [name, boundary] of [
+      ['expired route proof', {
+        ...BOUNDARY,
+        observed: {
+          ...BOUNDARY.observed,
+          routeProof: {
+            ref: 'route-expired.invalid',
+            issuedAt: new Date(Date.now() - 600_000).toISOString(),
+            expiresAt: new Date(Date.now() - 300_000).toISOString(),
+          },
+        },
+      }],
+      ['identity proof with an extra own key', {
+        ...BOUNDARY,
+        authenticated: {
+          ...BOUNDARY.authenticated,
+          identityProof: { ...proof('identity-unknown-key.invalid'), signature: 'synthetic-not-a-proof' },
+        },
+      }],
+    ]) {
+      const point = await harness(t, { boundary });
+      assert.deepEqual(await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+      }), name), { status: 'REFUSED', code: 'INTERACTION_REFUSED' }, name);
+      assertNothingSent(point.sink, point.dispatch);
+      assert.equal(point.sender.state, 'IDLE', name);
+    }
+  });
+
 /* ---------- Cancellation, contention and an unusable host ---------- */
 
 test('cancelling a genuinely active send invokes the transport zero times and disables the sender',

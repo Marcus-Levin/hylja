@@ -202,6 +202,12 @@ const COMMIT_KEYS: readonly string[] = ['id', 'version', 'digest'];
 const RESULT_KEYS: readonly string[] = ['version', 'interactionRef', 'imageDigest', 'coverage', 'remainder', 'units'];
 const FINDING_KEYS: readonly string[] = ['unitRef', 'classificationDigest', 'classification'];
 const CONTROL = /[\u0000-\u001f\u007f]/u;
+/**
+ * The destination label is interpolated into the image's `Host` header, so an ordinary space is
+ * refused there exactly as a control character is. It is the label bound only: every other string
+ * this module reads keeps the narrower control-character rule above.
+ */
+const LABEL_UNSAFE = /[\u0000-\u0020\u007f]/u;
 const HEX_DIGEST = /^[0-9a-f]{64}$/u;
 const MAX_DESTINATION_LABEL = 256;
 const CONTENT_TYPE = 'application/json; charset=utf-8';
@@ -260,7 +266,9 @@ function digestOf(bytes: Uint8Array): string {
 
 /**
  * A destination label is interpolated into the image's `Host` header, so it is validated here before
- * it can reach the image. This is a structural bound, not authentication of the route.
+ * it can reach the image: non-empty, bounded, and free of control characters and of ordinary spaces,
+ * because a space would already make the emitted header value ambiguous. This is a structural bound,
+ * not authentication of the route.
  */
 function usableDestination(destination: unknown): SentinelProcessDestination | null {
   const fields = exact(destination, DESTINATION_KEYS);
@@ -268,7 +276,7 @@ function usableDestination(destination: unknown): SentinelProcessDestination | n
   const id = fields['id'];
   const profileDigest = fields['profileDigest'];
   if (typeof id !== 'string' || id.length === 0 || id.length > MAX_DESTINATION_LABEL ||
-    CONTROL.test(id) || typeof profileDigest !== 'string' || !HEX_DIGEST.test(profileDigest)) return null;
+    LABEL_UNSAFE.test(id) || typeof profileDigest !== 'string' || !HEX_DIGEST.test(profileDigest)) return null;
   return { id, profileDigest };
 }
 
@@ -499,7 +507,15 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
     const observed = observationOf(trusted.sendPoint.observe());
     if (observed === null) return refused('ROUTE_REFUSED');
 
-    const envelope = createInteractionEnvelope(translated.draft, trusted.boundary);
+    // Binding the independently authenticated boundary to this interaction is the envelope's own
+    // refusal point, so it is caught here and nowhere else: evidence that cannot be bound at all
+    // (an expired, malformed or foreign-boundary window) is INTERACTION_REFUSED, exactly like
+    // evidence that was bound and is no longer current at the dispatch point below. Letting it reach
+    // the outer catch-all would report an internal failure for a boundary the host simply could not
+    // prove, and would carry no detail either way.
+    let envelope: InteractionEnvelope;
+    try { envelope = createInteractionEnvelope(translated.draft, trusted.boundary); }
+    catch { return refused('INTERACTION_REFUSED'); }
     const interactionRef = envelope.id;
     if (trusted.scope.tenantRef !== envelope.context.tenantId ||
       (envelope.context.projectId !== undefined && trusted.scope.projectRef !== envelope.context.projectId)) {

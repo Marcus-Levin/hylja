@@ -24,7 +24,10 @@ body:
     id: pointers
     attributes:
       label: Pointers
-      description: Relevant source files, contracts, specs and decisions, with their status lines.
+      description: >-
+        Relevant source files, contracts, specs and decisions, with their status lines. A test-only
+        join of unchanged accepted-v1 seams points at its test, the seam sources it exercises and the
+        shared [synthetic-e2e.md](../../docs/development/synthetic-e2e.md) limits.
     validations:
       required: true
 
@@ -40,7 +43,10 @@ body:
     id: acceptance
     attributes:
       label: Acceptance
-      description: Executable examples or observable checks. Prefer these over a written plan.
+      description: >-
+        Executable examples or observable checks, each naming the behavior or refusal that must go
+        RED first and the existing test file that asserts it. For a serialization change, name the
+        writer-reader round trip and the admitted byte extremes. Prefer these over a written plan.
     validations:
       required: true
 

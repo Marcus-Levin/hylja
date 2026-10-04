@@ -140,8 +140,11 @@ Content-Length: <UTF-8 byte length of the body>
 Message order, Unicode (including astral and combining characters) and every literal in the decoded
 text are preserved exactly: there is no treatment anywhere in this path, so the checked image is the sent
 image. `stream: false` is accepted by the codec and still yields this one complete, non-streamed image.
-A destination label is structurally validated (non-empty, bounded, no control character or space) before
-it can be interpolated into a header, so a hostile observed label cannot inject a header.
+A destination label is structurally validated (non-empty, bounded, no control character and no ordinary
+space) before it can be interpolated into a header, so a hostile observed label cannot inject a header.
+An ordinary space is refused here for the same reason a control character is: it would already make the
+emitted header value ambiguous, and an unusable observed label is `ROUTE_REFUSED` before any image is
+built.
 
 The image is snapshotted before any `await` and never leaves this module: the sentinel's own private
 `ALLOW` copy is the only representation the transport receives, handed over exactly once.
@@ -239,7 +242,7 @@ name, byte offset, exception message, transport error, sentinel reason or any pa
 | `ROUTE_CHANGED` | the route or profile changed between the check and the dispatch |
 | `POLICY_STALE` | the committed policy identity changed between the decision and the dispatch |
 | `DISPATCH_FAILED` | the trusted transport failed or did not confirm |
-| `SENDER_FAILED` | fail-closed catch-all for an unexpected internal failure |
+| `SENDER_FAILED` | fail-closed catch-all for an unexpected internal failure. No boundary the accepted host surface can supply reaches one, so this code is fixed and fail-closed but unexercised |
 
 ## Limits, stated honestly
 
@@ -273,11 +276,12 @@ protection. A production authenticated send path remains host adapter work.
 
 Evidence: [`test/openai-keep-sender.test.mjs`](../../test/openai-keep-sender.test.mjs), an executable
 matrix over the accepted path (a real sentinel child and a real loopback capture of exactly the declared
-image), whole-image coverage, every refusal code, cancellation and contention, a cancellation raised
-inside the final host observation and boundary evidence that expires under real elapsed time inside the
-trusted inspection, an accepted send point that is a Proxy whose `get` trap cancels the sender if the
-transport method is read back off it, the receiver a captured transport keeps and the later method swap
-that cannot retarget it, a revoked-Proxy host, and the "later caller or inspection-copy mutation changes
-no released byte" property. It calls no provider, holds no credential, reaches the network only on
+image), whole-image coverage, every refusal code except the `SENDER_FAILED` catch-all, cancellation and
+contention, a destination label carrying an ordinary space and boundary evidence that cannot be bound at
+all, a cancellation raised inside the final host observation and boundary evidence that expires under
+real elapsed time inside the trusted inspection, an accepted send point that is a Proxy whose `get` trap
+cancels the sender if the transport method is read back off it, the receiver a captured transport keeps
+and the later method swap that cannot retarget it, a revoked-Proxy host, and the "later caller or
+inspection-copy mutation changes no released byte" property. It calls no provider, holds no credential, reaches the network only on
 `127.0.0.1` on an OS-assigned ephemeral port, and every fixture value is obviously synthetic and
 non-routable.

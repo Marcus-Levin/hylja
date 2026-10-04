@@ -66,6 +66,17 @@ about any production path. Each is evidence for a seam, not an enforcement bound
 [capabilities.md](../capabilities.md#assurance-governance-and-release-seams), no adapter sits at a real
 send point in this repository.
 
+## What a test-only join carries
+
+A new test file that joins unchanged accepted-v1 seams over synthetic fixtures carries its evidence
+as pointers rather than as a new document: the test path and focused command from the table above, the
+seam sources it exercises, and this document's shared limits cited rather than restated. The reviewed
+head SHA, the run IDs, the model that actually ran and the real test counts go in the pull request,
+where a reviewer can check them against the commit.
+
+Write a normative contract when a change alters a runtime API or an obligation the seams are held to.
+Composing already-contracted seams differently over a new fixture is not such a change.
+
 ## Synthetic seam integration is not the real M1/M2/M3 path
 
 The plain-language distinction: what runs today is a **harness proving that existing pure seams
