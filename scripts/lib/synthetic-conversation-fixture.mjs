@@ -27,6 +27,12 @@ import { detectSecrets } from '../../dist/secret-detectors.js';
 
 /** Registered as a known original for both real children, on the request and the reply side. */
 export const PLANTED_ORIGINAL = 'avery.synthanon@synthetic-planted.invalid';
+/**
+ * The privacy-safe label this fixture registered that original under. It is the only label a fixed child
+ * may report back, and it is what the worker observation compares a reported rule against, so a `BLOCK`
+ * naming a rule can be shown to name THIS registration rather than something the child chose.
+ */
+export const PLANTED_ORIGINAL_REF = 'planted.person.demo';
 /** Obviously synthetic and not a live token: one documented vendor shape, exactly what the rule sees. */
 export const PLANTED_SECRET = `ghp_${'SYNTHETIC1'.repeat(4)}`;
 /** The generic irreversible literal of accepted decision 011, declared here and never imported. */
@@ -41,7 +47,7 @@ const KEY = Uint8Array.from({ length: 32 }, (unused, index) => (index * 29 + 7) 
 const registration = () => ({
   scope: SCOPE, key: KEY,
   entries: Object.freeze([Object.freeze({
-    kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: 'planted.person.demo',
+    kind: 'ORIGINAL', value: PLANTED_ORIGINAL, ref: PLANTED_ORIGINAL_REF,
   })]),
 });
 

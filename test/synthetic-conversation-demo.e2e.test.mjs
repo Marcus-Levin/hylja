@@ -1,77 +1,83 @@
 // #250: the operator-visible synthetic conversation demo, driven as a real subprocess.
 //
 // What this proves, precisely: the operator command runs the real application-level local conversation
-// owner - `createOpenAiLocalConversation` - over a real standard HTTP loopback peer and the real
-// fixture host, and prints a fixed summary derived from the real owner result and the real peer,
-// release, detector and child counters. The default invocation really classifies one synthetic masked
+// owner - `createOpenAiLocalConversation` - over a real standard HTTP loopback peer and the real fixture
+// host, and prints a fixed summary derived from the real owner result and the real peer, release,
+// detector and fixed-worker counters. The default invocation really classifies one synthetic masked
 // request with the real detector and the real policy engine, sends it to the peer once and releases one
-// guarded reply; the two declared negatives really hold at their declared counts, the blocked reply
-// reaching the peer once and releasing nothing, and the unsupported request reaching the peer not at
-// all. A malformed invocation is refused before any effect and echoes nothing.
+// guarded reply, with both real children really returning `ALLOW`. The two declared negatives really hold
+// at their declared counts: the blocked reply reaches the peer once, the second real child really runs,
+// really exits cleanly and really blocks that reply over the registered known original, and nothing is
+// released; the unsupported request reaches the peer not at all and starts no worker. A malformed
+// invocation is refused before any effect and echoes nothing.
 //
-// What it is NOT. This is not a gateway, a provider client, an authentication implementation, a
+// The fourth case is the one that keeps the two refusals honest. The accepted receiver collapses a
+// genuine block, a crashed child, a malformed reply and a missing reply into one `SENTINEL_BLOCKED`, so a
+// demonstration that trusted that code alone would print "success" for a worker that died. The
+// test-only fault driver terminates the SECOND real child and leaves the first alone: the run then
+// reports the same owner refusal code, one observed zero exit instead of two, one signal close, one
+// `ALLOW` and no `BLOCK`, and the demonstration declines itself with exit 1. The working blocked case is
+// asserted in the same test as the control, at its observed counts, so the fault case is not a run that
+// fails for an unrelated reason.
+//
+// Assertions are booleans, counts and fixed labels. Every comparison of captured stdout or stderr is
+// turned into a boolean BEFORE it reaches `assert`, so a failing report can never carry a captured byte,
+// a planted value or a native error into the TAP output. Planted material and the mask literal are
+// declared here independently of the script, and the confidentiality claim itself is observed rather
+// than asserted about: the suite spawns a real `node --test` run whose subprocess really printed the
+// planted values, and checks that the TAP that run reported contains none of them.
+//
+// What this is NOT. This is not a gateway, a provider client, an authentication implementation, a
 // restoration path, a streaming design or a held-out, scored or promotion result. The identity, clock,
 // policy bundle, profile digest, known-original registration and the static PUBLIC model/metadata
-// records are TRUSTED FIXTURES this demo declares; nothing here authenticates a principal, a tenant,
-// a workload or a control plane, and no detector absence is read as clearance. Every value is invented
-// and non-routable (`*.invalid`, loopback, a made-up token literal).
-//
-// Assertions are counts, booleans and fixed labels. Planted material and the mask literal are declared
-// here independently of the script and are only ever asserted ABSENT, so a failing assertion prints no
-// body, no key, no reply and no planted value into the TAP output.
+// records are TRUSTED FIXTURES this demo declares; nothing here authenticates a principal, a tenant, a
+// workload or a control plane, and no detector absence is read as clearance. Every value is invented and
+// non-routable (`*.invalid`, loopback, a made-up token literal).
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   MASKED, PLANTED_ORIGINAL, PLANTED_SECRET,
 } from '../scripts/lib/synthetic-conversation-fixture.mjs';
+import {
+  REPO_ROOT, runNode, runNodeTest, TEST_TIMEOUT_MS,
+} from './support/run-node-subprocess.mjs';
 
-const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DEMO = fileURLToPath(new URL('../scripts/synthetic-conversation-demo.mjs', import.meta.url));
-/** Bound every invocation, so a stalled peer or child fails this suite loudly instead of hanging it. */
-const BOUND_MS = 60_000;
-/** The bound is a deadline, not a kill policy for valid work: nothing here is killed unless it stalls. */
-const TEST_TIMEOUT_MS = 180_000;
+/** TEST-ONLY. The fixture driver can arm a worker fault; the operator command cannot reach it. */
+const FAULT_DRIVER = fileURLToPath(
+  new URL('./support/synthetic-conversation-demo-fault-driver.mjs', import.meta.url),
+);
+/** The test-only probe that really runs assertions over output carrying the planted values. */
+const CONFIDENTIALITY_PROBE = fileURLToPath(
+  new URL('./support/synthetic-conversation-demo-confidentiality-probe.test.mjs', import.meta.url),
+);
 
-/**
- * Run the real operator entry point in a real child process and report what actually happened. The
- * child's own stdout and stderr are returned for exact comparison and are never interpolated into an
- * assertion message, so no planted value and no native error can reach the TAP output.
- */
-function runDemo(args) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [DEMO, ...args], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
-    const stdout = [];
-    const stderr = [];
-    let stalled = false;
-    child.stdout.on('data', (chunk) => { stdout.push(chunk); });
-    child.stderr.on('data', (chunk) => { stderr.push(chunk); });
-    const timer = setTimeout(() => { stalled = true; child.kill('SIGKILL'); }, BOUND_MS);
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      resolve({
-        code, signal, stalled,
-        stdout: Buffer.concat(stdout).toString('utf8'),
-        stderr: Buffer.concat(stderr).toString('utf8'),
-      });
-    });
-  });
-}
+/** Run the real operator entry point in a real child process. */
+const runDemo = (args) => runNode(DEMO, args);
 
 /** The declared counters of each case, as the summary must report them. Nothing here is inferred. */
 const ROWS = Object.freeze({
   default: {
     result: 'COMPLETED', code: 'none', connections: 1, requests: 1, releases: 1, mask: 'yes',
     runs: 2, findings: 1,
+    workers: { spawned: 2, exitedZero: 2, closedBySignal: 0, frames: 2, allow: 2, block: 0, named: 0 },
   },
   'blocked-reply': {
     result: 'REFUSED', code: 'SENTINEL_BLOCKED', connections: 1, requests: 1, releases: 0, mask: 'yes',
     runs: 2, findings: 1,
+    workers: { spawned: 2, exitedZero: 2, closedBySignal: 0, frames: 2, allow: 1, block: 1, named: 1 },
   },
   'unsupported-request': {
     result: 'REFUSED', code: 'UNSUPPORTED_TOOLS', connections: 0, requests: 0, releases: 0, mask: 'no',
     runs: 0, findings: 0,
+    workers: { spawned: 0, exitedZero: 0, closedBySignal: 0, frames: 0, allow: 0, block: 0, named: 0 },
+  },
+  /** The blocked-reply case with its SECOND real child terminated: the first one still really allows. */
+  faulted: {
+    result: 'REFUSED', code: 'SENTINEL_BLOCKED', connections: 1, requests: 1, releases: 0, mask: 'yes',
+    runs: 2, findings: 1,
+    workers: { spawned: 2, exitedZero: 1, closedBySignal: 1, frames: 1, allow: 1, block: 0, named: 0 },
   },
 });
 
@@ -101,6 +107,14 @@ function summaryOf(name, row) {
     'application release carried the planted original: no',
     `real detector runs: ${row.runs}`,
     `real detector findings: ${row.findings}`,
+    `real fixed-worker children spawned: ${row.workers.spawned}`,
+    `real fixed-worker children that exited with code zero: ${row.workers.exitedZero}`,
+    `real fixed-worker children closed by a signal: ${row.workers.closedBySignal}`,
+    'real fixed-worker children that never reported close: 0',
+    `real fixed-worker replies read as exactly one complete decision frame: ${row.workers.frames}`,
+    `real fixed-worker ALLOW decisions: ${row.workers.allow}`,
+    `real fixed-worker BLOCK decisions: ${row.workers.block}`,
+    `real fixed-worker blocks naming the registered known original: ${row.workers.named}`,
     'fixed-worker children still live after cleanup: 0',
     'peer sockets open after cleanup: 0',
     'owner state after the exchange: IDLE',
@@ -113,13 +127,21 @@ function summaryOf(name, row) {
 const REFUSAL_STDERR = 'hylja synthetic conversation demo: argument refused\n'
   + 'expected: no arguments, or --case default | --case blocked-reply'
   + ' | --case unsupported-request\n';
+/** The exact line a demonstration that missed its own declared behaviour prints. */
+const DECLINED_STDERR = 'hylja synthetic conversation demo: the case did not match its declared behaviour\n';
 
-/** Nothing planted may appear anywhere in what the operator sees, in either stream. */
-const assertNoPlantedMaterial = (run) => {
+/**
+ * Nothing planted may appear anywhere in what the operator sees, in either stream. Each check is a
+ * boolean over the whole captured output, so a failing report says only that a value was present.
+ */
+const assertNoPlantedMaterial = (run, what) => {
   const printed = `${run.stdout}${run.stderr}`;
-  for (const value of [PLANTED_ORIGINAL, PLANTED_SECRET, MASKED]) {
-    assert.equal(printed.includes(value), false, 'no planted original, planted secret or mask literal printed');
-  }
+  assert.equal(printed.includes(PLANTED_ORIGINAL), false,
+    `${what}: no planted original printed`);
+  assert.equal(printed.includes(PLANTED_SECRET), false,
+    `${what}: no planted secret printed`);
+  assert.equal(printed.includes(MASKED), false,
+    `${what}: no mask literal printed`);
 };
 
 test('the default operator command masks one synthetic request and releases one guarded reply',
@@ -128,34 +150,34 @@ test('the default operator command masks one synthetic request and releases one 
     assert.equal(run.stalled, false, 'the invocation finished inside its bound');
     assert.equal(run.signal, null, 'the demo exited on its own, with no signal and no orphan left behind');
     assert.equal(run.code, 0, 'a completed demonstration exits zero');
-    assert.equal(run.stderr, '', 'the completed case prints nothing on stderr');
-    assert.equal(run.stdout, `${summaryOf('default', ROWS.default)}\n`,
+    assert.equal(run.stderr === '', true, 'the completed case prints nothing on stderr');
+    assert.equal(run.stdout === `${summaryOf('default', ROWS.default)}\n`, true,
       'the printed summary is exactly the declared fixed shape and counters');
-    assertNoPlantedMaterial(run);
+    assertNoPlantedMaterial(run, 'the default case');
   });
 
-test('a blocked reply reaches the peer once and releases nothing, and still exits zero',
+test('a blocked reply reaches the peer once, really blocks on the registered original, and releases nothing',
   { timeout: TEST_TIMEOUT_MS }, async () => {
     const run = await runDemo(['--case', 'blocked-reply']);
     assert.equal(run.stalled, false, 'the invocation finished inside its bound');
     assert.equal(run.signal, null, 'the demo exited on its own, with no signal and no orphan left behind');
     assert.equal(run.code, 0, 'an expected refusal is a successful demonstration');
-    assert.equal(run.stderr, '', 'the expected refusal prints nothing on stderr');
-    assert.equal(run.stdout, `${summaryOf('blocked-reply', ROWS['blocked-reply'])}\n`,
-      'one upstream request, zero releases and a real blocked reply are reported exactly');
-    assertNoPlantedMaterial(run);
+    assert.equal(run.stderr === '', true, 'the expected refusal prints nothing on stderr');
+    assert.equal(run.stdout === `${summaryOf('blocked-reply', ROWS['blocked-reply'])}\n`, true,
+      'one upstream request, zero releases and the real blocked reply are reported exactly');
+    assertNoPlantedMaterial(run, 'the blocked reply case');
   });
 
-test('an unsupported request reaches no payload request at all and releases nothing',
+test('an unsupported request reaches no payload request at all, starts no worker and releases nothing',
   { timeout: TEST_TIMEOUT_MS }, async () => {
     const run = await runDemo(['--case', 'unsupported-request']);
     assert.equal(run.stalled, false, 'the invocation finished inside its bound');
     assert.equal(run.signal, null, 'the demo exited on its own, with no signal and no orphan left behind');
     assert.equal(run.code, 0, 'an expected refusal is a successful demonstration');
-    assert.equal(run.stderr, '', 'the expected refusal prints nothing on stderr');
-    assert.equal(run.stdout, `${summaryOf('unsupported-request', ROWS['unsupported-request'])}\n`,
-      'the strict codec refusal is reported with zero peer requests and zero releases');
-    assertNoPlantedMaterial(run);
+    assert.equal(run.stderr === '', true, 'the expected refusal prints nothing on stderr');
+    assert.equal(run.stdout === `${summaryOf('unsupported-request', ROWS['unsupported-request'])}\n`, true,
+      'the strict codec refusal is reported with zero peer requests, zero workers and zero releases');
+    assertNoPlantedMaterial(run, 'the unsupported request case');
   });
 
 test('a malformed invocation is refused before any effect and never echoes its argument',
@@ -175,8 +197,59 @@ test('a malformed invocation is refused before any effect and never echoes its a
       assert.equal(run.stalled, false, 'the refusal finished inside its bound');
       assert.equal(run.signal, null, 'a refused invocation exits on its own');
       assert.equal(run.code, 2, 'a malformed argument exits non-zero');
-      assert.equal(run.stdout, '', 'a refused invocation printed no summary: it had no effect to report');
-      assert.equal(run.stderr, REFUSAL_STDERR, 'the refusal is the fixed text, with no argument echoed');
-      assertNoPlantedMaterial(run);
+      assert.equal(run.stdout === '', true, 'a refused invocation printed no summary: it had no effect to report');
+      assert.equal(run.stderr === REFUSAL_STDERR, true, 'the refusal is the fixed text, with no argument echoed');
+      assertNoPlantedMaterial(run, 'a refused invocation');
     }
+  });
+
+test('a terminated fixed worker fails the blocked case even though the owner reports the same refusal code',
+  { timeout: TEST_TIMEOUT_MS }, async () => {
+    // The working control, at its observed counts: two real children, both clean exits, one ALLOW and
+    // one BLOCK naming the registered known original.
+    const control = await runDemo(['--case', 'blocked-reply']);
+    assert.equal(control.code, 0, 'the working blocked case is the control and exits zero');
+    assert.equal(control.stdout === `${summaryOf('blocked-reply', ROWS['blocked-reply'])}\n`, true,
+      'the control really ran both fixed children to a declared decision');
+    // The fault: the SECOND real child is terminated and the first is left alone.
+    const faulted = await runNode(FAULT_DRIVER, ['terminate-second-worker']);
+    assert.equal(faulted.stalled, false, 'the faulted invocation finished inside its bound');
+    assert.equal(faulted.signal, null, 'the faulted run exited on its own, with no signal');
+    assert.equal(faulted.code, 1, 'a fixed worker that did not really run makes the demonstration exit non-zero');
+    assert.equal(faulted.stderr === DECLINED_STDERR, true,
+      'the faulted run reports one fixed line and nothing else');
+    assert.equal(faulted.stdout === `${summaryOf('blocked-reply', ROWS.faulted)}\n`, true,
+      'the faulted run reports the same owner refusal code with its own real worker counters');
+    // What makes the fault non-vacuous, stated directly: the kill really landed on one child only, and
+    // the first child still really returned ALLOW.
+    assert.equal(faulted.stdout.includes('real fixed-worker children closed by a signal: 1'), true,
+      'the terminated child really closed on a signal');
+    assert.equal(faulted.stdout.includes('real fixed-worker children that exited with code zero: 1'), true,
+      'exactly one child really exited cleanly, so the fault reached one worker and not both');
+    assert.equal(faulted.stdout.includes('real fixed-worker ALLOW decisions: 1'), true,
+      'the first request-side child was preserved and really allowed the masked request');
+    assert.equal(faulted.stdout.includes('real fixed-worker BLOCK decisions: 0'), true,
+      'no real BLOCK decision was observed, so the refusal code alone is never treated as a block');
+    assertNoPlantedMaterial(faulted, 'the faulted run');
+  });
+
+test('a real TAP run over output carrying the planted values reports none of them',
+  { timeout: TEST_TIMEOUT_MS }, async () => {
+    // Observed, not asserted about: a real `node --test` run of a probe whose subprocess really printed
+    // the planted original and the planted secret, with the runner's own TAP output captured here.
+    const probe = await runNodeTest(CONFIDENTIALITY_PROBE);
+    assert.equal(probe.stalled, false, 'the confidentiality probe finished inside its bound');
+    assert.equal(probe.signal, null, 'the probe exited on its own, with no signal');
+    assert.equal(probe.code, 0, 'the confidentiality probe passed');
+    const tap = `${probe.stdout}${probe.stderr}`;
+    assert.equal(tap.includes('reports none of it'), true,
+      'the probe really ran under the test runner, so the TAP output below is a real one');
+    assert.equal(tap.includes(PLANTED_ORIGINAL), false,
+      'the observed TAP output carries no planted original');
+    assert.equal(tap.includes(PLANTED_SECRET), false,
+      'the observed TAP output carries no planted secret');
+    assert.equal(tap.includes(MASKED), false,
+      'the observed TAP output carries no mask literal');
+    assert.equal(tap.includes(REPO_ROOT), false,
+      'the observed TAP output carries no checkout path from the captured streams');
   });

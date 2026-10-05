@@ -39,8 +39,8 @@ records and the tracked paths.
 ([#250](https://github.com/Marcus-Levin/hylja/issues/250)) runs the bounded local conversation owner
 ([openai-local-conversation.md](../contracts/openai-local-conversation.md)) over a real standard HTTP
 peer on `127.0.0.1` and prints one fixed human-readable summary of the real owner result and the real
-peer, release, detector and child counters. No original value, key, model traffic, argument or native
-error is ever printed.
+peer, release, detector and fixed-worker counters. No original value, key, model traffic, argument,
+signal name or native error is ever printed.
 
 ```sh
 npm run build && node scripts/synthetic-conversation-demo.mjs                    # one masked request, one guarded release
@@ -56,6 +56,22 @@ decision or child exists, with exit 2 and nothing echoed. The subprocess evidenc
 [`scripts/lib/synthetic-conversation-fixture.mjs`](../../scripts/lib/synthetic-conversation-fixture.mjs).
 The demo composes the accepted seams this document already routes and adds no transport, coordinator,
 policy authority or runtime surface; the limits below are its limits too.
+
+Both refusals are also reported against the real fixed-worker children, because the accepted receiver's
+one `SENTINEL_BLOCKED` code covers a genuine block, a crashed child, a malformed reply and a missing
+reply alike. The summary therefore also counts, per real child, the observed exit code, the signal close,
+exactly one complete decision frame, the fixed `ALLOW` or `BLOCK` decision, and whether a block carried
+the known-original reason code and named the registered ref; a case whose children did not really run the
+decision it declares exits 1 rather than reporting a success. The observation itself is fixture-only
+([`scripts/lib/synthetic-conversation-worker-observation.mjs`](../../scripts/lib/synthetic-conversation-worker-observation.mjs),
+driven by [`scripts/lib/synthetic-conversation-demo-cases.mjs`](../../scripts/lib/synthetic-conversation-demo-cases.mjs)):
+it observes the children, changes nothing, and is not an enforcement boundary. Its test-only fault hooks
+are reachable from fixture code alone - no operator argument, environment variable or file arms them -
+through [`test/support/synthetic-conversation-demo-fault-driver.mjs`](../../test/support/synthetic-conversation-demo-fault-driver.mjs),
+which terminates the second real child while preserving the first, and
+[`test/support/synthetic-conversation-demo-confidentiality-probe.test.mjs`](../../test/support/synthetic-conversation-demo-confidentiality-probe.test.mjs),
+which the suite runs under `node --test` to observe that assertions over output really carrying the
+planted values report none of them.
 
 ## What these runs are
 
