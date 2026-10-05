@@ -1,12 +1,15 @@
 # Decision 013: One local listener capability, not production identity
 
-Status: proposed; pending explicit human acceptance.
+Status: accepted technical direction by explicit project-owner approval, 2026-10-05.
+The owner authorized the recommended narrow local-access design and implementation;
+this acceptance covers the bounded synthetic milestone below, not production risk or release.
+Implementation is tracked in [#261](https://github.com/Marcus-Levin/hylja/issues/261).
 
 ## Context and authority
 
 A loopback HTTP surface adds an inbound caller to the composed local conversation path.
 Network location cannot confer trust ([security model](../security-model.md#identity-and-access)).
-This proposal narrows access to one local capability; it does not fulfill the production
+This decision narrows access to one local capability; it does not fulfill the production
 caller/workload authentication required by [#21](https://github.com/Marcus-Levin/hylja/issues/21)
 or adopt the [draft gateway slice](../specs/slice-3-openai-compatible-gateway.md).
 Implementation and durable limits belong in [capabilities](../capabilities.md);
@@ -23,7 +26,7 @@ The [conversation](../contracts/openai-local-conversation.md),
 [sender](../contracts/openai-text-sender.md) and
 [receiver](../contracts/openai-keep-receiver.md) retain their contracts unchanged.
 
-## Proposed decision
+## Decision
 
 1. One listener binds literal `127.0.0.1`, one host-provisioned random bearer capability,
    and one pinned host context: subject, tenant/project/session, purpose, profile,
@@ -71,13 +74,16 @@ Whole-message masking proves privacy mechanics, not reasoning utility.
 
 Listener before [#17](https://github.com/Marcus-Levin/hylja/issues/17) is a bounded proof
 choice: irreversible KEEP/MASK resolves no mappings. Parent #21 dependencies remain unchanged.
-The [proposed child brief](../development/proposals/2026-10-05/local-listener.md) is not
-an authorized live issue and cannot wire this record into runtime while it is proposed.
+The [planning brief](../development/proposals/2026-10-05/local-listener.md) remains a
+historical proposal, not the live task authority. The admitted child issue supplies runtime
+scope, prerequisites and acceptance; this record changes no runtime behavior by itself.
 
-## Single human decision and proposed product success
+## Acceptance scope and intended product proof
 
-Accept or decline only this narrowly described local-capability access model, explicitly
-excluding production identity and inspection authority. No adoption is recorded here.
+The owner's approval adopts only this narrowly described local-capability access model,
+explicitly excluding production identity and inspection authority. Implementation still needs
+behavior-first evidence, independent exact-head review and green CI; merge needs explicit
+authorization. The draft slice and proposed decision 010 remain unadopted.
 Success would be one non-streamed OpenAI-shaped HTTP client completing a guarded exchange
 against a synthetic loopback upstream within the intersection of pinned evidence windows,
 not a long-lived operational gateway. This child proves neither a real OpenAI SDK nor
