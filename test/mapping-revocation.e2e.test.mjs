@@ -124,6 +124,34 @@ function createBackend() {
   } };
 }
 
+/**
+ * A delegating view of the real registry, so a test can count or fault the seam calls this owner
+ * actually made. The owner binds the view's own `current` and `transition` at construction, exactly
+ * as it binds the real registry object's, so the view is the object it must call through.
+ */
+function countingRegistry(registry, { afterCurrent, wrapTransition } = {}) {
+  const counters = { current: 0, transition: 0 };
+  const view = { version: 1,
+    current: (...args) => {
+      counters.current += 1;
+      const answer = registry.current(...args);
+      if (typeof afterCurrent === 'function') afterCurrent(counters.current, answer);
+      return answer;
+    },
+    transition: (...args) => {
+      counters.transition += 1;
+      return typeof wrapTransition === 'function' ? wrapTransition(...args) : registry.transition(...args);
+    } };
+  return { view, counters };
+}
+
+/** The racing mutation a queued callback performs: the same transition this owner just applied. */
+function competitor(built) {
+  return built.scenario.registry.transition({ version: 1, mappingRef: built.scenario.mappingRef,
+    scope: { ...built.scenario.scope }, expectedRevision: built.scenario.revision, action: 'REVOKE' },
+  { now: NOW });
+}
+
 /* ---------- The two trusted hosts ---------- */
 
 /** The `USE` host over the real registry, audit substrate, policy and AEAD material. */
@@ -187,9 +215,13 @@ function createRevocationHost({ scenario, ledger, auditContext, overrides = {}, 
     authority: () => {
       counters.authority += 1;
       if (typeof hooks.onAuthority === 'function') hooks.onAuthority(counters.authority, fixture);
+      // `authorityScope` overrides the decision's own scope only; the context it carries stays at
+      // the bound scope. That separation is what makes a foreign or absent decision scope
+      // observable at all: a host cannot hide a foreign scope behind a matching context.
       const answer = { version: 1, subject: { ...state.subject },
         context: { ...state.scope, purpose: state.purpose }, decision: state.decision,
-        role: state.role, mappingRef: state.mappingRef, scope: { ...state.scope },
+        role: state.role, mappingRef: state.mappingRef,
+        scope: Object.hasOwn(state, 'authorityScope') ? state.authorityScope : { ...state.scope },
         revision: state.revision, expiresAt: state.expiresAt, now: state.now };
       return Object.hasOwn(state, 'extra') ? { ...answer, ...state.extra } : answer;
     },
@@ -432,6 +464,67 @@ test('an administrator whose audit actor is not recorded authorizes nothing', as
   assert.equal(revokeEvidence(built.ledger).length, 0);
 });
 
+test('an audit ledger or context outside the bound scope authorizes nothing', async () => {
+  const built = fullScenario();
+  const foreignLedger = createInMemoryAuditLedger(
+    { tenantId: FOREIGN_SCOPE.tenantId, projectId: FOREIGN_SCOPE.projectId });
+  const { view, counters } = countingRegistry(built.scenario.registry);
+  // Genuine A authority, the real A registry and a real B stream with a matching B context: only the
+  // audit destination is foreign, and every one of those values is honest on its own terms.
+  const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view,
+    audit: { ledger: foreignLedger, context: adminContext(FOREIGN_SCOPE), components: COMPONENTS } });
+
+  assert.equal((await owner.revoke()).code, 'WITHHELD');
+  // The refusal costs nothing: no host callback, no registry seam call, and no event in either
+  // stream - A's revocation is never written into B's ledger, and B's ledger stays empty.
+  assert.equal(built.revocation.counters.authority, 0);
+  assert.deepEqual(counters, { current: 0, transition: 0 });
+  assert.deepEqual(lifecycleOf(built.scenario), { state: 'ACTIVE', revision: built.scenario.revision });
+  assert.equal(foreignLedger.entries.length, 0);
+  assert.equal(revokeEvidence(built.ledger).length, 0);
+
+  // The positive control over the same authority, the same registry and the matching A stream.
+  assert.equal((await createBoundMappingRevocation(built.revocation.host).revoke()).code, 'REVOKED');
+  assert.deepEqual(lifecycleOf(built.scenario), { state: 'ABSENT', revision: undefined,
+    finding: 'NOT_LIVE' });
+});
+
+test('a trusted context whose scope moves off the bound scope refuses before the mutation', async () => {
+  const built = fullScenario({ hooks: { onAuthority: (n, fixture) => {
+    // The trusted context is host-owned and mutable, and the scope the append is handed is an owned
+    // snapshot taken at capture, so this move cannot rewrite the intent already recorded. The guard
+    // re-reads the live context inside the final continuation and refuses before anything it would
+    // misattribute is written.
+    if (n === 2) fixture.auditContext.scope.tenantId = 'tenant-revocation-gamma.invalid';
+  } } });
+  const owner = createBoundMappingRevocation(built.revocation.host);
+
+  assert.equal((await owner.revoke()).code, 'WITHHELD');
+  assert.deepEqual(lifecycleOf(built.scenario), { state: 'ACTIVE', revision: built.scenario.revision });
+  const evidence = revokeEvidence(built.ledger);
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].reason, 'RESOLUTION_AUTHORIZED');
+  // The intent that was already committed stays in the stream it belongs to.
+  assert.equal(evidence[0].scope.tenantId, SCOPE.tenantId);
+  assert.equal(evidence[0].scope.projectId, SCOPE.projectId);
+});
+
+test('a decision whose own scope is foreign or absent refuses with zero mutation', async () => {
+  for (const authorityScope of [{ ...FOREIGN_SCOPE }, null, 'not-a-scope.invalid']) {
+    const built = fullScenario();
+    const { view, counters } = countingRegistry(built.scenario.registry);
+    const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+    // The decision's own scope moves; the context it carries stays bound to A, so a host cannot
+    // answer for B while pointing at A's context.
+    built.revocation.state.authorityScope = authorityScope;
+
+    assert.equal((await owner.revoke()).code, 'WITHHELD');
+    assert.equal(counters.transition, 0);
+    assert.deepEqual(lifecycleOf(built.scenario), { state: 'ACTIVE', revision: built.scenario.revision });
+    assert.equal(revokeEvidence(built.ledger).length, 0);
+  }
+});
+
 /* ---------- 4. Audit outages on both sides of the mutation ---------- */
 
 test('an audit outage before the mutation withholds and leaves the mapping ACTIVE', async () => {
@@ -471,7 +564,96 @@ test('a fault recording the applied result stays revoked and never reports audit
     assert.equal(built.backend.state.calls, 0);
   });
 
-/* ---------- 5. Captured methods, receivers and the sealed segment ---------- */
+/* ---------- 5. What the registry actually answered ---------- */
+
+test('a mutation that applied and then failed is UNRECORDED and never claims WITHHELD', async () => {
+  for (const fault of ['throw', 'malformed-scope', 'throwing-getter']) {
+    const built = fullScenario();
+    const registry = built.scenario.registry;
+    const { view, counters } = countingRegistry(registry, { wrapTransition: (request, clock) => {
+      // The real transition is applied first, so the record really is terminal when the fault lands.
+      // Once the mutation has been attempted, uncertainty is the only honest answer: a `WITHHELD`
+      // here would claim zero mutation for a record the registry already moved.
+      const applied = registry.transition(request, clock);
+      if (fault === 'throw') throw new Error('synthetic post-mutation fault');
+      if (fault === 'malformed-scope') {
+        return { version: 1, state: 'CHANGED', metadata: { ...applied.metadata, scope: null } };
+      }
+      const metadata = { ...applied.metadata };
+      Object.defineProperty(metadata, 'scope', { enumerable: true,
+        get() { throw new Error('synthetic scope fault'); } });
+      return { version: 1, state: 'CHANGED', metadata };
+    } });
+    const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+
+    const result = await owner.revoke();
+    fixedShape(result);
+    assert.equal(result.code, 'UNRECORDED');
+    assert.equal(result.code === 'WITHHELD', false);
+    assert.equal(counters.transition, 1);
+    // The registry's own record is terminal: the mapping really was revoked and nothing revives it.
+    assert.deepEqual(lifecycleOf(built.scenario), { state: 'ABSENT', revision: undefined,
+      finding: 'NOT_LIVE' });
+    // Intent only: an application this owner cannot confirm is never recorded as a success.
+    const evidence = revokeEvidence(built.ledger);
+    assert.equal(evidence.length, 1);
+    assert.equal(evidence[0].reason, 'RESOLUTION_AUTHORIZED');
+    assert.equal(evidence.some((event) => event.outcome === 'APPLIED'), false);
+  }
+});
+
+test('an unconfirmed registry answer is UNRECORDED and records no applied evidence', async () => {
+  const built = fullScenario();
+  const registry = built.scenario.registry;
+  const { view, counters } = countingRegistry(registry, { wrapTransition: (request, clock) => {
+    // The record the registry really holds is reported back as an unchanged application: the seam
+    // claims nothing was applied and nothing was, so uncertainty is still the honest answer.
+    const live = registry.current({ version: 1, mappingRef: request.mappingRef,
+      scope: request.scope }, clock);
+    return { version: 1, state: 'UNCHANGED', metadata: live.metadata };
+  } });
+  const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+
+  const result = await owner.revoke();
+  fixedShape(result);
+  assert.equal(result.code, 'UNRECORDED');
+  assert.equal(counters.transition, 1);
+  assert.deepEqual(lifecycleOf(built.scenario), { state: 'ACTIVE', revision: built.scenario.revision });
+  const evidence = revokeEvidence(built.ledger);
+  assert.deepEqual(evidence.map((event) => event.outcome), ['ALLOWED']);
+  assert.equal(evidence[0].reason, 'RESOLUTION_AUTHORIZED');
+});
+
+test('a genuine registry refusal is WITHHELD with intent-only evidence and no applied event',
+  async () => {
+    const built = fullScenario();
+    const registry = built.scenario.registry;
+    const answers = [];
+    const { view, counters } = countingRegistry(registry, { wrapTransition: (request, clock) => {
+      // A competitor applies the same transition through the same registry first, so this owner's
+      // compare-and-set is answered by the shipped registry with its own refusal, not a planted one.
+      answers.push(registry.transition(request, clock), registry.transition(request, clock));
+      return answers[1];
+    } });
+    const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+
+    const result = await owner.revoke();
+    fixedShape(result);
+    assert.equal(result.code, 'WITHHELD');
+    assert.equal(counters.transition, 1);
+    // Both answers are the shipped registry's own, and the second confirms it applied nothing.
+    assert.equal(answers[0].state, 'CHANGED');
+    assert.equal(answers[1].state, 'REFUSED');
+    assert.equal(answers[1].reason, 'STALE_REVISION');
+    // The tombstone is the competitor's; this owner recorded its intent and no applied success.
+    assert.deepEqual(lifecycleOf(built.scenario), { state: 'ABSENT', revision: undefined,
+      finding: 'NOT_LIVE' });
+    const evidence = revokeEvidence(built.ledger);
+    assert.deepEqual(evidence.map((event) => event.outcome), ['ALLOWED']);
+    assert.equal(evidence[0].reason, 'RESOLUTION_AUTHORIZED');
+  });
+
+/* ---------- 6. Captured methods, receivers and the sealed segment ---------- */
 
 test('a transition method replaced after construction is never invoked', async () => {
   const built = fullScenario();
@@ -520,25 +702,79 @@ test('an authority callback that throws or answers with a boolean refuses with z
     }
   });
 
-test('a revocation queued by a host callback cannot land between the last guard and the mutation',
+test('a denial or an expiry queued at the last guard refuses before the mutation', async () => {
+  for (const queued of [(state) => { state.decision = 'DENY'; },
+    (state) => { state.expiresAt = state.now; }]) {
+    const built = fullScenario({ hooks: { onAuthority: (n, fixture) => {
+      // Queued on the final observation: the answer this owner acts on is normalized and fully
+      // guarded in the continuation that reads it, so a decision revoked or expired while that
+      // answer was pending still withholds - the authority cannot be stale at the mutation.
+      if (n === 2) queued(fixture.state);
+    } } });
+    const owner = createBoundMappingRevocation(built.revocation.host);
+
+    assert.equal((await owner.revoke()).code, 'WITHHELD');
+    // Exactly two observations: the initial one and the last awaited answer.
+    assert.equal(built.revocation.counters.authority, 2);
+    assert.deepEqual(lifecycleOf(built.scenario), { state: 'ACTIVE', revision: built.scenario.revision });
+    const evidence = revokeEvidence(built.ledger);
+    assert.equal(evidence.length, 1);
+    assert.equal(evidence[0].reason, 'RESOLUTION_AUTHORIZED');
+  }
+});
+
+test('a revocation queued by a host callback is observed before the mutation and never claimed',
   async () => {
+    const raced = { queued: 0, answer: undefined };
     const built = fullScenario({ hooks: { onAuthority: (n) => {
-      // Queued on the final observation: the sealed continuation runs the last registry guard and
-      // the compare-and-set with no await and no host property read between them, so this racing
-      // mutation never gets in and the owner's own CAS is the one that applies.
-      if (n === 3) {
-        queueMicrotask(() => {
-          built.scenario.registry.transition({ version: 1, mappingRef: built.scenario.mappingRef,
-            scope: { ...built.scenario.scope }, expectedRevision: built.scenario.revision,
-            action: 'REVOKE' }, { now: NOW });
-        });
+      // Queued by the last authority answer: the awaited answer resumes only after the microtask
+      // queue drains, so this racing mutation has already moved the record by the time the final
+      // guards run - and the owner's own compare-and-set is never reached.
+      if (n === 2) {
+        raced.queued += 1;
+        queueMicrotask(() => { raced.answer = competitor(built); });
       }
     } } });
     const owner = createBoundMappingRevocation(built.revocation.host);
 
-    assert.equal((await owner.revoke()).code, 'REVOKED');
+    const result = await owner.revoke();
+    fixedShape(result);
+    assert.equal(result.code, 'WITHHELD');
+    // The trigger really fired, on the final observation and exactly once, and its real transition
+    // really applied.
+    assert.equal(raced.queued, 1);
+    assert.equal(built.revocation.counters.authority, 2);
+    assert.equal(raced.answer.state, 'CHANGED');
     assert.deepEqual(lifecycleOf(built.scenario), { state: 'ABSENT', revision: undefined,
       finding: 'NOT_LIVE' });
+    // The tombstone is the competitor's: this owner recorded its intent and no applied success.
+    const evidence = revokeEvidence(built.ledger);
+    assert.deepEqual(evidence.map((event) => event.outcome), ['ALLOWED']);
+    assert.equal(evidence.some((event) => event.outcome === 'APPLIED'), false);
+  });
+
+test('a revocation queued at the last registry read cannot land between that read and the mutation',
+  async () => {
+    const built = fullScenario();
+    const raced = { queued: 0, answer: undefined };
+    const { view, counters } = countingRegistry(built.scenario.registry, { afterCurrent: (n) => {
+      // Queued by the last registry read of the whole call: the final guard and the compare-and-set
+      // share one continuation, so this racing mutation is queued behind the entire effect rather
+      // than inside it.
+      if (n === 2) {
+        raced.queued += 1;
+        queueMicrotask(() => { raced.answer = competitor(built); });
+      }
+    } });
+    const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+
+    assert.equal((await owner.revoke()).code, 'REVOKED');
+    assert.deepEqual(counters, { current: 2, transition: 1 });
+    assert.equal(raced.queued, 1);
+    assert.deepEqual(lifecycleOf(built.scenario), { state: 'ABSENT', revision: undefined,
+      finding: 'NOT_LIVE' });
+    assert.equal(raced.answer.state, 'REFUSED');
+    assert.equal(raced.answer.state === 'CHANGED', false);
   });
 
 test('an overlapping call is refused immediately, before any host call', async () => {
@@ -550,7 +786,7 @@ test('an overlapping call is refused immediately, before any host call', async (
   assert.equal((await held).code, 'REVOKED');
 });
 
-/* ---------- 6. Construction, privacy and the module's own silence ---------- */
+/* ---------- 7. Construction, privacy and the module's own silence ---------- */
 
 test('an unusable host is refused at construction with one fixed TypeError', () => {
   const built = fullScenario();

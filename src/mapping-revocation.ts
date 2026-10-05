@@ -22,26 +22,39 @@
  *      method, the registry object with its `current` and `transition` methods, and the audit
  *      substrate. A method re-pointed, swapped or re-targeted afterwards is never invoked, and the
  *      host callback runs with the host as its receiver;
- *   2. observe one coherent current administrative authority; require the bound scope and the
- *      pinned administrative purpose, require the closed role and `ALLOW`, and require the pinned
- *      reference and an unexpired decision;
+ *   2. observe one coherent current administrative authority; require its own scope **and** the scope
+ *      its context carries to be the bound scope, and require the bound reference, the pinned
+ *      administrative purpose, the closed role, `ALLOW`, a monotonic clock, an unexpired decision
+ *      and a pinned revision;
  *   3. require the audit substrate's recorded actor to be this authenticated administrative subject,
- *      and capture that identity as an owned immutable snapshot congruent with the ledger's;
+ *      and require both the ledger and the trusted context to carry the bound tenant/project, so a
+ *      revocation is never written into a foreign stream. That identity and scope are captured as an
+ *      owned immutable snapshot the append is actually handed;
  *   4. read the real registry `current`; require `FOUND` and `ACTIVE` and take the pinned revision
- *      from that read, so the compare-and-set is decided by the registry's own record;
+ *      from that read as an owned copy rather than a live host object, so the compare-and-set is
+ *      decided by the registry's own record;
  *   5. record the authorized intent through the real `appendAuditEvent` and gate it on
  *      `gateHighRiskEffect` applied to the value `appendAuditEvent` itself returned. An audit
  *      outage here withholds **before** the mutation, so nothing is revoked without evidence;
- *   6. re-observe after every external callback: the authority answer, the live audit actor and the
- *      registry read are the host-owned reads of each pass, and the fresh registry read is the last
- *      of them;
- *   7. the last answer this call awaits is the final authority observation. From the continuation
- *      that reads it, the whole final guard and the mutation run **in that same continuation**:
- *      there is no `await` at all between the last registry guard and the registry `transition`, so
- *      nothing a host callback queues can land between them;
- *   8. record the applied result through the real `appendAuditEvent` and gate it the same way. A
- *      fault here is `UNRECORDED`: the mapping stays revoked, nothing is revived, and no audited
- *      success is claimed.
+ *   6. await the raw authority answer exactly once more. That answer is the last thing this call
+ *      awaits, and the continuation that reads it is the one that normalizes it and runs the whole
+ *      final guard set - authority, congruence, live actor, live audit scope, then a fresh registry
+ *      `current` **last** - followed by the captured compare-and-set. There is no `await`, no host
+ *      property lookup and no dynamic function lookup anywhere in that continuation, so nothing a
+ *      host callback queues - a denial, an expiry, a rotation, a deletion, a swapped record - can
+ *      land between the last guard and the mutation;
+ *   7. mark the mutation attempted immediately before invoking `transition`, so from that instant on
+ *      no fault can leave through a path that claims zero mutation, and record the applied result
+ *      only after the registry confirmed it, gated the same way. A fault after an attempted mutation
+ *      is `UNRECORDED`: the mapping stays revoked, nothing is revived, and no audited success is
+ *      claimed.
+ *
+ * The registry's actual answer shapes are what the applied evidence is built from: a confirmed
+ * `{version: 1, state: 'REFUSED', reason}` is the registry confirming that it applied nothing, so
+ * that call is `WITHHELD` with no applied event; only a confirmed `CHANGED` carrying the bound
+ * reference and scope, `REVOKED`, at exactly the pinned revision plus one earns `APPLIED`; and a
+ * throw, a malformed answer, or any unconfirmed application - including `UNCHANGED` - is
+ * `UNRECORDED` with no applied event.
  *
  * Retry and idempotency semantics are the **registry's own**, and this module adds none. The
  * registry is monotonic: the first successful call moves the record to `REVOKED` at
@@ -65,13 +78,17 @@
  * - **Not authentication and not separation of duties enforced.** Every identity, role, purpose,
  *   clock and decision proof is a trusted obligation of the host. This module checks congruence and
  *   currentness; it cannot check that the decision really came from an authorization service.
+ * - **Not audit durability and not cross-coordinator coherence.** Each call checks its own captured
+ *   ledger, its own context and the registry state it reads; what another coordinator did at the
+ *   same instant is the registry's compare-and-set to answer, not this module's.
  * - **Not the parent #18 acceptance.** Integrated lifecycle, durable encrypted storage, an
  *   authenticated service, recovery and key destruction all stay open.
  * - **Not a protected-egress claim.** No byte leaves this process and no plaintext exists here.
  */
 import { AUDIT_BUNDLE_COMPONENTS, appendAuditEvent, gateHighRiskEffect } from './audit-ledger.js';
 import type { AuditBundleComponent, AuditLedger, AuditTrustedContext } from './audit-ledger.js';
-import type { MappingMetadataRecord, MappingMetadataRegistry } from './mapping-metadata-registry.js';
+import { MAPPING_METADATA_REASONS } from './mapping-metadata-registry.js';
+import type { MappingMetadataRegistry } from './mapping-metadata-registry.js';
 import type { WorkloadSubject } from './mapping-authorization.js';
 import type { RequestContext } from './interaction-envelope.js';
 
@@ -250,15 +267,64 @@ function scopeOf(value: unknown): MappingRevocationScope {
   return Object.freeze({ tenantId: text(v.tenantId, 256), projectId: text(v.projectId, 256),
     sessionId: text(v.sessionId, 256) });
 }
+/** A scope that must carry the bound tenant, project and session; `projectId` may be absent. */
+function withinBound(observed: { tenantId: string; projectId?: string; sessionId?: string },
+  bound: MappingRevocationScope): boolean {
+  return observed.tenantId === bound.tenantId && observed.projectId === bound.projectId &&
+    observed.sessionId === bound.sessionId;
+}
+
+/**
+ * The tenant/project projection of one audit destination. The ledger and the trusted context each
+ * carry one, and both must be the bound projection before anything is written: the append itself
+ * only checks the two against each other, so without this a genuine decision for A would be recorded
+ * into a foreign stream while the real A record was revoked.
+ */
+interface AuditScopeClaim { readonly tenantId: string; readonly projectId: string | null }
+function auditScope(value: unknown): AuditScopeClaim {
+  const v = fields(value, ['tenantId'], ['projectId']);
+  return Object.freeze({ tenantId: text(v.tenantId, 256),
+    projectId: Object.hasOwn(v, 'projectId') ? text(v.projectId, 256) : null });
+}
+function withinAuditScope(claim: AuditScopeClaim, bound: MappingRevocationScope): boolean {
+  return claim.tenantId === bound.tenantId && claim.projectId === bound.projectId;
+}
+
+/**
+ * One owned, immutable copy of a registry record's own identity. The guards read this, never the
+ * live host object, so a record whose fields are edited or trapped after the read cannot change
+ * what a later guard in the same continuation compares.
+ */
+interface OwnedRecord {
+  readonly mappingRef: string;
+  readonly scope: MappingRevocationScope;
+  readonly revision: number;
+}
+function ownedRecord(value: unknown, mappingRef: string, bound: MappingRevocationScope,
+  expected: 'ACTIVE' | 'REVOKED', denial: Denial): OwnedRecord {
+  const v = fields(value, ['version', 'mappingRef', 'scope', 'state', 'revision', 'createdAt',
+    'expiresAt']);
+  if (v.version !== 1 || v.state !== expected) fail(denial);
+  const recordScope = scopeOf(v.scope);
+  if (text(v.mappingRef, 256) !== mappingRef || !withinBound(recordScope, bound)) {
+    fail('SCOPE_MISMATCH');
+  }
+  // `createdAt` and `expiresAt` are required keys and are normalized here once, so a record that
+  // cannot be read whole is refused rather than partially accepted.
+  const createdAt = instant(v.createdAt);
+  const expiresAt = instant(v.expiresAt);
+  if (createdAt >= expiresAt) fail('INVALID_AUTHORITY');
+  return Object.freeze({ mappingRef, scope: recordScope, revision: revision(v.revision) });
+}
 
 /**
  * One owned, immutable copy of the audit actor identity. The ledger takes the actor from the trusted
  * context, so this module owns the value it hands over: a host that mutates its own actor object
  * mid-flight cannot re-attribute a revocation this module recorded.
  *
- * The **whole** read is normalized as one guard, because this runs inside the sealed segment, where
- * the live actor is the last host-owned read before the fresh registry read; a trap raised by a
- * hostile actor object there is one refusal like any other, never an escape.
+ * The **whole** read is normalized as one guard, because this also runs inside the sealed segment,
+ * where the live actor is a host-owned read; a trap raised by a hostile actor object there is one
+ * refusal like any other, never an escape.
  */
 interface AuditActor { readonly principalId: string; readonly workloadId?: string }
 function auditActor(value: AuditTrustedContext): AuditActor {
@@ -396,96 +462,122 @@ interface Observation {
   subject: WorkloadSubject;
   context: RequestContext;
   decision: MappingRevocationDecision;
+  role: MappingRevocationRole;
   revision: number;
   expiresAt: number;
 }
+/** The one mutable fact this call owns: once it is set, no fault may claim zero mutation again. */
+interface Phase { attempted: boolean }
 
 /**
  * Carries this call's own view of the fixed bindings: the host callback runs with the host as its
- * receiver, and the audit identity and frozen context the append is handed are read here. The
- * registry's `current` and `transition` are **not** read here: they were bound once at construction,
- * so this module reads no property of the host or of its registry again at any later point, and in
- * particular none between the last guard below and the mutation.
+ * receiver, and the audit identity, scope and frozen context the append is handed are owned here.
+ * The registry's `current` and `transition` are **not** read here: they were bound once at
+ * construction, so this module reads no property of the host or of its registry again at any later
+ * point, and in particular none between the last guard and the mutation.
+ *
+ * The audit destination is settled here, before the first host callback: the ledger and the trusted
+ * context must both carry the bound tenant/project, because the append itself only checks them
+ * against each other and would happily record this reference into a foreign stream.
  */
 function capture(fixed: FixedBindings): Captured {
-  const actor = auditActor(fixed.audit.context);
+  const { ledger, context: trusted } = fixed.audit;
+  const ledgerScope = attempt(() => auditScope(ledger.scope));
+  const contextScope = attempt(() => auditScope(trusted.scope));
+  if (!withinAuditScope(ledgerScope, fixed.scope) || !withinAuditScope(contextScope, fixed.scope)) {
+    fail('SCOPE_MISMATCH');
+  }
+  const actor = auditActor(trusted);
   return Object.freeze({
     fixed,
     host: fixed.host,
     authority: attempt(() => fixed.authority),
     actor,
-    auditContext: Object.freeze({ ...fixed.audit.context, actor }),
+    auditContext: Object.freeze({ ...trusted, actor,
+      scope: Object.freeze({ tenantId: contextScope.tenantId,
+        ...(contextScope.projectId === null ? {} : { projectId: contextScope.projectId }) }) }),
   });
 }
 
 /**
- * One coherent administrative authority observation, normalized once.
- *
- * The bound scope is a structural gate and the pinned administrative purpose is a second one: a
- * decision issued for any other purpose - including the purpose a `USE` grant would carry - never
- * reaches the registry. The decision is the closed `ALLOW`/`DENY` value inside this complete shape;
- * a bare boolean, a missing field, an unknown field, a foreign role, a decision naming another
- * reference or another scope, a stale pinned revision or an expired decision is refused, and each of
- * those refusals carries no detail back.
+ * Awaits the host's raw authority answer, and returns it **raw**. This is the only suspension point
+ * of the whole call, and it is entered twice: the first answer is normalized where it is read, the
+ * last one inside the sealed continuation that read it.
  */
-async function observe(captured: Captured): Promise<Observation> {
-  const raw = await ask(() => invoke(captured.authority, captured.host, []));
+async function askAuthority(captured: Captured): Promise<unknown> {
+  return await ask(() => invoke(captured.authority, captured.host, []));
+}
+
+/**
+ * One raw administrative authority answer, normalized once into owned values.
+ *
+ * This is synchronous on purpose: the last awaited answer of a call is normalized in the very
+ * continuation that read it, so no guard ever runs against an answer that is no longer the one this
+ * owner is acting on. The bound scope is checked twice and independently - once on the decision's
+ * own `scope` and once on the scope its `context` carries - and the pinned administrative purpose,
+ * bound reference, closed role, `ALLOW`, monotonic clock and unexpired decision are each required.
+ * A bare boolean, a missing or unknown field, a foreign role, a decision naming another reference
+ * or another scope, a stale pinned revision and an expired decision are all one refusal, and each
+ * carries no detail back.
+ */
+function normalize(raw: unknown, fixed: FixedBindings): Observation {
   const v = fields(raw, ['version', 'subject', 'context', 'decision', 'role', 'mappingRef', 'scope',
     'revision', 'expiresAt', 'now']);
   if (v.version !== 1) fail('INVALID_AUTHORITY');
+  const bound = fixed.scope;
   const observed = context(v.context);
-  const bound = captured.fixed.scope;
-  if (observed.tenantId !== bound.tenantId || observed.projectId !== bound.projectId ||
-    observed.sessionId !== bound.sessionId) fail('SCOPE_MISMATCH');
+  if (!withinBound(observed, bound)) fail('SCOPE_MISMATCH');
+  // The decision's own scope is validated on its own, never through the context beside it.
+  if (!withinBound(scopeOf(v.scope), bound)) fail('SCOPE_MISMATCH');
   // The purpose is bound at construction: only the administrative purpose may authorize this owner.
-  if (observed.purpose !== captured.fixed.adminPurpose) fail('SCOPE_MISMATCH');
-  if (text(v.mappingRef, 256) !== captured.fixed.mappingRef) fail('NOT_CONGRUENT');
+  if (observed.purpose !== fixed.adminPurpose) fail('SCOPE_MISMATCH');
+  if (text(v.mappingRef, 256) !== fixed.mappingRef) fail('NOT_CONGRUENT');
   const decision = member(v.decision, MAPPING_REVOCATION_DECISIONS);
-  if (member(v.role, MAPPING_REVOCATION_ROLES) === undefined) fail('INVALID_AUTHORITY');
-  if (decision !== 'ALLOW') fail('NOT_AUTHORIZED');
+  const role = member(v.role, MAPPING_REVOCATION_ROLES);
+  if (decision !== 'ALLOW' || role !== 'MAPPING_ADMIN') fail('NOT_AUTHORIZED');
   const now = instant(v.now);
   const expiresAt = instant(v.expiresAt);
   if (now >= expiresAt) fail('NOT_AUTHORIZED');
-  return Object.freeze({ now, subject: subject(v.subject), context: observed, decision,
+  return Object.freeze({ now, subject: subject(v.subject), context: observed, decision, role,
     revision: revision(v.revision), expiresAt });
 }
 
 /**
  * The recorded actor must be the authenticated administrative subject, and must still be that actor.
  * The ledger takes the actor from its trusted context and never from a draft, so this module hands
- * the append its own frozen snapshot of that actor; the host's live actor is re-read at every
- * recheck and a host that swaps its actor mid-flight is refused before anything it would
- * misattribute is written.
+ * the append its own frozen snapshot of that actor; the host's live actor and the live ledger and
+ * context scopes are re-read at this guard, which runs both before the intent append and inside the
+ * sealed continuation. A host that swaps its actor or moves either scope mid-flight is refused
+ * before anything it would misattribute is written.
  */
-function bindAuditActor(captured: Captured, observed: Observation): void {
+function bindAudit(captured: Captured, observed: Observation): void {
   const actor = captured.actor;
   if (actor.principalId !== observed.subject.principalId ||
     (actor.workloadId ?? null) !== observed.subject.workloadId) fail('AUDIT_ACTOR');
-  const live = auditActor(captured.fixed.audit.context);
+  const { ledger, context: trusted } = captured.fixed.audit;
+  const live = auditActor(trusted);
   if (live.principalId !== actor.principalId || (live.workloadId ?? null) !== (actor.workloadId ?? null)) {
     fail('AUDIT_ACTOR');
   }
+  const bound = captured.fixed.scope;
+  if (!withinAuditScope(attempt(() => auditScope(trusted.scope)), bound) ||
+    !withinAuditScope(attempt(() => auditScope(ledger.scope)), bound)) fail('SCOPE_MISMATCH');
 }
 
 /**
  * A real registry read. Only a `FOUND` record reaches anything else, and only an `ACTIVE` one can be
  * revoked: a tombstone is already terminal, so a repeat call is refused with zero mutation instead
- * of claiming a second effect.
+ * of claiming a second effect. What this returns is an owned copy of the record's own identity, so
+ * a later guard in the same continuation compares values this module holds, not a live host object.
  */
-function liveRecord(captured: Captured, now: number): MappingMetadataRecord {
+function liveRecord(captured: Captured, now: number): OwnedRecord {
   const { registry, readCurrent, mappingRef, scope } = captured.fixed;
   return attempt(() => {
     const found = invoke(readCurrent, registry, [{ version: 1, mappingRef,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId } },
     { now }]);
     if (found === null || typeof found !== 'object' || found.state !== 'FOUND') fail('NOT_CURRENT');
-    const record = found.metadata as MappingMetadataRecord;
-    if (record === null || typeof record !== 'object' || record.state !== 'ACTIVE') fail('NOT_ACTIVE');
-    const recordScope = fields(record.scope, ['tenantId', 'projectId', 'sessionId']);
-    if (text(record.mappingRef, 256) !== mappingRef || text(recordScope.tenantId, 256) !== scope.tenantId ||
-      text(recordScope.projectId, 256) !== scope.projectId ||
-      text(recordScope.sessionId, 256) !== scope.sessionId) fail('SCOPE_MISMATCH');
-    return record;
+    return ownedRecord(found.metadata, mappingRef, scope, 'ACTIVE', 'NOT_ACTIVE');
   });
 }
 
@@ -495,7 +587,9 @@ function congruent(observed: Observation, previous: Observation): void {
   if (observed.subject.principalId !== previous.subject.principalId ||
     (observed.subject.workloadId ?? null) !== (previous.subject.workloadId ?? null) ||
     observed.context.purpose !== previous.context.purpose ||
-    observed.decision !== previous.decision) fail('NOT_CONGRUENT');
+    observed.decision !== previous.decision || observed.role !== previous.role) {
+    fail('NOT_CONGRUENT');
+  }
   if (observed.revision !== previous.revision) fail('SUPERSEDED');
 }
 
@@ -531,87 +625,107 @@ function appendLifecycle(captured: Captured, now: number, phase: 'intent' | 'app
 /**
  * The whole ordered path, and the sealed mutation segment at its end.
  *
- * The last answer this call awaits is the final authority observation. Everything below that line is
- * one synchronous continuation: `sealed` runs the entire final guard and then the registry
- * mutation, with no await, no host property lookup and no dynamic function lookup between them.
- * Anything a host callback queues - a rotation, a deletion, a swapped record - can therefore no
- * longer land between the last registry guard and the compare-and-set.
+ * The last answer this call awaits is the **raw** authority answer, not a normalized observation:
+ * `sealed` normalizes it and runs the entire final guard and then the registry mutation in the one
+ * continuation that read it, with no await, no host property lookup and no dynamic function lookup
+ * between them. Anything a host callback queues - a denial, an expiry, a rotation, a deletion, a
+ * swapped record - can therefore no longer land between the last registry guard and the
+ * compare-and-set.
  *
  * A reflection, enumeration or index fault out of a host value anywhere in here is one refusal -
- * `WITHHELD`, claiming zero mutation - and never an escaped exception.
+ * `WITHHELD`, claiming zero mutation - and never an escaped exception. Once `phase.attempted` is
+ * set that is no longer available: the honest answer is `UNRECORDED`.
  */
 async function prepare(fixed: FixedBindings): Promise<MappingRevocationResult> {
+  const phase: Phase = { attempted: false };
   try {
     const captured = capture(fixed);
-    const first = await observe(captured);
-    bindAuditActor(captured, first);
-    const record = liveRecord(captured, first.now);
+    const first = normalize(await askAuthority(captured), fixed);
+    bindAudit(captured, first);
+    const pinned = liveRecord(captured, first.now).revision;
     // The compare-and-set is pinned to the revision this call's own fresh registry read observed.
-    let previous = first;
-    let pinned = revision(record.revision);
-    if (previous.revision !== pinned) fail('SUPERSEDED');
+    if (first.revision !== pinned) fail('SUPERSEDED');
 
     // Audit outage before the mutation withholds: nothing is revoked without recorded intent.
-    appendLifecycle(captured, previous.now, 'intent');
+    appendLifecycle(captured, first.now, 'intent');
 
-    previous = await recheck(captured, previous);
-    const applied = sealed(captured, previous, pinned);
-    // The applied result is recorded after the mutation and never before it: a fault here leaves the
-    // mapping revoked and reports `UNRECORDED`, which revives nothing and claims no audited success.
-    try {
-      appendLifecycle(captured, previous.now, 'applied');
-    } catch {
-      return UNRECORDED;
-    }
-    return applied;
+    return sealed(captured, first, normalize(await askAuthority(captured), fixed), pinned, phase);
   } catch (error) {
+    // The mutation segment has been reached, so nothing claims zero mutation from here on.
+    if (phase.attempted) return UNRECORDED;
     if (isRefusal(error)) throw error;
     return fail('HOST_FAULT');
   }
 }
 
 /**
- * The recheck that runs after every external callback: one fresh authority observation, then the
- * whole guard set, with nothing suspended between the observation and the answer.
+ * The sealed segment: the final guard and the mutation, in the one continuation the last awaited
+ * answer resumed into. The administrative proof, the pinned revision and the intent evidence were all
+ * established while guards could still run; from here the only host object touched is the registry,
+ * through the two methods captured at construction on the object captured at construction.
  */
-async function recheck(captured: Captured, previous: Observation): Promise<Observation> {
-  const observed = await observe(captured);
+function sealed(captured: Captured, previous: Observation, observed: Observation, pinned: number,
+  phase: Phase): MappingRevocationResult {
   congruent(observed, previous);
-  bindAuditActor(captured, observed);
-  const record = liveRecord(captured, observed.now);
-  if (revision(record.revision) !== previous.revision) fail('SUPERSEDED');
-  return observed;
+  bindAudit(captured, observed);
+  // The fresh registry read is the last guard before the mutation, and it is compared as an owned
+  // copy of the record's own identity.
+  if (liveRecord(captured, observed.now).revision !== pinned) fail('SUPERSEDED');
+  return applyRevocation(captured, observed, pinned, phase);
 }
 
 /**
- * The sealed segment: the final guard and the mutation, in the one continuation the last awaited
- * answer resumed into. The administrative proof, the audit identity and the pinned revision were all
- * established while guards could still run, and the only objects touched from here on are the two
- * registry methods captured at construction on the registry object captured at construction.
+ * The mutation segment, and the only place `attempted` is set.
+ *
+ * The registry's own answer shapes decide the code: a closed `REFUSED` is the registry confirming
+ * that it applied nothing, so that call is `WITHHELD`; only a confirmed `CHANGED` carrying the bound
+ * reference and scope, `REVOKED`, at exactly the pinned revision plus one earns an applied event
+ * and `REVOKED`; anything else - a throw, a malformed answer, an `UNCHANGED` repeat, a record that
+ * does not match what was pinned - leaves this owner unable to confirm what happened, so it is
+ * `UNRECORDED`. Nothing is revived, rolled back or second-guessed in any of those cases.
  */
-function sealed(captured: Captured, previous: Observation, pinned: number): MappingRevocationResult {
-  // The live audit actor is the last host-owned read before the fresh registry read, and that read
-  // is the last guard before the mutation. Both are inside the sealed continuation, and a trap
-  // raised by either is still one refusal - `WITHHELD`, zero mutation - not an escaped exception.
-  bindAuditActor(captured, previous);
-  const record = liveRecord(captured, previous.now);
-  if (revision(record.revision) !== pinned) fail('SUPERSEDED');
+function applyRevocation(captured: Captured, observed: Observation, pinned: number,
+  phase: Phase): MappingRevocationResult {
   const { registry, applyTransition, mappingRef, scope } = captured.fixed;
-  const applied = attempt(() => invoke(applyTransition, registry, [{ version: 1, mappingRef,
-    scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId },
-    expectedRevision: pinned, action: 'REVOKE' }, { now: previous.now }]));
-  // From here the mutation segment has been reached, so nothing is claimed as `WITHHELD`: either the
-  // registry's own answer reports the applied revocation, or the answer is `UNRECORDED` - the
-  // mapping is not revived, rolled back or second-guessed, and no audited success is claimed.
-  if (applied === null || typeof applied !== 'object' || applied.state !== 'CHANGED') {
+  let after: OwnedRecord | undefined;
+  let confirmed = false;
+  try {
+    // The mark goes on immediately before the invocation, so no fault raised from the call itself
+    // can still leave through a path that claims zero mutation.
+    phase.attempted = true;
+    const answer = invoke(applyTransition, registry, [{ version: 1, mappingRef,
+      scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId },
+      expectedRevision: pinned, action: 'REVOKE' }, { now: observed.now }]);
+    if (answer === null || typeof answer !== 'object') return UNRECORDED;
+    const reported = (answer as Fields).state;
+    if (reported === 'REFUSED') {
+      // The shipped refusal is closed, so a reason outside its own vocabulary is not a confirmation.
+      const v = fields(answer, ['version', 'state', 'reason']);
+      if (v.version !== 1) return UNRECORDED;
+      member(v.reason, MAPPING_METADATA_REASONS);
+      confirmed = true;
+    } else if (reported === 'CHANGED' || reported === 'UNCHANGED') {
+      const v = fields(answer, ['version', 'state', 'metadata']);
+      if (v.version !== 1) return UNRECORDED;
+      const record = ownedRecord(v.metadata, mappingRef, scope, 'REVOKED', 'INVALID_AUTHORITY');
+      // An `UNCHANGED` repeat is the registry's idempotent answer, not proof that this call applied
+      // the transition, and a revision other than `pinned + 1` is a record this call did not pin.
+      if (reported !== 'CHANGED' || record.revision !== pinned + 1) return UNRECORDED;
+      after = record;
+    } else return UNRECORDED;
+  } catch {
+    // A throw out of the registry, a trap on the returned record, a malformed answer: the attempt
+    // happened, so the honest answer is uncertainty rather than a claim or a refusal.
     return UNRECORDED;
   }
-  const after = applied.metadata as MappingMetadataRecord;
-  if (after === null || typeof after !== 'object' || after.state !== 'REVOKED') return UNRECORDED;
-  const afterScope = fields(after.scope, ['tenantId', 'projectId', 'sessionId']);
-  if (text(after.mappingRef, 256) !== mappingRef || text(afterScope.tenantId, 256) !== scope.tenantId ||
-    text(afterScope.projectId, 256) !== scope.projectId ||
-    text(afterScope.sessionId, 256) !== scope.sessionId ||
-    revision(after.revision) !== pinned + 1) return UNRECORDED;
+  if (confirmed) return WITHHELD;
+  if (after === undefined) return UNRECORDED;
+  // The applied result is recorded only after the registry confirmed it, and never before: a fault
+  // here leaves the mapping revoked and reports `UNRECORDED`, which revives nothing.
+  try {
+    appendLifecycle(captured, observed.now, 'applied');
+  } catch {
+    return UNRECORDED;
+  }
   return REVOKED;
 }
