@@ -27,12 +27,16 @@
  *      is re-required immediately before every append, before any effect exists and again at each record;
  *   4. require an actual `SELECTED`/`KEEP` decision from `decidePolicy` for `USE` over the pinned
  *      bundle;
- *   5. read the real registry `current` and require `FOUND` and `ACTIVE`;
+ *   5. read the real registry `current` and require `FOUND` and `ACTIVE`. The answer is read whole
+ *      first - one bounded local reader over the registry's own closed result schema, and behind it
+ *      the lifecycle record's own schema with every mandatory field present - and identity, scope and
+ *      the record's own window are settled before its state is allowed to mean anything;
  *   6. require an actual `AUTHORIZED` decision from `authorizeMappingOperation` for `USE`. A refusal
  *      at either of these two - and only one that names its own class - records one privacy-safe
  *      `DENIED` decision before it is returned, which is the whole of the refusal evidence below;
- *      the lifecycle class is read off a record already matched to this bound reference and scope, so
- *      a malformed, unreadable or foreign record is refused without one;
+ *      the lifecycle class is read off a complete, validated record already matched to this bound
+ *      reference and scope, so a malformed, incomplete, unreadable or foreign answer is refused
+ *      without one;
  *   7. load the sealed material and the DEK into owned copies. Every authority answer and the
  *      material answer may be a promise and is awaited before it is read, and no plaintext exists at
  *      any of those awaits;
@@ -78,20 +82,22 @@
  * `USE`.
  *
  * Refusal evidence. Two refusal classes, and only those two, leave a record, and only where this call
- * has already established the actor and the stream: the real registry reports a record that reads as
- * this bound reference's own record in the bound scope, and reports it as no longer live or no longer
- * `ACTIVE` (`LIFECYCLE_DENIED`), and the real authorization seam reports no grant at all or a grant
- * that has already expired (`RESOLUTION_DENIED`). Each is recorded by the same real `appendAuditEvent`,
+ * has already established the actor and the stream: the real registry reports, on its own
+ * `ABSENT`/`NOT_LIVE` branch or over a complete record of this bound reference in the bound scope
+ * that is no longer live at this instant or no longer `ACTIVE` (`LIFECYCLE_DENIED`), and the real
+ * authorization seam reports no grant at all or a grant that has already expired
+ * (`RESOLUTION_DENIED`). Each is recorded by the same real `appendAuditEvent`,
  * with the same owned identity, the same frozen context and the same pinned bundle identity the
  * accepted path uses, as one `AUTHORIZATION_ATTEMPT` / `USE` / `DENIED` event, and each costs no
  * material load and no backend call, because both guards run before any sealed byte exists. Everything
  * else records nothing: an unreadable or foreign authority, a policy `BLOCK` or `HELD`, a grant that is
  * misbound rather than absent or expired, an audit actor that is not the authenticated subject, an
- * audit substrate that is not this bound scope's own stream, a registry record that cannot be read as
- * this bound reference's own record in the bound scope, a host fault, and every refusal raised after the
- * material load. The decision is taken where the refusal is raised, from that refusal's own fixed class
- * - there is no catch-all logger, no inferred identity and no reconstructed draft, so a malformed,
- * foreign or trapped value can never be filed as evidence about somebody. A record never changes a
+ * audit substrate that is not this bound scope's own stream, a registry answer whose branch, keys,
+ * record, scope or window is not the registry's own schema or does not match this bound reference and
+ * scope, a host fault, and every refusal raised after the material load. The decision is taken where
+ * the refusal is raised, from that refusal's own fixed class - there is no catch-all logger, no
+ * inferred identity and no reconstructed draft, so a malformed, foreign or trapped value can never be
+ * filed as evidence about somebody. A record never changes a
  * code: the call is already `WITHHELD`, no effect follows a denial, and the appended result is
  * deliberately not read, so a ledger that cannot commit leaves the same `WITHHELD`, no exception and no
  * effect.
@@ -128,7 +134,9 @@ import { decidePolicy } from './policy.js';
 import type { PolicyBundle, PolicyDecision } from './policy.js';
 import { authorizeMappingOperation } from './mapping-authorization.js';
 import type { TrustedMappingGrant, WorkloadSubject } from './mapping-authorization.js';
-import type { MappingMetadataRecord, MappingMetadataRegistry } from './mapping-metadata-registry.js';
+import { MAPPING_METADATA_REASONS } from './mapping-metadata-registry.js';
+import type { MappingMetadataCurrentResult, MappingMetadataRecord,
+  MappingMetadataReason, MappingMetadataRegistry } from './mapping-metadata-registry.js';
 import { MAPPING_LIFECYCLE_STATES } from './mapping-lifecycle.js';
 import { MAPPING_AEAD_LIMITS, openMappingPayload } from './mapping-aead.js';
 import type { MappingSealedEnvelope } from './mapping-aead.js';
@@ -309,19 +317,20 @@ const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._=-]{0,127}$/u;
 const REVISION = /^\d{1,12}$/u;
 const KEY_VERSION = /^\d{1,12}(?:\.\d{1,12}){0,3}$/u;
 
-function fields(value: unknown, required: readonly string[], optional: readonly string[] = []): Fields {
+function fields(value: unknown, required: readonly string[], optional: readonly string[] = [],
+  code: Denial = 'INVALID_AUTHORITY'): Fields {
   if (value === null || typeof value !== 'object' || Array.isArray(value) ||
-    ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail('INVALID_AUTHORITY');
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail(code);
   const keys = Reflect.ownKeys(value);
-  if (keys.length > MAX_KEYS || keys.some((key) => typeof key !== 'string')) fail('INVALID_AUTHORITY');
+  if (keys.length > MAX_KEYS || keys.some((key) => typeof key !== 'string')) fail(code);
   const result: Fields = Object.create(null) as Fields;
   for (const key of keys as string[]) {
-    if (!required.includes(key) && !optional.includes(key)) fail('INVALID_AUTHORITY');
+    if (!required.includes(key) && !optional.includes(key)) fail(code);
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable || !('value' in descriptor)) fail('INVALID_AUTHORITY');
+    if (!descriptor?.enumerable || !('value' in descriptor)) fail(code);
     result[key] = descriptor.value;
   }
-  for (const name of required) if (!Object.hasOwn(result, name)) fail('INVALID_AUTHORITY');
+  for (const name of required) if (!Object.hasOwn(result, name)) fail(code);
   return result;
 }
 function text(value: unknown, limit = REF_LIMIT): string {
@@ -329,8 +338,9 @@ function text(value: unknown, limit = REF_LIMIT): string {
     /[\u0000-\u001f\u007f]/u.test(value)) fail('INVALID_AUTHORITY');
   return value;
 }
-function member<T extends string>(value: unknown, choices: readonly T[]): T {
-  if (typeof value !== 'string' || !choices.includes(value as T)) fail('INVALID_AUTHORITY');
+function member<T extends string>(value: unknown, choices: readonly T[],
+  code: Denial = 'INVALID_AUTHORITY'): T {
+  if (typeof value !== 'string' || !choices.includes(value as T)) fail(code);
   return value as T;
 }
 function instant(value: unknown): number {
@@ -633,70 +643,124 @@ async function observe(captured: Captured): Promise<Observation> {
  * The registry record reduced to the five values every guard below uses. A real registry read yields
  * this owned, frozen claim inside the same synchronous step that called the host: the captured
  * `current` runs on the captured registry, and nothing in the sealed effect segment reads a property
- * of the object it returned.
+ * of the object it returned. All three scope parts are present because a record that did not carry
+ * them was refused before this claim existed.
  */
 interface RecordClaim {
   readonly mappingRef: string;
-  readonly scope: { readonly tenantId: string; readonly projectId?: string; readonly sessionId: string };
+  readonly scope: { readonly tenantId: string; readonly projectId: string; readonly sessionId: string };
   readonly lifecycle: 'ACTIVE';
   readonly revision: number;
   readonly expiresAt: number;
 }
 
 /**
- * One registry record read as owned values, lifecycle included. It is built **before** any guard
- * decides what class a refusal on it is, so identity, scope and shape are settled first and the
- * lifecycle is read off a record already known to be this executor's own.
+ * One registry record read as the lifecycle schema itself defines it, not as a subset of it that
+ * happens to parse: `version` 1, the reference, **all three** scope parts, one state from the
+ * lifecycle's own vocabulary, a positive revision and two nonnegative safe-integer instants whose
+ * window is coherent. Nothing here is optional and nothing is invented: a field the real schema
+ * requires is required here, and a record that omits one is a malformed value rather than a record
+ * this call could attribute anything to.
+ *
+ * The timestamps are read with the registry's own rule - a nonnegative safe integer - rather than
+ * this module's stricter `instant` reader, which refuses a zero instant for an observed clock. A
+ * record created at the epoch is a record the real schema permits, so a rule invented here would
+ * refuse an answer the registry is entitled to give.
  */
-interface RecordAnswer {
-  readonly mappingRef: string;
-  readonly scope: { readonly tenantId: string; readonly projectId?: string; readonly sessionId: string };
-  readonly state: (typeof MAPPING_LIFECYCLE_STATES)[number];
-  readonly revision: number;
-  readonly expiresAt: number;
+function currentRecord(value: unknown): MappingMetadataRecord {
+  const v = fields(value, ['version', 'mappingRef', 'scope', 'state', 'revision', 'createdAt',
+    'expiresAt'], [], 'NOT_CURRENT');
+  if (v.version !== 1) fail('NOT_CURRENT');
+  const scope = fields(v.scope, ['tenantId', 'projectId', 'sessionId'], [], 'NOT_CURRENT');
+  const createdAt = epoch(v.createdAt);
+  const expiresAt = epoch(v.expiresAt);
+  // A record whose own window is incoherent is malformed, not a lifecycle that happened to expire.
+  if (createdAt >= expiresAt) fail('NOT_CURRENT');
+  const revision = epoch(v.revision);
+  if (revision < 1) fail('NOT_CURRENT');
+  return Object.freeze({ version: 1, mappingRef: text(v.mappingRef, 256),
+    scope: Object.freeze({ tenantId: text(scope.tenantId, 256),
+      projectId: text(scope.projectId, 256), sessionId: text(scope.sessionId, 256) }),
+    state: member(v.state, MAPPING_LIFECYCLE_STATES, 'NOT_CURRENT'),
+    revision, createdAt, expiresAt });
 }
 
-/** A real registry read. Only a `FOUND`, `ACTIVE` record at a live instant reaches anything else. */
+/** A nonnegative safe-integer epoch-millisecond instant, the rule the lifecycle record itself uses. */
+function epoch(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) fail('NOT_CURRENT');
+  return value;
+}
+
+/**
+ * One registry answer read as the registry's own closed result schema: `version` 1, one of its three
+ * fixed branch states, and exactly the keys that branch carries. `FOUND` carries a record and no
+ * reason; `ABSENT` and `REFUSED` carry one reason from the registry's fixed vocabulary and no record.
+ *
+ * This is a local boundary reader, built from the module's own bounded readers, and its return type
+ * is the shipped `MappingMetadataCurrentResult` - so the shape this module attributes evidence to is
+ * the registry's own schema and the compiler rejects a reader that drifts from it. A value that is
+ * not one of those three branches, or that carries the other branch's key, or that is malformed at
+ * any level below, is refused here and names nothing: an answer this registry did not produce is not
+ * evidence about a record this call never proved it held.
+ */
+function currentAnswer(value: unknown): MappingMetadataCurrentResult {
+  const v = fields(value, ['version', 'state'], ['metadata', 'reason'], 'NOT_CURRENT');
+  if (v.version !== 1) fail('NOT_CURRENT');
+  const state = v.state;
+  if (state === 'FOUND') {
+    if (!Object.hasOwn(v, 'metadata') || Object.hasOwn(v, 'reason')) fail('NOT_CURRENT');
+    return Object.freeze({ version: 1 as const, state: 'FOUND' as const,
+      metadata: currentRecord(v.metadata) });
+  }
+  if (state !== 'ABSENT' && state !== 'REFUSED') fail('NOT_CURRENT');
+  if (!Object.hasOwn(v, 'reason') || Object.hasOwn(v, 'metadata')) fail('NOT_CURRENT');
+  const reason = member<MappingMetadataReason>(v.reason, MAPPING_METADATA_REASONS, 'NOT_CURRENT');
+  return Object.freeze({ version: 1 as const, state, reason });
+}
+
+/**
+ * A real registry read. Only a `FOUND`, `ACTIVE` record at a live instant reaches anything else.
+ *
+ * The complete answer is read and validated **before** this call decides what class a refusal on it
+ * is. Identity, scope, shape and window are settled first, so the lifecycle class is read off a
+ * record this executor has already proved is its own record in the bound scope - never off an
+ * unreadable, foreign or malformed value that happens to carry the word `CREATED` or a reason.
+ */
 function liveRecord(captured: Captured, now: number): RecordClaim {
   const { registry, readCurrent, mappingRef, scope } = captured.fixed;
   return attempt(() => {
-    const found = invoke(readCurrent, registry, [{ version: 1, mappingRef,
+    const answer = currentAnswer(invoke(readCurrent, registry, [{ version: 1, mappingRef,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId } },
-    { now }]);
-    if (found === null || typeof found !== 'object') fail('NOT_CURRENT');
-    if (found.state !== 'FOUND') {
+    { now }]));
+    if (answer.state !== 'FOUND') {
       // The registry's own reason is what makes this refusal attributable, so it is read here rather
-      // than inferred: only a record this registry holds and reports as no longer live is the
-      // lifecycle denial this call records. An unknown reference, a refused read and a trap all
-      // record nothing, because none of them is evidence about a record that existed.
-      fail('NOT_CURRENT', found.reason === 'NOT_LIVE' ? 'LIFECYCLE_DENIED' : undefined);
+      // than inferred - and only the branch that registry actually reports `NOT_LIVE` on, with a
+      // record it holds and no longer calls current, names a lifecycle. An unknown reference, a
+      // refused read, a malformed answer and a trap all record nothing, because none of them is
+      // evidence about a record that existed.
+      fail('NOT_CURRENT', answer.state === 'ABSENT' && answer.reason === 'NOT_LIVE'
+        ? 'LIFECYCLE_DENIED' : undefined);
     }
-    const record: MappingMetadataRecord = found.metadata;
-    // A `FOUND` answer that carries no readable record is a refusal with no evidence at all: `null`,
-    // a non-object, a record with no scope, a record with an unreadable revision or a record whose
-    // own state is not one of the lifecycle's fixed states are all malformed values, and an
-    // unreadable value is never filed as a fact about a lifecycle.
-    if (record === null || typeof record !== 'object') fail('NOT_ACTIVE');
-    const recordScope = fields(record.scope, ['tenantId', 'projectId', 'sessionId']);
-    const answer: RecordAnswer = Object.freeze({ mappingRef: text(record.mappingRef, 256),
-      scope: Object.freeze({ tenantId: text(recordScope.tenantId, 256),
-        ...(Object.hasOwn(recordScope, 'projectId') ? { projectId: text(recordScope.projectId, 256) }
-          : {}),
-        sessionId: text(recordScope.sessionId, 256) }),
-      state: member(record.state, MAPPING_LIFECYCLE_STATES),
-      revision: instant(record.revision), expiresAt: instant(record.expiresAt) });
+    const record = answer.metadata;
     // Identity and scope are settled before the lifecycle is allowed to say anything: the record must
     // be this executor's own record in the bound scope, or the read is not the current-record seam
     // this call bound at construction and its state is another scope's metadata, not evidence here.
-    if (answer.mappingRef !== mappingRef || !equal(answer.scope,
-      { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId })) {
+    if (record.mappingRef !== mappingRef || record.scope.tenantId !== scope.tenantId ||
+      record.scope.projectId !== scope.projectId || record.scope.sessionId !== scope.sessionId) {
       fail('SCOPE_MISMATCH');
     }
+    // A clock earlier than the record's own creation instant is not a lifecycle this call can name:
+    // the real registry inserts at the current clock and cannot report a record from before it, so
+    // the answer is refused as one this seam cannot support and records nothing.
+    if (now < record.createdAt) fail('NOT_CURRENT');
+    // A validated record of this bound reference whose own expiry has passed at this instant is no
+    // longer live. That is the lifecycle fact the class exists for, read off the record's own window.
+    if (now >= record.expiresAt) fail('NOT_ACTIVE', 'LIFECYCLE_DENIED');
     // A validated record of this bound reference that the real registry still reports as current, and
-    // that is simply not `ACTIVE`, is the one lifecycle fact this call records.
-    if (answer.state !== 'ACTIVE') fail('NOT_ACTIVE', 'LIFECYCLE_DENIED');
-    return Object.freeze({ mappingRef: answer.mappingRef, scope: answer.scope, lifecycle: 'ACTIVE',
-      revision: answer.revision, expiresAt: answer.expiresAt });
+    // that is simply not `ACTIVE`, is the other lifecycle fact this call records.
+    if (record.state !== 'ACTIVE') fail('NOT_ACTIVE', 'LIFECYCLE_DENIED');
+    return Object.freeze({ mappingRef: record.mappingRef, scope: record.scope, lifecycle: 'ACTIVE',
+      revision: record.revision, expiresAt: record.expiresAt });
   });
 }
 

@@ -1387,3 +1387,269 @@ test('a record that is not a validated record of this bound reference records no
     assert.equal(revokedHost.counters.material, 0);
     assert.equal(revokedBackend.state.calls, 0);
   });
+/* ---------- 20. Lifecycle evidence needs a complete, validated registry answer ---------- */
+
+/**
+ * A registry that answers with exactly the value one case planted. The shipped registry still holds
+ * the real record and is still what the fixture's grant, revision and sealed material were built
+ * from, so nothing here weakens the world the executor is reasoning about: only the answer the host
+ * hands back is replaced, which is what an unauthenticated host is free to do. `seen.calls` is the
+ * non-vacuity evidence that a case really reached the read it claims to be about.
+ */
+function answeredRegistry(answer) {
+  const seen = { calls: 0, answered: undefined };
+  return { registry: { version: 1, current(request, clock) {
+    seen.calls += 1;
+    seen.answered = typeof answer === 'function' ? answer(request, clock, seen.calls) : answer;
+    return seen.answered;
+  } }, seen };
+}
+
+/** The real `FOUND` answer over the real record, before a case plants something else in its place. */
+function foundAnswer(scenario) {
+  const found = scenario.registry.current({ version: 1, mappingRef: scenario.mappingRef,
+    scope: { ...scenario.scope } }, { now: USE_NOW });
+  assert.equal(found.state, 'FOUND');
+  return found;
+}
+
+/** One planted answer, and the fixed outcome every row of the matrix owes. */
+async function assertPlantedRefusal(scenario, answer, entries, name) {
+  const backend = createBackend();
+  const planted = answeredRegistry(answer);
+  const built = createHost({ scenario, backend, registry: planted.registry });
+  const refused = await createBoundMappingUse(built.host).use();
+  assertFixedShape(refused);
+  assert.equal(refused.code, 'WITHHELD', name);
+  // Non-vacuity: the read really happened, so every row is an answer this call declined to attribute
+  // rather than a refusal that happened before the registry was ever consulted.
+  assert.equal(planted.seen.calls >= 1, true, name);
+  assert.equal(built.counters.material, 0, name);
+  assert.equal(backend.state.calls, 0, name);
+  assert.equal(cleared(backend.state.retained), false, name);
+  assert.equal(built.ledger.entries.length, entries, name);
+  if (entries === 1) assertAttributableDenial(built, built.ledger.entries[0].event,
+    'LIFECYCLE_DENIED');
+}
+
+test('a FOUND record relabelled and stripped of its own mandatory fields records no denial', async () => {
+  const scenario = buildScenario();
+  const record = foundAnswer(scenario).metadata;
+  const planted = { version: 1, state: 'FOUND',
+    metadata: { mappingRef: record.mappingRef, scope: { ...record.scope }, state: 'CREATED',
+      revision: record.revision, expiresAt: record.expiresAt } };
+  // The planted value is what a host that relabels a real record as `CREATED` while dropping the
+  // fields the lifecycle schema makes mandatory actually hands back. Its state names a lifecycle and
+  // nothing else about it is malformed, which is exactly why the shape has to be settled first.
+  assert.equal(Object.hasOwn(planted.metadata, 'version'), false);
+  assert.equal(Object.hasOwn(planted.metadata, 'createdAt'), false);
+  await assertPlantedRefusal(scenario, planted, 0, 'stripped record');
+
+  // The same relabelling with every mandatory field present is a different case, and the shipped
+  // registry really produces it: that one is an attributable lifecycle denial (see below).
+  const complete = await answeredRegistry({ version: 1, state: 'FOUND',
+    metadata: { version: 1, mappingRef: record.mappingRef, scope: { ...record.scope },
+      state: 'CREATED', revision: record.revision, createdAt: record.createdAt,
+      expiresAt: record.expiresAt } });
+  assert.equal(complete.seen.calls, 0);
+});
+
+test('an answer state the registry never returns cannot carry NOT_LIVE evidence', async () => {
+  const scenario = buildScenario();
+  const record = foundAnswer(scenario).metadata;
+  // A discriminator outside the registry's own three branches, carrying the reason that would
+  // otherwise name a lifecycle. The reason is only ever evidence about a branch the registry owns.
+  await assertPlantedRefusal(scenario, { version: 1, state: 'unknown', reason: 'NOT_LIVE' }, 0,
+    'state outside the registry branches');
+  // The same reason on the `REFUSED` branch: the shipped registry reports `NOT_LIVE` as `ABSENT`,
+  // so a refusal that claims it never proved it held this record.
+  await assertPlantedRefusal(scenario, { version: 1, state: 'REFUSED', reason: 'NOT_LIVE' }, 0,
+    'NOT_LIVE on the REFUSED branch');
+  // The genuine reasons of the other two branches name no lifecycle, so they record nothing either.
+  await assertPlantedRefusal(scenario, { version: 1, state: 'ABSENT', reason: 'UNKNOWN_MAPPING' }, 0,
+    'an unknown reference');
+  await assertPlantedRefusal(scenario, { version: 1, state: 'REFUSED', reason: 'INVALID_REQUEST' }, 0,
+    'a refused read');
+  // A reason outside the registry's own vocabulary is a malformed answer, not a lifecycle fact.
+  await assertPlantedRefusal(scenario, { version: 1, state: 'ABSENT', reason: 'NOT_LIVE_AT_ALL' }, 0,
+    'a reason outside the vocabulary');
+  // The genuine lifecycle answer this file's other cases depend on, planted directly so the row
+  // above cannot pass merely because the executor refuses `ABSENT` altogether.
+  await assertPlantedRefusal(scenario, { version: 1, state: 'ABSENT', reason: 'NOT_LIVE' }, 1,
+    'the genuine NOT_LIVE answer');
+  assert.equal(record.state, 'ACTIVE');
+});
+
+test('every mandatory envelope key is required before any lifecycle class is attached', async () => {
+  const scenario = buildScenario();
+  const record = foundAnswer(scenario).metadata;
+  const envelopeCases = [
+    ['no answer at all', null],
+    ['an answer that is not an object', 'FOUND'],
+    ['an answer that is an array', []],
+    ['an empty answer', {}],
+    ['no discriminator', { version: 1 }],
+    ['a wrong version', { version: 2, state: 'ABSENT', reason: 'NOT_LIVE' }],
+    ['no version', { state: 'ABSENT', reason: 'NOT_LIVE' }],
+    ['a state outside the vocabulary', { version: 1, state: 'NOT_FOUND', reason: 'NOT_LIVE' }],
+    ['a branch with no reason', { version: 1, state: 'ABSENT' }],
+    ['a reason branch carrying a record', { version: 1, state: 'ABSENT', reason: 'NOT_LIVE',
+      metadata: { ...record } }],
+    ['a record branch carrying a reason', { version: 1, state: 'FOUND', metadata: { ...record },
+      reason: 'NOT_LIVE' }],
+    ['a record branch carrying no record', { version: 1, state: 'FOUND' }],
+    ['an unknown key on a record branch', { version: 1, state: 'FOUND', metadata: { ...record },
+      note: 'x' }],
+    ['an unknown key on a reason branch', { version: 1, state: 'ABSENT', reason: 'NOT_LIVE',
+      note: 'x' }],
+    ['an inherited prototype', Object.assign(Object.create({ state: 'ABSENT', reason: 'NOT_LIVE' }),
+      { version: 1 })]];
+  for (const [name, answer] of envelopeCases) {
+    await assertPlantedRefusal(scenario, answer, 0, `envelope: ${name}`);
+  }
+});
+
+test('every mandatory record and scope field is required before any lifecycle class is attached',
+  async () => {
+    const scenario = buildScenario();
+    const record = foundAnswer(scenario).metadata;
+    const without = (key) => { const copy = { ...record }; delete copy[key]; return copy; };
+    const scopeWithout = (key) => { const copy = { ...record.scope }; delete copy[key]; return copy; };
+    const rows = [
+      ['no version', without('version')],
+      ['no mappingRef', without('mappingRef')],
+      ['no scope', without('scope')],
+      ['no state', without('state')],
+      ['no revision', without('revision')],
+      ['no createdAt', without('createdAt')],
+      ['no expiresAt', without('expiresAt')],
+      ['an unknown record key', { ...record, note: 'x' }],
+      ['a wrong record version', { ...record, version: 2 }],
+      ['an empty mappingRef', { ...record, mappingRef: '' }],
+      ['a mappingRef with a control character', { ...record, mappingRef: 'xSy\u0000y' }],
+      ['a mappingRef of another reference', { ...record,
+        mappingRef: buildScenario({ scope: FOREIGN_SCOPE }).mappingRef }],
+      ['a scope that is not an object', { ...record, scope: 'tenant-bound-use-alpha.invalid' }],
+      ['a scope with no tenantId', { ...record, scope: scopeWithout('tenantId') }],
+      ['a scope with no projectId', { ...record, scope: scopeWithout('projectId') }],
+      ['a scope with no sessionId', { ...record, scope: scopeWithout('sessionId') }],
+      ['a scope with an unknown key', { ...record, scope: { ...record.scope, note: 'x' } }],
+      ['an empty tenantId', { ...record, scope: { ...record.scope, tenantId: '' } }],
+      ['a scope padded with whitespace', { ...record,
+        scope: { ...record.scope, sessionId: ' session-bound-use-alpha.invalid ' } }],
+      ['another tenant', { ...record, scope: { ...FOREIGN_SCOPE } }],
+      ['another session in this tenant', { ...record, scope: { ...scenario.scope,
+        sessionId: FOREIGN_SCOPE.sessionId } }],
+      ['a state outside the lifecycle vocabulary', { ...record, state: 'unknown' }],
+      ['a state that is not a string', { ...record, state: 7 }],
+      ['a revision below one', { ...record, revision: 0 }],
+      ['a fractional revision', { ...record, revision: 2.5 }],
+      ['a revision carried as text', { ...record, revision: '2' }],
+      ['a negative createdAt', { ...record, createdAt: -1 }],
+      ['a fractional createdAt', { ...record, createdAt: T0 + 0.5 }],
+      ['a negative expiresAt', { ...record, expiresAt: -1 }],
+      ['a createdAt that is not a number', { ...record, createdAt: String(T0) }],
+      ['a record on an inherited prototype', Object.assign(Object.create({ state: 'REVOKED' }),
+        { ...record })]];
+    for (const [name, metadata] of rows) {
+      await assertPlantedRefusal(scenario, { version: 1, state: 'FOUND', metadata }, 0, `record: ${name}`);
+    }
+  });
+
+test('a coherent record whose own window is closed, or not yet open, names what it can', async () => {
+  const scenario = buildScenario();
+  const record = foundAnswer(scenario).metadata;
+  const incoherent = [
+    ['createdAt equal to expiresAt', { ...record, createdAt: record.expiresAt }],
+    ['createdAt after expiresAt', { ...record, createdAt: record.expiresAt + 1 }],
+    ['both at the epoch', { ...record, createdAt: 0, expiresAt: 0 }]];
+  for (const [name, metadata] of incoherent) {
+    await assertPlantedRefusal(scenario, { version: 1, state: 'FOUND', metadata }, 0, `window: ${name}`);
+  }
+
+  // A clock earlier than the record's own creation instant is not a lifecycle this call can name:
+  // the shipped registry cannot report one, so the answer is refused as unreadable and recorded
+  // nowhere, while the record itself is complete and matches this bound reference and scope.
+  await assertPlantedRefusal(scenario, { version: 1, state: 'FOUND',
+    metadata: { ...record, createdAt: USE_NOW + 1 } }, 0, 'window: created in the future');
+
+  // A complete record of this bound reference and scope whose expiry has passed at the observed
+  // instant is no longer live, whatever state the answer claims: that is the lifecycle fact the
+  // class exists for, so it is recorded.
+  await assertPlantedRefusal(scenario, { version: 1, state: 'FOUND',
+    metadata: { ...record, expiresAt: USE_NOW } }, 1, 'window: expired at the observed instant');
+});
+
+test('a getter or a trapping registry answer is a refusal with no evidence at all', async () => {
+  const scenario = buildScenario();
+  const record = foundAnswer(scenario).metadata;
+  const trappedKeys = { ownKeys() { throw new Error('synthetic answer reflection fault'); } };
+  const trappedDescriptor = { getOwnPropertyDescriptor() {
+    throw new Error('synthetic answer descriptor fault'); } };
+  const getterRecord = { ...record };
+  Object.defineProperty(getterRecord, 'revision', { enumerable: true,
+    get() { throw new Error('synthetic record accessor fault'); } });
+  const hiddenRecord = Object.defineProperty({ ...record }, 'revision',
+    { enumerable: false, value: record.revision, configurable: true });
+  const getterEnvelope = { version: 1 };
+  Object.defineProperty(getterEnvelope, 'state', { enumerable: true,
+    get() { throw new Error('synthetic envelope accessor fault'); } });
+  const rows = [
+    ['an accessor on the discriminator', getterEnvelope],
+    ['an accessor on the record', { version: 1, state: 'FOUND', metadata: getterRecord }],
+    ['a hidden record field', { version: 1, state: 'FOUND', metadata: hiddenRecord }],
+    ['an envelope whose own keys trap', new Proxy({ version: 1, state: 'ABSENT', reason: 'NOT_LIVE' },
+      trappedKeys)],
+    ['a record whose own keys trap', { version: 1, state: 'FOUND',
+      metadata: new Proxy({ ...record }, trappedKeys) }],
+    ['a record whose descriptors trap', { version: 1, state: 'FOUND',
+      metadata: new Proxy({ ...record }, trappedDescriptor) }]];
+  for (const [name, answer] of rows) {
+    await assertPlantedRefusal(scenario, answer, 0, `trap: ${name}`);
+  }
+});
+
+test('the genuine lifecycle states still record their own evidence and the effect still spends',
+  async () => {
+    // The accepted path is the control for everything below: the same host, actor and ledger record
+    // exactly two ALLOWED decisions, load the material once and spend the private resource once.
+    const control = createHost();
+    assert.equal((await createBoundMappingUse(control.host).use()).code, 'USED');
+    assert.equal(control.ledger.entries.length, 2);
+    assert.equal(control.ledger.entries.every((entry) => entry.event.outcome === 'ALLOWED'), true);
+    assert.equal(control.counters.material, 1);
+    assert.equal(control.backend.state.calls, 1);
+
+    // A genuine in-bound record the shipped registry still calls current, and that is simply not
+    // `ACTIVE`: complete, matched and attributable, so the lifecycle class is recorded once.
+    const unactivated = buildScenario({ activate: false });
+    const unactivatedBackend = createBackend();
+    const notActive = createHost({ scenario: unactivated, backend: unactivatedBackend });
+    const current = unactivated.registry.current({ version: 1, mappingRef: unactivated.mappingRef,
+      scope: { ...unactivated.scope } }, { now: USE_NOW });
+    assert.equal(current.state, 'FOUND');
+    assert.equal(current.metadata.state, 'CREATED');
+    assert.equal((await createBoundMappingUse(notActive.host).use()).code, 'WITHHELD');
+    assert.equal(notActive.ledger.entries.length, 1);
+    assertAttributableDenial(notActive, notActive.ledger.entries[0].event, 'LIFECYCLE_DENIED');
+    assert.equal(notActive.counters.material, 0);
+    assert.equal(unactivatedBackend.state.calls, 0);
+
+    // A genuine revoked record, revoked through the shipped reducer: the registry stops reporting it
+    // as current and answers `ABSENT` / `NOT_LIVE`, which is the branch that names the lifecycle.
+    const revoked = buildScenario();
+    const revokedBackend = createBackend();
+    const revokedHost = createHost({ scenario: revoked, backend: revokedBackend });
+    const applied = revoked.registry.transition({ version: 1, mappingRef: revoked.mappingRef,
+      scope: { ...revoked.scope }, expectedRevision: 2, action: 'REVOKE' }, { now: USE_NOW });
+    assert.equal(applied.state, 'CHANGED');
+    const afterRevocation = revoked.registry.current({ version: 1, mappingRef: revoked.mappingRef,
+      scope: { ...revoked.scope } }, { now: USE_NOW });
+    assert.equal(afterRevocation.state, 'ABSENT');
+    assert.equal(afterRevocation.reason, 'NOT_LIVE');
+    assert.equal((await createBoundMappingUse(revokedHost.host).use()).code, 'WITHHELD');
+    assert.equal(revokedHost.ledger.entries.length, 1);
+    assertAttributableDenial(revokedHost, revokedHost.ledger.entries[0].event, 'LIFECYCLE_DENIED');
+    assert.equal(revokedHost.counters.material, 0);
+    assert.equal(revokedBackend.state.calls, 0);
+  });
