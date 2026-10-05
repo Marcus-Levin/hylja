@@ -33,6 +33,30 @@ The listed files also match the `test/*.test.mjs` glob in the [`npm test`](../..
 so the full suite reruns them. `npm run check:docs` and `npm run check:fixtures` cover the evidence
 records and the tracked paths.
 
+### One runnable demo command
+
+[`scripts/synthetic-conversation-demo.mjs`](../../scripts/synthetic-conversation-demo.mjs)
+([#250](https://github.com/Marcus-Levin/hylja/issues/250)) runs the bounded local conversation owner
+([openai-local-conversation.md](../contracts/openai-local-conversation.md)) over a real standard HTTP
+peer on `127.0.0.1` and prints one fixed human-readable summary of the real owner result and the real
+peer, release, detector and child counters. No original value, key, model traffic, argument or native
+error is ever printed.
+
+```sh
+npm run build && node scripts/synthetic-conversation-demo.mjs                    # one masked request, one guarded release
+node scripts/synthetic-conversation-demo.mjs --case blocked-reply                # one upstream request, zero releases
+node scripts/synthetic-conversation-demo.mjs --case unsupported-request          # zero payload requests, zero releases
+```
+
+Both `--case` runs are expected refusals and exit zero; a case that deviates from what it declares
+exits 1, and a malformed argument is refused before any peer, socket, owner, detector, policy
+decision or child exists, with exit 2 and nothing echoed. The subprocess evidence is
+[`test/synthetic-conversation-demo.e2e.test.mjs`](../../test/synthetic-conversation-demo.e2e.test.mjs)
+(`node --test test/synthetic-conversation-demo.e2e.test.mjs`), and its declared fixtures are in
+[`scripts/lib/synthetic-conversation-fixture.mjs`](../../scripts/lib/synthetic-conversation-fixture.mjs).
+The demo composes the accepted seams this document already routes and adds no transport, coordinator,
+policy authority or runtime surface; the limits below are its limits too.
+
 ## What these runs are
 
 Each one joins **already-shipped, accepted-v1 seams** inside one test file over explicitly synthetic,
