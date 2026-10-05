@@ -143,12 +143,12 @@ file is `SETUP_FAILED_STALE_EVIDENCE`, so a previous run's evidence can never pa
 
 **When `requiredReferences` is configured** (and only then): it is one structured declaration, never
 prose that is parsed. The only accepted shape is an array of at most 16 `{ label, path }` entries, a
-label of at most 128 characters with no control character, and an absolute path of at most 4096
-characters. Anything else — a bare path string, a label-to-path map, a primitive entry, an unknown
-field, a relative or overbound path, a control character in a label, or an overbound count — is
-`SETUP_FAILED_REQUIRED_REFERENCE` in both readers, never a repaired value, and no declared label or
-path is echoed into any record. An absent key and an explicit empty list are the same assertion of no
-references, and run no probe at all.
+non-empty label of at most 128 characters with no control character, and an absolute path of at most
+4096 characters. Anything else — a bare path string, a label-to-path map, a primitive entry, an
+unknown field, an empty label, a relative or overbound path, a control character in a label, or an
+overbound count — is `SETUP_FAILED_REQUIRED_REFERENCE` in both readers, never a repaired value, and no
+declared label or path is echoed into any record. An absent key and an explicit empty list are the
+same assertion of no references, and run no probe at all.
 
 Admission is file metadata alone: each path must be an existing regular file the launching process can
 open for reading. Nothing is read from the file, no path is resolved, searched for, or substituted for
@@ -156,12 +156,20 @@ another file, and nothing is inferred from the task prose. The CLI probes before
 controller probes again before it resolves the launch contract, so a missing, directory, unreadable or
 otherwise non-regular entry is the fixed reference refusal with zero dispatch: no launch contract, no
 child process, no persisted dispatch record, no armed timer, and every existing artifact left exactly
-as it was. Symlinks are followed, so a link to a readable regular file is admitted and a broken one is
-missing. Admitted labels and exact paths are rendered once, into the one effective task that both the
-launch contract and the dispatched request carry, inside the existing 1 MiB raw cap; an effective task
-past that cap fails restrictively rather than dropping a pointer. A process that bypasses file
-permissions admits what it can actually open, so admission is not approval and no promise is made
-that a path still exists, or is still readable, when the leaf reads it.
+as it was. A non-regular path is refused from its metadata before it is opened, because the open is
+the only unbounded step in admission: a FIFO with no writer makes a blocking read-only open wait for a
+writer, and both probes run before any watchdog exists to bound that wait. The one open that remains
+is read-only, never a write, and non-blocking where the platform carries `O_NONBLOCK`; on a platform
+without that flag the open is an ordinary read-only one and no non-blocking guarantee is made there.
+The opened descriptor's own `fstat` decides readability, so a path that becomes a FIFO between the
+stat and the open is refused rather than admitted, and the descriptor is closed in a `finally` on
+every path. No content is read on any path. Symlinks are followed, so a link to a readable regular
+file is admitted and a broken one is missing. Admitted labels and exact paths are rendered once, into
+the one effective task that both the launch contract and the dispatched request carry, inside the
+existing 1 MiB raw cap; an effective task past that cap fails restrictively rather than dropping a
+pointer. A process that bypasses file permissions admits what it can actually open, so admission is
+not approval and no promise is made that a path still exists, or is still readable, when the leaf
+reads it.
 
 The controller resolves `resolveSubagentLaunchContract` for this exact task, cwd, fresh context, parent
 model registry and the one bridge value it declares (`LANE_BRIDGE_INPUT`, `{ mode: 'off' }` — off
@@ -240,7 +248,7 @@ provably the same code and not a re-implementation of it.
 
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (47 tests, 37 of them in the lane file). Two of them
+platform (49 tests, 39 of them in the lane file). Two of them
 fake only the child transport, so the shipped default platform is what runs: the default filesystem
 must read the progress tail with bounded positional descriptor reads and close every descriptor it
 opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
@@ -273,6 +281,20 @@ call, no armed timer and the planted artifact preserved. The unreadable branch i
 injected metadata probe in both readers, because a mode-000 file is genuinely readable to a root
 process and a permission bit would prove nothing there; the real-fs branches (missing, directory,
 regular readable file) run the shipped probe unpatched.
+One case refuses the structured `{ label: "", path }` shape over a real readable file — not the
+primitive `['']` entry — in both readers, then drives the shipped entry point with that exact config
+path and asserts it emits nothing, and runs the CLI to assert zero spawns and nothing written; the
+identical file under a non-empty label is admitted by both readers, so the label is what is refused.
+A FIFO-without-writer cannot be probed in the test runner itself without an unbounded wait there, so
+one bounded subprocess control does it instead: the child imports the real controller, runs the real
+probe over a real `mkfifo` FIFO that no writer ever opens, and then builds the real controller around
+it with the probe unpatched, under a 15 s wall clock. The retained RED is that control hitting the
+bound — `ETIMEDOUT` at 15,000 ms, killed mid-probe — because the shipped probe opened before it
+checked regularity; after the fix the same control reports non-regular metadata refused, zero preflight
+calls, zero dispatch and no persisted dispatch record, in about 90 ms. The root process never opens
+that FIFO. A platform without a named pipe reports a skip with the reason, never a silent pass.
+Metadata admission proves neither later availability nor content approval, and the retained control
+covers one POSIX FIFO rather than every non-regular file type.
 A read-only
 smoke on root's own installed Pi ran from
 `/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and

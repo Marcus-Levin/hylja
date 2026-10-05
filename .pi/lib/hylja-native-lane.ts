@@ -33,14 +33,15 @@
  * entry is admitted by file metadata alone - an existing regular file this process can open for
  * reading, contents never read - before the launch contract is resolved and before any request is
  * emitted, so a missing, relative, wrong-shaped, directory, unreadable or overbound entry is the fixed
- * setup refusal with zero dispatch. Admission is exactly that: not approval, and no promise that the
+ * setup refusal with zero dispatch. A non-regular path is refused before it is opened, so no declared
+ * path can make this admission wait on a writer that may never arrive. Admission is exactly that: not approval, and no promise that the
  * path still exists or is still readable when the leaf reads it. Admitted labels and exact paths are
  * rendered once into the same effective task the launch contract is resolved for, inside the existing
  * raw task cap. Omitting the list keeps the previous behaviour exactly, with no probe and no paragraph.
  */
 
 import { randomUUID } from 'node:crypto';
-import { closeSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { clearTimeout as cancelTimer, setTimeout as startTimer } from 'node:timers';
 import { pathToFileURL } from 'node:url';
@@ -270,12 +271,13 @@ const record = (value: unknown): Record<string, unknown> | null =>
 	(typeof value === 'object' && value !== null && !Array.isArray(value) ? value : null) as Record<string, unknown> | null;
 
 /**
- * A label is short text with no control character, so a rendered line cannot be forged by a label.
- * A path is absolute, bounded, and NUL-free: exactly what the operator declared, never resolved or
- * searched for. Nothing here is inferred from the task prose.
+ * A label is non-empty short text with no control character, so a rendered line cannot be forged by a
+ * label and cannot be left blank by one. A path is absolute, bounded, and NUL-free: exactly what the
+ * operator declared, never resolved or searched for. Nothing here is inferred from the task prose.
  */
 const isSimpleLabel = (value: unknown): value is string =>
 	isText(value)
+	&& value.length > 0
 	&& value.length <= MAX_REFERENCE_LABEL_CHARS
 	&& !Array.from(value).some((char) => {
 		const code = char.codePointAt(0) ?? 0;
@@ -288,8 +290,8 @@ const isReferencePath = (value: unknown): value is string =>
 /**
  * Parses the one optional structured list. Absent stays absent and an empty list asserts no
  * references. Every other shape - a bare path string, a label-to-path map, a primitive entry, an
- * unknown field, a relative or overbound path, a control character in a label, or more entries than
- * the bound - is the fixed reference refusal. No planted label, path or entry is ever returned.
+ * unknown field, an empty or control-character label, a relative or overbound path, or more entries
+ * than the bound - is the fixed reference refusal. No planted label, path or entry is ever returned.
  */
 function parseRequiredReferences(value: unknown): readonly LaneRequiredReference[] | null {
 	if (value === undefined) return null;
@@ -319,32 +321,64 @@ export function checkRequiredReferenceList(value: unknown): LaneReferenceList {
 }
 
 /**
- * The shipped probe: stat metadata plus one open-for-read that is closed immediately and reads
- * nothing. A process that bypasses file permissions admits exactly what it can actually open, which
- * is the honest answer for the process that will read the path later.
+ * The one open this adapter performs: read-only, never a write, and non-blocking where the platform
+ * carries that flag. A non-blocking read-open is what keeps a path that becomes a FIFO between the
+ * stat and the open from parking this process on a writer that may never arrive. On a platform without
+ * the flag the open is an ordinary read-only one and the descriptor check below is the only guard left,
+ * which is stated rather than assumed: admission there cannot promise a non-blocking open.
+ */
+const READ_OPEN_FLAGS = constants.O_RDONLY | (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0);
+
+/**
+ * The shipped probe: stat metadata plus one non-blocking open-for-read that is closed immediately and
+ * reads nothing. A process that bypasses file permissions admits exactly what it can actually open,
+ * which is the honest answer for the process that will read the path later.
+ *
+ * Non-regular metadata is refused before the open rather than after it, because the open is the only
+ * unbounded step here: a FIFO with no writer makes a blocking read-open wait for one, and this
+ * admission runs before any watchdog exists to bound that wait. The open is repeated only for a
+ * regular file, and the opened descriptor's own fstat decides readability, so a substitution between
+ * the stat and the open is caught instead of admitted. No content is read on any path.
  */
 export const probeReferenceMetadata: LaneReferenceProbe = (path) => {
+	let stats: ReturnType<typeof statSync>;
 	try {
-		const stats = statSync(path);
-		let readable = false;
-		try {
-			closeSync(openSync(path, 'r'));
-			readable = true;
-		} catch {
-			readable = false;
-		}
-		return { isFile: stats.isFile(), isDirectory: stats.isDirectory(), readable };
+		stats = statSync(path);
 	} catch {
 		// No readable metadata at all: absent, a broken link, or a denied path component. The
 		// underlying error text never leaves this adapter.
 		return null;
 	}
+	const isFile = stats.isFile();
+	const isDirectory = stats.isDirectory();
+	let readable = false;
+	if (isFile && !isDirectory) {
+		let handle: number | undefined;
+		try {
+			handle = openSync(path, READ_OPEN_FLAGS);
+			// The descriptor is what a later reader would actually get, not the path this adapter stat'd.
+			readable = fstatSync(handle).isFile();
+		} catch {
+			readable = false;
+		} finally {
+			if (handle !== undefined) {
+				try {
+					closeSync(handle);
+				} catch {
+					// A descriptor this adapter cannot close is not one it claims it opened.
+					readable = false;
+				}
+			}
+		}
+	}
+	return { isFile, isDirectory, readable };
 };
 
 /**
  * Admits declared references by metadata alone: each path must be an existing regular file this
  * process can open for reading. Contents are never read, no path is resolved, searched for or
- * substituted, and admission is neither approval nor a promise about later availability.
+ * substituted, and admission is neither approval nor a promise about later availability. A non-regular
+ * path is refused before it is opened, so it can never make this admission wait.
  */
 export function admitRequiredReferences(references: readonly LaneRequiredReference[], probe: LaneReferenceProbe): void {
 	for (const reference of references) {

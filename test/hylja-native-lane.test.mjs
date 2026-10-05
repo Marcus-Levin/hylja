@@ -6,6 +6,7 @@
 // planted strings below are synthetic values that never leave this process unless a case asserts they
 // did not leak.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import nodeFs from 'node:fs';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -13,16 +14,19 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import ts from 'typescript';
 
 import {
 	FIXED_LANE_INPUT,
+	LANE_CONFIG_ENV,
+	LANE_SUBAGENTS_ENV,
 	MAX_PROGRESS_BYTES,
 	MAX_PROGRESS_RECORDS,
 	SETUP_FAILURES as LANE_SETUP_FAILURES,
 	createLaneController,
+	probeReferenceMetadata,
 	readExplicitVerdict,
 	readLaneConfig,
 	resolveInstalledModules,
@@ -1765,13 +1769,187 @@ test('the CLI admits a real required reference before it launches and refuses on
 });
 
 /**
- * Real default adapters, real default platform. These two cases exist because injected fake
+ * An empty label is not a label. This is the structured `{ label: '', path }` shape with a real,
+ * readable file behind it, not the primitive `['']` entry: only the label can be refused here, and
+ * both readers refuse it before either seam can dispatch anything.
+ */
+test('an empty label over a readable file is refused by both readers with zero dispatch', async () => {
+	const profile = { model: REVIEWER_MODEL, timeoutMs: 900_000 };
+	const { dir, config, configPath, cleanup } = tempConfig();
+	const refs = tempReferences(dir);
+	const emptyLabel = [{ label: '', path: refs.file }];
+	try {
+		// Both readers refuse the same declared shape, with the same fixed code and no echo.
+		writeFileSync(configPath, JSON.stringify({ ...config, requiredReferences: emptyLabel }, null, 2));
+		assert.throws(() => readLaneConfig(configPath),
+			(error) => error.message === LANE_SETUP_FAILURES.references, 'the controller reader refuses an empty label');
+		assert.equal(validateLaneConfig({ ...config, requiredReferences: emptyLabel }, profile).reason,
+			SETUP_FAILURES.references, 'the CLI reader refuses an empty label');
+
+		// The shipped entry point, driven with that exact config path: the reader refuses, so the
+		// handler emits nothing at all. No request event, no module resolution, no dispatch record.
+		const { pi, emitted, input } = fakePi();
+		const restore = [LANE_CONFIG_ENV, LANE_SUBAGENTS_ENV].map((name) => [name, process.env[name]]);
+		process.env[LANE_CONFIG_ENV] = configPath;
+		process.env[LANE_SUBAGENTS_ENV] = config.subagents;
+		try {
+			hyljaNativeLane(pi);
+			assert.equal((await input()({ text: FIXED_LANE_INPUT })).action, 'handled');
+		} finally {
+			for (const [name, value] of restore) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
+		assert.deepEqual(emitted, [], 'the controller reader refuses before anything is emitted');
+
+		// The CLI, same config: the refusal precedes the spawn, so no child exists and nothing is written.
+		const spawned = [];
+		const result = await runNativeLane(['--config', configPath], { spawn: fakeSpawn({ record: spawned }) });
+		assert.equal(result.reason, SETUP_FAILURES.references);
+		assert.equal(spawned.length, 0, 'zero dispatch: the CLI reader refuses before Pi is spawned');
+		for (const path of [config.receipt, config.dispatch, config.verification, config.progress]) {
+			assert.equal(existsSync(path), false, `nothing was written to ${path}`);
+		}
+
+		// The control: the identical readable file under a non-empty label is admitted by both readers,
+		// so what was refused is the label itself and nothing about the path.
+		const control = [{ label: 'required contract', path: refs.file }];
+		const controlPath = join(dir, 'lane-nonempty-label.json');
+		writeFileSync(controlPath, JSON.stringify({ ...config, requiredReferences: control }, null, 2));
+		assert.deepEqual(readLaneConfig(controlPath).requiredReferences, control);
+		assert.equal(validateLaneConfig({ ...config, requiredReferences: control }, profile).ok, true);
+	} finally {
+		cleanup();
+	}
+});
+
+/**
+ * Real default adapters, real default platform. These cases exist because injected fake
  * dependencies passed while the shipped defaults did not: a fake range read honored the range while
  * the default read the whole file and sliced it, and fake signal hooks recorded a callback while the
  * default registered nothing at all. Nothing here needs an installed Pi, a provider or the network:
  * the temporary platform above supplies synthetic entrypoints and the child transport is fake, so the
  * only real components under test are the CLI's own default filesystem and signal registration.
  */
+/** The wall clock the FIFO control is allowed. A blocking open hits it and the child is killed. */
+const FIFO_CONTROL_TIMEOUT_MS = 15_000;
+
+/**
+ * The bounded subprocess control around the shipped probe. A FIFO with no writer cannot be probed in
+ * the test runner itself without risking an unbounded wait there, so the wait is confined to a child
+ * a finite timeout can kill. The child imports the real controller, runs the real probe over that
+ * FIFO and then builds the real controller around it with the probe left unpatched.
+ */
+const fifoControlChild = (controllerUrl) => `
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createLaneController, probeReferenceMetadata, readLaneConfig } from '${controllerUrl}';
+
+const fifoPath = process.argv[2];
+// The shipped probe over a FIFO nobody ever opens for writing: metadata and an open, never a read.
+const metadata = probeReferenceMetadata(fifoPath);
+const dir = mkdtempSync(join(tmpdir(), 'hylja-fifo-lane-'));
+const guard = join(dir, 'guard.ts');
+writeFileSync(guard, 'export default function syntheticGuard() {}\\n');
+const dispatchPath = join(dir, 'dispatch.json');
+const configPath = join(dir, 'lane.json');
+writeFileSync(configPath, JSON.stringify({
+	key: 'fifo-control',
+	agent: 'hylja-reviewer',
+	task: 'synthetic FIFO control task',
+	cwd: dir,
+	timeoutMs: 600000,
+	requiredReferences: [{ label: 'synthetic fifo', path: fifoPath }],
+	sessionDir: join(dir, 'sessions'),
+	receipt: join(dir, 'receipt.json'),
+	dispatch: dispatchPath,
+	progress: join(dir, 'progress.ndjson'),
+	guard,
+}, null, 2));
+const loaded = readLaneConfig(configPath);
+const delegation = {
+	SUBAGENT_DELEGATION_REQUEST_EVENT: 'prompt-template:subagent:request',
+	SUBAGENT_DELEGATION_STARTED_EVENT: 'prompt-template:subagent:started',
+	SUBAGENT_DELEGATION_UPDATE_EVENT: 'prompt-template:subagent:update',
+	SUBAGENT_DELEGATION_RESPONSE_EVENT: 'prompt-template:subagent:response',
+	SUBAGENT_DELEGATION_CANCEL_EVENT: 'prompt-template:subagent:cancel',
+};
+const emitted = [];
+const pi = {
+	events: { on: () => () => {}, emit: (event) => { emitted.push(event); } },
+	on: () => {},
+};
+let preflightCalls = 0;
+const preflight = {
+	resolveSubagentLaunchContract: async (input) => {
+		preflightCalls += 1;
+		return {
+			ok: true,
+			contract: {
+				version: 3,
+				context: input.context,
+				roots: { cwd: input.cwd },
+				model: 'synthetic-fifo-control-model:max',
+				thinking: 'max',
+				intercomBridge: { active: false, mode: 'off' },
+				tools: { configuredExtensions: [guard], runtimeExtensions: [], disableAmbientExtensions: true },
+				launchContractDigest: 'synthetic-fifo-control-digest',
+				digest: 'synthetic-fifo-control-digest:contract',
+				diagnostics: [],
+			},
+		};
+	},
+};
+const controller = await createLaneController(pi, loaded, { delegation, preflight }, { addSignalListener: () => () => {} });
+const report = {
+	metadata,
+	setupFailure: controller.setupFailure,
+	dispatched: emitted.filter((event) => event === delegation.SUBAGENT_DELEGATION_REQUEST_EVENT).length,
+	preflightCalls,
+	dispatchPersisted: existsSync(dispatchPath),
+};
+rmSync(dir, { recursive: true, force: true });
+process.stdout.write(JSON.stringify(report));
+`;
+
+test('a writer-less FIFO is refused by the shipped probe inside a bounded subprocess, never by waiting on it', (t) => {
+	const dir = mkdtempSync(join(tmpdir(), 'hylja-fifo-control-'));
+	try {
+		// Platform honesty: a platform without a named pipe reports a skip, never a silent pass.
+		const fifoPath = join(dir, 'required-reference.fifo');
+		const made = spawnSync('mkfifo', [fifoPath]);
+		if (made.error !== undefined || made.status !== 0 || !statSync(fifoPath).isFIFO()) {
+			t.skip(`no writable FIFO on this platform: ${made.error?.code ?? `mkfifo exit ${made.status}`}`);
+			return;
+		}
+		// The pre-open rejection is observable on any platform, with no blocking open involved at all.
+		const subdir = join(dir, 'reference-subdir');
+		mkdirSync(subdir);
+		const childPath = join(dir, 'fifo-control-child.mjs');
+		writeFileSync(childPath, fifoControlChild(pathToFileURL(resolve(repoRoot, '.pi', 'lib', 'hylja-native-lane.ts')).href));
+		const control = spawnSync(process.execPath, [childPath, fifoPath],
+			{ timeout: FIFO_CONTROL_TIMEOUT_MS, encoding: 'utf8' });
+		// The bound is the proof: a blocking open exceeds it and the child is killed mid-probe.
+		assert.equal(control.error, undefined,
+			`the probe exceeded the ${FIFO_CONTROL_TIMEOUT_MS} ms bound: ${control.error?.code ?? control.signal}`);
+		assert.equal(control.signal, null, 'the control was not killed by the bound');
+		assert.equal(control.status, 0, control.stderr);
+		const report = JSON.parse(control.stdout);
+		assert.deepEqual(report.metadata, { isFile: false, isDirectory: false, readable: false },
+			'non-regular metadata is refused without reading a byte');
+		assert.equal(report.setupFailure, LANE_SETUP_FAILURES.references);
+		assert.equal(report.preflightCalls, 0, 'no launch contract was resolved');
+		assert.equal(report.dispatched, 0, 'zero dispatch');
+		assert.equal(report.dispatchPersisted, false, 'no dispatch record was persisted');
+		assert.deepEqual(probeReferenceMetadata(subdir), { isFile: false, isDirectory: true, readable: false },
+			'a non-regular path is refused before it is opened, so it is never reported readable');
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test('the real default filesystem reads a bounded positional progress tail and closes every fd', async () => {
 	const { config, configPath, cleanup } = tempConfig();
 	// A whole-file read of this planted progress file is 8 MiB; the tail cap is 128 KiB.

@@ -114,7 +114,8 @@ const defaultFs = {
 	readFile: (path) => readFileSync(path, 'utf8'),
 	exists: existsSync,
 	// Bounded metadata over one declared reference path: stat plus one open that reads nothing and is
-	// closed immediately. Absent, broken and denied paths answer null and are never admitted.
+	// closed immediately. Absent, broken and denied paths answer null and are never admitted, and a
+	// non-regular path is refused before it is opened, so it cannot block this host.
 	file: probeReferenceMetadata,
 	size: (path) => statSync(path).size,
 	read: (path, offset, length) => {
@@ -195,7 +196,9 @@ export function validateLaneConfig(value, profile) {
  * Admits every declared reference by metadata alone, before Pi is spawned: each path must be an
  * existing regular file this host can open for reading. Nothing is read from the file, no path is
  * searched for or substituted, and admission is not approval nor a guarantee about later
- * availability. Omission runs no probe at all, so the previous behaviour is unchanged.
+ * availability. A non-regular path is refused from its metadata before it is opened, so a writer-less
+ * FIFO cannot make this pre-spawn check wait: the watchdog that would bound the native lane does not
+ * exist yet. Omission runs no probe at all, so the previous behaviour is unchanged.
  */
 export function checkRequiredReferences(config, fs) {
 	const references = config.requiredReferences ?? [];
