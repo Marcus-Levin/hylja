@@ -151,10 +151,17 @@ function snapshot(value: unknown): { request: SyntheticAdmissionRequest | Admiss
     if (REQUIRED.some((key) => !Object.hasOwn(fields, key))) return { request: 'INVALID_REQUEST' };
     const scope = closedData(fields.scope as object, SCOPE_MEMBERS);
     if (!scope || SCOPE_MEMBERS.some((key) => !Object.hasOwn(scope, key))) return { request: 'INVALID_REQUEST' };
-    const request = Object.freeze({ version: fields.version, original: fields.original,
-      scope: Object.freeze({ tenantRef: scope.tenantRef, projectRef: scope.projectRef }),
+    // The snapshot record itself carries a null prototype, like the `fields` it is built from. An optional
+    // member the caller omitted must therefore read as `undefined` here rather than walk to
+    // `Object.prototype`, where a caller-planted getter would run and answer with planted text instead of
+    // the fixed refusal this module promises. No prototype chain is read at any stage, present or absent.
+    const request = Object.freeze(Object.assign(Object.create(null) as Record<string, unknown>, {
+      version: fields.version, original: fields.original,
+      scope: Object.freeze(Object.assign(Object.create(null),
+        { tenantRef: scope.tenantRef, projectRef: scope.projectRef })),
       configured: fields.configured, inputRef: fields.inputRef,
-      ...(Object.hasOwn(fields, 'fieldKey') ? { fieldKey: fields.fieldKey } : {}) });
+      ...(Object.hasOwn(fields, 'fieldKey') ? { fieldKey: fields.fieldKey } : {}),
+    }));
     return { request: request as unknown as SyntheticAdmissionRequest };
   } catch { return { request: 'INVALID_REQUEST' }; }
 }
@@ -236,7 +243,10 @@ export function inspectSyntheticEngineeringReference(value: unknown): SyntheticA
     if (!GRAMMAR.test(text)) return refused('OUT_OF_SYNTHETIC_GRAMMAR');
     // The real #8 runs first: a secret-like trusted field context, or any credential the value itself
     // carries, is the floor and nothing below it can overturn it.
-    const secrets = detectSecrets({ text, inputRef, ...(fieldKey === undefined ? {} : { fieldKey }) });
+    // The request handed to #8 carries a null prototype and names every member #8 destructures, itself
+    // included. An absent member then reads as `undefined` rather than walking to `Object.prototype`,
+    // so a caller-planted getter cannot be invoked by the detection seam on this module's behalf.
+    const secrets = detectSecrets(Object.assign(Object.create(null), { text, inputRef, fieldKey }));
     if (secrets.status !== 'COMPLETE') return refused('INCOMPLETE_INSPECTION');
     if (secrets.candidates.length) return refused('SECRET_EVIDENCE');
     const detected = detectNormalizedCandidates({ input: text, inputRef, scope,

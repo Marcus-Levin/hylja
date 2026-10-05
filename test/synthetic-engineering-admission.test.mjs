@@ -146,6 +146,32 @@ test('a caller getter is never invoked: the record is read through descriptors o
   assert.equal(reads, 0);
 });
 
+test('an inherited fieldKey never escapes: a planted getter cannot answer with planted text', () => {
+  const base = { version: 1, original: bytes(GOOD), scope: A, configured: config, inputRef: 'field-a.invalid' };
+  // The caller supplies no own fieldKey. Reading the omitted optional member must not walk to
+  // Object.prototype, where a planted getter would throw and its text would escape as the thrown error
+  // instead of leaving this seam as one of its fixed refusal codes.
+  let planted = 'planted-inherited-field.invalid';
+  Object.defineProperty(Object.prototype, 'fieldKey', {
+    configurable: true,
+    get() { throw new Error(planted); },
+  });
+  let result;
+  try {
+    result = inspectSyntheticEngineeringReference({ ...base });
+  } finally {
+    delete Object.prototype.fieldKey;
+  }
+  assert.ok(planted, 'the getter was planted');
+  assert.equal(JSON.stringify(result).includes('planted'), false, 'no planted text reaches the caller');
+  if (result.outcome === 'REFUSED') {
+    assert.ok(ADMISSION_REFUSALS.includes(result.reason), `${result.reason} is a fixed refusal code`);
+  } else {
+    // A getter that answers rather than throws changes no evidence, so a legitimate classification stands.
+    assert.equal(result.outcome, 'CLASSIFIED');
+  }
+});
+
 test('caller byte changes after the call cannot change the evidence already returned', () => {
   const original = bytes(GOOD);
   const captured = inspect(original);
