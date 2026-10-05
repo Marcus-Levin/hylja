@@ -18,7 +18,8 @@
 // a self-reported counter inside the module. Setup metadata operations (`lstatSync`, `realpathSync`,
 // run once per construction) are counted separately from the per-call effect triple
 // (`openSync`, `fstatSync`, `closeSync`), and every zero-open case ships a same-target control that
-// proves the instrument registers a real open at that exact target.
+// proves the instrument registers the **complete** triple - one open, one fstat, one close - at that
+// exact target, not merely an open.
 //
 // What is deliberately NOT claimed: this file cannot observe the recovered identifier, the contents
 // of any target, or any heap state. It observes codes, real native call counts and file identity.
@@ -73,6 +74,14 @@ function sameBytes(left, right) {
 function openDescriptors() {
   try { return cjs.readdirSync('/proc/self/fd').length; } catch { return -1; }
 }
+/**
+ * One boolean: two observed filesystem identities really name different files. Both operands are
+ * observed with the instrumented `lstatSync` **outside** every effect window, so this comparison can
+ * never spend an effect counter and no device or inode number is ever an assertion operand.
+ */
+function distinctIdentity(left, right) {
+  return left.dev !== right.dev || left.ino !== right.ino;
+}
 
 /* ---------- Fixed synthetic literals ---------- */
 
@@ -108,6 +117,14 @@ const ABSENT_LEAF = 'absent.txt';
 const MIRROR_LEAF = 'mirrored.txt';
 const DIRECTORY_LEAF = 'nested';
 const LINK_LEAF = 'linked.txt';
+const SUBSTITUTED_LEAF = 'substituted.txt';
+/**
+ * Where the bound inode is **renamed** instead of unlinked. Keeping it alive at a second owned path
+ * inside the same fixture directory is what makes a substitution deterministic: an unlink/recreate
+ * pair can hand the just-freed inode straight back to the replacement, and the case would then pass
+ * only by luck. Both names are owned fixture paths and both are removed in a `finally`.
+ */
+const RETAINED_LEAF = 'substituted-bound.txt';
 
 const keyBytes = (fill) => new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fill(fill);
 
@@ -622,12 +639,13 @@ test('a symbolic-link root is refused at construction and never opened', async (
   assert.deepEqual(refused, { opens: 0, stats: 0, closes: 0, lstats: 1, realpaths: 0 });
   assert.equal(built.counters.material, 0);
 
-  // Same-target control: the trusted real root really does open.
+  // Same-target control: the trusted real root really does open, and spends the whole effect triple.
   const controlHost = createHost(buildScenario());
   const control = createBoundFilePresence(controlHost.host, target());
   const controlMark = mark();
   assert.equal((await control.handle.use()).code, 'USED');
-  assert.equal(since(controlMark).opens, 1);
+  assert.deepEqual(since(controlMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 },
+    'linked-root control');
   control.dispose();
   created.dispose();
 });
@@ -641,9 +659,13 @@ test('a symlink target, a directory and a substituted inode all refuse without l
     const symlink = createBoundFilePresence(symlinkHost.host, target({ leaf: LINK_LEAF }));
     const symlinkMark = mark();
     const descriptors = openDescriptors();
-    // `O_NOFOLLOW` makes the real open itself refuse the link, so the descriptor never exists.
+    // `O_NOFOLLOW` makes the kernel refuse the link inside the open itself, so **no descriptor is ever
+    // created**: the `finally` that owns the close has nothing to close and spends nothing. The trace
+    // is therefore one open, no fstat and no close - not the full triple.
     assert.equal((await symlink.handle.use()).code, 'FAILED');
-    assert.deepEqual(since(symlinkMark), { opens: 1, stats: 0, closes: 0, lstats: 0, realpaths: 0 });
+    assert.deepEqual(since(symlinkMark), { opens: 1, stats: 0, closes: 0, lstats: 0, realpaths: 0 },
+      'symlink leaf');
+    assert.equal(descriptors === openDescriptors() || descriptors === -1, true);
     symlink.dispose();
 
     const directoryScenario = buildScenario();
@@ -653,31 +675,54 @@ test('a symlink target, a directory and a substituted inode all refuse without l
     const directoryMark = mark();
     // The real open and the real fstat both ran, the descriptor was a directory, and it was closed.
     assert.equal((await directory.handle.use()).code, 'FAILED');
-    assert.deepEqual(since(directoryMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 });
+    assert.deepEqual(since(directoryMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 },
+      'directory leaf');
     assert.equal(descriptors === openDescriptors() || descriptors === -1, true);
     directory.dispose();
 
-    // Substitution: the construction-bound identity is this inode, so a different file that appears
-    // at the same name is refused rather than reported.
-    const substituteName = join(TRUSTED, 'substituted.txt');
+    // Substitution: the construction-bound identity is this inode, so a different file that appears at
+    // the same name is refused rather than reported. The bound inode is **renamed**, not unlinked, so
+    // it stays alive at a second owned path: unlink-and-recreate can hand the just-freed inode
+    // straight back to the replacement, and the case would then pass only by luck.
+    const substituteName = join(TRUSTED, SUBSTITUTED_LEAF);
+    const retainedName = join(TRUSTED, RETAINED_LEAF);
     const substituteHost = createHost(buildScenario());
     cjs.writeFileSync(substituteName, 'synthetic substitution body one\n');
+    const boundObservation = cjs.lstatSync(substituteName);
     const substitute = createBoundFilePresence(substituteHost.host,
-      target({ leaf: 'substituted.txt' }));
-    const substituteMark = mark();
-    cjs.unlinkSync(substituteName);
+      target({ leaf: SUBSTITUTED_LEAF }));
+    cjs.renameSync(substituteName, retainedName);
     cjs.writeFileSync(substituteName, 'synthetic substitution body two\n');
-    assert.equal((await substitute.handle.use()).code, 'FAILED');
-    assert.deepEqual(since(substituteMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 });
-    substitute.dispose();
-    cjs.rmSync(substituteName, { force: true });
+    const replacementObservation = cjs.lstatSync(substituteName);
+    const substituteMark = mark();
+    try {
+      // The precondition, asserted before the effect as two booleans: both paths are regular files,
+      // and the replacement really is a different file. Every observation above is real filesystem
+      // metadata taken outside this window, so none of it can be a self-reported module value.
+      assert.equal(boundObservation.isFile() && replacementObservation.isFile(), true,
+        'substitution operands');
+      assert.equal(distinctIdentity(boundObservation, replacementObservation), true,
+        'substitution identities differ');
+      // The open and the fstat both ran on the replacement and the descriptor was closed again.
+      assert.equal((await substitute.handle.use()).code, 'FAILED');
+      assert.deepEqual(since(substituteMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 },
+        'substitution leaf');
+      assert.equal(descriptors === openDescriptors() || descriptors === -1, true);
+    } finally {
+      substitute.dispose();
+      // Both names are owned fixture paths inside this test's own ephemeral tree, and both go.
+      cjs.rmSync(substituteName, { force: true });
+      cjs.rmSync(retainedName, { force: true });
+    }
 
-    // Same-target control: a genuine bound file at its bound identity still spends the effect.
+    // Same-target control: a genuine bound file at its bound identity spends the whole effect triple.
     const controlHost = createHost(buildScenario());
     const control = createBoundFilePresence(controlHost.host, target());
     const controlMark = mark();
     assert.equal((await control.handle.use()).code, 'USED');
-    assert.equal(since(controlMark).opens, 1);
+    assert.deepEqual(since(controlMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 },
+      'nonregular control');
+    assert.equal(seen.openPath === PRESENT_PATH, true);
     control.dispose();
   });
 
@@ -733,9 +778,10 @@ test('disposal blocks later calls and clears the owned configuration it created'
 
   const beforeDispose = mark();
   // The paired same-target control for every zero-count below, in this same test and at this same
-  // target: the genuine present file really opens before anything is disposed.
+  // target: the genuine present file really opens, fstats and closes before anything is disposed.
   assert.equal((await created.handle.use()).code, 'USED');
-  assert.equal(since(beforeDispose).opens, 1);
+  assert.deepEqual(since(beforeDispose), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 },
+    'disposal control');
 
   created.dispose();
   // A second disposal is safe, and every later call is refused before any native function is reached.
@@ -764,11 +810,12 @@ test('disposal from inside a host callback refuses the in-flight call before any
     assert.equal(result.code, 'FAILED');
     assert.deepEqual(since(before), { opens: 0, stats: 0, closes: 0, lstats: 0, realpaths: 0 });
 
-    // Control: the identical hook sequence without the disposal spends the effect normally.
+    // Control: the identical hook sequence without the disposal spends the whole effect triple.
     const controlHost = createHost(buildScenario(), { hooks: { onAuthority: () => {} } });
     const control = createBoundFilePresence(controlHost.host, target());
     const controlMark = mark();
     assert.equal((await control.handle.use()).code, 'USED');
-    assert.equal(since(controlMark).opens, 1);
+    assert.deepEqual(since(controlMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 },
+      'in-callback disposal control');
     control.dispose();
   });
