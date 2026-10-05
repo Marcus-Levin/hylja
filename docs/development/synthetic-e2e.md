@@ -33,6 +33,48 @@ The listed files also match the `test/*.test.mjs` glob in the [`npm test`](../..
 so the full suite reruns them. `npm run check:docs` and `npm run check:fixtures` cover the evidence
 records and the tracked paths.
 
+### One runnable demo command
+
+[`scripts/synthetic-conversation-demo.mjs`](../../scripts/synthetic-conversation-demo.mjs)
+([#250](https://github.com/Marcus-Levin/hylja/issues/250)) runs the bounded local conversation owner
+([openai-local-conversation.md](../contracts/openai-local-conversation.md)) over a real standard HTTP
+peer on `127.0.0.1` and prints one fixed human-readable summary of the real owner result and the real
+peer, release, detector and fixed-worker counters. No original value, key, model traffic, argument,
+signal name or native error is ever printed, on any exit path: a runtime that cannot load, a summary
+that cannot be built and an output pipe that is broken all end in the same fixed decline line and exit 1,
+and the subprocess evidence proves the broken-pipe case by closing the reader of stdout before the demo writes.
+
+```sh
+npm run build && node scripts/synthetic-conversation-demo.mjs                    # one masked request, one guarded release
+node scripts/synthetic-conversation-demo.mjs --case blocked-reply                # one upstream request, zero releases
+node scripts/synthetic-conversation-demo.mjs --case unsupported-request          # zero payload requests, zero releases
+```
+
+Both `--case` runs are expected refusals and exit zero; a case that deviates from what it declares
+exits 1, and a malformed argument is refused before any peer, socket, owner, detector, policy
+decision or child exists, with exit 2 and nothing echoed. The subprocess evidence is
+[`test/synthetic-conversation-demo.e2e.test.mjs`](../../test/synthetic-conversation-demo.e2e.test.mjs)
+(`node --test test/synthetic-conversation-demo.e2e.test.mjs`), and its declared fixtures are in
+[`scripts/lib/synthetic-conversation-fixture.mjs`](../../scripts/lib/synthetic-conversation-fixture.mjs).
+The demo composes the accepted seams this document already routes and adds no transport, coordinator,
+policy authority or runtime surface; the limits below are its limits too.
+
+Both refusals are also reported against the real fixed-worker children, because the accepted receiver's
+one `SENTINEL_BLOCKED` code covers a genuine block, a crashed child, a malformed reply and a missing
+reply alike. The summary therefore also counts, per real child, the observed exit code, the signal close,
+exactly one complete decision frame, the fixed `ALLOW` or `BLOCK` decision, and whether a block carried
+the known-original reason code and named the registered ref; a case whose children did not really run the
+decision it declares exits 1 rather than reporting a success. The observation itself is fixture-only
+([`scripts/lib/synthetic-conversation-worker-observation.mjs`](../../scripts/lib/synthetic-conversation-worker-observation.mjs),
+driven by [`scripts/lib/synthetic-conversation-demo-cases.mjs`](../../scripts/lib/synthetic-conversation-demo-cases.mjs)):
+it observes the children, changes nothing, and is not an enforcement boundary. Its test-only fault hooks
+are reachable from fixture code alone - no operator argument, environment variable or file arms them -
+through [`test/support/synthetic-conversation-demo-fault-driver.mjs`](../../test/support/synthetic-conversation-demo-fault-driver.mjs),
+which terminates the second real child while preserving the first, and
+[`test/support/synthetic-conversation-demo-confidentiality-probe.test.mjs`](../../test/support/synthetic-conversation-demo-confidentiality-probe.test.mjs),
+which the suite runs under `node --test` to observe that assertions over output really carrying the
+planted values report none of them.
+
 ## What these runs are
 
 Each one joins **already-shipped, accepted-v1 seams** inside one test file over explicitly synthetic,
