@@ -21,16 +21,22 @@
  *   has is `127.0.0.1:<captured port>`, and it is never re-derived, re-read or redirected. A port that
  *   is not a plain usable loopback port is `ENDPOINT_REFUSED` before anything can exist. The request
  *   route is this module's own constant, and the caller supplies exactly one member, `body`.
- * - The **handoff is synchronous**. Between the sender's last check and `socket.write` there is no
- *   callback, no `await` and no host input: the guards are read and the exact sender-checked bytes are
- *   written in one turn. The only thing after that write is the kernel's loopback handshake, which
- *   carries no authority; the actual remote endpoint is confirmed as soon as it exists, and a mismatch
- *   closes the socket and fails the exchange.
+ * - The handoff is **prepared, then immediate**. Readiness owns the bounded connection and confirms the
+ *   captured endpoint tuple, but it carries no byte and grants no approval: it is awaited only after the
+ *   inspection, the policy decisions, the derivation and the real child `ALLOW`, and every route, commit,
+ *   proof-freshness and cancellation guard is then re-read against the private plan-derived image. Only
+ *   after those guards does one synchronous turn hand the exact sender-checked bytes to the captured
+ *   write function of the already connected socket, with no callback, no `await` and no host input in
+ *   between. The kernel may still hold that write in its buffer; it carries no authority, and the
+ *   endpoint is confirmed before the write, never after it.
  * - The reply is parsed by **one narrow supported profile**, decided here and refused rather than
  *   permissively tolerated: `HTTP/1.1 200 OK`, a bounded header block of exactly this shape, one
- *   `Content-Length`, no `Transfer-Encoding`, a JSON `Content-Type`, no duplicate header name, and a
- *   body of exactly the declared length that must decode as UTF-8. Chunked, opaque, incomplete,
- *   oversized, mislabelled or undecodable replies are refused, never truncated and never guessed.
+ *   `Content-Length`, no `Transfer-Encoding` and no `Content-Encoding`, a JSON `Content-Type` whose only
+ *   optional parameter is `charset=utf-8` with balanced quotes, no duplicate header name, and a
+ *   body of exactly the declared length that must decode as UTF-8. Chunked, compressed, opaque, incomplete,
+ *   oversized, mislabelled or undecodable replies are refused, never truncated and never guessed. The
+ *   header bound is on the header block alone, so TCP segmentation cannot change what is accepted, and a
+ *   first reply carrying surplus after its declared length is ignored and the socket is closed.
  * - Cancellation is **owned**, sticky and one-way: it propagates to the sender, the receiver and the
  *   live socket, and this owner can never dispatch again afterwards.
  * - Every refusal is a fixed code. No exception message, transport error, parser excerpt, socket
@@ -88,6 +94,18 @@ export type LocalConversationState = 'IDLE' | 'BUSY' | 'CANCELLED' | 'FAILED';
 /** A failure of the owned transport only, before it can become a sender or receiver refusal. */
 type TransportCode = 'TRANSPORT_FAILED' | 'RESPONSE_REFUSED' | 'RESPONSE_TRUNCATED'
   | 'RESPONSE_TOO_LARGE' | 'RESPONSE_TIMEOUT' | 'CANCELLED';
+
+/**
+ * What readiness prepares and the handoff then uses: the connected socket, the write and end functions
+ * captured on it, and the time the one exchange deadline still has left. Nothing here is a handle a
+ * caller can hold, and nothing here can be read or replaced between the handoff's guard and its write.
+ */
+interface PreparedTransport {
+  readonly socket: LoopbackSocket;
+  readonly write: (image: Uint8Array) => void;
+  readonly end: () => void;
+  readonly remaining: () => number;
+}
 
 /** What the trusted host observes at the send and release points. Each owner re-validates it itself. */
 export interface LocalConversationObservation {
@@ -148,7 +166,12 @@ const STATUS_LINE = 'HTTP/1.1 200 OK';
 const TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u;
 const HEADER_VALUE = /^[\t\x20-\x7e]*$/u;
 const LENGTH = /^[1-9][0-9]*$/u;
-const CONTENT_TYPE = /^application\/json(?:[ \t]*;[ \t]*charset[ \t]*=[ \t]*"?utf-8"?)?$/iu;
+/**
+ * The one supported content type: `application/json`, optionally with the single `charset` parameter and
+ * nothing else. A quoted value must carry BOTH quotes - `charset="utf-8` is a malformed label and is
+ * refused like any other - so no header can claim a value this parser only half accepted.
+ */
+const CONTENT_TYPE = /^application\/json(?:[ \t]*;[ \t]*charset[ \t]*=[ \t]*(?:"utf-8"|utf-8)[ \t]*)?$/iu;
 const CR = 13;
 const LF = 10;
 
@@ -227,6 +250,9 @@ function replyFrameOf(head: Uint8Array): ReplyFrame | null {
     if (seen.has(key)) return null;
     seen.add(key);
     if (key === 'transfer-encoding') return null;
+    // This owner implements no decompression, so any content coding is a label it cannot honour. The
+    // identity coding is refused as well: one supported profile has no second spelling of "no encoding".
+    if (key === 'content-encoding') return null;
     if (key === 'content-length') {
       if (!LENGTH.test(value)) return null;
       bodyBytes = Number.parseInt(value, 10);
@@ -237,7 +263,7 @@ function replyFrameOf(head: Uint8Array): ReplyFrame | null {
   return Object.freeze({ headBytes: head.byteLength + 4, bodyBytes });
 }
 
-/** Offset of the first CRLFCRLF, or -1. Bounded by the caller's own head cap. */
+/** Offset of the first CRLFCRLF, or -1. The caller's own bound decides when that becomes a refusal. */
 function headEnd(bytes: Uint8Array): number {
   for (let at = 0; at + 3 < bytes.byteLength; at += 1) {
     if ((bytes[at] ?? 0) === CR && (bytes[at + 1] ?? 0) === LF &&
@@ -289,16 +315,82 @@ export function createOpenAiLocalConversation(host: unknown): OpenAiLocalConvers
   let cancelled = false;
   let stop: (() => void) | null = null;
   let reply: Uint8Array | null = null;
+  let prepared: PreparedTransport | null = null;
   let transportCode: TransportCode | null = null;
+  // The two accepted host methods, captured once on the accepted host object. They are invoked through
+  // the trusted `Reflect.apply`, so a host method that reads its own state keeps its own receiver and no
+  // host property is read again at either the send point or the application sink.
+  const observeHost = observe as () => LocalConversationObservation;
+  const replyHost = onReply as (text: string) => Promise<void>;
 
   /**
-   * One owned exchange over the captured endpoint. It resolves only when a complete, strictly framed
+   * Readiness: open the owned connection and confirm the captured endpoint tuple, and nothing else. It
+   * sends no byte, approves nothing, and is awaited only after every authorizing stage has completed.
+   * Node buffers a write made while connecting and resumes it on `connect`, so the transport is prepared
+   * HERE and the dispatch-point guards are read after it, never before.
+   */
+  const waitUntilReady = (): Promise<void> => new Promise<void>((resolve, reject) => {
+    let socket: LoopbackSocket;
+    try { socket = createConnection({ port, host: LOOPBACK, localAddress: LOOPBACK, family: 4 }); }
+    catch { transportCode = 'TRANSPORT_FAILED'; reject(); return; }
+    const open = socket;
+    const deadlineAt = Date.now() + timeoutMs;
+    let settled = false;
+    let timer: WorkerTimer | null = null;
+    const settle = (code: TransportCode | null): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      stop = null;
+      if (code === null) {
+        // The write and end functions are captured here, on the socket readiness just confirmed, so the
+        // handoff below invokes them directly and reads no socket property between its guard and the
+        // write. Only the deadline and the socket itself stay behind.
+        const writeMethod = open.write;
+        const endMethod = open.end;
+        prepared = Object.freeze({
+          socket: open,
+          write: (bytes: Uint8Array): void => { Reflect.apply(writeMethod, open, [bytes]); },
+          end: (): void => { Reflect.apply(endMethod, open, []); },
+          remaining: (): number => Math.max(0, deadlineAt - Date.now()),
+        });
+        resolve();
+        return;
+      }
+      transportCode = code;
+      try { open.destroy(); } catch { /* already closed */ }
+      reject();
+    };
+    stop = (): void => { settle('CANCELLED'); };
+    open.on('error', () => { settle(cancelled ? 'CANCELLED' : 'TRANSPORT_FAILED'); });
+    open.on('close', () => { settle(cancelled ? 'CANCELLED' : 'TRANSPORT_FAILED'); });
+    open.on('connect', () => {
+      // The endpoint actually reached, confirmed before a single byte exists on the wire. A mismatch
+      // closes the socket and fails the exchange, so the queued write can never reach another endpoint.
+      if (cancelled || open.connecting || open.remotePort !== port || open.remoteAddress !== LOOPBACK ||
+        open.remoteFamily !== 'IPv4' || open.localAddress !== LOOPBACK) {
+        settle(cancelled ? 'CANCELLED' : 'TRANSPORT_FAILED');
+        return;
+      }
+      settle(null);
+    });
+    timer = setTimeout(() => { settle('RESPONSE_TIMEOUT'); }, timeoutMs);
+    timer.unref();
+  });
+
+  /**
+   * One owned exchange over the prepared socket. It resolves only when a complete, strictly framed
    * reply body is in hand; every other end - refusal, truncation, oversize, timeout, cancellation,
-   * socket error or a close that arrives first - settles once with a fixed code. Buffers this owner
-   * allocated are zeroed in that one place, on every outcome.
+   * socket error or a close that arrives first - settles once with a fixed code. Every buffer this
+   * exchange allocated is zeroed in that one place, on every outcome.
    */
   const receive = (image: Uint8Array): Promise<Uint8Array | null> => new Promise((resolve) => {
+    const transport = prepared;
+    prepared = null;
+    if (transport === null) { transportCode = cancelled ? 'CANCELLED' : 'TRANSPORT_FAILED'; resolve(null); return; }
+    const socket = transport.socket;
     const chunks: Uint8Array[] = [];
+    const owned: Uint8Array[] = [];
     let received = 0;
     let frame: ReplyFrame | null = null;
     let timer: WorkerTimer | null = null;
@@ -308,56 +400,62 @@ export function createOpenAiLocalConversation(host: unknown): OpenAiLocalConvers
       settled = true;
       if (timer !== null) { clearTimeout(timer); timer = null; }
       stop = null;
+      // Unconditional cleanup of every buffer this exchange allocated: the received chunks, and the
+      // concatenations that exist only to locate the head terminator and to cut the declared body.
       for (const chunk of chunks) chunk.fill(0);
       chunks.length = 0;
-      try { socket.destroy(); } catch { /* already closed or never opened */ }
+      for (const buffer of owned) buffer.fill(0);
+      owned.length = 0;
+      try { socket.destroy(); } catch { /* already closed */ }
       if (body === null) transportCode = code;
       resolve(body);
     };
-    let socket: LoopbackSocket;
-    try { socket = createConnection({ port, host: LOOPBACK, localAddress: LOOPBACK, family: 4 }); }
-    catch { resolve(null); return; }
-    const open = socket;
-    stop = (): void => { try { open.destroy(); } catch { /* already closed */ } };
-    open.on('error', () => { done(null, cancelled ? 'CANCELLED' : 'TRANSPORT_FAILED'); });
-    open.on('close', () => { done(null, cancelled ? 'CANCELLED' : 'RESPONSE_TRUNCATED'); });
-    open.on('connect', () => {
-      // The endpoint actually reached, confirmed as soon as it exists. The image is already queued in
-      // the kernel's buffer for the captured literal, so a mismatch here cannot have gone anywhere else.
-      if (open.remotePort !== port || open.remoteAddress !== LOOPBACK ||
-        open.remoteFamily !== 'IPv4' || open.localAddress !== LOOPBACK) done(null, 'TRANSPORT_FAILED');
-    });
-    open.on('data', (chunk) => {
+    socket.on('error', () => { done(null, cancelled ? 'CANCELLED' : 'TRANSPORT_FAILED'); });
+    socket.on('close', () => { done(null, cancelled ? 'CANCELLED' : 'RESPONSE_TRUNCATED'); });
+    socket.on('data', (chunk) => {
       if (settled) return;
       chunks.push(chunk);
       received += chunk.byteLength;
       if (frame === null) {
-        // The head bound ends an endless header block; nothing is parsed before the profile can be read.
-        if (received > LIMITS.maxHeadBytes) { done(null, 'RESPONSE_TOO_LARGE'); return; }
+        // The head bound is measured on the header block alone. The terminator is located first and the
+        // bound applied to its offset plus the four terminator bytes, so a body coalesced with a small
+        // head is never refused and a terminator split across two reads is still found.
         const bytes = join(chunks);
+        owned.push(bytes);
         const at = headEnd(bytes);
-        if (at < 0) return;
+        if (at < 0) {
+          // No complete head yet. An endless header block ends here, on the head bound alone.
+          if (received > LIMITS.maxHeadBytes) done(null, 'RESPONSE_TOO_LARGE');
+          return;
+        }
+        if (at + 4 > LIMITS.maxHeadBytes) { done(null, 'RESPONSE_TOO_LARGE'); return; }
         const parsed = replyFrameOf(bytes.subarray(0, at));
         if (parsed === null) { done(null, 'RESPONSE_REFUSED'); return; }
         frame = parsed;
       }
       const expected = frame.headBytes + frame.bodyBytes;
       if (received < expected) return;
-      // Exactly the declared bytes are used. Anything after them is surplus this owner never parses.
+      // Exactly the declared bytes are used. Anything after them is surplus this owner never parses,
+      // and the socket is closed rather than drained.
       const all = join(chunks);
+      owned.push(all);
       done(all.slice(frame.headBytes, expected), null);
     });
+    stop = (): void => { try { socket.destroy(); } catch { /* already closed */ } };
 
-    // The synchronous handoff. Every guard is read and the exact sender-checked bytes are handed to the
-    // owned socket in this one synchronous turn: the promise executor runs inside the call itself, so
-    // no callback, no `await` and no host input separates them.
-    if (cancelled || open.destroyed || !open.writable || open.bytesWritten !== 0) {
+    // The synchronous handoff, on the already connected socket. Every guard is read and the exact
+    // sender-checked bytes are handed to the captured write in this one synchronous turn: the promise
+    // executor runs inside the call itself, so no callback, no `await` and no host input separates them.
+    if (cancelled || socket.destroyed || socket.connecting || !socket.writable ||
+      socket.bytesWritten !== 0) {
       done(null, cancelled ? 'CANCELLED' : 'TRANSPORT_FAILED');
       return;
     }
-    open.write(image);
-    open.end();
-    timer = setTimeout(() => { done(null, 'RESPONSE_TIMEOUT'); }, timeoutMs);
+    transport.write(image);
+    transport.end();
+    const remaining = transport.remaining();
+    if (remaining <= 0) { done(null, 'RESPONSE_TIMEOUT'); return; }
+    timer = setTimeout(() => { done(null, 'RESPONSE_TIMEOUT'); }, remaining);
     timer.unref();
   });
 
@@ -366,7 +464,8 @@ export function createOpenAiLocalConversation(host: unknown): OpenAiLocalConvers
   const senderOwner = createOpenAiTextSender({
     ...sender,
     sendPoint: {
-      observe: (): LocalConversationObservation => (observe as () => LocalConversationObservation)(),
+      waitUntilReady: async (): Promise<void> => { await waitUntilReady(); },
+      observe: (): LocalConversationObservation => Reflect.apply(observeHost, host, []),
       sendExact: async (checked: Uint8Array): Promise<void> => {
         reply = await receive(checked);
         if (reply === null) throw new Error();
@@ -376,9 +475,9 @@ export function createOpenAiLocalConversation(host: unknown): OpenAiLocalConvers
   const receiverOwner = createOpenAiKeepReceiver({
     ...receiver,
     releasePoint: {
-      observe: (): LocalConversationObservation => (observe as () => LocalConversationObservation)(),
+      observe: (): LocalConversationObservation => Reflect.apply(observeHost, host, []),
       releaseExact: async (image: Uint8Array): Promise<void> => {
-        await (onReply as (text: string) => Promise<void>)(decodeText(image));
+        await Reflect.apply(replyHost, host, [decodeText(image)]);
       },
     },
   });
@@ -416,7 +515,17 @@ export function createOpenAiLocalConversation(host: unknown): OpenAiLocalConvers
       if (cancelled) return Promise.resolve(refused('CANCELLED'));
       busy = true;
       transportCode = null;
-      return run(input).catch(() => refused('CONVERSATION_FAILED')).finally(() => { busy = false; });
+      return run(input).catch(() => refused('CONVERSATION_FAILED')).finally(() => {
+        busy = false;
+        // Unconditional end-of-exchange cleanup: a prepared but undispatched socket is destroyed and an
+        // abandoned reply no decode ever consumed is wiped, on every outcome of every exchange.
+        const abandoned = prepared;
+        prepared = null;
+        if (abandoned !== null) { try { abandoned.socket.destroy(); } catch { /* already closed */ } }
+        const undelivered = reply;
+        reply = null;
+        if (undelivered !== null) undelivered.fill(0);
+      });
     },
     cancel: (): void => {
       if (cancelled) return;

@@ -111,7 +111,8 @@ caller supplies endpoint and body only.
 [#201](https://github.com/Marcus-Levin/hylja/issues/201) set, with the inspection member renamed to
 state its binding: `boundary`, `sourceTrust`, `policyBundle`, `scope`, `known`, `sentinel`,
 `inspectOriginal` and `sendPoint`. Anything else — an unknown key, an accessor, a symbol key, a
-missing member, a non-function `inspectOriginal`, `observe` or `sendExact`, a `sourceTrust` that is not
+missing member, a non-function `inspectOriginal`, `observe`, `waitUntilReady` or `sendExact`, a
+`sourceTrust` that is not
 a trust level, a missing or `undefined` `known` — yields a permanently restrictive sender whose state
 is `FAILED` and whose every `send` is `HOST_INVALID`. Construction never throws and never sends.
 
@@ -122,10 +123,19 @@ the sentinel child. `observe()` returns `{ destination: { id, profileDigest }, c
 digest } }` and is called once before the check and once more in the same synchronous turn as the
 dispatch; redirects are prohibited (`ROUTE_CHANGED`), and a changed commit is `POLICY_STALE`.
 
-Structural validity is the only thing this module checks about its host. `inspectOriginal`, `observe`
-and `sendExact` are read once during validation and then invoked as those captured function references
+The send point has exactly three own data properties: `observe`, the required `waitUntilReady` and
+`sendExact`. `waitUntilReady(): Promise<void>` is awaited once, after the child `ALLOW` and before the
+dispatch-point guards. It prepares the transport without sending anything, returns no approval and is
+never a re-check of any evidence; its job is only to make the transport ready so the guards below it are
+read against a transport that will really dispatch now. A send point that cannot be prepared is
+`HOST_INVALID`, and there is no optional readiness and no fallback dispatch path.
+
+Structural validity is the only thing this module checks about its host. `inspectOriginal`, `observe`,
+`waitUntilReady` and `sendExact` are read once during validation and then invoked as those captured
+function references
 on the receiver they were accepted on, so no trusted-host property is read after the last guard and a
-later host-side method swap cannot retarget an existing sender. `observe` and `sendExact` keep the send
+later host-side method swap cannot retarget an existing sender. `observe`, `waitUntilReady` and
+`sendExact` keep the send
 point's own object as their receiver. `inspectOriginal` runs on the accepted **own-data-property
 snapshot** of the host: a frozen shallow copy carrying exactly the members that were validated, so a
 callback that reads its own host state — `this.sendPoint`, `this.boundary`, its own classification
@@ -198,11 +208,22 @@ outside this contract.
 6. Rebuild the final image from the plan, re-parse it through the strict codec and check its congruence.
 7. One check in the real fixed-worker child process over the **exact final bytes**, under the scope and
    registration captured before the inspection.
-8. Re-observe the route, profile and policy commit, re-read the boundary evidence's freshness, then
-   re-read sticky cancellation, and dispatch — all in one synchronous turn, with no callback and no
-   `await` between the last check and `sendExact`.
+8. Await the send point's required `waitUntilReady()`, which prepares the transport and sends nothing.
+9. Verify the released bytes are still the private plan-derived image, re-observe the route, profile and
+   policy commit, re-read the boundary evidence's freshness, then re-read sticky cancellation, and
+   dispatch — all in one synchronous turn, with no callback and no `await` between the last check and
+   `sendExact`.
 
-**Step 8 is ordered, and the order is the guarantee.** The final `observe()` is host code, so it runs
+**Steps 8 and 9 are ordered, and the order is the guarantee.** A transport may buffer a write made while
+connecting and resume it on `connect`, so the dispatch-point guards must be read **after** the transport
+is ready, not before. `waitUntilReady()` is a **required** member of the send point, not an optional
+legacy path: it prepares the transport, carries no byte, returns no approval, decides nothing and cannot
+grant a route, a commit or a freshness, and it is awaited only after every authorizing stage has
+completed. Nothing is redone after that `await`; a rejection, a failure or a cancellation raised while it
+runs is `DISPATCH_FAILED` and withholds the dispatch.
+
+**Step 9 is also ordered, and that order is a second guarantee.** The final `observe()` is host code, so
+it runs
 first and every structural and freshness check it can invalidate follows it; cancellation is read again
 last, immediately before the transport call. The freshness re-read is the
 [envelope contract's own rule](interaction-envelope.md): an unchanged proof digest is **not** a current

@@ -596,6 +596,17 @@ test('an unresolved inspection and an upstream sentinel block reach no socket, o
         'INSPECTION_REFUSED');
       assertNothingReachedPeer(state);
       assertNothingReleased(releases);
+
+      /* The ACTUAL positive exchange on this same peer and this same sink: the counters above were
+         real, so a peer that never answers can never explain them. */
+      assert.deepEqual(await bounded(conversation.exchange(acceptedRequest()), 'same-peer control'),
+        { status: 'COMPLETED' });
+      assert.equal(state.connections, 1, 'the control opened exactly one connection');
+      assert.equal(state.requests, 1, 'and delivered exactly one request');
+      assert.equal(releases.length, 1, 'and exactly one guarded release');
+      assert.equal(releases[0] === EXPECTED_RELEASE, true,
+        'the released text is the declared canonical image');
+      await closed(state, 'same-peer control');
     }
 
     /* The planted secret survives into the final bytes: real policy then selects KEEP over the fixture
@@ -704,7 +715,7 @@ test('an unsupported, truncated or oversize reply releases nothing; the controls
       assertRefusal(await bounded(conversation.exchange(acceptedRequest()), entry.name), entry.code);
       assert.equal(state.connections, 1, `${entry.name}: exactly one connection reached the peer`);
       assert.equal(state.requests, 1, `${entry.name}: the peer read exactly one complete request`);
-      assert.equal(state.images[0].toString('utf8'), EXPECTED_MASKED_IMAGE,
+      assert.equal(state.images[0].toString('utf8') === EXPECTED_MASKED_IMAGE, true,
         `${entry.name}: the peer received exactly the declared masked image`);
       assertNothingReleased(releases);
       await closed(state, entry.name);
@@ -718,6 +729,134 @@ test('an unsupported, truncated or oversize reply releases nothing; the controls
       assert.equal(control[0], EXPECTED_RELEASE, `${entry.name}: and it is the declared canonical image`);
       assert.equal(state.connections, 2, `${entry.name}: the control opened exactly one more connection`);
     }
+  });
+
+/* ---------- The reply profile: labeling, head bound and surplus, over one raw peer each ---------- */
+
+test('the head bound, the reply labeling and the surplus profile are decided on the reply alone',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    /* A body that is far larger than the head bound, but a small head. It must be accepted identically
+       however the peer happened to segment it, because the bound is on the header block, never on the
+       bytes coalesced with it. */
+    const BIG_BODY_BYTES = 4_199;
+    const BIG_REPLY_BODY = REPLY_BODY.replace(
+      'Rotation window 02:00 UTC.', `Rotation window 02:00 UTC.${'x'.repeat(BIG_BODY_BYTES - REPLY_BYTES)}`);
+    assert.equal(Buffer.byteLength(BIG_REPLY_BODY, 'utf8') === BIG_BODY_BYTES, true,
+      'the declared body is larger than the header bound');
+    const bigHead = Buffer.from(
+      'HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n'
+      + `Content-Length: ${BIG_BODY_BYTES}\r\nConnection: close\r\n\r\n`, 'utf8');
+    const bigBody = Buffer.from(BIG_REPLY_BODY, 'utf8');
+    const segmentations = [
+      {
+        name: 'coalesced', respond: (socket) => { socket.end(Buffer.concat([bigHead, bigBody])); },
+      },
+      {
+        // The terminator itself is split across two writes, so the head is never whole in one chunk.
+        name: 'segmented', respond: (socket) => {
+          socket.write(bigHead.subarray(0, bigHead.byteLength - 2));
+          socket.write(bigHead.subarray(bigHead.byteLength - 2));
+          socket.end(bigBody);
+        },
+      },
+    ];
+
+    for (const entry of segmentations) {
+      const state = await startRawPeer(t, (socket) => { entry.respond(socket); });
+      const releases = [];
+      const { conversation } = createConversation(state, { releases });
+      assert.deepEqual(await bounded(conversation.exchange(acceptedRequest()), entry.name),
+        { status: 'COMPLETED' }, entry.name);
+      assert.equal(state.connections, 1, `${entry.name}: exactly one connection`);
+      assert.equal(state.requests, 1, `${entry.name}: exactly one request`);
+      assert.equal(releases.length, 1, `${entry.name}: exactly one guarded release`);
+      assert.equal(state.images[0].toString('utf8') === EXPECTED_MASKED_IMAGE, true,
+        `${entry.name}: the peer received exactly the declared masked image`);
+      await closed(state, entry.name);
+    }
+
+    /* Labeling outside the one supported profile is refused, and a balanced quoted charset is not. */
+    const labelled = [
+      { name: 'unmatched charset quote', header: 'Content-Type: application/json; charset="utf-8\r\n', code: 'RESPONSE_REFUSED' },
+      { name: 'mislabelled gzip', header: 'Content-Type: application/json; charset=utf-8\r\nContent-Encoding: gzip\r\n', code: 'RESPONSE_REFUSED' },
+      { name: 'identity content encoding', header: 'Content-Type: application/json; charset=utf-8\r\nContent-Encoding: identity\r\n', code: 'RESPONSE_REFUSED' },
+    ];
+    for (const entry of labelled) {
+      const state = await startRawPeer(t, (socket) => { socket.end(Buffer.from(
+        `HTTP/1.1 200 OK\r\n${entry.header}Content-Length: ${REPLY_BYTES}\r\n\r\n${REPLY_BODY}`, 'utf8')); });
+      const releases = [];
+      const { conversation } = createConversation(state, { releases });
+      assertRefusal(await bounded(conversation.exchange(acceptedRequest()), entry.name), entry.code);
+      assert.equal(state.requests, 1, `${entry.name}: the peer read exactly one request`);
+      assertNothingReleased(releases);
+      await closed(state, entry.name);
+    }
+
+    /* A balanced quoted charset, and a first reply that carries surplus after the declared length, are
+       both inside the one supported profile: the surplus is ignored and the socket is closed. */
+    const accepted = [
+      {
+        name: 'quoted utf-8 charset',
+        bytes: () => Buffer.from(`HTTP/1.1 200 OK\r\nContent-Type: application/json; charset="utf-8"\r\n`
+          + `Content-Length: ${REPLY_BYTES}\r\n\r\n${REPLY_BODY}`, 'utf8'),
+      },
+      {
+        name: 'surplus after the declared length',
+        bytes: () => Buffer.concat([rawReply(), Buffer.from('{"surplus":true}', 'utf8')]),
+      },
+    ];
+    for (const entry of accepted) {
+      const state = await startRawPeer(t, (socket) => { socket.end(entry.bytes()); });
+      const releases = [];
+      const { conversation } = createConversation(state, { releases });
+      assert.deepEqual(await bounded(conversation.exchange(acceptedRequest()), entry.name),
+        { status: 'COMPLETED' }, entry.name);
+      assert.equal(releases.length, 1, `${entry.name}: exactly one guarded release`);
+      assert.equal(releases[0] === EXPECTED_RELEASE, true,
+        `${entry.name}: the release is the declared canonical image, surplus ignored`);
+      await closed(state, entry.name);
+    }
+  });
+
+test('the accepted host methods run on the host receiver they were validated on',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const state = await startHttpPeer(t);
+    const releases = [];
+    let receiverPreserved = true;
+    const observation = OBSERVATION;
+    // Declared as real methods on their own object, so a lost `this` is observable from inside.
+    const host = {
+      port: state.port,
+      timeoutMs: DEADLINE_MS,
+      observe() {
+        if (this !== host) receiverPreserved = false;
+        this.observations = (this.observations ?? 0) + 1;
+        return observation;
+      },
+      async onReply(reply) {
+        if (this !== host) receiverPreserved = false;
+        this.sink = (this.sink ?? []).concat([reply]);
+        releases.push(reply);
+      },
+      sender: {
+        boundary: BOUNDARY, sourceTrust: SOURCE_TRUST, policyBundle: BUNDLE, scope: SCOPE,
+        known: registration(), sentinel: { deadlineMs: DEADLINE_MS }, inspectOriginal: requestInspect([]),
+      },
+      receiver: {
+        boundary: BOUNDARY, policyBundle: BUNDLE, scope: SCOPE, known: registration(),
+        sentinel: { deadlineMs: DEADLINE_MS }, inspect: replyInspect([]),
+      },
+    };
+    const conversation = createOpenAiLocalConversation(host);
+    assert.deepEqual(await bounded(conversation.exchange(acceptedRequest()), 'host receiver'),
+      { status: 'COMPLETED' });
+    assert.equal(receiverPreserved, true,
+      'every accepted host method ran on the host object it was validated on');
+    assert.equal(state.connections, 1);
+    assert.equal(state.requests, 1);
+    assert.equal(releases.length, 1);
+    assert.equal(releases[0] === EXPECTED_RELEASE, true);
+    await closed(state, 'host receiver');
   });
 
 /* ---------- A timeout and a cancellation leave the application empty and the peer closed ---------- */

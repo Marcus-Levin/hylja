@@ -177,6 +177,15 @@ export interface TextSenderSendPoint {
    * Redirects are prohibited: a different route is a refusal, never a followed location.
    */
   observe(): TextSenderObservation;
+  /**
+   * REQUIRED, and awaited only after the inspection, the policy decisions, the derivation and the real
+   * fixed-worker child have all completed. It prepares the transport without sending: it carries no
+   * byte, returns no approval, decides nothing, and cannot grant a route, a commit or a freshness.
+   * It exists because a transport may defer its native write until after the connection completes, so
+   * the dispatch-point guards must be read **after** the transport is ready, not before. A rejected or
+   * failed readiness is `DISPATCH_FAILED`, exactly as a failed transport is, and it withholds the bytes.
+   */
+  waitUntilReady(): Promise<void>;
   /** Sends exactly these bytes, once. A resolved promise is the only confirmation of the effect. */
   sendExact(image: Uint8Array): Promise<void>;
 }
@@ -216,7 +225,7 @@ export interface OpenAiTextSender {
 /* ---------- Fixed, closed vocabularies and strict structural readers ---------- */
 
 const HOST_KEYS: readonly string[] = ['boundary', 'sourceTrust', 'policyBundle', 'scope', 'known', 'sentinel', 'inspectOriginal', 'sendPoint'];
-const SEND_POINT_KEYS: readonly string[] = ['observe', 'sendExact'];
+const SEND_POINT_KEYS: readonly string[] = ['observe', 'waitUntilReady', 'sendExact'];
 const OBSERVATION_KEYS: readonly string[] = ['destination', 'commit'];
 const DESTINATION_KEYS: readonly string[] = ['id', 'profileDigest'];
 const COMMIT_KEYS: readonly string[] = ['id', 'version', 'digest'];
@@ -236,6 +245,7 @@ const encoder = new TextEncoder();
 
 type Fields = Record<string, unknown>;
 type ObserveMethod = () => TextSenderObservation;
+type WaitUntilReadyMethod = () => Promise<void>;
 type SendExactMethod = (image: Uint8Array) => Promise<void>;
 type InspectOriginalMethod = (image: Uint8Array, binding: TextInspectionBinding) => unknown;
 
@@ -344,8 +354,12 @@ function trustedHost(value: unknown): TextSenderHost | null {
   if (sendPoint === null) return null;
   const inspect = fields['inspectOriginal'];
   const observe = sendPoint['observe'];
+  const waitUntilReady = sendPoint['waitUntilReady'];
   const sendExact = sendPoint['sendExact'];
-  if (typeof inspect !== 'function' || typeof observe !== 'function' || typeof sendExact !== 'function') return null;
+  // Readiness is a required member, never an optional legacy path: a send point that cannot be prepared
+  // cannot be dispatched through, so there is exactly one shape and no fallback.
+  if (typeof inspect !== 'function' || typeof observe !== 'function' ||
+    typeof waitUntilReady !== 'function' || typeof sendExact !== 'function') return null;
   if (!(TRUST_LEVELS as readonly string[]).includes(fields['sourceTrust'] as string)) return null;
   const recordish = fields['boundary'];
   const bundle = fields['policyBundle'];
@@ -368,6 +382,7 @@ function trustedHost(value: unknown): TextSenderHost | null {
     inspectOriginal: captured(inspect as InspectOriginalMethod, snapshot),
     sendPoint: Object.freeze({
       observe: captured(observe as ObserveMethod, fields['sendPoint']),
+      waitUntilReady: captured(waitUntilReady as WaitUntilReadyMethod, fields['sendPoint']),
       sendExact: captured(sendExact as SendExactMethod, fields['sendPoint']),
     }),
   }) as unknown as TextSenderHost;
@@ -837,6 +852,18 @@ export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
       }
       const release = outcome.release;
 
+      // Readiness comes next, and only here. Everything that could authorize a dispatch has already
+      // happened - the inspection, the real policy decision per unit, the derivation and the real
+      // fixed-worker child ALLOW - and none of it is redone after this await. Readiness prepares the
+      // transport and carries no byte: it returns no approval, grants no route, no commit and no
+      // freshness, and it is not itself a re-check. It is here because a transport may buffer the write
+      // until its connection completes, so the dispatch-point guards below must be read AFTER the
+      // transport is ready, never before. A rejection, a failure or a cancellation raised while it runs
+      // withholds the dispatch entirely.
+      if (cancelled) return refused('CANCELLED');
+      try { await trusted.sendPoint.waitUntilReady(); }
+      catch { return refused('DISPATCH_FAILED'); }
+
       // The dispatch point, deliberately ordered. The transport and observation callables were captured
       // during validation, so this is the last point at which any host property is read at all: the final
       // host observation and every structural and freshness check it can invalidate happen first; sticky
@@ -844,6 +871,9 @@ export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
       // so a cancel raised by that last callback can no longer reach a dispatch. The early read below only
       // spares the host a second observation.
       if (cancelled) return refused('CANCELLED');
+      // The released bytes are still the private plan-derived image the child ALLOWed. Readiness is a
+      // transport event, so it cannot be allowed to substitute a different buffer for them.
+      if (digestOf(release) !== derived.imageDigest) return refused('DISPATCH_FAILED');
       const current = observationOf(trusted.sendPoint.observe());
       if (current === null) return refused('ROUTE_REFUSED');
       if (!same(current.destination, observed.destination)) return refused('ROUTE_CHANGED');

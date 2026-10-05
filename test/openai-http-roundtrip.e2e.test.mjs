@@ -359,6 +359,9 @@ function createSender(state) {
     inspectOriginal: inspectWholeImage,
     sendPoint: {
       observe: () => OBSERVATION,
+      // Readiness is a required member: the whole socket lifecycle below lives inside `sendExact`, so
+      // this transport has no deferred write and nothing that can withhold a byte after preparation.
+      waitUntilReady: async () => {},
       sendExact: rawSocketTransport(state),
     },
   };

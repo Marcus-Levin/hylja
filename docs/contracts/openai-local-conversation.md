@@ -63,34 +63,53 @@ non-function member or hostile trap (a revoked Proxy included) is `HOST_INVALID`
 
 **The endpoint is captured, never re-derived.** One numeric port is captured at construction and read only
 from the closure; the destination is the literal `127.0.0.1` with `localAddress` pinned to the same literal
-and `family: 4`. There is no host name, no URL, no name resolution, no TLS, no proxy and no redirect. The
-`connect` handler confirms `remotePort`, `remoteAddress`, `remoteFamily` and `localAddress` against that
-captured endpoint as soon as the connection exists; a mismatch closes the socket and fails the exchange.
+and `family: 4`. There is no host name, no URL, no name resolution, no TLS, no proxy and no redirect.
 
-**The handoff is synchronous.** The promise executor runs inside the sender's own dispatch call, so every
-guard is read and `socket.write(image)` writes the **exact sender-checked bytes** in one turn: no callback,
-no `await` and no host input separates the sender's last check from the write. That write is preceded by a
-re-read of cancellation and of `destroyed`, `writable` and `bytesWritten === 0`, and followed by `end()`.
-Only the kernel's loopback handshake follows, and it carries no authority.
+**Readiness is a required member of the send point this owner supplies**, so the endpoint is confirmed
+**before** any byte exists on the wire: `waitUntilReady()` opens the one bounded connection, checks
+`connecting` is false and that `remotePort`, `remoteAddress`, `remoteFamily` and `localAddress` all match
+that captured endpoint, and captures the socket's `write` and `end` functions. A mismatch closes the
+socket and fails the exchange. Readiness sends nothing, approves nothing and decides nothing; it is
+awaited only after the inspection, the policy decisions, the derivation and the real child `ALLOW`, and
+the composed sender then re-reads the route, commit, evidence freshness and cancellation **after** it.
+
+**The handoff is immediate.** Once those guards are read, one synchronous turn calls the captured
+`write(image)` with the **exact sender-checked bytes** on the already connected socket and then `end()`:
+the promise executor runs inside the sender's own dispatch call, so no callback, no `await` and no host
+input separates them. That write is preceded by a re-read of cancellation and of `destroyed`,
+`connecting`, `writable` and `bytesWritten === 0`. The kernel may still hold the write in its own buffer;
+that carries no authority, and the endpoint was confirmed before the write rather than after it.
 
 **Exactly one supported reply profile**, decided here and refused rather than tolerated:
 
 | Element | Accepted value |
 |---|---|
 | status line | exactly `HTTP/1.1 200 OK` |
-| header block | at most `4096` bytes received before a complete head, at most `32` fields |
+| header block | at most `4096` bytes **of head, terminator included**, at most `32` fields |
 | field names/values | RFC token names, visible ASCII or tab values, no duplicate name |
 | `Transfer-Encoding` | absent; its presence is refused, never parsed |
+| `Content-Encoding` | absent; this owner implements no decompression, so even `identity` is refused |
 | `Content-Length` | exactly one, `^[1-9][0-9]*$`, at most `65536` bytes |
-| `Content-Type` | `application/json`, optionally with `charset=utf-8` |
+| `Content-Type` | `application/json`, optionally with `charset=utf-8` or `charset="utf-8"`; an unmatched quote is refused |
 | body | exactly the declared length, decodable as **strict UTF-8** |
 
-Chunked, compressed, opaque, truncated, mislabelled, oversized, duplicated, empty-length, undecodable and
-surplus-trailing replies are refused, never truncated and never guessed; bytes after the declared length
-are never parsed. The body bound is the strict response codec's own `maxResponseBytes`, reused rather than
-restated, and no codec rule is re-implemented here. One exchange settles once: every received chunk is
-zeroed, the socket is destroyed and the reply buffer is zeroed after its single decode, on the accepted
-path and on every refusal alike, and the `unref`'d deadline timer is cleared. That claims the buffers
+**The header bound is on the header block alone**, never on the bytes coalesced with it: the CRLFCRLF
+terminator is located first and the bound applied to its offset plus those four bytes, so a valid body
+larger than `4096` bytes is accepted identically whether the peer coalesced it with the head, segmented
+it, or split the terminator across two reads. Only an unterminated block that already passes the bound is
+`RESPONSE_TOO_LARGE`. The declared body length is a second, independent bound.
+
+Chunked, compressed, opaque, truncated, mislabelled, oversized, duplicated, empty-length and undecodable
+replies are refused, never truncated and never guessed. **Surplus after the declared length is ignored,
+not refused**: the first reply's exactly declared bytes are cut, the remainder is never parsed, and the
+socket is closed rather than drained — the accepted one-response profile terminates the connection
+instead of reading past what it authorized. Bytes after the declared length never reach a codec. The
+body bound is the strict response codec's own `maxResponseBytes`, reused rather than
+restated, and no codec rule is re-implemented here. One exchange settles once: every received chunk and
+every concatenation this owner allocated for it are zeroed in that one place, the socket is destroyed, and
+the reply buffer is zeroed after its single decode or when the exchange ends without one, on the accepted
+path and on every refusal alike, as is any socket that was prepared but never dispatched. The `unref`'d
+deadline timer is cleared. That claims the buffers
 **this module allocated** and nothing else: no erasure of immutable strings, caller input, runtime, peer
 or child copies, and no heap, RSS or swap erasure is claimed or proved.
 
@@ -100,8 +119,9 @@ or child copies, and no heap, RSS or swap erasure is claimed or proved.
    strict request codec, private ORIGINAL image, snapshot-bound inspection evidence over it, the real `SEND`
    policy decision per unit with its accepted `KEEP`/`MASK` plan, and the real fixed-worker child over the
    final bytes.
-2. Open the owned socket to the captured endpoint, confirm it, hand the exact checked bytes over
-   synchronously, read one bounded reply under the profile above, decode it as strict UTF-8, then run the
+2. Await the sender's readiness on the captured endpoint, then hand the exact checked bytes over
+   immediately on the connected socket, read one bounded reply under the profile above, decode it as
+   strict UTF-8, then run the
    composed **receiver** over that text unchanged - its own strict codec, private canonical image,
    inspection, real policy decision per unit, real fixed-worker child and guarded release - for exactly one
    `onReply` call.
@@ -148,15 +168,20 @@ part of the input, and no result carries bytes, a digest or a handle.
   result, a comparative win or promotion evidence ([evaluation.md](../evaluation.md)).
 
 [`test/openai-local-conversation.e2e.test.mjs`](../../test/openai-local-conversation.e2e.test.mjs) runs
-six cases over a real `node:http` peer and raw `node:net` peers on `127.0.0.1`
+eight cases over a real `node:http` peer and raw `node:net` peers on `127.0.0.1`
 (`node --test test/openai-local-conversation.e2e.test.mjs`, route:
 [synthetic-e2e.md](../development/synthetic-e2e.md)): the accepted conversation, with a real detector run,
 a real policy `MASK`, both real fixed-worker children, one connection and one parsed request compared
 against an independently declared masked image, and one guarded release of a declared canonical image; an
-unresolved inspection and an upstream sentinel block that reach no socket, each followed by a real positive
-control on the same sink; a registered original in the reply that releases nothing while the control on the
+unresolved inspection and an upstream sentinel block that reach no socket, the first followed by a real
+positive exchange on the same peer and sink; a registered original in the reply that releases nothing while
+the control on the
 same owner releases; chunked, non-200, oversize-length, duplicate-length, truncated and header-flood
-replies, each followed by a positive control on the same peer; a silent peer that times out and a cancelled
+replies, each followed by a positive control on the same peer; a reply larger than the header bound
+accepted identically whether the peer coalesced it with the head or split the terminator across two reads,
+three mislabelled or malformed header cases refused, and a balanced quoted charset plus a surplus-tailed
+first reply accepted with the surplus ignored; accepted `observe`/`onReply` methods proven to run on the
+host receiver they were validated on; a silent peer that times out and a cancelled
 in-flight exchange with a sticky `CANCELLED` owner; and unusable hosts, endpoints, deadlines and call
 shapes that never dispatch. Unexercised by that suite: `CONVERSATION_FAILED`, the endpoint-mismatch branch
 of `TRANSPORT_FAILED`, and an undecodable-UTF-8 body. Every fixture value is obviously synthetic and

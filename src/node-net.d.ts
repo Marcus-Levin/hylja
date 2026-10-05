@@ -17,6 +17,8 @@ declare module 'node:net' {
     readonly remoteFamily: string | undefined;
     readonly localAddress: string | undefined;
     readonly destroyed: boolean;
+    /** True while the kernel handshake is still outstanding; the owner refuses to write before it clears. */
+    readonly connecting: boolean;
     readonly writable: boolean;
     /** Zero until the owner's single synchronous handoff writes; it is read as that handoff's guard. */
     readonly bytesWritten: number;

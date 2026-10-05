@@ -457,6 +457,10 @@ function createSender(state, runs, mode = 'real') {
     inspectOriginal: conversationInspect(runs, mode),
     sendPoint: {
       observe: () => OBSERVATION,
+      // Readiness is a required member: this in-memory capture owns no connection, so there is nothing
+      // to prepare and nothing that can withhold a byte after it. The real socket lifecycle below lives
+      // wholly inside `sendExact`, so this transport has no deferred write to guard against.
+      waitUntilReady: async () => {},
       sendExact: async (image) => {
         dispatch.push(Buffer.from(image));
         await rawSocketTransport(state)(image);
