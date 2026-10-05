@@ -189,8 +189,12 @@ non-empty digest strings, and every `configured`, `runtime` and `required` diges
 explicitly empty list is a valid assertion of an empty set and stays distinct from missing evidence.
 Any missing, reused or mismatched part is a setup failure with a fixed code,
 never an inferred pass. Exit codes: `0` verified completed lane, `2` setup or evidence failure
-(INCOMPLETE), `3` the leaf finished non-completed. A `completed` leaf is not approval: the verdict is
-only the leaf's own literal `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE` line.
+(INCOMPLETE), `3` the leaf finished non-completed. What is printed alongside them is fixed: a setup
+refused before any child is launched prints exactly one bounded JSON line carrying only the fixed
+`verdict` and the fixed setup code — never a config path, a task, a declared reference, a detail or a
+thrown message — so an exit 2 is never silent and cannot be read as a lane that never ran; a launched
+lane prints its one full verification record and nothing else. A `completed` leaf is not approval: the
+verdict is only the leaf's own literal `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE` line.
 
 Four bindings carry that last rule, each refused rather than inferred:
 
@@ -248,7 +252,7 @@ provably the same code and not a re-implementation of it.
 
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (49 tests, 39 of them in the lane file). Two of them
+platform (50 tests, 40 of them in the lane file). Two of them
 fake only the child transport, so the shipped default platform is what runs: the default filesystem
 must read the progress tail with bounded positional descriptor reads and close every descriptor it
 opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
@@ -295,6 +299,14 @@ calls, zero dispatch and no persisted dispatch record, in about 90 ms. The root 
 that FIFO. A platform without a named pipe reports a skip with the reason, never a silent pass.
 Metadata admission proves neither later availability nor content approval, and the retained control
 covers one POSIX FIFO rather than every non-regular file type.
+One case spawns the shipped CLI itself, because every other case drives the exported function
+in-process and therefore cannot observe what root actually receives: a missing config, a config
+declaring no `sessionDir` and a config whose declared session directory does not exist each exit 2,
+print exactly one bounded `verdict`/`reason` line with nothing planted echoed into it, launch nothing
+and write nothing, while the identical platform with every declared path present really launches the
+owned child and still logs exactly one full verification record. Its synthetic `pi` records its own
+launch, so zero dispatch is proved at the process boundary instead of asserted about an injected
+spawn.
 A read-only
 smoke on root's own installed Pi ran from
 `/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and

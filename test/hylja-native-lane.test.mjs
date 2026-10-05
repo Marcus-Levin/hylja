@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import nodeFs from 'node:fs';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -2060,6 +2060,91 @@ test('the real default signal hooks own SIGINT and SIGTERM, stop once, and are r
 			childRef?.emit('close', 143);
 			await pending;
 		}
+	} finally {
+		cleanup();
+	}
+});
+
+/**
+ * The shipped entry point, run as a real child process. Every case above drives the exported function
+ * in-process, so none of them can observe what root actually receives: whether the CLI prints
+ * anything at all, and which exit code it hands back. An early refusal that exited 2 silently was
+ * indistinguishable from a lane that was never attempted. No local Pi, provider or network is
+ * involved: the temporary platform's `pi` is a synthetic script that records its own launch, which is
+ * also how zero dispatch is proved at the process boundary rather than by an assertion about an
+ * injected spawn.
+ */
+const laneCliPath = resolve(repoRoot, 'scripts', 'development', 'run-native-lane.mjs');
+/** The bound on one whole CLI process. A real lane is minutes; these setups refuse before launch. */
+const CLI_PROCESS_TIMEOUT_MS = 30_000;
+const PLANTED_CLI_KEY = 'synthetic-planted-cli-key.invalid';
+const PLANTED_CLI_TASK = 'synthetic-planted-cli-task.invalid';
+
+test('the real CLI process prints one bounded JSON refusal for a setup it refuses before launch', () => {
+	const { dir, config, configPath, cleanup } = tempConfig();
+	// A planted key and task, obviously synthetic and never routable, so an echo into the record is
+	// observable rather than inferred. The child records its own launch from the same platform.
+	const markerPath = join(dir, 'pi-was-launched');
+	writeFileSync(config.pi, `#!/bin/sh\n: > '${markerPath}'\nexit 0\n`);
+	chmodSync(config.pi, 0o755);
+	let variant = 0;
+	const variantPath = (overrides) => {
+		const path = join(dir, `lane-cli-process-${variant += 1}.json`);
+		// `sessionDir: undefined` serializes to an absent field, which is the shape case below.
+		writeFileSync(path, JSON.stringify({ ...config, key: PLANTED_CLI_KEY, task: PLANTED_CLI_TASK, ...overrides }, null, 2));
+		return path;
+	};
+	try {
+		const cases = [
+			// The config file itself is absent, so nothing about it can be reported from it.
+			{ name: 'missing config', path: join(dir, 'lane-cli-process-absent.json'), reason: SETUP_FAILURES.install },
+			// A config that reads correctly but declares no session directory: the field is missing, so
+			// the shape is refused before any path is probed.
+			{ name: 'no sessionDir field', path: variantPath({ sessionDir: undefined }), reason: SETUP_FAILURES.config },
+			// A declared but absent session directory: every field is well formed, so the refusal is the
+			// freshness/existence check rather than the shape check.
+			{ name: 'absent session directory', path: variantPath({ sessionDir: join(dir, 'absent-session-dir') }), reason: SETUP_FAILURES.install },
+		];
+		for (const { name, path, reason } of cases) {
+			const run = spawnSync(process.execPath, [laneCliPath, '--config', path],
+				{ cwd: repoRoot, timeout: CLI_PROCESS_TIMEOUT_MS, encoding: 'utf8' });
+			assert.equal(run.error, undefined, `${name}: the CLI process exceeded its bound (${run.error?.code})`);
+			assert.equal(run.signal, null, `${name}: the CLI process was not killed`);
+			assert.equal(run.status, 2, `${name}: a setup failure stays exit 2`);
+			assert.equal(run.stderr, '', `${name}: one stdout record, never a traceback or a warning`);
+			const lines = run.stdout.split('\n');
+			assert.equal(lines.length, 2, `${name}: exactly one record line, got ${lines.length - 1}`);
+			assert.equal(lines[1], '', `${name}: that record is newline terminated`);
+			const record = JSON.parse(lines[0]);
+			assert.deepEqual(Object.keys(record), ['verdict', 'reason'], `${name}: two fixed fields and nothing else`);
+			assert.deepEqual(record, { verdict: 'INCOMPLETE', reason }, `${name}: the fixed refusal`);
+			for (const planted of [PLANTED_CLI_KEY, PLANTED_CLI_TASK, config.cwd, dir]) {
+				assert.equal(run.stdout.includes(planted), false, `${name}: no ${planted} echo`);
+			}
+			assert.equal(existsSync(markerPath), false, `${name}: zero dispatch, the refusal preceded the spawn`);
+			for (const written of [config.receipt, config.verification, config.progress, config.dispatch]) {
+				assert.equal(existsSync(written), false, `${name}: nothing was written to ${written}`);
+			}
+		}
+
+		// The control: the identical platform and the identical CLI with every declared path present,
+		// so the same marker proves a real launch happened. Without it, the zero-dispatch assertions
+		// above would also hold for a CLI that never spawns anything at all.
+		const launched = spawnSync(process.execPath, [laneCliPath, '--config', configPath],
+			{ cwd: repoRoot, timeout: CLI_PROCESS_TIMEOUT_MS, encoding: 'utf8' });
+		assert.equal(launched.error, undefined, `control: ${launched.error?.code}`);
+		assert.equal(launched.status, 2, `control: the fake child leaves no leaf evidence, stderr: ${launched.stderr}`);
+		assert.equal(existsSync(markerPath), true, 'the control really launched the owned child');
+		const lines = launched.stdout.split('\n');
+		assert.equal(lines.length, 2, `one logged verification record and no refusal line, got ${lines.length - 1}`);
+		const record = JSON.parse(lines[0]);
+		assert.equal(record.key, config.key, 'the launched run logs its own verification record');
+		assert.equal(record.agent, config.agent);
+		assert.equal(record.verdict, 'INCOMPLETE');
+		assert.equal(record.reason, SETUP_FAILURES.receipt, 'the synthetic child wrote no receipt');
+		assert.equal(record.nativeExitCode, 0, 'the owned child ran and closed cleanly');
+		assert.deepEqual(JSON.parse(readFileSync(config.verification, 'utf8')), record,
+			'the printed record and the persisted one are the same record');
 	} finally {
 		cleanup();
 	}
