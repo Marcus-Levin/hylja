@@ -30,6 +30,15 @@
  *   observation, and the snapshotted boundary proof intervals are re-read for freshness at the dispatch
  *   point, immediately before the transport call. That is freshness, never authenticity: authenticating
  *   those proofs remains the host's obligation, and an unchanged digest is not a current proof.
+ * - The scope and the known-original registration the child is asked to check under are captured into
+ *   **private copies before the trusted inspection callback runs**, and those copies - not the host's own
+ *   mutable objects - are what the child receives. `scope` and `known` are host-owned and mutable: read
+ *   only at check time, a host that rewrites either during the inspection would decide which scope the
+ *   real child runs under, and the dispatch would then happen under a scope this sender never bound to
+ *   this interaction. The existing sentinel snapshot seam owns that validation and copying, so it is
+ *   reused rather than duplicated, and its request id is this send's own generated interaction identity.
+ *   It is not a rule that revokes on host-side mutation: a host that rewrites its own members to the same
+ *   values is checked under exactly the captured ones.
  * - Every accepted method is captured once, on the receiver it was validated on, and is never looked up
  *   on the host object again. `inspect`, `observe` and `sendExact` run as the function references the
  *   validated data properties held, so reading a method back off the host at the dispatch point - a
@@ -57,6 +66,7 @@ import type {
   SentinelProcessScope,
 } from './egress-sentinel-process.js';
 import type { SentinelProcessDestination } from './egress-sentinel-process-protocol.js';
+import { snapshotSentinelRequest } from './egress-sentinel-process-protocol.js';
 import { OPENAI_TEXT_REQUEST_ENDPOINT, translateOpenAiTextRequest } from './openai-text-request.js';
 import type { OpenAiTextRequestRefusal } from './openai-text-request.js';
 
@@ -517,10 +527,6 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
     try { envelope = createInteractionEnvelope(translated.draft, trusted.boundary); }
     catch { return refused('INTERACTION_REFUSED'); }
     const interactionRef = envelope.id;
-    if (trusted.scope.tenantRef !== envelope.context.tenantId ||
-      (envelope.context.projectId !== undefined && trusted.scope.projectRef !== envelope.context.projectId)) {
-      return refused('SCOPE_REFUSED');
-    }
 
     let image: SendImage;
     try { image = buildImage(translated.draft, observed.destination.id); } catch { return refused('SENDER_FAILED'); }
@@ -530,72 +536,123 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
       version: 1, interactionRef, imageDigest, units,
     });
 
-    // The inspector gets its own copy. It can answer, mutate or throw; none of it reaches the bytes,
-    // and a thrown value is never inspected: its text, class and stack are all caller-controlled.
-    let findings: readonly KeepInspectionFinding[] | null;
-    try { findings = findingsOf(trusted.inspect(image.bytes.slice(), binding), binding); } catch { findings = null; }
-    if (findings === null) return refused('INSPECTION_REFUSED');
-    const byUnit = new Map(findings.map((finding) => [finding.unitRef, finding] as const));
-
-    for (const unit of units) {
-      const finding = byUnit.get(unit.unitRef);
-      if (finding === undefined) return refused('INSPECTION_REFUSED');
-      const classification = usableClassification(finding);
-      if (classification === null) return refused('INSPECTION_REFUSED');
-      const request: PolicyRequest = {
-        version: 1, interactionRef, candidateRef: unit.unitRef,
-        subject: envelope.subject, context: envelope.context, source: envelope.source,
-        destination: envelope.destination, classification, operation: 'SEND',
-        policy: KNOWN_POLICY_BUNDLE,
-      };
-      const boundary: PolicyBoundary = {
-        interactionRef, candidateRef: unit.unitRef,
-        classificationDigest: finding.classificationDigest,
-        authenticated: { subject: envelope.subject, context: envelope.context },
-        observed: { source: { ...envelope.source, trust: trusted.sourceTrust }, destination: envelope.destination },
-        policy: { ...observed.commit },
-      };
-      const decision = decidePolicy(request, boundary, trusted.policyBundle);
-      if (decision.state === 'DENIED') return refused('POLICY_DENIED');
-      if (decision.state === 'HELD') return refused('POLICY_HELD');
-      if (decision.treatment !== 'KEEP') return refused('POLICY_NOT_KEEP');
-    }
-
-    const outcome = await runner.check({
-      bytes: image.bytes, scope: trusted.scope, destination: observed.destination,
+    // The exact request the child is asked to check is captured into private, capped copies BEFORE the
+    // host inspector runs, and those copies are what the child is later handed. The existing sentinel
+    // snapshot seam owns that validation and copying, so this reuses it instead of adding a second
+    // context validator: an unknown own key, an oversized registration, a registration scope that is not
+    // the check scope, an unsupported value or a hostile trap refuses here exactly as the runner's own
+    // check refuses, before any child exists. The per-operation binding token is this send's own generated
+    // interaction identity - never a fixed global id - and the runner still mints the real per-child
+    // request id when it spawns.
+    const taken = snapshotSentinelRequest({
+      bytes: image.bytes,
+      scope: trusted.scope,
+      destination: observed.destination,
       // What the decision authorized: the route in the authenticated boundary, not the observed one.
       // A swapped boundary or a changed route is therefore a real mismatch for the child to find.
       authorized: { id: envelope.destination.ref, profileDigest: observed.destination.profileDigest },
       known: trusted.known,
-    });
-    // A cancellation this sender asked for is reported as one; every other non-`ALLOW` outcome,
-    // including a check that never ran, collapses into one fixed sentinel refusal.
-    if (outcome.status !== 'ALLOW') return refused(outcome.code === 'CANCELLED' ? 'CANCELLED' : 'SENTINEL_BLOCKED');
-    const release = outcome.release;
+    }, `${interactionRef}.sentinel`);
+    if (!taken.ok) {
+      // Nothing on this branch reaches a child, so both outcomes withhold. A scope that does not belong
+      // to the authenticated context keeps the refusal it has always reported; it is read through own
+      // data descriptors, never an accessor, and it decides nothing that could authorize an effect.
+      const tenantRef = ownData(trusted.scope, 'tenantRef');
+      const projectRef = ownData(trusted.scope, 'projectRef');
+      if (tenantRef !== envelope.context.tenantId ||
+        (envelope.context.projectId !== undefined && projectRef !== envelope.context.projectId)) {
+        return refused('SCOPE_REFUSED');
+      }
+      return refused('SENTINEL_BLOCKED');
+    }
+    const capturedRequest = taken.value;
+    try {
+      // The captured scope is compared against the BOUND ENVELOPE, not against an earlier mutable alias
+      // of the host object: this is the scope the child is about to run under, so it is the one that
+      // must belong to this authenticated tenant/project.
+      if (capturedRequest.scope.tenantRef !== envelope.context.tenantId ||
+        (envelope.context.projectId !== undefined &&
+          capturedRequest.scope.projectRef !== envelope.context.projectId)) {
+        return refused('SCOPE_REFUSED');
+      }
 
-    // The dispatch point, deliberately ordered. The transport and observation callables were captured
-    // during validation, so this is the last point at which any host property is read at all: the final
-    // host observation and every structural and freshness check it can invalidate happen first; sticky
-    // cancellation is then re-read with nothing between that read and the transport call but this frame,
-    // so a cancel raised by that last callback can no longer reach a dispatch. The early read below only
-    // spares the host a second observation.
-    if (cancelled) return refused('CANCELLED');
-    const current = observationOf(trusted.sendPoint.observe());
-    if (current === null) return refused('ROUTE_REFUSED');
-    if (!same(current.destination, observed.destination)) return refused('ROUTE_CHANGED');
-    if (!same(current.commit, observed.commit)) return refused('POLICY_STALE');
-    // The finite trusted callback and the fixed-worker child both took real time. Re-read the boundary
-    // evidence this interaction was bound under: a proof window that closed during the send is not a
-    // still-current context, and the identity, context and observed route it authorized are no longer
-    // usable for this dispatch. Recreating the envelope instead would mint a new interaction identity
-    // and invalidate every digest, unit reference and policy decision already pinned over it.
-    if (!currentEvidence(envelope, Date.now())) return refused('INTERACTION_REFUSED');
-    // No callback and no await separates this read from the effect it guards.
-    if (cancelled) return refused('CANCELLED');
-    try { await trusted.sendPoint.sendExact(release); }
-    catch { return refused('DISPATCH_FAILED'); }
-    // The effect already happened once. It is never retried, repeated or replayed from a returned handle.
-    return Object.freeze({ status: 'SENT' as const });
+      // The inspector gets its own copy. It can answer, mutate or throw; none of it reaches the bytes,
+      // and a thrown value is never inspected: its text, class and stack are all caller-controlled.
+      let findings: readonly KeepInspectionFinding[] | null;
+      try { findings = findingsOf(trusted.inspect(image.bytes.slice(), binding), binding); } catch { findings = null; }
+      if (findings === null) return refused('INSPECTION_REFUSED');
+      const byUnit = new Map(findings.map((finding) => [finding.unitRef, finding] as const));
+
+      for (const unit of units) {
+        const finding = byUnit.get(unit.unitRef);
+        if (finding === undefined) return refused('INSPECTION_REFUSED');
+        const classification = usableClassification(finding);
+        if (classification === null) return refused('INSPECTION_REFUSED');
+        const request: PolicyRequest = {
+          version: 1, interactionRef, candidateRef: unit.unitRef,
+          subject: envelope.subject, context: envelope.context, source: envelope.source,
+          destination: envelope.destination, classification, operation: 'SEND',
+          policy: KNOWN_POLICY_BUNDLE,
+        };
+        const boundary: PolicyBoundary = {
+          interactionRef, candidateRef: unit.unitRef,
+          classificationDigest: finding.classificationDigest,
+          authenticated: { subject: envelope.subject, context: envelope.context },
+          observed: { source: { ...envelope.source, trust: trusted.sourceTrust }, destination: envelope.destination },
+          policy: { ...observed.commit },
+        };
+        const decision = decidePolicy(request, boundary, trusted.policyBundle);
+        if (decision.state === 'DENIED') return refused('POLICY_DENIED');
+        if (decision.state === 'HELD') return refused('POLICY_HELD');
+        if (decision.treatment !== 'KEEP') return refused('POLICY_NOT_KEEP');
+      }
+
+      const outcome = await runner.check({
+        // The private captured bytes, scope and registration. A host alias mutated during the inspection
+        // cannot retarget the check: the child is asked about exactly what this send captured.
+        bytes: capturedRequest.payload,
+        scope: capturedRequest.scope,
+        destination: capturedRequest.observed,
+        authorized: capturedRequest.authorized,
+        known: capturedRequest.known,
+      });
+      // A cancellation this sender asked for is reported as one; every other non-`ALLOW` outcome,
+      // including a check that never ran, collapses into one fixed sentinel refusal.
+      if (outcome.status !== 'ALLOW') {
+        return refused(outcome.code === 'CANCELLED' ? 'CANCELLED' : 'SENTINEL_BLOCKED');
+      }
+      const release = outcome.release;
+
+      // The dispatch point, deliberately ordered. The transport and observation callables were captured
+      // during validation, so this is the last point at which any host property is read at all: the final
+      // host observation and every structural and freshness check it can invalidate happen first; sticky
+      // cancellation is then re-read with nothing between that read and the transport call but this frame,
+      // so a cancel raised by that last callback can no longer reach a dispatch. The early read below only
+      // spares the host a second observation.
+      if (cancelled) return refused('CANCELLED');
+      const current = observationOf(trusted.sendPoint.observe());
+      if (current === null) return refused('ROUTE_REFUSED');
+      if (!same(current.destination, observed.destination)) return refused('ROUTE_CHANGED');
+      if (!same(current.commit, observed.commit)) return refused('POLICY_STALE');
+      // The finite trusted callback and the fixed-worker child both took real time. Re-read the boundary
+      // evidence this interaction was bound under: a proof window that closed during the send is not a
+      // still-current context, and the identity, context and observed route it authorized are no longer
+      // usable for this dispatch. Recreating the envelope instead would mint a new interaction identity
+      // and invalidate every digest, unit reference and policy decision already pinned over it.
+      if (!currentEvidence(envelope, Date.now())) return refused('INTERACTION_REFUSED');
+      // No callback and no await separates this read from the effect it guards.
+      if (cancelled) return refused('CANCELLED');
+      try { await trusted.sendPoint.sendExact(release); }
+      catch { return refused('DISPATCH_FAILED'); }
+      // The effect already happened once. It is never retried, repeated or replayed from a returned handle.
+      return Object.freeze({ status: 'SENT' as const });
+    } finally {
+      // These provisional copies are this sender's own and exist only for this send. They are zeroed when
+      // it ends - including on an inspection, policy or sentinel refusal - and they are never reachable
+      // from a result, a binding, a finding or the sent bytes.
+      capturedRequest.payload.fill(0);
+      capturedRequest.known?.key.fill(0);
+    }
   };
 
   return Object.freeze({
