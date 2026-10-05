@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -452,7 +452,7 @@ test('a caller-mutated input cannot change the private image that is checked and
 
 /** Generated stdlib-only child. It never imports the sentinel, a policy module or any package. */
 const FAKE_WORKER = String.raw`
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -492,6 +492,22 @@ function fields(request) {
   return out;
 }
 function sha256(bytes) { return createHash('sha256').update(bytes).digest('hex'); }
+
+/**
+ * Readiness is written to a private staged name inside this child's OWN installation directory and then
+ * renamed onto the final ready name. A rename within one directory is atomic, so the final name never
+ * exists with an empty or partial payload: it appears only once the whole publication is on disk. The
+ * in-place write this replaces exposed the final name between create/truncate and write, so a parent
+ * could see the name and read an incomplete file - the fixture race, not a runner defect.
+ */
+function stage(relative, payload) {
+  const staged = HERE + relative + '.staged-' + process.pid;
+  writeFileSync(staged, JSON.stringify(payload));
+  return staged;
+}
+function publish(relative, payload) {
+  renameSync(stage(relative, payload), HERE + relative);
+}
 /** A structurally valid reply that echoes the real request binding unless a field is overridden. */
 function reply(request, override = {}) {
   const f = fields(request);
@@ -523,14 +539,19 @@ process.stdin.on('end', () => {
       env: process.env, argv: process.argv.slice(1), execPath: process.execPath,
     }));
   }
-  if (control.pidFile) {
-    writeFileSync(HERE + control.pidFile, JSON.stringify({ pid: process.pid }));
-  }
+  // Readiness is published only where a control asked for it, and always as a COMPLETE payload renamed
+  // onto the final name. The stall-unpublished control is the deliberate negative: it writes the complete
+  // staged file and never renames it, so no final name ever appears.
+  if (control.pidFile && control.mode === 'stall') publish(control.pidFile, { pid: process.pid });
+  if (control.pidFile && control.mode === 'stall-unpublished') stage(control.pidFile, { pid: process.pid });
   switch (control.mode) {
     case 'report':
       process.exit(0);
       return;
     case 'stall':
+    case 'stall-unpublished':
+      // Both hold open exactly like a stalled child, so readiness is decided by what was published and
+      // never by this process exiting.
       setInterval(() => {}, 1000);
       return;
     case 'trickle':
@@ -566,7 +587,9 @@ process.stdin.on('end', () => {
     case 'grandchild': {
       const held = spawn(process.execPath, ['-e', 'setTimeout(() => {}, ' + (control.grandchildMs ?? 900) + ')'],
         { stdio: ['ignore', 'inherit', 'inherit'] });
-      writeFileSync(HERE + control.pidFile, JSON.stringify({ pid: process.pid, held: held.pid }));
+      // This readiness is only complete once the held child exists: both pids are published together,
+      // never a premature name that carries only this process.
+      publish(control.pidFile, { pid: process.pid, held: held.pid });
       setInterval(() => {}, 1000);
       return;
     }
@@ -606,6 +629,75 @@ async function fakeRunner(control, config) {
   return { runner: module.createSentinelProcessRunner(config), installation };
 }
 
+/** Finite handshake bounds for readiness observation, unchanged from the previous fixed budget. */
+const READINESS_POLL_MS = 20;
+const READINESS_POLLS = 100;
+
+/**
+ * Readiness is the FINAL ready name existing, never a parse that retries a malformed publication.
+ * The child renames a complete staged file onto that name, so its existence IS completed publication
+ * and one read is the whole observation. This never catches, retries or sleeps on a partial file.
+ */
+function readPublication(directory, name) {
+  const path = join(directory, name);
+  if (!existsSync(path)) return null;
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
+/** Wait for a completed publication within a finite number of polls, or `null` if it never lands. */
+async function awaitPublication(directory, name, polls = READINESS_POLLS) {
+  for (let attempt = 0; attempt < polls; attempt++) {
+    const published = readPublication(directory, name);
+    if (published !== null) return published;
+    await delay(READINESS_POLL_MS);
+  }
+  return null;
+}
+
+/** Poll a bounded number of times and report whether the final ready name ever appeared. */
+async function publicationAppeared(directory, name, polls) {
+  for (let attempt = 0; attempt < polls; attempt++) {
+    if (readPublication(directory, name) !== null) return true;
+    await delay(READINESS_POLL_MS);
+  }
+  return false;
+}
+
+/**
+ * The child's staged name is the ready name plus a private suffix, so this reports whether a staged
+ * write really happened in the owned installation directory. It never reads the payload.
+ */
+async function stagedWriteAppeared(directory, name, polls = READINESS_POLLS) {
+  const prefix = name + '.staged-';
+  for (let attempt = 0; attempt < polls; attempt++) {
+    if (readdirSync(directory).some((entry) => entry.startsWith(prefix))) return true;
+    await delay(READINESS_POLL_MS);
+  }
+  return false;
+}
+
+test('the readiness boundary itself: a partially written ready name is not a publication, a renamed one is', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'hylja-egress-readiness-'));
+  installations.push(directory);
+  const ready = join(directory, 'fake-pid.json');
+
+  // The publication this fixture used to make: the ready name exists from its creation onwards, so its
+  // existence is not completed publication and a parent can read a file with no content in it.
+  writeFileSync(ready, '');
+  assert.equal(existsSync(ready), true);
+  assert.equal(readFileSync(ready, 'utf8').length > 0, false);
+
+  // The publication now in use: the complete payload exists only under a private staged name, and the
+  // ready name appears with that whole payload or not at all.
+  rmSync(ready);
+  const staged = join(directory, 'fake-pid.json.staged-synthetic');
+  writeFileSync(staged, JSON.stringify({ pid: process.pid }));
+  assert.equal(existsSync(ready), false, 'a staged write published the ready name');
+  renameSync(staged, ready);
+  assert.equal(existsSync(ready), true);
+  assert.equal(typeof JSON.parse(readFileSync(ready, 'utf8')).pid, 'number');
+});
+
 test('a stalled child is terminated at the absolute deadline, with no in-thread fallback and no release', async () => {
   const { runner } = await fakeRunner({ mode: 'stall' }, { deadlineMs: 500, cleanupGraceMs: 2_000 });
   const started = Date.now();
@@ -639,13 +731,13 @@ test('runner-owned cancel() is observed promptly and really terminates the child
   const pending = runner.check(request());
   assert.equal(runner.state, 'BUSY');
 
-  let pid = null;
-  for (let attempt = 0; attempt < 100 && pid === null; attempt++) {
-    await delay(20);
-    const path = join(installation, 'fake-pid.json');
-    if (existsSync(path)) pid = JSON.parse(readFileSync(path, 'utf8')).pid;
-  }
-  assert.equal(typeof pid, 'number', 'the synthetic child never started');
+  // The final name appears only after a complete staged file is renamed onto it, so this one read is
+  // a real child's real pid rather than a name that was visible while its file was still empty.
+  const published = await awaitPublication(installation, 'fake-pid.json');
+  assert.ok(published !== null, 'the synthetic child never published a complete readiness');
+  const pid = published.pid;
+  assert.equal(typeof pid, 'number', 'the published readiness carried no pid');
+  assert.equal(alive(pid), true, 'the published pid is not a live child process');
 
   runner.cancel();
   const outcome = await bounded(pending, 5_000, 'cancelled check');
@@ -657,6 +749,58 @@ test('runner-owned cancel() is observed promptly and really terminates the child
   assert.ok(elapsed < 10_000, `cancellation was not prompt (${elapsed}ms)`);
   assert.equal(alive(pid), false, 'the cancelled child was still alive after close');
   assert.equal(runner.state, 'IDLE');
+});
+
+test('a staged readiness write is never observed as ready, and the check stays pending until it is', async () => {
+  // Deterministic negative control for the removed race. The child writes its COMPLETE payload to a
+  // private staged name and never renames it, so the final name can never appear; the observation must
+  // report not-ready instead of counting a temporary write as readiness.
+  const { runner, installation } = await fakeRunner({ mode: 'stall-unpublished', pidFile: 'fake-pid.json' }, {
+    deadlineMs: 30_000, cleanupGraceMs: 2_000,
+  });
+  const pending = runner.check(request());
+  let settled = false;
+  pending.then(() => { settled = true; }, () => { settled = true; });
+
+  assert.equal(await stagedWriteAppeared(installation, 'fake-pid.json'), true,
+    'the control never wrote its private staged file, so it proved nothing');
+  assert.equal(await publicationAppeared(installation, 'fake-pid.json', 30), false,
+    'a staged temporary write was observed as a completed publication');
+  assert.equal(settled, false, 'the check settled while its readiness was never published');
+
+  // The child is still a real running process: cancelling it is what ends the check, not its exit.
+  runner.cancel();
+  const outcome = await bounded(pending, 5_000, 'staged readiness cancel');
+  assert.equal(outcome.status, 'BLOCK');
+  assert.equal(outcome.code, 'CANCELLED');
+  assert.equal('release' in outcome, false);
+  assert.equal(runner.state, 'IDLE');
+});
+
+test('a complete publication is a live child on the noncancelled stalled path, and the deadline stops it', async () => {
+  // The same observation without a cancel: readiness must be a real running child, and the run must end
+  // at the absolute deadline with a confirmed stop and a still usable runner.
+  const { runner, installation } = await fakeRunner({ mode: 'stall', pidFile: 'fake-pid.json' }, {
+    deadlineMs: 2_000, cleanupGraceMs: 2_000,
+  });
+  const started = Date.now();
+  const pending = runner.check(request());
+  const published = await awaitPublication(installation, 'fake-pid.json');
+  assert.ok(published !== null, 'the stalled child never published a complete readiness');
+  const pid = published.pid;
+  assert.equal(typeof pid, 'number', 'the published readiness carried no pid');
+  assert.equal(alive(pid), true, 'the published pid is not a live child process');
+
+  const outcome = await bounded(pending, 5_000, 'stalled deadline check');
+  const elapsed = Date.now() - started;
+
+  assert.equal(outcome.status, 'BLOCK');
+  assert.equal(outcome.code, 'DEADLINE_EXCEEDED');
+  assert.equal('release' in outcome, false);
+  assert.ok(elapsed >= 1_950, `deadline fired early at ${elapsed}ms`);
+  assert.ok(elapsed < 4_000, `deadline did not bound the stall (${elapsed}ms)`);
+  assert.equal(alive(pid), false, 'the stopped child was still alive after close');
+  assert.equal(runner.state, 'IDLE', 'a confirmed stop must leave the runner usable');
 });
 
 test('a late reply never overrides a deadline that already fired', async () => {
@@ -677,11 +821,14 @@ test('an uncertain cleanup quarantines the runner instead of reporting a confirm
 
   const after = await bounded(runner.check(request()), 2_000, 'post-quarantine check');
   assert.equal(after.code, 'RUNNER_QUARANTINED');
-  const report = JSON.parse(readFileSync(join(installation, 'fake-pid.json'), 'utf8'));
-  assert.equal(typeof report.held, 'number');
+  // The grandchild readiness is published as one complete payload that already carries the held pid, so
+  // this read is never a name that appeared before its content did.
+  const published = await awaitPublication(installation, 'fake-pid.json');
+  assert.ok(published !== null, 'the quarantined child never published a complete readiness');
+  assert.equal(typeof published.held, 'number');
   // Let the held grandchild exit so this test leaves no live process behind.
-  for (let attempt = 0; attempt < 150 && alive(report.held); attempt++) await delay(20);
-  assert.equal(alive(report.held), false, 'the held grandchild outlived the test');
+  for (let attempt = 0; attempt < 150 && alive(published.held); attempt++) await delay(20);
+  assert.equal(alive(published.held), false, 'the held grandchild outlived the test');
 });
 
 test('a crashing child, a missing reply and a truncated reply are each distinct restrictive codes', async () => {
