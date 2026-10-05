@@ -58,7 +58,7 @@ The transport and worker-boundary groups drive a real `python3` subprocess and r
 
 ### Proposed modules: unwired, no authority
 
-These compile, are property-tested and are reachable only from their own tests. No `src/` module, policy, classification v1 or adapter imports them, and `src/index.ts` exports none of them. One exception, and it grants nothing: the evaluation-only [`evaluations/gym-annotation-schema.mjs`](../evaluations/gym-annotation-schema.mjs) imports the draft model's `ATTRIBUTE_STATES` and `FIDELITY_PREDICATES` **names** so the proposed export format cannot drift from contract names; reusing a constant is not adoption and wires nothing into accepted v1. A **proposed** record has no authority until a human accepts it (accepted decisions 001-009 are [here](decisions/009-secrets-are-not-synthetic-identities.md)).
+These compile, are property-tested and are reachable only from their own tests. No `src/` module, policy, classification v1 or adapter imports them, and `src/index.ts` exports none of them. One exception, and it grants nothing: the evaluation-only [`evaluations/gym-annotation-schema.mjs`](../evaluations/gym-annotation-schema.mjs) imports the draft model's `ATTRIBUTE_STATES` and `FIDELITY_PREDICATES` **names** so the proposed export format cannot drift from contract names; reusing a constant is not adoption and wires nothing into accepted v1. A **proposed** record has no authority until a human accepts it (which records are accepted: [Proposed designs stay proposed](#proposed-designs-stay-proposed)).
 
 | Module | Status | Contract | Issue |
 |---|---|---|---|
@@ -106,7 +106,9 @@ Everything in `evaluations/`, `scripts/research/` and `docs/research/` is **publ
 
 ### Proposed designs stay proposed
 
-Accepted: decisions [001](decisions/001-enforcement-core-not-advisory-filter.md)-[009](decisions/009-secrets-are-not-synthetic-identities.md).
+Accepted: the decision records under [decisions/](decisions/) whose own **status line** says accepted,
+including [011](decisions/011-policy-selected-whole-message-mask.md), accepted technical direction
+under the project owner's delegated CTO authority.
 
 Proposed and unwired: [decision 010](decisions/010-separate-information-dimensions-and-task-fidelity.md), the [#65](https://github.com/Marcus-Levin/hylja/issues/65) taxonomy, the [#66](https://github.com/Marcus-Levin/hylja/issues/66) information model, the [#68](https://github.com/Marcus-Levin/hylja/issues/68) transformation semantics and the [#67](https://github.com/Marcus-Levin/hylja/issues/67) Gym design. No merge, green suite or passing preparation checker accepts a proposal.
 
