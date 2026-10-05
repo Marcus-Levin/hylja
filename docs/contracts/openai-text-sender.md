@@ -125,9 +125,14 @@ dispatch; redirects are prohibited (`ROUTE_CHANGED`), and a changed commit is `P
 Structural validity is the only thing this module checks about its host. `inspectOriginal`, `observe`
 and `sendExact` are read once during validation and then invoked as those captured function references
 on the receiver they were accepted on, so no trusted-host property is read after the last guard and a
-later host-side method swap cannot retarget an existing sender. Everything else is re-checked by the
-authority that owns it: the envelope, `decidePolicy` and the sentinel runner. Invoking the captured
-transport is still host code.
+later host-side method swap cannot retarget an existing sender. `observe` and `sendExact` keep the send
+point's own object as their receiver. `inspectOriginal` runs on the accepted **own-data-property
+snapshot** of the host: a frozen shallow copy carrying exactly the members that were validated, so a
+callback that reads its own host state — `this.sendPoint`, `this.boundary`, its own classification
+fixtures — sees the host's own members and not the wrappers this module installs over them. The raw
+method is never called again through any other name. Everything else is re-checked by the authority
+that owns it: the envelope, `decidePolicy` and the sentinel runner. Invoking the captured transport is
+still host code.
 
 ## The captured scope and registration
 
@@ -164,9 +169,22 @@ the final image, handed over exactly once. Message order, Unicode (including ast
 characters) and every literal in a `KEEP` unit are preserved exactly. `stream: false` yields this one
 complete, non-streamed image.
 
-The provisional byte and key copies this send owns are **zeroed in a `finally` when the send ends** —
-including on an inspection, policy, derivation or sentinel refusal — and are never reachable from a
-result, a binding, a finding, a plan entry or the sent bytes.
+This send owns a fixed set of byte buffers, and **every one of them is zeroed when the send ends**, on
+the accepted path and on every refusal alike: the framed ORIGINAL image; the private copy of it handed
+to `inspectOriginal`; the rebuilt FINAL image and the private copy of it handed to the sentinel check;
+the head and body encode buffers each image is framed from; the encode buffer behind each unit digest;
+and, from the sentinel snapshot seam, the captured request payload and the captured registration key.
+The wipe is one enrollment list consulted from a single `finally`, so a refusal taken before the
+inspection ever runs clears the ORIGINAL image too, and a derivation that fails after it has already
+framed its final image clears that image where it abandoned it. None of these buffers is ever reachable
+from a result, a binding, a finding, a plan entry or the sent bytes.
+
+**That is a statement about the buffers this module allocated, and about nothing else.** It claims no
+erasure of the immutable JS strings this module holds (the body text, the message literals, the model
+literal), of the caller's own input, of a copy the trusted inspector or the transport makes for itself
+or hands onward, of the bytes inside the sentinel child, of any other process's or the runtime's memory,
+or of anything recoverable through a heap inspection. Caller-retained and cross-process copies are
+outside this contract.
 
 ## The accepted path
 
@@ -213,7 +231,7 @@ name, byte offset, exception message, transport error, sentinel reason, literal 
 | `ROUTE_CHANGED` | the route or profile changed between the check and the dispatch |
 | `POLICY_STALE` | the committed policy identity changed between the decision and the dispatch |
 | `DISPATCH_FAILED` | the trusted transport failed or did not confirm |
-| `SENDER_FAILED` | fail-closed for a deterministic derivation failure, and for an unexpected internal failure. No accepted host surface reaches the second case, so that one is fixed but unexercised |
+| `SENDER_FAILED` | fail-closed for a deterministic derivation failure, and for an unexpected internal failure. The derivation case is exercised by a masked rebuild that outgrows the codec's own byte bound; no accepted host surface reaches the internal-failure case, so that one is fixed but unexercised |
 
 A known-original or canary registration that already holds the mask literal is a real collision: the
 fixed child finds it in the final bytes and the whole send is `SENTINEL_BLOCKED` with no dispatch
@@ -233,9 +251,9 @@ survives in a `KEEP` unit withholds the same way.
 - **One unit per message, whole image per send.** No streaming holdback, no interleaved tool argument
   handling, no chunk abort handling and no backpressure; streaming input is refused by the codec.
 - **Originals exist in this process for the duration of one send.** They are held in private copies so
-  real policy can decide over them, and the byte and key copies this sender owns are zeroed when the
-  send ends. No erasure of copies inside the runtime, the inspector, the transport or the child is
-  claimed, and nothing here restores an original.
+  real policy can decide over them, and the buffers this module allocated are zeroed when the send ends.
+  No erasure of the immutable strings this module holds, of the caller's input, of copies inside the
+  runtime, the inspector, the transport or the child is claimed, and nothing here restores an original.
 - **A mask is not a utility claim.** Nothing here measures whether a masked conversation still works,
   and no held-out, comparative or promotion result follows from it.
 - **Not an evaluation result.** The evidence below is unscored, synthetic and non-enforcing
@@ -254,5 +272,9 @@ cases are retained; the additions are the mixed and all-masked positives over a 
 and a real fixed child with the final image declared as a literal, exact UTF-8 length, duplicate
 occurrences treated as separate units, marker lookalikes and a registered literal collision, and the
 withholding controls for a `MASK` decision on `METADATA` or `MODEL`, every other treatment and a held
-review. It calls no provider, holds no credential, reaches the network only on `127.0.0.1` on an
-OS-assigned ephemeral port, and every fixture value is obviously synthetic and non-routable.
+review; the inspection callback's receiver (the accepted data-property snapshot, with a normal masked
+release as its control); the owned-buffer zeroing of the inspection copy on both a masked send and an
+inspection refusal, asserted only as a count of zero bytes; and a masked rebuild that crosses the
+codec's own byte bound, which exercises the derivation-refusal branch for the first time. It calls no
+provider, holds no credential, reaches the network only on `127.0.0.1` on an OS-assigned ephemeral port,
+and every fixture value is obviously synthetic and non-routable.

@@ -286,6 +286,16 @@ function digestOf(bytes: Uint8Array): string {
 }
 
 /**
+ * A unit digest over encoded text. The encode buffer is this caller's own temporary - it exists to be
+ * hashed and nothing else - so it is zeroed here rather than left for the garbage collector. The JS
+ * string it was encoded from is immutable and is not, and cannot be, erased by this module.
+ */
+function digestOfText(text: string): string {
+  const encoded = encoder.encode(text);
+  try { return digestOf(encoded); } finally { encoded.fill(0); }
+}
+
+/**
  * A destination label is interpolated into the image's `Host` header, so it is validated here before
  * it can reach the image: non-empty, bounded, and free of control characters and of ordinary spaces,
  * because a space would already make the emitted header value ambiguous. This is a structural bound,
@@ -348,11 +358,14 @@ function trustedHost(value: unknown): TextSenderHost | null {
   // The validated data-property snapshot is authoritative for the callables: each one is captured on the
   // receiver it was found on and is never read off the host again. The send point keeps its own object
   // as its receiver, so a host method that reads its own state still sees it, while a later host-side
-  // replacement of `observe` or `sendExact` cannot retarget a sender that already exists.
+  // replacement of `observe` or `sendExact` cannot retarget a sender that already exists. The inspection
+  // member is installed under the name the host declares it, so the call site reads THIS captured
+  // function - and never the raw function the spread above carried over - and the receiver it runs on is
+  // that same accepted snapshot, carrying the host's own accepted members and not the wrappers below.
   const snapshot = Object.freeze({ ...fields });
   return Object.freeze({
     ...snapshot,
-    inspect: captured(inspect as InspectOriginalMethod, snapshot),
+    inspectOriginal: captured(inspect as InspectOriginalMethod, snapshot),
     sendPoint: Object.freeze({
       observe: captured(observe as ObserveMethod, fields['sendPoint']),
       sendExact: captured(sendExact as SendExactMethod, fields['sendPoint']),
@@ -455,15 +468,22 @@ function frameImage(messages: readonly DraftMessage[], model: string, hostLabel:
     `Content-Length: ${encoder.encode(body).byteLength}`,
     '', '',
   ].join('\r\n');
+  // The two encode buffers exist only to be copied into the framed image, so they are this function's own
+  // temporaries and are zeroed before it returns. The framed `bytes` itself is owned by whoever built
+  // this image - the ORIGINAL image or the derivation - and is enrolled there instead.
   const headBytes = encoder.encode(head);
-  const bodyBytes = encoder.encode(body);
-  const bytes = new Uint8Array(headBytes.byteLength + bodyBytes.byteLength);
-  bytes.set(headBytes, 0);
-  bytes.set(bodyBytes, headBytes.byteLength);
-  return Object.freeze({
-    bytes, metadataLength: headBytes.byteLength, hostLabel, body, model, modelLiteral, messages,
-    messageLiterals: Object.freeze(messages.map((message) => message.literal)),
-  });
+  try {
+    const bodyBytes = encoder.encode(body);
+    const bytes = new Uint8Array(headBytes.byteLength + bodyBytes.byteLength);
+    try {
+      bytes.set(headBytes, 0);
+      bytes.set(bodyBytes, headBytes.byteLength);
+    } finally { bodyBytes.fill(0); }
+    return Object.freeze({
+      bytes, metadataLength: headBytes.byteLength, hostLabel, body, model, modelLiteral, messages,
+      messageLiterals: Object.freeze(messages.map((message) => message.literal)),
+    });
+  } finally { headBytes.fill(0); }
 }
 
 /** The ORIGINAL image: what the caller's body says, with no treatment applied anywhere. */
@@ -501,35 +521,43 @@ function deriveFinal(image: SendImage, units: readonly TextInspectionUnit[],
       ? message.literal : MASK_JSON_LITERAL };
   });
   const final = frameImage(messages, image.model, image.hostLabel);
-  const finalUnits = unitsOf(final, interactionRef);
-  const maskedDigest = digestOf(encoder.encode(MASK_JSON_LITERAL));
-  for (let index = 0; index < plan.length; index += 1) {
-    const entry = plan[index] as UnitPlan;
-    const original = units[index] as TextInspectionUnit;
-    const derived = finalUnits[index] as TextInspectionUnit;
-    if (entry.unitRef !== original.unitRef || entry.unitRef !== derived.unitRef ||
-      entry.unitKind !== original.kind || entry.unitKind !== derived.kind ||
-      entry.originalDigest !== original.digest) throw new TypeError('binding');
-    if (entry.treatment === 'MASK') {
-      if (entry.unitKind !== 'MESSAGE' || derived.digest !== maskedDigest) throw new TypeError('mask');
-    } else if (entry.unitKind !== 'METADATA' && derived.digest !== original.digest) {
-      // A KEEP model or message unit must still carry its own original bytes. The METADATA unit is the
-      // one exception decision 011 authorizes: its header block covers the recomputed Content-Length.
-      throw new TypeError('keep');
+  // Every refusal below abandons this final image, and an abandoned image is still an allocated copy of
+  // the wire bytes. So the one buffer allocated for the rebuild is this function's own: it is returned
+  // to the caller only if the whole derivation holds, and zeroed here if anything in it fails.
+  try {
+    const finalUnits = unitsOf(final, interactionRef);
+    const maskedDigest = digestOfText(MASK_JSON_LITERAL);
+    for (let index = 0; index < plan.length; index += 1) {
+      const entry = plan[index] as UnitPlan;
+      const original = units[index] as TextInspectionUnit;
+      const derived = finalUnits[index] as TextInspectionUnit;
+      if (entry.unitRef !== original.unitRef || entry.unitRef !== derived.unitRef ||
+        entry.unitKind !== original.kind || entry.unitKind !== derived.kind ||
+        entry.originalDigest !== original.digest) throw new TypeError('binding');
+      if (entry.treatment === 'MASK') {
+        if (entry.unitKind !== 'MESSAGE' || derived.digest !== maskedDigest) throw new TypeError('mask');
+      } else if (entry.unitKind !== 'METADATA' && derived.digest !== original.digest) {
+        // A KEEP model or message unit must still carry its own original bytes. The METADATA unit is the
+        // one exception decision 011 authorizes: its header block covers the recomputed Content-Length.
+        throw new TypeError('keep');
+      }
     }
-  }
-  const reparsed = translateOpenAiTextRequest({ endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: final.body });
-  if (reparsed.status !== 'TRANSLATED') throw new TypeError('codec');
-  const decoded = draftMessages(reparsed.draft);
-  if (reparsed.draft.metadata?.model !== image.model || decoded.length !== messages.length) {
-    throw new TypeError('codec');
-  }
-  for (let index = 0; index < messages.length; index += 1) {
-    if (decoded[index]?.role !== messages[index]?.role || decoded[index]?.literal !== messages[index]?.literal) {
+    const reparsed = translateOpenAiTextRequest({ endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: final.body });
+    if (reparsed.status !== 'TRANSLATED') throw new TypeError('codec');
+    const decoded = draftMessages(reparsed.draft);
+    if (reparsed.draft.metadata?.model !== image.model || decoded.length !== messages.length) {
       throw new TypeError('codec');
     }
+    for (let index = 0; index < messages.length; index += 1) {
+      if (decoded[index]?.role !== messages[index]?.role || decoded[index]?.literal !== messages[index]?.literal) {
+        throw new TypeError('codec');
+      }
+    }
+    return Object.freeze({ bytes: final.bytes, imageDigest: digestOf(final.bytes), units: finalUnits });
+  } catch (failure) {
+    final.bytes.fill(0);
+    throw failure;
   }
-  return Object.freeze({ bytes: final.bytes, imageDigest: digestOf(final.bytes), units: finalUnits });
 }
 
 /**
@@ -546,10 +574,10 @@ function derivationOf(image: SendImage, units: readonly TextInspectionUnit[],
 function unitsOf(image: SendImage, interactionRef: string): readonly TextInspectionUnit[] {
   const units: TextInspectionUnit[] = [
     { unitRef: `${interactionRef}-u0`, kind: 'METADATA', digest: digestOf(image.bytes.subarray(0, image.metadataLength)) },
-    { unitRef: `${interactionRef}-u1`, kind: 'MODEL', digest: digestOf(encoder.encode(image.modelLiteral)) },
+    { unitRef: `${interactionRef}-u1`, kind: 'MODEL', digest: digestOfText(image.modelLiteral) },
   ];
   image.messageLiterals.forEach((literal, index) => {
-    units.push({ unitRef: `${interactionRef}-u${index + 2}`, kind: 'MESSAGE', digest: digestOf(encoder.encode(literal)) });
+    units.push({ unitRef: `${interactionRef}-u${index + 2}`, kind: 'MESSAGE', digest: digestOfText(literal) });
   });
   return Object.freeze(units);
 }
@@ -666,6 +694,16 @@ export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
 
     let image: SendImage;
     try { image = buildImage(translated.draft, observed.destination.id); } catch { return refused('SENDER_FAILED'); }
+    // Every byte buffer this send allocates is enrolled here the instant it is allocated, and every
+    // enrolled buffer is zeroed when this send ends: on the accepted path, and on every refusal alike,
+    // including the refusals taken before the inspection ever runs. A buffer this module allocated is
+    // its own to clear; caller-supplied text, immutable JS strings and anything the trusted inspector
+    // copies out for itself are not this module's to erase. This is a statement about the buffers this
+    // module owns, not about the runtime's memory, a heap dump or any other process's copies.
+    const owned: Uint8Array[] = [];
+    const own = (buffer: Uint8Array): Uint8Array => { owned.push(buffer); return buffer; };
+    const wipeOwned = (): void => { for (const buffer of owned) buffer.fill(0); };
+    own(image.bytes);
     const imageDigest = digestOf(image.bytes);
     const units = unitsOf(image, interactionRef);
     const binding: TextInspectionBinding = Object.freeze({
@@ -695,7 +733,9 @@ export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
     if (!taken.ok) {
       // Nothing on this branch reaches a child, so both outcomes withhold. A scope that does not belong
       // to the authenticated context keeps the refusal it has always reported; it is read through own
-      // data descriptors, never an accessor, and it decides nothing that could authorize an effect.
+      // data descriptors, never an accessor, and it decides nothing that could authorize an effect. The
+      // ORIGINAL image built above is this send's own buffer, so it is cleared on this path too.
+      wipeOwned();
       const tenantRef = ownData(trusted.scope, 'tenantRef');
       const projectRef = ownData(trusted.scope, 'projectRef');
       if (tenantRef !== envelope.context.tenantId ||
@@ -705,9 +745,6 @@ export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
       return refused('SENTINEL_BLOCKED');
     }
     const capturedRequest = taken.value;
-    // This sender's own private copy of the FINAL image, made once the plan is known and zeroed with
-    // the rest of this send's copies below.
-    let checked: Uint8Array | null = null;
     try {
       // The captured scope is compared against the BOUND ENVELOPE, not against an earlier mutable alias
       // of the host object: this is the scope the child is about to run under, so it is the one that
@@ -719,9 +756,12 @@ export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
       }
 
       // The inspector gets its own copy. It can answer, mutate or throw; none of it reaches the bytes,
-      // and a thrown value is never inspected: its text, class and stack are all caller-controlled.
+      // and a thrown value is never inspected: its text, class and stack are all caller-controlled. The
+      // copy is enrolled before the call, so it is cleared whether the callback answers or throws.
       let findings: readonly TextInspectionFinding[] | null;
-      try { findings = findingsOf(trusted.inspectOriginal(image.bytes.slice(), binding), binding); } catch { findings = null; }
+      const inspected = own(image.bytes.slice());
+      try { findings = findingsOf(trusted.inspectOriginal(inspected, binding), binding); }
+      catch { findings = null; }
       if (findings === null) return refused('INSPECTION_REFUSED');
       const byUnit = new Map(findings.map((finding) => [finding.unitRef, finding] as const));
       const plan: UnitPlan[] = [];
@@ -769,7 +809,11 @@ export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
       // with this frame.
       const derived = derivationOf(image, units, plan, interactionRef);
       if (derived === null) return refused('SENDER_FAILED');
-      checked = derived.bytes.slice();
+      // The rebuilt image the derivation allocated and this sender's private copy of it are both this
+      // send's own buffers. A refused derivation never reaches this line - it clears its own final image
+      // where it abandoned it - and here both copies are enrolled and cleared when the send ends.
+      own(derived.bytes);
+      const checked = own(derived.bytes.slice());
 
       const outcome = await runner.check({
         // The private FINAL bytes, under the scope and registration captured before the inspection. A
@@ -813,9 +857,9 @@ export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
       return Object.freeze({ status: 'SENT' as const });
     } finally {
       // These provisional copies are this sender's own and exist only for this send. They are zeroed when
-      // it ends - including on an inspection, policy or sentinel refusal - and they are never reachable
-      // from a result, a binding, a finding or the sent bytes.
-      checked?.fill(0);
+      // it ends - including on an inspection, policy, derivation or sentinel refusal - and they are never
+      // reachable from a result, a binding, a finding or the sent bytes.
+      wipeOwned();
       capturedRequest.payload.fill(0);
       capturedRequest.known?.key.fill(0);
     }

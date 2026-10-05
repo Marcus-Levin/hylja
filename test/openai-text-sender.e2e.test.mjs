@@ -1309,3 +1309,103 @@ test('a MASK decision on METADATA or MODEL, or any other treatment, withholds th
       assert.equal(point.sender.state, 'IDLE', name);
     }
   });
+
+/* ---------- The receiver the inspection callback runs on, and owned-copy lifetime ---------- */
+
+test('the inspection callback runs on the accepted data-property snapshot receiver',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const bundle = bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']);
+    const observation = Object.freeze({
+      destination: { id: SINK.ref, profileDigest: PROFILE_DIGEST },
+      commit: Object.freeze({ ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(bundle) }),
+    });
+    let receiverPreserved = true;
+    let swapped = 0;
+    let released = null;
+    // Declared as real methods on their own objects, so a lost receiver is observable from inside.
+    const sendPoint = {
+      observe() { if (this !== sendPoint) receiverPreserved = false; return observation; },
+      async sendExact(image) {
+        if (this !== sendPoint) receiverPreserved = false;
+        released = Buffer.from(image);
+      },
+    };
+    // The accepted callback must see the receiver it was validated on: the host's own accepted data
+    // properties, carrying the ORIGINAL members and not the wrappers this sender installed over them.
+    const classify = inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] });
+    const accepted = function inspectOriginal(image, binding) {
+      if (this.inspectOriginal !== accepted) receiverPreserved = false;
+      if (this.sendPoint !== sendPoint) receiverPreserved = false;
+      if (this.sendPoint.observe !== sendPoint.observe) receiverPreserved = false;
+      return classify(image, binding);
+    };
+    const point = await harness(t, {
+      policyBundle: bundle, sink: null, inspect: accepted, observations: [observation, observation],
+      host: { sendPoint },
+    });
+    // A host that replaces its own inspection method after construction does not retarget this sender.
+    point.host.inspectOriginal = () => { swapped += 1; return undefined; };
+    const leaky = `Escalate to ${PLANTED_ORIGINAL} before the window opens.`;
+    assert.deepEqual(await bounded(point.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT,
+      body: requestBody([{ role: 'user', content: leaky }]),
+    }), 'snapshot receiver'), { status: 'SENT' });
+    assert.equal(receiverPreserved, true, 'the callback ran on the accepted snapshot, not on a wrapper');
+    assert.equal(swapped, 0, 'the replacement installed after construction was never invoked');
+    // Normal new control: the same path still releases exactly the declared masked image.
+    const expectedBody = '{"model":"fixture-model-keep-sender","messages":['
+      + `{"role":"user","content":${JSON.stringify(MASKED)}}]}`;
+    assert.equal(released.equals(maskedImage(expectedBody)), true, 'the transport received the masked image');
+    assert.equal(released.includes(PLANTED_ORIGINAL), false);
+    assert.equal(point.sender.state, 'IDLE');
+  });
+
+test('a byte copy this send hands the inspector is zeroed when the send ends',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const bundle = bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']);
+    const leaky = `Escalate to ${PLANTED_ORIGINAL} before the window opens.`;
+    // The inspector RETAINS the copy it is handed instead of scribbling on it, so a zero byte
+    // afterwards can only have come from the sender's own end-of-send cleanup. Only a count of zero
+    // bytes is ever asserted; no byte of the copy and no planted value can reach the TAP output.
+    for (const [name, expected] of [['masked send', 'SENT'], ['inspection refusal', 'INSPECTION_REFUSED']]) {
+      let retained = null;
+      const classify = inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] });
+      const inspect = (image, binding) => {
+        retained = image;
+        return expected === 'SENT' ? classify(image, binding) : { ...classify(image, binding), remainder: 'UNKNOWN' };
+      };
+      const point = await harness(t, { policyBundle: bundle, inspect });
+      const result = await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT,
+        body: requestBody([{ role: 'user', content: leaky }]),
+      }), name);
+      assert.deepEqual(result, expected === 'SENT'
+        ? { status: 'SENT' } : { status: 'REFUSED', code: expected }, name);
+      assert.equal(retained !== null && retained.length > 0, true, `${name}: a real copy was handed over`);
+      assert.equal(retained.reduce((zero, byte) => zero + (byte === 0 ? 1 : 0), 0), retained.length,
+        `${name}: every byte of the sender's own inspection copy is zero once the send ended`);
+    }
+  });
+
+test('a masked rebuild that outgrows the strict codec byte bound withholds the whole send',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // The original body sits inside the codec's own 65_536-byte bound, and the fixed mask literal is
+    // 14 bytes longer than the empty message unit it replaces, so the rebuilt body crosses that bound
+    // and the strict re-parse refuses it. This is the real derivation refusal: no child is spawned.
+    const TARGET_BYTES = 65_534;
+    const skeleton = requestBody([{ role: 'user', content: '' }, { role: 'user', content: '' }]);
+    const body = requestBody([
+      { role: 'user', content: '' },
+      { role: 'user', content: 'x'.repeat(TARGET_BYTES - Buffer.byteLength(skeleton, 'utf8')) },
+    ]);
+    assert.equal(Buffer.byteLength(body, 'utf8'), TARGET_BYTES, 'the fixture body is inside the codec bound');
+    const point = await harness(t, {
+      policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']),
+      inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+    });
+    assert.deepEqual(await bounded(point.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body,
+    }), 'rebuild over the codec byte bound'), { status: 'REFUSED', code: 'SENDER_FAILED' });
+    assertNothingSent(point.sink, point.dispatch);
+    assert.equal(point.sender.state, 'IDLE');
+  });
