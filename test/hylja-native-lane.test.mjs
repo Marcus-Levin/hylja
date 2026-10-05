@@ -41,6 +41,7 @@ import {
 	readProgress,
 	readRoleProfile,
 	runNativeLane,
+	MAX_CONFIG_BYTES,
 	MAX_RANGE_READ_BYTES,
 	SETUP_FAILURES,
 	validateLaneConfig,
@@ -2306,6 +2307,445 @@ test('the fallback role reads back as a lane config and receives the writer timi
 		assert.equal(preflight.calls[0].task, controller.request.task, 'one effective task binds the digest');
 		completeLeaf(pi, controller, 'Implemented the scoped change.\n');
 		await controller.settle();
+	} finally {
+		cleanup();
+	}
+});
+
+/**
+ * The lane config read is the one unbounded step that happens before any watchdog exists: the watchdog
+ * that would bound the native lane is armed only after the config is admitted and Pi is spawned. Root
+ * hands this CLI an exact path, so a config that is a FIFO nobody writes, a directory, something past
+ * the byte window, or bytes that are not UTF-8 must each be the fixed refusal with zero children, and
+ * none of them may become a stall, a traceback, a second exit code or an echo.
+ *
+ * The first case drives the shipped CLI as a real process, because that is the boundary where a stall
+ * or an uncaught refusal actually reaches root. The refusals that need this process to hand the reader a
+ * descriptor it did not admit run in one bounded child instead, so a broken reader cannot park the test
+ * runner on the very wait it is looking for.
+ */
+const CONFIG_REFUSAL_TIMEOUT_MS = 10_000;
+
+test('the real CLI refuses a non-regular lane config at once, launches nothing and echoes nothing', (t) => {
+	const { dir, config, configPath, cleanup } = tempConfig();
+	const markerPath = join(dir, 'pi-was-launched');
+	writeFileSync(config.pi, `#!/bin/sh\n: > '${markerPath}'\nexit 0\n`);
+	chmodSync(config.pi, 0o755);
+	try {
+		const fifoPath = join(dir, 'lane-config.fifo');
+		const made = spawnSync('mkfifo', [fifoPath]);
+		// Platform honesty: the named pipe is the case the root census stalled on. A host without one
+		// gets the character device, which is the same non-regular claim on the same default reader,
+		// and the diagnostic states which platform actually ran this.
+		const fifoUsable = made.error === undefined && made.status === 0 && statSync(fifoPath).isFIFO();
+		if (!fifoUsable) {
+			t.diagnostic(`no writable FIFO here (${made.error?.code ?? `mkfifo exit ${made.status}`}): the character device is the non-regular control`);
+		}
+		const cases = [
+			...(fifoUsable ? [{ name: 'writer-less fifo', path: fifoPath }] : []),
+			{ name: 'character device', path: '/dev/null' },
+			{ name: 'directory', path: dir },
+		];
+		for (const { name, path } of cases) {
+			rmSync(markerPath, { force: true });
+			const run = spawnSync(process.execPath, [laneCliPath, '--config', path],
+				{ cwd: repoRoot, timeout: CONFIG_REFUSAL_TIMEOUT_MS, encoding: 'utf8' });
+			assert.equal(run.error, undefined,
+				`${name}: the config read stalled instead of refusing (${run.error?.code ?? run.signal})`);
+			assert.equal(run.signal, null, `${name}: the refusal was not killed by the bound`);
+			assert.equal(run.status, 2, `${name}: a setup failure stays exit 2`);
+			assert.equal(run.stderr, '', `${name}: one stdout record, never a traceback or a warning`);
+			const lines = run.stdout.split('\n');
+			assert.equal(lines.length, 2, `${name}: exactly one record line, got ${lines.length - 1}`);
+			assert.deepEqual(JSON.parse(lines[0]), { verdict: 'INCOMPLETE', reason: SETUP_FAILURES.config },
+				`${name}: the fixed config refusal`);
+			for (const planted of [PLANTED_CLI_KEY, PLANTED_CLI_TASK, config.cwd, dir]) {
+				assert.equal(run.stdout.includes(planted), false, `${name}: no ${planted} echo`);
+			}
+			assert.equal(existsSync(markerPath), false, `${name}: zero dispatch, the refusal preceded the spawn`);
+			for (const written of [config.receipt, config.verification, config.progress, config.dispatch]) {
+				assert.equal(existsSync(written), false, `${name}: nothing was written to ${written}`);
+			}
+		}
+		// The control: the identical platform and the identical CLI over one regular config really
+		// launches, so the refusals above cannot be explained by a CLI that never spawns anything.
+		rmSync(markerPath, { force: true });
+		const control = spawnSync(process.execPath, [laneCliPath, '--config', configPath],
+			{ cwd: repoRoot, timeout: CLI_PROCESS_TIMEOUT_MS, encoding: 'utf8' });
+		assert.equal(control.status, 2, `control: the synthetic child leaves no leaf evidence (${control.stderr})`);
+		assert.equal(existsSync(markerPath), true, 'a regular config launches the owned child');
+	} finally {
+		cleanup();
+	}
+});
+
+test('the default config reader admits one bounded byte window, not a character count, and closes it', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	const realOpen = nodeFs.openSync;
+	const realRead = nodeFs.readSync;
+	const realClose = nodeFs.closeSync;
+	const realReadFile = nodeFs.readFileSync;
+	const opened = new Set();
+	const closed = new Set();
+	const reads = [];
+	const wholeFile = [];
+	nodeFs.openSync = (path, ...rest) => {
+		const fd = realOpen(path, ...rest);
+		if (path === configPath) opened.add(fd);
+		return fd;
+	};
+	nodeFs.readSync = (fd, buffer, offset, length, position) => {
+		if (opened.has(fd)) reads.push({ allocated: buffer.length, length, position });
+		return realRead(fd, buffer, offset, length, position);
+	};
+	nodeFs.closeSync = (fd) => {
+		if (opened.has(fd)) closed.add(fd);
+		return realClose(fd);
+	};
+	nodeFs.readFileSync = (path, ...rest) => {
+		const data = realReadFile(path, ...rest);
+		if (path === configPath) wholeFile.push(data.length);
+		return data;
+	};
+	syncBuiltinESMExports();
+	const run = async (path) => {
+		const record = [];
+		const result = await runNativeLane(['--config', path], { spawn: fakeSpawn({ record }) });
+		return { result, launched: record.length };
+	};
+	try {
+		// Oversized by bytes while still inside the character count: a two-byte character costs twice
+		// in the file and once in the decoded string, so a bound measured in characters admits this.
+		const padded = JSON.stringify({ ...config, key: PLANTED_CLI_KEY, task: 'é'.repeat(32_768) }, null, 2);
+		assert.equal(Buffer.byteLength(padded, 'utf8') > MAX_CONFIG_BYTES, true, 'the planted config is past the byte window');
+		assert.equal(padded.length <= MAX_CONFIG_BYTES, true, 'the same config is inside the character count');
+		writeFileSync(configPath, padded);
+		const tooBig = await run(configPath);
+		assert.equal(tooBig.result.reason, SETUP_FAILURES.config, 'a config past the byte window is refused');
+		assert.equal(tooBig.launched, 0, 'an oversized config launches nothing');
+		assert.equal(JSON.stringify(tooBig.result).includes(PLANTED_CLI_KEY), false, 'no planted key in the refusal');
+		assert.equal(JSON.stringify(tooBig.result).includes('é'), false, 'no planted task character in the refusal');
+
+		// Bytes that are not UTF-8 are a refusal, not a repaired replacement character inside a task.
+		const decoded = Buffer.from(JSON.stringify({ ...config, task: `synthetic ${PLANTED_CLI_TASK}` }, null, 2), 'utf8');
+		const at = decoded.indexOf(Buffer.from(PLANTED_CLI_TASK, 'utf8'));
+		assert.equal(at > 0, true, 'the planted task is inside the config');
+		decoded[at] = 0xff;
+		writeFileSync(configPath, decoded);
+		const broken = await run(configPath);
+		assert.equal(broken.result.reason, SETUP_FAILURES.config, 'undecodable config bytes are refused');
+		assert.equal(broken.launched, 0, 'an undecodable config launches nothing');
+
+		// The control: the same reader over a regular config inside the window launches exactly once,
+		// and the accounting below is what proves the read was bounded, positional and owned.
+		writeFileSync(configPath, JSON.stringify({ ...config, key: PLANTED_CLI_KEY, task: PLANTED_CLI_TASK }, null, 2));
+		const control = await run(configPath);
+		assert.equal(control.launched, 1, 'a valid regular config launches the owned child');
+		assert.equal(control.result.reason, SETUP_FAILURES.receipt, 'the synthetic child leaves no leaf evidence behind');
+		assert.equal(JSON.parse(readFileSync(config.verification, 'utf8')).key, PLANTED_CLI_KEY,
+			'the planted key reaches the record the launched lane wrote');
+
+		assert.deepEqual(wholeFile, [], 'the default reader never reads the config as a whole file');
+		for (const read of reads) {
+			assert.equal(read.allocated <= MAX_CONFIG_BYTES + 1, true, `allocation ${read.allocated} exceeds the window`);
+			assert.equal(read.length <= MAX_CONFIG_BYTES + 1, true, `read ${read.length} exceeds the window`);
+			assert.equal(read.position, 0, 'the config is read from its own descriptor, once, at its start');
+		}
+		assert.equal(reads.length, 3, `one bounded read per config read, got ${reads.length}`);
+		assert.deepEqual([...opened], [...closed], 'every descriptor the config reader opened is closed in a finally');
+	} finally {
+		nodeFs.openSync = realOpen;
+		nodeFs.readSync = realRead;
+		nodeFs.closeSync = realClose;
+		nodeFs.readFileSync = realReadFile;
+		syncBuiltinESMExports();
+		cleanup();
+	}
+});
+
+/**
+ * Two faults a reader cannot see from its own happy path, both injected into the shipped default
+ * reader over a real temporary config. A fault handed only to a fake adapter would prove the fake.
+ *
+ * The short read is driven over a file that is a complete valid JSON config followed by bytes that
+ * are not JSON at all, so the only way to parse it is to parse a prefix and call that the file: the
+ * descriptor still reports the full size, and the delivered bytes stop inside the config.
+ */
+test('a short config read is refused without a retry, never admitted as a JSON prefix', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	const realOpen = nodeFs.openSync;
+	const realRead = nodeFs.readSync;
+	const realClose = nodeFs.closeSync;
+	const owned = new Set();
+	const reads = [];
+	let prefixBytes = 0;
+	try {
+		const valid = JSON.stringify({ ...config, key: PLANTED_CLI_KEY, task: PLANTED_CLI_TASK }, null, 2);
+		const trailing = '\nnot-a-json-config-synthetic-trailing.invalid\n';
+		writeFileSync(configPath, `${valid}${trailing}`);
+		prefixBytes = Buffer.byteLength(valid, 'utf8');
+		// The prefix is a whole valid config and the file is not: only a short read can admit the one
+		// while refusing the other.
+		assert.equal(JSON.parse(valid).key, PLANTED_CLI_KEY, 'the delivered prefix is complete valid JSON');
+		assert.throws(() => JSON.parse(readFileSync(configPath, 'utf8')), 'the config file as a whole is not valid JSON');
+		assert.equal(prefixBytes < statSync(configPath).size, true, 'the prefix stops inside the file');
+		nodeFs.openSync = (path, ...rest) => {
+			const fd = realOpen(path, ...rest);
+			if (path === configPath) owned.add(fd);
+			return fd;
+		};
+		// The fault: the descriptor delivers those bytes and reports only as many of them, which is
+		// what a short read looks like from inside the reader. Nothing else in this lane is patched.
+		nodeFs.readSync = (fd, buffer, offset, length, position) => {
+			if (!owned.has(fd)) return realRead(fd, buffer, offset, length, position);
+			const delivered = realRead(fd, buffer, offset, length, position);
+			const reported = Math.min(delivered, prefixBytes);
+			reads.push({ requested: length, reported });
+			return reported;
+		};
+		nodeFs.closeSync = (fd) => {
+			owned.delete(fd);
+			return realClose(fd);
+		};
+		syncBuiltinESMExports();
+		const record = [];
+		const result = await runNativeLane(['--config', configPath], { spawn: fakeSpawn({ record }) });
+		assert.equal(result.reason, SETUP_FAILURES.config, 'a short read is the fixed config refusal');
+		assert.equal(record.length, 0, 'a short read launches nothing');
+		assert.equal(reads.length, 1, `the read is issued once and never retried, got ${reads.length}`);
+		assert.equal(reads[0].requested, MAX_CONFIG_BYTES + 1, 'still one bounded window request, never a smaller one');
+		assert.equal(JSON.stringify(result).includes(PLANTED_CLI_KEY), false, 'no planted key in the refusal');
+		assert.equal(JSON.stringify(result).includes(PLANTED_CLI_TASK), false, 'no planted task in the refusal');
+		for (const written of [config.receipt, config.verification, config.progress, config.dispatch]) {
+			assert.equal(existsSync(written), false, `nothing was written to ${written}`);
+		}
+	} finally {
+		nodeFs.openSync = realOpen;
+		nodeFs.readSync = realRead;
+		nodeFs.closeSync = realClose;
+		syncBuiltinESMExports();
+		cleanup();
+	}
+});
+
+/**
+ * A close that fails is the other half of the same ownership claim. The descriptor is real and the
+ * bytes really were read, so the reader must still refuse: it may not report cleanup it did not get.
+ * The failed close leaves the descriptor open, so this test closes what it handed over rather than
+ * claiming the lane left nothing behind.
+ */
+test('a config close that fails withholds admission and launches no child', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	const realOpen = nodeFs.openSync;
+	const realClose = nodeFs.closeSync;
+	const owned = new Set();
+	const leaked = new Set();
+	try {
+		writeFileSync(configPath, JSON.stringify({ ...config, key: PLANTED_CLI_KEY, task: PLANTED_CLI_TASK }, null, 2));
+		nodeFs.openSync = (path, ...rest) => {
+			const fd = realOpen(path, ...rest);
+			if (path === configPath) owned.add(fd);
+			return fd;
+		};
+		// The fault: only the close of the descriptor the reader owns fails, and it fails before the
+		// descriptor is released, so the descriptor number stays valid and this test can close it.
+		nodeFs.closeSync = (fd) => {
+			if (!owned.has(fd)) return realClose(fd);
+			owned.delete(fd);
+			leaked.add(fd);
+			throw Object.assign(new Error('synthetic close failure'), { code: 'EIO' });
+		};
+		syncBuiltinESMExports();
+		const record = [];
+		const result = await runNativeLane(['--config', configPath], { spawn: fakeSpawn({ record }) });
+		// This test owns the descriptor the failed close left open, so it closes it here. That is
+		// cleanup the reader attempted and did not complete, not proof that it had closed anything.
+		const unclosed = [...leaked];
+		for (const fd of unclosed) {
+			try {
+				realClose(fd);
+			} catch {
+				// Already gone: nothing of this test's is left behind either way.
+			}
+		}
+		assert.equal(result.reason, SETUP_FAILURES.config, 'a failed close is the fixed config refusal');
+		assert.equal(record.length, 0, 'a failed close launches nothing');
+		assert.equal(unclosed.length, 1, 'exactly one descriptor was left for this test to close');
+		assert.equal(JSON.stringify(result).includes(PLANTED_CLI_KEY), false, 'no planted key in the refusal');
+		assert.equal(JSON.stringify(result).includes(PLANTED_CLI_TASK), false, 'no planted task in the refusal');
+		for (const written of [config.receipt, config.verification, config.progress, config.dispatch]) {
+			assert.equal(existsSync(written), false, `nothing was written to ${written}`);
+		}
+		// The control: the identical config over a close that works really launches the owned child,
+		// so the refusal above is the failed close and not a config this lane would never have run.
+		nodeFs.openSync = realOpen;
+		nodeFs.closeSync = realClose;
+		syncBuiltinESMExports();
+		const control = [];
+		const launched = await runNativeLane(['--config', configPath], { spawn: fakeSpawn({ record: control }) });
+		assert.equal(control.length, 1, 'a close that works admits the same config and launches the owned child');
+		assert.equal(launched.reason, SETUP_FAILURES.receipt, 'the synthetic child leaves no leaf evidence behind');
+	} finally {
+		nodeFs.openSync = realOpen;
+		nodeFs.closeSync = realClose;
+		syncBuiltinESMExports();
+		cleanup();
+	}
+});
+
+/**
+ * The refusals that need this process to hand the reader a descriptor it did not admit: an open that
+ * resolves to a directory, a read that fails, and a path that turns into a writer-less FIFO between
+ * the metadata check and the open. That last one blocks for as long as it has to, so all three run in
+ * one child a finite bound can kill, and a child the bound kills is the failure this control exists for.
+ */
+const configDescriptorChild = `
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+
+const [configPath, fifoPath, directoryPath, cliUrl] = process.argv.slice(2);
+const lane = await import(cliUrl);
+const realOpen = fs.openSync;
+const realRead = fs.readSync;
+const realClose = fs.closeSync;
+// Per case, because the OS reuses a descriptor number as soon as one is closed: a set shared across
+// cases would report a reused number as one it had already accounted for.
+let seen = { opened: new Set(), closed: new Set() };
+const fakeSpawn = (record) => (command, args) => {
+	record.push({ command, args });
+	const child = new EventEmitter();
+	child.stderr = new EventEmitter();
+	child.kill = () => true;
+	child.pid = 4242;
+	queueMicrotask(() => child.emit('close', 0));
+	return child;
+};
+const caseFor = async (patch, restore) => {
+	seen = { opened: new Set(), closed: new Set() };
+	patch();
+	syncBuiltinESMExports();
+	const record = [];
+	try {
+		const result = await lane.runNativeLane(['--config', configPath], { spawn: fakeSpawn(record) });
+		return {
+			reason: result.reason, launched: record.length,
+			opened: seen.opened.size,
+			closed: [...seen.opened].filter((fd) => seen.closed.has(fd)).length,
+		};
+	} finally {
+		restore();
+		syncBuiltinESMExports();
+	}
+};
+// Every descriptor this patch hands the reader is tracked, so the report can show it was closed.
+const trackOpens = (over) => {
+	fs.openSync = (path, ...rest) => {
+		const fd = over(path, ...rest);
+		seen.opened.add(fd);
+		return fd;
+	};
+	fs.closeSync = (fd) => {
+		if (seen.opened.has(fd)) seen.closed.add(fd);
+		return realClose(fd);
+	};
+};
+// The descriptor itself decides the type: a path that stats regular and opens as a directory is refused.
+const openedDirectory = await caseFor(() => {
+	trackOpens((path, ...rest) => (path === configPath ? realOpen(directoryPath, ...rest) : realOpen(path, ...rest)));
+}, () => { fs.openSync = realOpen; fs.closeSync = realClose; });
+// A read that fails is the fixed refusal, and the descriptor it owned is still closed.
+const unreadable = await caseFor(() => {
+	trackOpens((path, ...rest) => realOpen(path, ...rest));
+	fs.readSync = (fd, ...rest) => {
+		if (seen.opened.has(fd)) throw Object.assign(new Error('synthetic read failure'), { code: 'EIO' });
+		return realRead(fd, ...rest);
+	};
+}, () => { fs.openSync = realOpen; fs.closeSync = realClose; fs.readSync = realRead; });
+// Last, because it leaves the config path a FIFO: regular when the reader stats it, writer-less when
+// the reader opens it, so the non-blocking open is what keeps the refusal from waiting for a writer.
+const raced = await caseFor(() => {
+	trackOpens((path, ...rest) => {
+		if (path === configPath) fs.renameSync(fifoPath, configPath);
+		return realOpen(path, ...rest);
+	});
+}, () => { fs.openSync = realOpen; fs.closeSync = realClose; });
+process.stdout.write(JSON.stringify({ openedDirectory, unreadable, raced }));
+`;
+
+test('the config reader refuses a non-regular, unreadable or raced descriptor and closes each one', (t) => {
+	const { dir, config, configPath, cleanup } = tempConfig();
+	const childPath = join(dir, 'config-descriptor-child.mjs');
+	try {
+		const fifoPath = join(dir, 'raced-config.fifo');
+		const made = spawnSync('mkfifo', [fifoPath]);
+		if (made.error !== undefined || made.status !== 0 || !statSync(fifoPath).isFIFO()
+			|| typeof nodeFs.constants.O_NONBLOCK !== 'number') {
+			// Platform honesty: without a named pipe, or without a non-blocking open flag, there is no
+			// bounded race to run here and a skip states that instead of passing silently.
+			t.skip(`no FIFO or no O_NONBLOCK on this platform: ${made.error?.code ?? `mkfifo exit ${made.status}`}`);
+			return;
+		}
+		writeFileSync(childPath, configDescriptorChild);
+		const control = spawnSync(process.execPath,
+			[childPath, configPath, fifoPath, dir, pathToFileURL(laneCliPath).href],
+			{ timeout: FIFO_CONTROL_TIMEOUT_MS, encoding: 'utf8' });
+		assert.equal(control.error, undefined,
+			`the config read exceeded the ${FIFO_CONTROL_TIMEOUT_MS} ms bound: ${control.error?.code ?? control.signal}`);
+		assert.equal(control.signal, null, 'the child was not killed by the bound');
+		assert.equal(control.status, 0, control.stderr);
+		const report = JSON.parse(control.stdout);
+		assert.deepEqual(report.openedDirectory,
+			{ reason: SETUP_FAILURES.config, launched: 0, opened: 1, closed: 1 },
+			'a descriptor that is not a regular file is refused before a byte is read');
+		assert.deepEqual(report.unreadable,
+			{ reason: SETUP_FAILURES.config, launched: 0, opened: 1, closed: 1 },
+			'a failed read is the fixed refusal and its descriptor is still closed');
+		assert.deepEqual(report.raced,
+			{ reason: SETUP_FAILURES.config, launched: 0, opened: 1, closed: 1 },
+			'a path that becomes a writer-less FIFO after the stat is refused by the opened descriptor');
+		assert.equal(statSync(configPath).isFIFO(), true, 'the raced path is left exactly as the refusal found it');
+	} finally {
+		cleanup();
+	}
+});
+
+/**
+ * The seam the default reader sits behind. An injected adapter is trusted with what it admits: this
+ * process cannot re-prove a virtual filesystem, so a host that supplies its own config reader owns the
+ * bytes that reader hands over. The real-file guarantee above belongs to the default alone and is not
+ * something an adapter inherits or can widen by returning something else.
+ */
+test('an injected config reader owns its own bytes, and the default keeps the real-file guarantee', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	try {
+		const absent = join(config.sessionDir, 'no-such-config.json');
+		assert.equal(existsSync(absent), false);
+		const record = [];
+		const trusted = await runNativeLane(['--config', absent], {
+			// The injected adapter owns every read this lane makes, the config included; the shipped
+			// reader never sees the absent path. Every other path stays honest, so the freshness rule
+			// the lane also enforces is not disabled along with the file the adapter is standing in for.
+			fs: {
+				exists: (path) => path === absent || existsSync(path),
+				readFile: (path) => readFileSync(path, 'utf8'),
+				readConfig: (path) => (path === absent ? Buffer.from(JSON.stringify(config)) : null),
+			},
+			spawn: fakeSpawn({ record }),
+		});
+		assert.equal(trusted.reason, SETUP_FAILURES.receipt, 'the injected bytes were admitted and the lane ran');
+		assert.equal(record.length, 1, 'an injected reader drives exactly one owned child');
+
+		// The same absent path with no injected reader is the fixed refusal: the default owns the file.
+		const refused = await runNativeLane(['--config', absent], { spawn: fakeSpawn({ record: [] }) });
+		assert.equal(refused.reason, SETUP_FAILURES.install, 'the default reader refuses a config path that is not there');
+		// A reader that fails is contained as the fixed refusal rather than escaping to the caller.
+		const throwing = await runNativeLane(['--config', configPath], {
+			fs: { exists: () => true, readConfig: () => { throw new Error('synthetic reader failure'); } },
+			spawn: fakeSpawn({ record: [] }),
+		});
+		assert.equal(throwing.reason, SETUP_FAILURES.config, 'a throwing injected reader is the fixed refusal');
+		assert.equal(JSON.stringify(throwing).includes('synthetic reader failure'), false, 'no thrown text escapes');
 	} finally {
 		cleanup();
 	}

@@ -130,6 +130,25 @@ frontmatter deadline; an
 optional `softBudgetMs` is a positive integer strictly below `timeoutMs`; an optional
 `requiredReferences` list is described below; a `model` key is refused rather than ignored.
 
+**How the config is read is part of that bound.** It is read through one descriptor the CLI owns and
+closes on every path: metadata first, then one non-blocking read-only open, then the opened
+descriptor's own type and size, then exactly one read of at most 65,537 bytes. The window is bytes,
+not decoded characters, and the single byte past it is the oversize signal, so a config that only fits
+by character count is refused rather than truncated and parsed. That one read must also be complete: it
+has to deliver every byte the opened descriptor reports, because a truncated config can still be a
+parseable JSON prefix followed by bytes that are not JSON. A short read is therefore refused with no
+retry and no repair, never admitted as the prefix it delivered. The close belongs to the same
+admission. It is attempted on every path, and a close that fails withholds the bytes already read:
+this process does not report cleanup it did not get. A path that is not a regular file, one that
+becomes non-regular between the metadata check and the open, one past the window, one whose read falls
+short of its own descriptor, one whose close fails, bytes that are not UTF-8, and a read that fails are
+all `SETUP_FAILED_LANE_CONFIG` with zero children, one fixed record and nothing echoed, because no
+watchdog exists yet to bound a wait. Withholding the bytes on a failed close is a refusal of the read,
+not a claim that the descriptor was closed anyway. That is a claim about a POSIX host that carries
+`O_NONBLOCK` and about the bytes this process allocates, reads and attempts to release; it is not a
+bound on I/O latency against a remote or otherwise slow filesystem, and not a guarantee about what a
+concurrent writer changes between the stat and the open.
+
 ```json
 {
   "key": "issue-182-round2",
@@ -277,7 +296,7 @@ provably the same code and not a re-implementation of it.
 
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (54 tests, 44 of them in the lane file). The dedicated writer fallback's own cases cover the
+platform (60 tests, 50 of them in the lane file). The dedicated writer fallback's own cases cover the
 four bounds it could have loosened: its exact role/model pair is admitted while a foreign route or a
 different budget is refused in both model checks, the default writer and the reviewer keep their own
 `:max` requirement, the fallback writer reports `writerAcceptanceGate` and
@@ -328,6 +347,34 @@ bound — `ETIMEDOUT` at 15,000 ms, killed mid-probe — because the shipped pro
 checked regularity; after the fix the same control reports non-regular metadata refused, zero preflight
 calls, zero dispatch and no persisted dispatch record, in about 90 ms. The root process never opens
 that FIFO. A platform without a named pipe reports a skip with the reason, never a silent pass.
+The config read gets the same treatment, because it happens before any watchdog exists. One case spawns
+the shipped CLI over a writer-less FIFO, a character device and a directory: each exits 2 at once with
+one fixed refusal line, nothing planted echoed, zero dispatch and nothing written, while the identical
+platform over one regular config really launches. One case drives the shipped default reader and
+asserts that a config past the byte window but inside the character count and bytes that are not UTF-8
+are each refused with zero children while a valid regular config still launches, that the single
+positional read and its allocation stay inside the window, that the config is never read as a whole
+file, and that every descriptor it opened is closed. One bounded child hands that reader a descriptor it
+did not admit — an open that resolves to a directory, a read that throws, and a path renamed into a
+writer-less FIFO between the metadata check and the open — so each is the fixed refusal with its
+descriptor closed and nothing launched; the root process never opens that FIFO either. Two further
+cases drive the shipped default reader with one fault each, over a real temporary config. A read that
+delivers fewer bytes than the opened descriptor reports is refused with no retry and no launch: the
+config behind it is a complete valid JSON object followed by bytes that are not JSON, so only a reader
+that admitted the prefix could parse it, and the case asserts the single read is still requested at the
+full 65,537-byte window. A close that fails withholds the bytes already read and launches no child, and
+the test closes the descriptor it handed over itself, because a failed close is a refusal of the read
+and not a proof that the lane released anything; its control is the identical config over a close that
+works, which really launches the owned child. The retained RED
+is the shape the probe control caught: the real CLI process hitting its own bound, `ETIMEDOUT`, killed
+with no child and no record at all; an open that resolves to a directory admitted and launching a child;
+a config past the byte window but inside the character count admitted for the same reason; and no
+seam at all for a config reader, because the config went through the same injected `readFile` as every
+other artifact. Both new controls retained the same RED against the shipped reader before the fix: each
+admitted its bytes, launched exactly one child and returned `SETUP_FAILED_MISSING_RECEIPT` instead of
+the config refusal, which is what a config prefix parsed as a whole config looks like from outside. An
+injected config reader is trusted with its own bytes, which is a statement about an
+adapter a host supplies, not a widening of the default reader's guarantee.
 Metadata admission proves neither later availability nor content approval, and the retained control
 covers one POSIX FIFO rather than every non-regular file type.
 One case spawns the shipped CLI itself, because every other case drives the exported function
