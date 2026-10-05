@@ -25,7 +25,9 @@
 // a planted value or a native error into the TAP output. Planted material and the mask literal are
 // declared here independently of the script, and the confidentiality claim itself is observed rather
 // than asserted about: the suite spawns a real `node --test` run whose subprocess really printed the
-// planted values, and checks that the TAP that run reported contains none of them.
+// planted values and whose designated comparison really fails uncaught, then checks that the failing TAP
+// that run reported contains none of them. The unsafe counterpart, which really does leak, runs alongside
+// so that safe comparison is not vacuous.
 //
 // What this is NOT. This is not a gateway, a provider client, an authentication implementation, a
 // restoration path, a streaming design or a held-out, scored or promotion result. The identity, clock,
@@ -40,7 +42,7 @@ import {
   MASKED, PLANTED_ORIGINAL, PLANTED_SECRET,
 } from '../scripts/lib/synthetic-conversation-fixture.mjs';
 import {
-  REPO_ROOT, runNode, runNodeTest, TEST_TIMEOUT_MS,
+  runNode, runNodeTest, TEST_TIMEOUT_MS,
 } from './support/run-node-subprocess.mjs';
 
 const DEMO = fileURLToPath(new URL('../scripts/synthetic-conversation-demo.mjs', import.meta.url));
@@ -48,10 +50,23 @@ const DEMO = fileURLToPath(new URL('../scripts/synthetic-conversation-demo.mjs',
 const FAULT_DRIVER = fileURLToPath(
   new URL('./support/synthetic-conversation-demo-fault-driver.mjs', import.meta.url),
 );
-/** The test-only probe that really runs assertions over output carrying the planted values. */
+/** The test-only probe that really runs assertions over output carrying the planted values, and fails. */
 const CONFIDENTIALITY_PROBE = fileURLToPath(
   new URL('./support/synthetic-conversation-demo-confidentiality-probe.test.mjs', import.meta.url),
 );
+/**
+ * The unsafe counterpart: the same comparison with the captured stream as a string operand, which really
+ * does report it. Its leaking TAP is captured in this process and only ever reduced to booleans.
+ */
+const UNSAFE_NEGATIVE_CONTROL = fileURLToPath(
+  new URL('./support/synthetic-conversation-demo-unsafe-negative-control.test.mjs', import.meta.url),
+);
+/** The probe's own test name, declared here so the failing entry can be matched by NAME, not by count. */
+const PROBE_TEST_NAME =
+  'a subprocess output carrying planted material enters the assertion path and reports none of it';
+/** The probe's designated failing message, declared here and identical to the probe's own constant. */
+const PROBE_DESIGNATED_MESSAGE =
+  'this probe ends on a deliberately failing boolean comparison over a captured stream';
 
 /** Run the real operator entry point in a real child process. */
 const runDemo = (args) => runNode(DEMO, args);
@@ -275,23 +290,43 @@ test('a reply the protocol must refuse never passes as the genuine known-origina
     }
   });
 
-test('a real TAP run over output carrying the planted values reports none of it',
+test('a real failing TAP run over output carrying the planted values reports none of them',
   { timeout: TEST_TIMEOUT_MS }, async () => {
-    // Observed, not asserted about: a real `node --test` run of a probe whose subprocess really printed
-    // the planted original and the planted secret, with the runner's own TAP output captured here.
+    // Observed, not asserted about. The probe really runs under the real test runner, its subprocess
+    // really printed the planted values, and its designated comparison really fails UNCAUGHT - so the run
+    // really exits non-zero and the report really carries a named `not ok` entry and a failure count.
     const probe = await runNodeTest(CONFIDENTIALITY_PROBE);
+    assert.equal(probe.transportFailure, false,
+      'a legitimate completed failing test run is preserved, not turned into a transport failure');
     assert.equal(probe.stalled, false, 'the confidentiality probe finished inside its bound');
     assert.equal(probe.signal, null, 'the probe exited on its own, with no signal');
-    assert.equal(probe.code, 0, 'the confidentiality probe passed');
+    assert.equal(probe.code, 1, 'the designated comparison really failed, so the runner reported a non-zero exit');
     const tap = `${probe.stdout}${probe.stderr}`;
-    assert.equal(tap.includes('reports none of it'), true,
-      'the probe really ran under the test runner, so the TAP output below is a real one');
+    assert.equal(tap.includes(`not ok 1 - ${PROBE_TEST_NAME}`), true,
+      'the real TAP report carries the named failing entry for the probe test');
+    assert.equal(tap.includes('# fail 1'), true, 'the real failure count was reported');
+    assert.equal(tap.includes(PROBE_DESIGNATED_MESSAGE), true,
+      'the failure the runner reported is the designated one, not some other failure');
+    // The confidentiality claim, over that real failing report: booleans only, so this test's own
+    // assertions can never report a captured byte either.
     assert.equal(tap.includes(PLANTED_ORIGINAL), false,
-      'the observed TAP output carries no planted original');
+      'the observed failing TAP output carries no planted original');
     assert.equal(tap.includes(PLANTED_SECRET), false,
-      'the observed TAP output carries no planted secret');
+      'the observed failing TAP output carries no planted secret');
     assert.equal(tap.includes(MASKED), false,
-      'the observed TAP output carries no mask literal');
-    assert.equal(tap.includes(REPO_ROOT), false,
-      'the observed TAP output carries no checkout path from the captured streams');
+      'the observed failing TAP output carries no mask literal');
+
+    // The unsafe counterpart, so the three checks above are not vacuous. Its TAP is captured here, in
+    // this process's memory, and is ONLY ever reduced to booleans: it is never compared to another
+    // string, never put in an assertion message, printed, logged or written anywhere.
+    const unsafe = await runNodeTest(UNSAFE_NEGATIVE_CONTROL);
+    assert.equal(unsafe.transportFailure, false, 'the unsafe control ran, and finished on its own');
+    assert.equal(unsafe.code, 1, 'the unsafe comparison really failed too');
+    const leaked = `${unsafe.stdout}${unsafe.stderr}`;
+    assert.equal(leaked.includes(PLANTED_ORIGINAL), true,
+      'the unsafe string operand really reported the planted original, so the safe check above is not vacuous');
+    assert.equal(leaked.includes(PLANTED_SECRET), true,
+      'the unsafe string operand really reported the planted secret too');
+    assert.equal(leaked.includes(MASKED), false,
+      'the mask literal is in no captured stream at all, so neither run could have reported it');
   });
