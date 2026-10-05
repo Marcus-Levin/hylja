@@ -133,15 +133,18 @@ function policyBundle(decision = 'KEEP') {
  * would be observed rather than trusted.
  */
 function createBackend({ handle = ORIGINAL, behaviour = 'match', bound = false,
-  applyFault = false } = {}) {
+  applyFault = false, probe = undefined } = {}) {
   const provisioned = new TextEncoder().encode(handle);
-  const state = { calls: 0, retained: undefined };
+  const state = { calls: 0, retained: undefined, probed: undefined };
   const backend = {
     state,
     lookup(identifier) {
       if (bound && this !== backend) throw new Error('synthetic receiver fault');
       state.calls += 1;
       state.retained = identifier;
+      // The optional probe reads the world at the moment the resource is really called, so a test can
+      // observe the state the effect was actually spent against instead of inferring it.
+      if (typeof probe === 'function') state.probed = probe();
       if (behaviour === 'throw') throw new Error('synthetic resource fault');
       if (behaviour === 'non-boolean') return { matched: true };
       let matched = identifier.byteLength === provisioned.byteLength;
@@ -159,12 +162,21 @@ function createBackend({ handle = ORIGINAL, behaviour = 'match', bound = false,
   }
   return backend;
 }
-/** A byte source that throws on one index read, so a copy of it is interrupted part-way through. */
+/**
+ * A byte source that throws on one index read, so a copy of it is interrupted part-way through. The
+ * typed-array accessors are forwarded with the **target** as their receiver: a `Proxy` is not itself a
+ * typed array, so forwarding `byteLength` with the `Proxy` would throw before a single byte was read
+ * and this case would prove an early refusal instead of an interrupted copy. `source.reads` counts
+ * the index reads that reached the trap, which is how the fault index itself is asserted.
+ */
 function interruptedBytes(bytes, faultAt = 5) {
-  return new Proxy(bytes, { get(target, property, receiver) {
-    if (property === String(faultAt)) throw new Error('synthetic byte fault');
-    return Reflect.get(target, property, receiver);
+  const source = { reads: 0, faultAt, reached: false, bytes: undefined };
+  source.bytes = new Proxy(bytes, { get(target, property) {
+    if (typeof property === 'string' && /^(?:0|[1-9][0-9]*)$/u.test(property)) source.reads += 1;
+    if (property === String(faultAt)) { source.reached = true; throw new Error('synthetic byte fault'); }
+    return Reflect.get(target, property, target);
   } });
+  return source;
 }
 function cleared(buffer) {
   if (buffer === undefined) return false;
@@ -199,11 +211,13 @@ function createHost(options = {}) {
     destination: DESTINATION, grant: Object.hasOwn(options, 'grant') ? options.grant
       : makeGrant(scenario, record, 'USE'),
     keyVersion: KEY_VERSION, now: USE_NOW };
+  const interrupted = options.interruptedCiphertext
+    ? interruptedBytes(scenario.envelope.ciphertext) : undefined;
   const counters = { authority: 0, material: 0 };
   const hooks = options.hooks ?? {};
   const order = [];
   const fixture = { host: undefined, state, counters, scenario, backend, ledger, auditContext,
-    bundle, hooks, order, source: scenario.envelope.ciphertext };
+    bundle, hooks, order, interrupted, source: scenario.envelope.ciphertext };
   const report = () => ({ version: 1, subject: { ...state.subject }, context: { ...state.context },
     destination: { ...state.destination },
     grant: state.grant === undefined ? undefined : { ...state.grant },
@@ -231,8 +245,8 @@ function createHost(options = {}) {
       counters.material += 1;
       order.push('material');
       if (typeof hooks.onMaterial === 'function') hooks.onMaterial(fixture);
-      const ciphertext = options.interruptedCiphertext
-        ? interruptedBytes(scenario.envelope.ciphertext) : scenario.envelope.ciphertext;
+      const ciphertext = interrupted === undefined
+        ? scenario.envelope.ciphertext : interrupted.bytes;
       return { version: 1, envelope: { ...scenario.envelope, ciphertext },
         key: keyBytes(options.keyFill ?? 0x11),
         mappingRevision: options.materialRevision ?? String(record.revision),
@@ -776,19 +790,76 @@ test('the effect segment resolves no mutable function property and re-reads no c
     assert.equal(served.counter.reads > 0, true);
     assert.equal(served.counter.reads, refused.counter.reads);
 
-    // A classification that changes after the material load is refused before the resource, whether
-    // the change arrives as a value or as a revocation of the record it names.
-    const mutated = counting();
-    const mutatedHost = createHost({ classification: mutated.classification,
-      hooks: { onMaterial(fixture) {
-        fixture.host.registry.transition({ version: 1, mappingRef: fixture.host.mappingRef,
-          scope: { ...fixture.host.scope }, expectedRevision: 2, action: 'REVOKE' }, { now: USE_NOW });
-      } } });
-    const afterMutation = await createBoundMappingUse(mutatedHost.host).use();
-    assert.equal(afterMutation.code, 'WITHHELD');
-    assert.equal(mutatedHost.backend.state.calls, 0);
-    assert.equal(mutatedHost.counters.material, 1);
+    // A classification that drifts after the material load is refused before the resource, while the
+    // registry record is still ACTIVE: nothing is withdrawn, the pinned digest simply no longer
+    // describes what the policy engine was handed, so this is digest congruence and not lifecycle.
+    const drifted = { ...EVIDENCE };
+    const driftedHost = createHost({ classification: drifted,
+      hooks: { onMaterial() { drifted.sensitivity = 'PUBLIC'; } } });
+    const afterDrift = await createBoundMappingUse(driftedHost.host).use();
+    assert.equal(afterDrift.code, 'WITHHELD');
+    assert.equal(driftedHost.backend.state.calls, 0);
+    assert.equal(driftedHost.counters.material, 1);
+    assert.equal(driftedHost.ledger.entries.length, 0);
+    const stillActive = driftedHost.scenario.registry.current({ version: 1,
+      mappingRef: driftedHost.scenario.mappingRef, scope: { ...driftedHost.scenario.scope } },
+      { now: USE_NOW });
+    assert.equal(stillActive.metadata.state, 'ACTIVE');
   });
+
+test('an effect is spent only while the registry record is still ACTIVE at the backend', async () => {
+  // The actual gap control, and the cheap way to see it. The live audit actor is the last host-owned
+  // read before the fresh registry read, so a host that queues one finite revocation from it queues
+  // that revocation inside the sealed segment itself. The resource probes the shipped registry at
+  // the instant it is really called, so a spend against stale state is observed, not inferred.
+  const control = { armed: false, queued: false, revoke: () => {} };
+  const auditContext = { version: AUDIT_SCHEMA_VERSION,
+    scope: { tenantId: SCOPE.tenantId, projectId: SCOPE.projectId },
+    integrationId: 'integration-bound-use-fixture.invalid',
+    actorBinding: 'AUTHENTICATED_UPSTREAM', pseudonymKey: keyBytes(0x33), chainKey: keyBytes(0x77) };
+  Object.defineProperty(auditContext, 'actor', { enumerable: true, configurable: true, get() {
+    if (control.armed && !control.queued) {
+      control.queued = true;
+      queueMicrotask(() => { control.revoke(); });
+    }
+    return { principalId: WORKLOAD.principalId, workloadId: WORKLOAD.workloadId };
+  } });
+  let built;
+  const backend = createBackend({ probe() {
+    const found = built.scenario.registry.current({ version: 1,
+      mappingRef: built.scenario.mappingRef, scope: { ...built.scenario.scope } }, { now: USE_NOW });
+    return found.state === 'FOUND' ? found.metadata.state : found.state;
+  } });
+  built = createHost({ backend, auditContext, hooks: { onAuthority(count, fixture) {
+    // The fourth observation is the last answer this call awaits: the final guard and the effect are
+    // what happens next, in the continuation that reads it.
+    if (count >= 4) control.armed = true;
+    control.revoke = () => {
+      const applied = fixture.host.registry.transition({ version: 1,
+        mappingRef: fixture.host.mappingRef, scope: { ...fixture.host.scope },
+        expectedRevision: 2, action: 'REVOKE' }, { now: USE_NOW });
+      assert.equal(applied.state, 'CHANGED');
+    };
+  } } });
+  const result = await createBoundMappingUse(built.host).use();
+  assertFixedShape(result);
+  assert.equal(built.counters.authority, 4);
+  assert.equal(result.code, 'USED');
+  assert.equal(backend.state.calls, 1);
+  // The only spend this case allows is one made against a record the registry still calls ACTIVE.
+  assert.equal(backend.state.probed, 'ACTIVE');
+  assert.equal(cleared(backend.state.retained), true);
+  // The queued revocation really was finite and really landed; it landed after the sealed effect was
+  // already complete, and a revocation that lands then is not expected to cancel it retroactively.
+  assert.equal(control.queued, true);
+  await new Promise((resolve) => { setImmediate(resolve); });
+  const afterwards = built.scenario.registry.current({ version: 1,
+    mappingRef: built.scenario.mappingRef, scope: { ...built.scenario.scope } }, { now: USE_NOW });
+  // A revoked record is no longer live, so the shipped registry stops reporting it as the current
+  // one at all: the queued revocation really landed, just not inside the effect.
+  assert.equal(afterwards.state, 'ABSENT');
+  assert.equal(afterwards.reason, 'NOT_LIVE');
+});
 
 /* ---------- 15. Host callbacks keep their own receiver and may answer asynchronously ---------- */
 
@@ -846,6 +917,9 @@ test('a byte source that throws mid-copy, and a host fault before the effect, bo
     assert.equal(torn.backend.state.calls, 0);
     assert.equal(torn.ledger.entries.length, 0);
     assert.equal(cleared(torn.backend.state.retained), false);
+    // The copy really was interrupted: the fault index was reached, not refused before allocation.
+    assert.equal(torn.interrupted.reached, true);
+    assert.equal(torn.interrupted.reads, torn.interrupted.faultAt + 1);
     // The host's own buffers belong to the host: this module overwrites only what it copied.
     assert.notEqual(torn.source[0], 0);
 

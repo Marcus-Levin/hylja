@@ -877,6 +877,97 @@ test('boundary evidence that cannot be bound refuses with INTERACTION_REFUSED an
     }
   });
 
+/* ---------- The captured scope and registration the child is asked to check under ---------- */
+
+test('a host that rewrites its own scope, registration scope, key or entries cannot retarget the check',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // LEAKY_REQUEST_BODY carries the planted original and the fixture classifies the whole image PUBLIC
+    // with detector evidence, so real policy selects KEEP for every unit and the send really reaches the
+    // real child. Only the sentinel's own known-original registration can withhold it from there.
+    const foreign = { tenantRef: 'tenant-foreign-keep.invalid', projectRef: 'project-foreign-keep.invalid' };
+
+    /** One mutable, host-owned scope and registration per control. Nothing here is frozen. */
+    const aliasHost = () => {
+      const scope = { tenantRef: SCOPE.tenantRef, projectRef: SCOPE.projectRef };
+      const key = KEY.slice();
+      const known = {
+        scope: { tenantRef: SCOPE.tenantRef, projectRef: SCOPE.projectRef }, key, entries: [],
+      };
+      for (const entry of BENIGN_ENTRIES) known.entries.push({ ...entry });
+      return { scope, key, known };
+    };
+
+    for (const [name, rewrite] of [
+      // Everything the child would be asked to run under moved to a foreign tenant: a different scope, a
+      // matching registration scope, different key bytes and a registration that no longer holds A.
+      ['every scope, key and entry alias rewritten to a foreign tenant', (alias) => {
+        alias.scope.tenantRef = foreign.tenantRef;
+        alias.scope.projectRef = foreign.projectRef;
+        alias.known.scope.tenantRef = foreign.tenantRef;
+        alias.known.scope.projectRef = foreign.projectRef;
+        alias.key.fill(0x2a);
+        alias.known.entries = [];
+      }],
+      // Only the key array rewritten IN PLACE: the same Uint8Array the host handed over, different
+      // bytes. This one is not a bypass on its own - the child fingerprints the registration entries and
+      // the payload under the same key of one request frame - so what it shows is that the captured key
+      // bytes are what the child is handed and that the outcome stays one fixed restrictive refusal.
+      ['the key array rewritten in place', (alias) => { alias.key.fill(0x00); }],
+      // Only the entry list replaced, with an equal-shaped list that no longer holds A's original.
+      ['the entry list replaced without the planted original', (alias) => {
+        alias.known.entries = [{ kind: 'CANARY', value: PLANTED_CANARY, ref: 'planted.canary.2' }];
+      }],
+    ]) {
+      const alias = aliasHost();
+      // A finite inspection that rewrites the host's own members after they were handed over. The
+      // sender still checks under the scope and registration it captured privately.
+      const point = await harness(t, {
+        inspect: (image, binding) => { rewrite(alias); return inspectWholeImage(image, binding); },
+        host: { scope: alias.scope, known: alias.known },
+      });
+      const result = await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: LEAKY_REQUEST_BODY,
+      }), name);
+      assert.deepEqual(result, { status: 'REFUSED', code: 'SENTINEL_BLOCKED' }, name);
+      assertNothingSent(point.sink, point.dispatch);
+      assert.equal(point.sender.state, 'IDLE', name);
+    }
+
+    // An unknown own key on the registration is still one fixed restrictive refusal and no effect.
+    const unknown = aliasHost();
+    unknown.known.clearance = 'PUBLIC';
+    const unusable = await harness(t, { host: { scope: unknown.scope, known: unknown.known } });
+    assert.deepEqual(await bounded(unusable.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: LEAKY_REQUEST_BODY,
+    }), 'unknown registration key'), { status: 'REFUSED', code: 'SENTINEL_BLOCKED' });
+    assertNothingSent(unusable.sink, unusable.dispatch);
+    assert.equal(unusable.sender.state, 'IDLE');
+
+    // Positive control on the same mechanism: a benign rewrite that keeps the captured tenant A values
+    // sends normally. Capturing a private copy is not a rule that revokes on any host-side mutation, and
+    // no such automatic revocation rule is invented here.
+    const benign = aliasHost();
+    const benignPoint = await harness(t, {
+      inspect: (image, binding) => {
+        benign.scope.tenantRef = SCOPE.tenantRef;
+        benign.scope.projectRef = SCOPE.projectRef;
+        benign.known.scope = { tenantRef: SCOPE.tenantRef, projectRef: SCOPE.projectRef };
+        benign.known.key = KEY.slice();
+        benign.known.entries = BENIGN_ENTRIES.map((entry) => ({ ...entry }));
+        return inspectWholeImage(image, binding);
+      },
+      host: { scope: benign.scope, known: benign.known },
+    });
+    assert.deepEqual(await bounded(benignPoint.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    }), 'benign host rewrite'), { status: 'SENT' });
+    assert.equal(benignPoint.dispatch.length, 1);
+    assert.equal(benignPoint.sink.captures.length, 1);
+    assert.equal(benignPoint.sink.captures[0].equals(expectedImage()), true,
+      'a benign host rewrite still sends the declared image');
+    assert.equal(benignPoint.sender.state, 'IDLE');
+  });
+
 /* ---------- Cancellation, contention and an unusable host ---------- */
 
 test('cancelling a genuinely active send invokes the transport zero times and disables the sender',

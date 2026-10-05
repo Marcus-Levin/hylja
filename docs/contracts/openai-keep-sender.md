@@ -72,6 +72,9 @@ second concurrent call is refused with `SENDER_BUSY` rather than queued, pooled 
 else — an unknown key, an accessor, a symbol key, a missing member, a non-function `inspect` or
 `sendExact`, a `sourceTrust` that is not a trust level — yields a permanently restrictive sender whose
 state is `FAILED` and whose every `send` is `HOST_INVALID`. Construction never throws and never sends.
+`known` is the one member whose absence is not a neutral default: only a registration object or an
+explicit `null` is accepted, so a missing or `undefined` `known` is `HOST_INVALID` like any other missing
+member, never a silent empty registration.
 
 | Member | Meaning |
 | --- | --- |
@@ -123,6 +126,58 @@ send calls `cancel()`, which is sender-owned and sticky and is read again after 
 
 Invoking the captured transport is still host code. Its honesty, and anything its own receiver does, stay
 integration-host obligations.
+
+## The captured scope and registration the child is asked to check under
+
+`scope` and `known` are host-owned objects this module neither owns nor can freeze: a host may rewrite
+either of them between the moment it handed them over and the moment a child is spawned. The request the
+child is asked to check is therefore captured into **private copies before `inspect` is called**, through
+the existing sentinel snapshot seam
+([egress-sentinel-process.md](egress-sentinel-process.md)) — `snapshotSentinelRequest` — which already
+owns that validation and copying. Nothing here re-implements it, and no second context validator or
+wrapper exists.
+
+What the capture owns, for this one send:
+
+- the exact image bytes, as a private copy that is then handed to the runner;
+- the **check scope**, validated and frozen from own data descriptors;
+- the registration: **its own scope**, its **key bytes** (a private copy, never the host's array) and its
+  **entry list**, each capped by that seam's own bounds;
+- the observed destination and the authorized destination, exactly as they were bound above.
+
+Those captured fields — not `trusted.scope` and not `trusted.known` — are what the runner is asked to
+check, so a host that rewrites its own scope, registration scope, key array or entry list while the finite
+inspection runs cannot retarget the real child. The scope the child runs under is compared to the **bound
+envelope's** context, never to an earlier alias of the host object. An unknown own key, an oversized
+registration, a registration scope that is not the check scope, an unsupported value or a hostile trap is
+`SENTINEL_BLOCKED` here, before any child exists and before any host callback below has run: the same
+fixed refusal the runner's own check returns for the same input.
+
+When the snapshot is refused, the scope is re-read through own data descriptors and the fallback can only
+restrict: the read never invokes an accessor, but a Proxy `getOwnPropertyDescriptor` trap can still run, and
+a trap that throws is caught and yields no value. The refusal is `SCOPE_REFUSED` when that read cannot supply
+a `tenantRef` equal to the bound envelope's `tenantId`, or a `projectRef` equal to its `projectId` where the
+envelope defines one; otherwise it stays `SENTINEL_BLOCKED`. Neither outcome reaches a child, so the branch
+cannot turn a refusal into a check or a dispatch.
+
+The per-operation binding token is this send's **own generated interaction identity**, never a fixed global
+id, and the runner still mints the real per-child request id when it spawns. Nothing about the child's own
+request identity is invented or faked here, and the authorized destination is still the route the
+authenticated boundary carried.
+
+This is **not** a rule that revokes on host-side mutation. A host that rewrites its own members to the same
+values is checked under exactly the captured ones and dispatches normally; what cannot happen is a child
+being asked about a scope or registration this send never bound. The provisional byte and key copies are
+**zeroed in a `finally` when the send ends** — including on an inspection, policy or sentinel refusal —
+and are never reachable from a result, a binding, a finding or the sent bytes.
+
+Scope of the claim, stated narrowly. This is a **local snapshot-ownership property of this one module over
+two of its own host members**. It says nothing about any other egress path, about a host that builds a
+*different* registration before the next send, about the sentinel's own detection quality, about
+inspection correctness or finiteness, or about transport honesty — those stay host obligations. One
+measured nuance: rewriting the host's key array alone is not a bypass, because the child fingerprints the
+registration entries and the payload under the same key of one request frame; the scope and entry aliases
+are what matter. This is **not** a production result and **not** a held-out result.
 
 ## The exact private image
 
@@ -198,7 +253,8 @@ fabricates no evidence of its own.
 5. `decidePolicy` for **every** unit with a distinct candidate reference, and require `SELECTED` with
    treatment `KEEP` for all of them.
 6. One check in the real fixed-worker child process over the exact bytes, with the authorized destination
-   taken from the authenticated boundary rather than from the observation.
+   taken from the authenticated boundary rather than from the observation, under the scope and registration
+   captured privately before the inspection.
 7. Re-observe the route, profile and policy commit, re-read the boundary evidence's freshness, then
    re-read sticky cancellation, and dispatch — all in one synchronous turn, with no callback and no
    `await` between the last check and `sendExact`.
@@ -233,12 +289,12 @@ name, byte offset, exception message, transport error, sentinel reason or any pa
 | `CANCELLED` | `cancel()` was observed, including inside the final host observation, or this sender was already cancelled |
 | `INTERACTION_REFUSED` | the trusted boundary could not be bound to this interaction, or the evidence it was bound under is no longer current at the dispatch point |
 | `ROUTE_REFUSED` | the observed destination, profile digest or commit is not usable |
-| `SCOPE_REFUSED` | the sentinel scope does not belong to the authenticated tenant/project |
+| `SCOPE_REFUSED` | the sentinel scope the child would run under does not belong to the authenticated tenant/project, or could not be established from own data descriptors after a refused snapshot |
 | `INSPECTION_REFUSED` | empty, partial, foreign, unresolved, substituted or unbound inspection evidence |
 | `POLICY_DENIED` | the real policy seam denied: unknown or stale policy, foreign context, profile or rule mismatch |
 | `POLICY_HELD` | the real policy seam held the decision for review |
 | `POLICY_NOT_KEEP` | a real selected treatment that is not `KEEP` |
-| `SENTINEL_BLOCKED` | the child did not `ALLOW` these bytes, or the check could not run at all |
+| `SENTINEL_BLOCKED` | the child did not `ALLOW` these bytes, the request could not be snapshotted at all, or the check could not run |
 | `ROUTE_CHANGED` | the route or profile changed between the check and the dispatch |
 | `POLICY_STALE` | the committed policy identity changed between the decision and the dispatch |
 | `DISPATCH_FAILED` | the trusted transport failed or did not confirm |
@@ -281,7 +337,10 @@ contention, a destination label carrying an ordinary space and boundary evidence
 all, a cancellation raised inside the final host observation and boundary evidence that expires under
 real elapsed time inside the trusted inspection, an accepted send point that is a Proxy whose `get` trap
 cancels the sender if the transport method is read back off it, the receiver a captured transport keeps
-and the later method swap that cannot retarget it, a revoked-Proxy host, and the "later caller or
-inspection-copy mutation changes no released byte" property. It calls no provider, holds no credential, reaches the network only on
-`127.0.0.1` on an OS-assigned ephemeral port, and every fixture value is obviously synthetic and
-non-routable.
+and the later method swap that cannot retarget it, a host that rewrites its own scope, registration scope, key
+array and entry list mid-inspection while the planted original still withholds under the privately captured
+tenant A (with a benign rewrite to the same values still dispatching, so no automatic revocation rule is
+invented), an unknown registration key staying one fixed restrictive refusal, a revoked-Proxy host, and the
+"later caller or inspection-copy mutation changes no released byte" property. It calls no provider, holds no
+credential, reaches the network only on `127.0.0.1` on an OS-assigned ephemeral port, and every fixture value
+is obviously synthetic and non-routable.

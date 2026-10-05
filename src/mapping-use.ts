@@ -28,17 +28,22 @@
  *      material answer may be a promise and is awaited before it is read, and no plaintext exists at
  *      any of those awaits;
  *   8. after that callback, and after **every** later external callback, re-observe the coherent
- *      authority, re-read the real registry, reauthorize and rerun the real policy, require the live
- *      audit actor to still be the captured one, and require an unchanged revision and key version
- *      and congruence with the actor, scope, classification, destination and policy decision already
+ *      authority, require the live audit actor to still be the captured one, rerun the real policy
+ *      over the pinned bundle and require the same decision reference, re-read the real registry,
+ *      reauthorize on the claim that read reduced to owned values, and require an unchanged revision
+ *      and key version and congruence with the actor, scope, classification and destination already
  *      recorded;
  *   9. record the authorization attempt and the policy decision through the real
  *      `appendAuditEvent`, gating each one on `gateHighRiskEffect` applied to the value that
  *      `appendAuditEvent` itself returned, then re-observe again;
- *  10. from the last guard to the effect there is no await, no host property lookup and no dynamic
- *      function lookup: captured classification primitives and one captured `Reflect.apply` feed the
- *      real `openMappingPayload` on an independently established expected AAD, and the **captured**
- *      synchronous backend is invoked on its own receiver with the recovered bytes;
+ *  10. the last answer this call awaits is one more authority observation. From the continuation
+ *      that reads it to the effect there is no await at all: that one continuation runs the whole
+ *      final guard and the effect itself, so no queued revocation, no late host property read and no
+ *      dynamic function lookup can land between the guard and the opener or the backend. Every
+ *      remaining host-owned read is ordered before the last one, which is the real registry read on
+ *      the captured `current`, and captured classification primitives and one captured `Reflect.apply`
+ *      feed the real `openMappingPayload` on an independently established expected AAD, with the
+ *      **captured** synchronous backend invoked on its own receiver and the recovered bytes;
  *  11. only a primitive boolean from that backend becomes `USED` or `NOT_FOUND`. Every owned byte
  *      buffer - each envelope copy, the DEK copy and the recovered plaintext - is enrolled the
  *      moment it comes into existence and overwritten in one `finally` on the success path and on
@@ -282,9 +287,12 @@ function destination(value: unknown): Destination {
 function grant(value: unknown): TrustedMappingGrant {
   const v = fields(value, ['version', 'mappingRef', 'revision', 'principal', 'context',
     'destination', 'operation', 'expiresAt']);
+  // The nested identities are normalized here too, not carried by reference: the authorization seam
+  // reads them later, and a grant whose inner objects stayed host-owned would be a host property read
+  // inside the sealed effect segment.
   return Object.freeze({ version: v.version as 1, mappingRef: text(v.mappingRef, 256),
-    revision: v.revision as number, principal: v.principal as WorkloadSubject,
-    context: v.context as RequestContext, destination: v.destination as Destination,
+    revision: v.revision as number, principal: subject(v.principal), context: context(v.context),
+    destination: destination(v.destination),
     operation: v.operation as TrustedMappingGrant['operation'], expiresAt: v.expiresAt as number });
 }
 function equal(left: unknown, right: unknown): boolean {
@@ -438,7 +446,7 @@ export function createBoundMappingUse(hostValue: unknown): BoundMappingUse {
     if (busy) return WITHHELD;
     busy = true;
     try {
-      return await run(fixed);
+      return await prepare(fixed);
     } catch (error) {
       // A refusal is `WITHHELD`. Anything else escaped the sealed effect segment itself - an opener
       // or a backend that threw is the honest case - so the effect was reached and never completed.
@@ -479,13 +487,6 @@ interface Material {
   keyVersion: string;
 }
 interface State { observation: Observation; revision: number; decision: PolicyDecision }
-interface SealedEffect {
-  captured: Captured;
-  material: Material;
-  state: State;
-  /** The cleanup list, established by the load and extended by the opener's plaintext. */
-  owned: Uint8Array[];
-}
 
 /**
  * Captures every callback function and every receiver this call will use, once, before the first
@@ -536,22 +537,49 @@ async function observe(captured: Captured): Promise<Observation> {
     destination: destination(v.destination), grant: grant(v.grant), keyVersion });
 }
 
+/**
+ * The registry record reduced to the five values every guard below uses. A real registry read yields
+ * this owned, frozen claim inside the same synchronous step that called the host: the captured
+ * `current` runs on the captured registry, and nothing in the sealed effect segment reads a property
+ * of the object it returned.
+ */
+interface RecordClaim {
+  readonly mappingRef: string;
+  readonly scope: { readonly tenantId: string; readonly projectId?: string; readonly sessionId: string };
+  readonly lifecycle: 'ACTIVE';
+  readonly revision: number;
+  readonly expiresAt: number;
+}
+
 /** A real registry read. Only a `FOUND`, `ACTIVE` record at a live instant reaches anything else. */
-function liveRecord(captured: Captured, now: number): MappingMetadataRecord {
+function liveRecord(captured: Captured, now: number): RecordClaim {
   const { registry, readCurrent, mappingRef, scope } = captured.fixed;
   return attempt(() => {
     const found = invoke(readCurrent, registry, [{ version: 1, mappingRef,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId } },
     { now }]);
     if (found === null || typeof found !== 'object' || found.state !== 'FOUND') fail('NOT_CURRENT');
-    const record = found.metadata;
+    const record: MappingMetadataRecord = found.metadata;
     if (record === null || typeof record !== 'object' || record.state !== 'ACTIVE') fail('NOT_ACTIVE');
-    return record;
+    const recordScope = fields(record.scope, ['tenantId', 'projectId', 'sessionId']);
+    const claim: RecordClaim = Object.freeze({ mappingRef: text(record.mappingRef, 256),
+      scope: Object.freeze({ tenantId: text(recordScope.tenantId, 256),
+        ...(Object.hasOwn(recordScope, 'projectId') ? { projectId: text(recordScope.projectId, 256) }
+          : {}),
+        sessionId: text(recordScope.sessionId, 256) }),
+      lifecycle: 'ACTIVE', revision: instant(record.revision), expiresAt: instant(record.expiresAt) });
+    // The record the registry returned must be this executor's own record in the bound scope, or the
+    // read is not the current-record seam this call bound at construction.
+    if (claim.mappingRef !== mappingRef || !equal(claim.scope,
+      { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId })) {
+      fail('SCOPE_MISMATCH');
+    }
+    return claim;
   });
 }
 
 /** The real purpose-bound authorization seam, for `USE` only, on the grant this observation read. */
-function authorize(captured: Captured, observed: Observation, record: MappingMetadataRecord): void {
+function authorize(captured: Captured, observed: Observation, claim: RecordClaim): void {
   const { mappingRef } = captured.fixed;
   const { semanticType, sensitivity } = captured.classification;
   const decision = attempt(() => authorizeMappingOperation(
@@ -559,9 +587,9 @@ function authorize(captured: Captured, observed: Observation, record: MappingMet
       destination: { ...observed.destination }, operation: 'USE' },
     { authenticated: { subject: { ...observed.subject }, context: { ...observed.context } },
       observed: { destination: { ...observed.destination } } },
-    { version: 1, mappingRef: record.mappingRef, scope: { ...record.scope },
-      lifecycle: record.state, semanticType, sensitivity,
-      revision: record.revision, expiresAt: record.expiresAt },
+    { version: 1, mappingRef: claim.mappingRef, scope: { ...claim.scope },
+      lifecycle: claim.lifecycle, semanticType, sensitivity,
+      revision: claim.revision, expiresAt: claim.expiresAt },
     observed.grant, { now: observed.now }));
   if (decision.state !== 'AUTHORIZED') fail('UNAUTHORIZED');
 }
@@ -628,28 +656,41 @@ async function loadMaterial(captured: Captured, owned: Uint8Array[]): Promise<Ma
     revision, keyVersion };
 }
 
-/**
- * The recheck that runs after every external callback: authority, clock, registry, authorization and
- * policy are all read again, the audit actor must still be the captured one, and the material must
- * still be the material this instant would use.
- */
-async function recheck(captured: Captured, material: Material, previous: State): Promise<State> {
-  const observed = await observe(captured);
+/** What a fresh observation must still match. Pure over values this module already owns. */
+function congruent(observed: Observation, previous: State): void {
   if (observed.now < previous.observation.now) fail('CLOCK');
   if (!equal(observed.subject, previous.observation.subject) ||
     !equal(observed.context, previous.observation.context) ||
     !equal(observed.destination, previous.observation.destination)) fail('NOT_CONGRUENT');
   if (observed.keyVersion !== previous.observation.keyVersion) fail('MATERIAL_STALE');
-  const record = liveRecord(captured, observed.now);
-  if (record.revision !== previous.revision) fail('SUPERSEDED');
-  authorize(captured, observed, record);
+}
+
+/**
+ * The recheck itself, with no await in it: the whole guard set one fresh observation must pass. The
+ * ordering is deliberate and is the reason the last guard is the fresh registry read. The live audit
+ * actor and the pinned policy bundle are host-owned objects and are read first; the registry read
+ * follows, and after it every remaining step reads only owned copies.
+ */
+function verified(captured: Captured, material: Material, previous: State,
+  observed: Observation): State {
+  congruent(observed, previous);
+  bindAuditActor(captured, observed);
   const decision = selectPolicy(captured, observed);
   if (decision.decisionRef !== previous.decision.decisionRef) fail('NOT_CONGRUENT');
-  bindAuditActor(captured, observed);
-  if (material.revision !== String(record.revision) || material.keyVersion !== observed.keyVersion) {
-    fail('MATERIAL_STALE');
-  }
-  return { observation: observed, revision: record.revision, decision };
+  const claim = liveRecord(captured, observed.now);
+  if (claim.revision !== previous.revision) fail('SUPERSEDED');
+  authorize(captured, observed, claim);
+  if (material.revision !== String(claim.revision) ||
+    material.keyVersion !== observed.keyVersion) fail('MATERIAL_STALE');
+  return { observation: observed, revision: claim.revision, decision };
+}
+
+/**
+ * The recheck that runs after every external callback: one fresh observation, then the whole guard
+ * set above with nothing suspended between the observation and the answer.
+ */
+async function recheck(captured: Captured, material: Material, previous: State): Promise<State> {
+  return verified(captured, material, previous, await observe(captured));
 }
 
 /** Appends one decision and gates the effect on the value the real append itself returned. */
@@ -680,42 +721,66 @@ function appendDecision(captured: Captured, observed: Observation, state: State,
 }
 
 /**
- * Everything that happens while a guard may still run. A reflection, enumeration or index fault out
- * of a host value in here is one refusal - `WITHHELD` - and never an escaped exception that would
- * be reported as a reached effect.
+ * The whole ordered path, and the sealed effect segment at its end.
+ *
+ * The last answer this call awaits is the final authority observation. Everything below that line is
+ * one synchronous continuation: `sealed` runs the entire final guard and then the effect, with no
+ * await, no host property lookup and no dynamic function lookup between them, and the plaintext the
+ * backend is handed is enrolled in the cleanup list and overwritten in the `finally` below before
+ * this function's promise is even settled. A revocation queued by any host callback can therefore no
+ * longer land between the fresh registry read and the opener or the backend.
+ *
+ * A reflection, enumeration or index fault out of a host value anywhere in here is one refusal -
+ * `WITHHELD` - and never an escaped exception that would be reported as a reached effect.
  */
-async function prepare(fixed: FixedBindings, owned: Uint8Array[]): Promise<SealedEffect> {
+async function prepare(fixed: FixedBindings): Promise<MappingUseResult> {
+  const owned: Uint8Array[] = [];
+  let sealing = false;
   try {
     const captured = capture(fixed);
     const observed = await observe(captured);
-    const record = liveRecord(captured, observed.now);
-    authorize(captured, observed, record);
-    const decision = selectPolicy(captured, observed);
     bindAuditActor(captured, observed);
+    const decision = selectPolicy(captured, observed);
+    const claim = liveRecord(captured, observed.now);
+    authorize(captured, observed, claim);
 
     const material = await loadMaterial(captured, owned);
-    let state = await recheck(captured, material, { observation: observed,
-      revision: record.revision, decision });
+    let state: State = { observation: observed, revision: claim.revision, decision };
+    state = await recheck(captured, material, state);
 
     appendDecision(captured, state.observation, state, 'attempt');
     state = await recheck(captured, material, state);
     appendDecision(captured, state.observation, state, 'policy');
-    state = await recheck(captured, material, state);
-    return { captured, material, state, owned };
+    // The last suspension of this call. The continuation that resumes here is already the sealed one.
+    const final = await observe(captured);
+    sealing = true;
+    return sealed(captured, material, state, final, owned);
   } catch (error) {
+    // A throw raised inside the sealed segment is a reached effect that could not be completed, so
+    // it escapes to the caller of `use()` as `FAILED` instead of being downgraded to a refusal.
+    if (sealing) throw error;
     if (isRefusal(error)) throw error;
-    fail('HOST_FAULT');
+    return fail('HOST_FAULT');
+  } finally {
+    // Every owned byte buffer - each envelope copy, the DEK copy and the recovered plaintext - is
+    // overwritten here, on the success path and on every exceptional path, in the same continuation
+    // that spent or refused the effect.
+    for (const buffer of owned) buffer.fill(0);
+    owned.length = 0;
   }
 }
 
 /**
- * The sealed effect segment. No await, no host property lookup and no dynamic function lookup from
- * here to the backend call: the scope, the classification primitive, the invocation mechanics and
- * both buffers were all established while guards could still run, and the only host object touched
- * is the backend, through the captured function and its captured receiver.
+ * The sealed effect segment: the final guard and the effect, in the one continuation the last
+ * awaited answer resumed into. `verified` is the same guard set every recheck runs, with its own
+ * fresh registry read; `spend` follows it immediately. The scope, the classification primitive, the
+ * invocation mechanics and both buffers were all established while guards could still run, and the
+ * only host object touched from here on is the backend, through the captured function on its
+ * captured receiver.
  */
-function effect(sealed: SealedEffect): MappingUseResult {
-  const { captured, material, state } = sealed;
+function sealed(captured: Captured, material: Material, previous: State, observed: Observation,
+  owned: Uint8Array[]): MappingUseResult {
+  const state = verified(captured, material, previous, observed);
   const { tenantId, projectId } = captured.fixed.scope;
   const scope = Object.freeze({ tenantId, projectId, entityId: captured.fixed.entityId,
     classification: captured.classification.semanticType,
@@ -724,20 +789,9 @@ function effect(sealed: SealedEffect): MappingUseResult {
   const opened = OPEN_PAYLOAD({ scope, envelope, key });
   if (opened.status !== 'OPENED') fail('OPEN_REFUSED');
   const plaintext = opened.plaintext;
-  sealed.owned.push(plaintext);
+  owned.push(plaintext);
   const outcome = invoke(captured.lookup, captured.receiver, [plaintext]);
   if (outcome === true) return USED;
   if (outcome === false) return NOT_FOUND;
   return fail('BACKEND_CONTRACT');
-}
-
-/** The whole ordered path. Every owned byte buffer is overwritten in the `finally` below. */
-async function run(fixed: FixedBindings): Promise<MappingUseResult> {
-  const owned: Uint8Array[] = [];
-  try {
-    return effect(await prepare(fixed, owned));
-  } finally {
-    for (const buffer of owned) buffer.fill(0);
-    owned.length = 0;
-  }
 }
