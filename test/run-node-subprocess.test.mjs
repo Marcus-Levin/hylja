@@ -17,11 +17,14 @@
 // this repository's own invented material.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import {
-  BOUND_MS, REPO_ROOT, TEST_TIMEOUT_MS, runNode, runNodeFixture, runNodeTest,
+  BOUND_MS, MAX_CAPTURE_BYTES, REPO_ROOT, TEST_TIMEOUT_MS, runNode, runNodeFixture, runNodeTest,
 } from './support/run-node-subprocess.mjs';
 
 const FIXTURE = fileURLToPath(new URL('./support/run-node-subprocess-fixture.mjs', import.meta.url));
@@ -32,6 +35,45 @@ const FAILING_CONTROL = fileURLToPath(
 const CONTROL_MESSAGE = 'this control fails on purpose';
 /** Short enough to keep the suite quick, long enough that a healthy child never reaches it. */
 const SHORT_BOUND_MS = 1_500;
+/** Long enough that a loaded host has started the fixture and its descendant before the stall fires. */
+const TREE_BOUND_MS = 3_000;
+
+/** The pid a fixture published, or `null` while nothing complete has been published. */
+function publishedPid(file) {
+  try {
+    const text = readFileSync(file, 'utf8').trim();
+    return /^[0-9]+$/.test(text) ? Number(text) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the process is really still RUNNING, observed from the OS: a signal-0 probe, then (where the OS
+ * exposes it) the process state, because an exited process that has not been reaped yet still answers a
+ * signal-0 probe and is a zombie, not a running descendant. A process this check cannot read is running.
+ */
+function isRunning(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) !== 'Z';
+  } catch {
+    return true;
+  }
+}
+
+/** Stop a process this test started, whatever the helper did, so a failing run leaves nothing behind. */
+function reap(pid) {
+  if (pid === null) return;
+  try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+}
+
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 test('a child that really runs reports its own exit code and both captured streams', { timeout: TEST_TIMEOUT_MS },
   async () => {
@@ -112,6 +154,89 @@ test('a stall inside the bound is reported as a stall, and only the owned child 
     assert.equal(typeof run.signal, 'string', 'the stop really was a signal');
     assert.equal(run.stdout, '', 'a stopped run captured nothing');
     assert.equal(run.stderr, '', 'a stopped run reported nothing');
+  });
+
+test('a stalled run takes down its whole process tree before it returns', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'hylja-run-node-'));
+  const file = join(directory, 'descendant.pid');
+  let pid = null;
+  let aliveWhileRunning = false;
+  let watcher = null;
+  try {
+    const run = await runNodeFixture({
+      entry: FIXTURE, args: ['descendant', file], boundMs: TREE_BOUND_MS,
+      inspect: () => {
+        // Observed, not assumed: the first time the descendant is published it must really be running.
+        watcher = setInterval(() => {
+          const seen = publishedPid(file);
+          if (seen === null) return;
+          clearInterval(watcher);
+          aliveWhileRunning = isRunning(seen);
+        }, 5);
+      },
+    });
+    pid = publishedPid(file);
+    const aliveAtReturn = pid !== null && isRunning(pid);
+    assert.equal(run.stalled, true, 'the run stalled inside its short bound');
+    assert.equal(pid !== null, true, 'the fixture really spawned a descendant');
+    assert.equal(aliveWhileRunning, true, 'the descendant was really running before the stop, so the probe is not vacuous');
+    assert.equal(aliveAtReturn, false, 'no descendant is still running once the helper has returned');
+  } finally {
+    clearInterval(watcher);
+    reap(pid);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a failed run stops retaining output at once, even while a process out of its reach keeps writing',
+  { timeout: TEST_TIMEOUT_MS }, async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'hylja-run-node-'));
+    const file = join(directory, 'stray.pid');
+    const seen = { failed: false, arrivedAfterFailure: 0, retained: () => -1 };
+    let pid = null;
+    let watcher = null;
+    try {
+      const run = await runNodeFixture({
+        entry: FIXTURE, args: ['stray', file], boundMs: 30_000,
+        inspect: ({ child, retainedChunks }) => {
+          seen.retained = retainedChunks;
+          // A listener of this test's own, so the data that really keeps arriving is counted separately.
+          child.stderr.on('data', () => { if (seen.failed) seen.arrivedAfterFailure += 1; });
+          // Once the stray writer exists, the run really fails: a genuine error on the owned stdout pipe.
+          watcher = setInterval(() => {
+            if (publishedPid(file) === null) return;
+            clearInterval(watcher);
+            seen.failed = true;
+            child.stdout.destroy(new Error('fixture pipe error'));
+          }, 5);
+        },
+      });
+      pid = publishedPid(file);
+      const retainedAtReturn = seen.retained();
+      await sleep(150);
+      const retainedLater = seen.retained();
+      assert.equal(run.transportFailure, true, 'a run that lost a pipe is a transport failure');
+      assert.equal(seen.arrivedAfterFailure > 0, true,
+        'output really kept arriving after the failure, so the retention check below is not vacuous');
+      assert.equal(retainedAtReturn, 0, 'no chunk is retained when the helper returns');
+      assert.equal(retainedLater, 0, 'no chunk is retained afterwards either');
+    } finally {
+      clearInterval(watcher);
+      reap(pid);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+test('output beyond the retention bound fails the run closed and keeps nothing', { timeout: TEST_TIMEOUT_MS },
+  async () => {
+    let retained = () => -1;
+    const run = await runNodeFixture({
+      entry: FIXTURE, args: ['flood'], inspect: (probe) => { retained = probe.retainedChunks; },
+    });
+    assert.equal(run.transportFailure, true, 'a stream larger than the bound is a transport failure, not a capture');
+    assert.equal(run.stdout === '' && run.stderr === '', true, 'nothing the overflowing run produced is returned');
+    assert.equal(retained(), 0, 'nothing is retained after the overflow');
+    assert.equal(MAX_CAPTURE_BYTES > 0 && MAX_CAPTURE_BYTES < 5 * 1024 * 1024, true, 'the bound is positive and below the flood');
   });
 
 test('a real descriptor exhaustion is contained as a fixed transport failure', { timeout: TEST_TIMEOUT_MS },

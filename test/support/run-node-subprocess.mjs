@@ -32,6 +32,8 @@ import { fileURLToPath } from 'node:url';
 export const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 /** Bound every invocation, so a stalled peer or child fails the suite loudly instead of hanging it. */
 export const BOUND_MS = 60_000;
+/** Placeholder for the red checkpoint: the current helper has no retention bound. */
+export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 /** The bound is a deadline, not a kill policy for valid work: only a stalled owned child is stopped. */
 export const TEST_TIMEOUT_MS = 180_000;
 /**
@@ -50,7 +52,7 @@ const FIXED_FAILURE = Object.freeze({
  * that child, and settle exactly once. `spawnOptions` is passed to the native spawn unchanged, so a
  * fixture can hand the native call a genuinely bad option and observe the real failure it raises.
  */
-function runOwnedChild(execPath, execArgs, spawnOptions, boundMs) {
+function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null) {
   return new Promise((resolve) => {
     const stdout = [];
     const stderr = [];
@@ -137,6 +139,10 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs) {
     child.stderr.on('data', (chunk) => { stderr.push(chunk); });
     child.stdout.on('error', failTheRun);
     child.stderr.on('error', failTheRun);
+    // TEST-ONLY seam: a fixture may look at the real child and at how many chunks are retained right now.
+    if (typeof inspect === 'function') {
+      try { inspect({ child, retainedChunks: () => stdout.length + stderr.length }); } catch { /* a probe never decides the run */ }
+    }
     // The bound is a deadline on this invocation. It stops only the owned child, and whether the child
     // really goes away is decided by its own `close`, with this bound as the fallback.
     own(() => {
@@ -189,7 +195,7 @@ export function runNodeTest(entry) {
  * spawn unchanged and whatever the OS does is what is observed.
  * Reachable from test files under `test/` only; no product or operator command imports this module.
  */
-export function runNodeFixture({ entry = null, args = [], spawnOptions = {}, boundMs = BOUND_MS } = {}) {
+export function runNodeFixture({ entry = null, args = [], spawnOptions = {}, boundMs = BOUND_MS, inspect = null } = {}) {
   const execArgs = entry === null ? [...args] : [entry, ...args];
-  return runOwnedChild(process.execPath, execArgs, { ...ownChildOptions, ...spawnOptions }, boundMs);
+  return runOwnedChild(process.execPath, execArgs, { ...ownChildOptions, ...spawnOptions }, boundMs, inspect);
 }
