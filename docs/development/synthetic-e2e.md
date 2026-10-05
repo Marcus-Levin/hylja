@@ -23,17 +23,12 @@ command. Tests import `../dist/*.js`, so build once before any of them.
 
 ```sh
 npm ci --ignore-scripts --no-fund   # once per worktree; lockfile-driven, no lifecycle scripts
-npm run build                        # required once: every test above imports dist/
-node --test test/openai-request-sendpoint.e2e.test.mjs
-node --test test/openai-response-inspection.e2e.test.mjs
-node --test test/mapping-roundtrip.e2e.test.mjs
-node --test test/openai-http-roundtrip.e2e.test.mjs
-node --test test/egress-sendpoint.e2e.test.mjs
+npm run test:e2e                   # every listed run in one command; check:fixtures and build run first
 ```
 
-All five files match the `test/*.test.mjs` glob in the [`npm test`](../../package.json) script, so the
-same files also run in the full suite. `npm run check:docs` and `npm run check:fixtures` cover the
-evidence records and the tracked paths.
+The listed files also match the `test/*.test.mjs` glob in the [`npm test`](../../package.json) script,
+so the full suite reruns them. `npm run check:docs` and `npm run check:fixtures` cover the evidence
+records and the tracked paths.
 
 ## What these runs are
 
