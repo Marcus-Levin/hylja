@@ -1944,14 +1944,24 @@ test('a writer-less FIFO is refused by the shipped probe inside a bounded subpro
 		assert.equal(control.error, undefined,
 			`the probe exceeded the ${FIFO_CONTROL_TIMEOUT_MS} ms bound: ${control.error?.code ?? control.signal}`);
 		assert.equal(control.signal, null, 'the control was not killed by the bound');
-		assert.equal(control.status, 0, control.stderr);
+		// Every value below is read from this child's captured stdout or stderr. A failed assert prints the
+		// compared actual itself, so each fact is asserted as a boolean comparison with a fixed message:
+		// Node then prints the comparison, never the child's own output.
+		assert.equal(control.stderr === '', true, 'the control child wrote no stderr of its own');
+		assert.equal(control.status, 0, 'the control child exited zero');
 		const report = JSON.parse(control.stdout);
-		assert.deepEqual(report.metadata, { isFile: false, isDirectory: false, readable: false },
-			'non-regular metadata is refused without reading a byte');
-		assert.equal(report.setupFailure, LANE_SETUP_FAILURES.references);
-		assert.equal(report.preflightCalls, 0, 'no launch contract was resolved');
-		assert.equal(report.dispatched, 0, 'zero dispatch');
-		assert.equal(report.dispatchPersisted, false, 'no dispatch record was persisted');
+		assert.equal(
+			report.metadata.isFile === false && report.metadata.isDirectory === false
+				&& report.metadata.readable === false,
+			true,
+			'non-regular metadata is refused without reading a byte: no file, no directory, not readable');
+		assert.equal(Object.keys(report.metadata).join(',') === 'isFile,isDirectory,readable', true,
+			'the child reports exactly those three metadata fields');
+		assert.equal(report.setupFailure === LANE_SETUP_FAILURES.references, true,
+			'the references refusal is the reported setup failure');
+		assert.equal(report.preflightCalls === 0, true, 'no launch contract was resolved');
+		assert.equal(report.dispatched === 0, true, 'zero dispatch');
+		assert.equal(report.dispatchPersisted === false, true, 'no dispatch record was persisted');
 		assert.deepEqual(probeReferenceMetadata(subdir), { isFile: false, isDirectory: true, readable: false },
 			'a non-regular path is refused before it is opened, so it is never reported readable');
 	} finally {
@@ -2120,13 +2130,15 @@ test('the real CLI process prints one bounded JSON refusal for a setup it refuse
 			assert.equal(run.error, undefined, `${name}: the CLI process exceeded its bound (${run.error?.code})`);
 			assert.equal(run.signal, null, `${name}: the CLI process was not killed`);
 			assert.equal(run.status, 2, `${name}: a setup failure stays exit 2`);
-			assert.equal(run.stderr, '', `${name}: one stdout record, never a traceback or a warning`);
+			assert.equal(run.stderr === '', true, `${name}: one stdout record, never a traceback or a warning`);
 			const lines = run.stdout.split('\n');
 			assert.equal(lines.length, 2, `${name}: exactly one record line, got ${lines.length - 1}`);
-			assert.equal(lines[1], '', `${name}: that record is newline terminated`);
+			assert.equal(lines[1] === '', true, `${name}: that record is newline terminated`);
+			// The parsed record still holds the captured bytes, so its fields are compared as booleans.
 			const record = JSON.parse(lines[0]);
-			assert.deepEqual(Object.keys(record), ['verdict', 'reason'], `${name}: two fixed fields and nothing else`);
-			assert.deepEqual(record, { verdict: 'INCOMPLETE', reason }, `${name}: the fixed refusal`);
+			assert.equal(Object.keys(record).join(',') === 'verdict,reason', true,
+				`${name}: two fixed fields and nothing else`);
+			assert.equal(record.verdict === 'INCOMPLETE' && record.reason === reason, true, `${name}: the fixed refusal`);
 			for (const planted of [PLANTED_CLI_KEY, PLANTED_CLI_TASK, config.cwd, dir]) {
 				assert.equal(run.stdout.includes(planted), false, `${name}: no ${planted} echo`);
 			}
@@ -2142,17 +2154,23 @@ test('the real CLI process prints one bounded JSON refusal for a setup it refuse
 		const launched = spawnSync(process.execPath, [laneCliPath, '--config', configPath],
 			{ cwd: repoRoot, timeout: CLI_PROCESS_TIMEOUT_MS, encoding: 'utf8' });
 		assert.equal(launched.error, undefined, `control: ${launched.error?.code}`);
-		assert.equal(launched.status, 2, `control: the fake child leaves no leaf evidence, stderr: ${launched.stderr}`);
+		assert.equal(launched.stderr === '', true, 'control: the fake child leaves no leaf evidence of its own');
+		assert.equal(launched.status, 2, 'control: a launched run with no leaf evidence still refuses with exit 2');
 		assert.equal(existsSync(markerPath), true, 'the control really launched the owned child');
 		const lines = launched.stdout.split('\n');
 		assert.equal(lines.length, 2, `one logged verification record and no refusal line, got ${lines.length - 1}`);
+		// The record is parsed from the captured stdout, so each field is compared as a boolean rather than
+		// asserted as a value Node would print.
 		const record = JSON.parse(lines[0]);
-		assert.equal(record.key, config.key, 'the launched run logs its own verification record');
-		assert.equal(record.agent, config.agent);
-		assert.equal(record.verdict, 'INCOMPLETE');
-		assert.equal(record.reason, SETUP_FAILURES.receipt, 'the synthetic child wrote no receipt');
-		assert.equal(record.nativeExitCode, 0, 'the owned child ran and closed cleanly');
-		assert.deepEqual(JSON.parse(readFileSync(config.verification, 'utf8')), record,
+		assert.equal(record.key === config.key, true, 'the launched run logs its own verification record');
+		assert.equal(record.agent === config.agent, true, 'that record names the configured agent');
+		assert.equal(record.verdict === 'INCOMPLETE', true, 'the launched run is still a refusal');
+		assert.equal(record.reason === SETUP_FAILURES.receipt, true, 'the synthetic child wrote no receipt');
+		assert.equal(record.nativeExitCode === 0, true, 'the owned child ran and closed cleanly');
+		const persisted = JSON.parse(readFileSync(config.verification, 'utf8'));
+		assert.equal(Object.keys(persisted).join(',') === Object.keys(record).join(','), true,
+			'the printed record and the persisted one carry the same fields in the same order');
+		assert.equal(JSON.stringify(persisted) === JSON.stringify(record), true,
 			'the printed record and the persisted one are the same record');
 	} finally {
 		cleanup();
@@ -2354,10 +2372,11 @@ test('the real CLI refuses a non-regular lane config at once, launches nothing a
 				`${name}: the config read stalled instead of refusing (${run.error?.code ?? run.signal})`);
 			assert.equal(run.signal, null, `${name}: the refusal was not killed by the bound`);
 			assert.equal(run.status, 2, `${name}: a setup failure stays exit 2`);
-			assert.equal(run.stderr, '', `${name}: one stdout record, never a traceback or a warning`);
+			assert.equal(run.stderr === '', true, `${name}: one stdout record, never a traceback or a warning`);
 			const lines = run.stdout.split('\n');
 			assert.equal(lines.length, 2, `${name}: exactly one record line, got ${lines.length - 1}`);
-			assert.deepEqual(JSON.parse(lines[0]), { verdict: 'INCOMPLETE', reason: SETUP_FAILURES.config },
+			const refusal = JSON.parse(lines[0]);
+			assert.equal(refusal.verdict === 'INCOMPLETE' && refusal.reason === SETUP_FAILURES.config, true,
 				`${name}: the fixed config refusal`);
 			for (const planted of [PLANTED_CLI_KEY, PLANTED_CLI_TASK, config.cwd, dir]) {
 				assert.equal(run.stdout.includes(planted), false, `${name}: no ${planted} echo`);
@@ -2372,7 +2391,8 @@ test('the real CLI refuses a non-regular lane config at once, launches nothing a
 		rmSync(markerPath, { force: true });
 		const control = spawnSync(process.execPath, [laneCliPath, '--config', configPath],
 			{ cwd: repoRoot, timeout: CLI_PROCESS_TIMEOUT_MS, encoding: 'utf8' });
-		assert.equal(control.status, 2, `control: the synthetic child leaves no leaf evidence (${control.stderr})`);
+		assert.equal(control.stderr === '', true, 'control: the synthetic child leaves no leaf evidence of its own');
+		assert.equal(control.status, 2, 'control: a launched run with no leaf evidence still refuses with exit 2');
 		assert.equal(existsSync(markerPath), true, 'a regular config launches the owned child');
 	} finally {
 		cleanup();
@@ -2693,17 +2713,22 @@ test('the config reader refuses a non-regular, unreadable or raced descriptor an
 		assert.equal(control.error, undefined,
 			`the config read exceeded the ${FIFO_CONTROL_TIMEOUT_MS} ms bound: ${control.error?.code ?? control.signal}`);
 		assert.equal(control.signal, null, 'the child was not killed by the bound');
-		assert.equal(control.status, 0, control.stderr);
+		assert.equal(control.stderr === '', true, 'the child wrote no stderr of its own');
+		assert.equal(control.status, 0, 'the child exited zero');
 		const report = JSON.parse(control.stdout);
-		assert.deepEqual(report.openedDirectory,
-			{ reason: SETUP_FAILURES.config, launched: 0, opened: 1, closed: 1 },
-			'a descriptor that is not a regular file is refused before a byte is read');
-		assert.deepEqual(report.unreadable,
-			{ reason: SETUP_FAILURES.config, launched: 0, opened: 1, closed: 1 },
-			'a failed read is the fixed refusal and its descriptor is still closed');
-		assert.deepEqual(report.raced,
-			{ reason: SETUP_FAILURES.config, launched: 0, opened: 1, closed: 1 },
-			'a path that becomes a writer-less FIFO after the stat is refused by the opened descriptor');
+		// The three cases carry the captured stdout, so each field is compared as a boolean and the field
+		// set is counted: a failure prints the comparison, never the child's own report.
+		for (const [field, caseName] of [
+			['openedDirectory', 'a descriptor that is not a regular file is refused before a byte is read'],
+			['unreadable', 'a failed read is the fixed refusal and its descriptor is still closed'],
+			['raced', 'a path that becomes a writer-less FIFO after the stat is refused by the opened descriptor'],
+		]) {
+			const observed = report[field];
+			assert.equal(observed.reason === SETUP_FAILURES.config && observed.launched === 0
+				&& observed.opened === 1 && observed.closed === 1, true, caseName);
+			assert.equal(Object.keys(observed).join(',') === 'reason,launched,opened,closed', true,
+				`${caseName}: exactly those four fields`);
+		}
 		assert.equal(statSync(configPath).isFIFO(), true, 'the raced path is left exactly as the refusal found it');
 	} finally {
 		cleanup();
