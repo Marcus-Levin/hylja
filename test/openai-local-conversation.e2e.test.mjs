@@ -1223,6 +1223,82 @@ test('an unusable host or an unusable loopback endpoint can never dispatch',
       { status: 'COMPLETED' });
     assert.equal(released.length, 1);
   });
+
+/* ---------- An owner this module cannot compose is refused before any exchange can start ----- */
+
+/**
+ * A nested owner host can be the exact declared outer SHAPE and still be a host that composed owner
+ * cannot own at all: their own host validation is closed, and they answer that with a permanently
+ * FAILED owner rather than a runtime refusal. Each case below is outer-valid - the same own data keys
+ * in the same declared set - so only the composed owners' own closed validation can refuse them.
+ */
+test('a nested owner host its own composed owner cannot own refuses this owner at construction',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const state = await startHttpPeer(t);
+    const releases = [];
+    const inbound = [];
+    let observations = 0;
+    let inspected = 0;
+
+    const sender = (over = {}) => ({
+      boundary: BOUNDARY, sourceTrust: SOURCE_TRUST, policyBundle: BUNDLE, scope: SCOPE,
+      known: registration(), sentinel: { deadlineMs: DEADLINE_MS },
+      inspectOriginal: requestInspect([]),
+      ...over,
+    });
+    const receiver = (over = {}) => ({
+      boundary: BOUNDARY, policyBundle: BUNDLE, scope: SCOPE, known: registration(),
+      sentinel: { deadlineMs: DEADLINE_MS },
+      inspect: (image, binding) => { inspected += 1; return replyInspect(inbound)(image, binding); },
+      ...over,
+    });
+    const base = (over = {}) => ({
+      port: state.port, timeoutMs: DEADLINE_MS,
+      observe: () => { observations += 1; return OBSERVATION; },
+      onReply: async (reply) => { releases.push(reply); },
+      sender: sender(), receiver: receiver(),
+      ...over,
+    });
+
+    for (const [name, over] of [
+      ['a receiver inspector that is not a function', { receiver: receiver({ inspect: null }) }],
+      ['a receiver with no policy bundle', { receiver: receiver({ policyBundle: null }) }],
+      ['a receiver with no scope', { receiver: receiver({ scope: null }) }],
+      ['a receiver with no sentinel configuration', { receiver: receiver({ sentinel: null }) }],
+      ['a receiver with no boundary', { receiver: receiver({ boundary: null }) }],
+      ['a sender inspector that is not a function', { sender: sender({ inspectOriginal: null }) }],
+      ['a sender with an unsupported source trust', { sender: sender({ sourceTrust: 'TRUSTED_MOSTLY' }) }],
+      ['a sender with no sentinel configuration', { sender: sender({ sentinel: null }) }],
+    ]) {
+      const refused = createOpenAiLocalConversation(base(over));
+      assert.equal(refused.state, 'FAILED', `${name}: no exchange is admitted`);
+      assertRefusal(await bounded(refused.exchange(acceptedRequest()), name), 'HOST_INVALID');
+      assert.equal(refused.state, 'FAILED', `${name}: the refusal is permanent`);
+      assert.deepEqual(await bounded(refused.exchange({ body: 'still refused' }), name), { status: 'REFUSED',
+        code: 'HOST_INVALID' }, `${name}: a later call is refused the same way`);
+      /* Permanent means permanent: cancelling an owner that owns nothing changes nothing. */
+      refused.cancel();
+      assert.equal(refused.state, 'FAILED', `${name}: it is still FAILED after a cancel`);
+    }
+    /* No composed send ever began, so none of its stages ran at all: the fixed-worker child check is
+       requested only inside a send that has already observed, inspected and decided. */
+    assert.equal(observations, 0, 'the composed sender observed nothing, so no child check was requested');
+    assert.equal(inspected, 0, 'the composed receiver inspected nothing');
+    assert.equal(inbound.length, 0, 'no reply translation or classification ran');
+    assertNothingReachedPeer(state);
+    assertNothingReleased(releases);
+
+    /* The genuine control on this same peer: the counters above are real, because the same owners, the
+       same fixed worker and the same policy really complete one conversation here. */
+    const { conversation } = createConversation(state, { releases });
+    assert.deepEqual(await bounded(conversation.exchange(acceptedRequest()), 'same-peer control'),
+      { status: 'COMPLETED' });
+    assert.equal(state.connections, 1, 'the control opened exactly one connection');
+    assert.equal(state.requests, 1, 'and delivered exactly one request');
+    assert.equal(releases.length, 1, 'and exactly one guarded release');
+    assert.equal(releases[0] === EXPECTED_RELEASE, true);
+    await closed(state, 'same-peer control');
+  });
 /* ---------- What the exchange allocates is zeroed when it ends, on all four real endings --------- */
 
 /**

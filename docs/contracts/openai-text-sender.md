@@ -302,9 +302,18 @@ only meaningful against a capture that behaves like this module does: readiness 
 and confirms readiness without sending anything, `sendExact` invokes the captured native write
 synchronously before its own first `await`, and the send-finally disposes a socket that was prepared but
 never dispatched. That split is what the durable ordering guard measures, as fixed labels rather than
-timing: a cancellation queued from the final observation records `['cancel']` with the write never
-following it, a live control records `['write']`, a cancellation raised during readiness records zero
-writes and zero requests, and a caller-queued cancellation in the same turn records `['write', 'cancel']`.
+timing. The load-bearing case is a cancellation **queued with `queueMicrotask` from inside the final
+observation**: it can only run on a later turn than the one that observation returned on, so the sender
+must still hand the exact bytes to the connected socket in that same turn, and the guard asserts the
+captured native write label precedes the real queued cancellation (`['write', 'cancel']`), that the
+cancellation really ran once and left the sender `CANCELLED`, and that one exact request crossed the one
+real connection. Inserting a single `await Promise.resolve()` between the last guard and the native handoff
+inverts that order to `['cancel', 'write']` and fails the case, so it measures a real turn boundary rather
+than a label. The synchronous interventions are kept and named for what they are: a cancellation raised
+inside the final observation records `['cancel']` with zero native writes and zero requests, a live
+control records `['write']`, a cancellation raised during readiness records zero writes and zero requests
+with no connection at all, and the raw transport with no sender in the way records `['write', 'cancel']`
+for a write followed by a queued callback.
 The same split was migrated in the other three conversation test files, so no test transport can supply a
 deferred write that a queued cancellation would overtake. It calls no
 provider, holds no credential, reaches the network only on `127.0.0.1` on an OS-assigned ephemeral port,

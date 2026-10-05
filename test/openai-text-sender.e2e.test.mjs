@@ -721,7 +721,7 @@ test('a cancellation raised inside the last host observation withholds the dispa
     assert.equal(sink.connections, 1, 'readiness opened the one connection this transport owns');
   });
 
-test('the migrated real transport writes in its first synchronous turn, never after a queued cancel',
+test('the migrated real transport writes in the sender\'s own synchronous turn, never after it',
   { timeout: TEST_TIMEOUT_MS }, async (t) => {
     const commit = { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(BUNDLE) };
     const observation = Object.freeze({ destination: { id: SINK.ref, profileDigest: PROFILE_DIGEST }, commit });
@@ -729,9 +729,57 @@ test('the migrated real transport writes in its first synchronous turn, never af
       endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
     });
 
-    /* Case 1: a cancellation queued from the LAST observation. Readiness has already opened the one
-       real connection, so the counters below cannot be explained by never having prepared one - and
-       the fixed-label order shows the native write never followed the cancellation. */
+    /* Case 1: the durable queued guard, and the one this ordering claim actually rests on. The
+       cancellation is QUEUED with `queueMicrotask` from inside the FINAL observation, so it can only
+       run on a later turn than the one that observation returned on. The sender therefore still has to
+       hand the exact bytes to the connected socket in that same turn, and the observed effect order is
+       the proof: the captured native write label PRECEDES the cancel label the queued callback pushed.
+       If any await were ever inserted between the last guard and the native handoff, this queued
+       cancellation would run FIRST, the dispatch would be withheld and this case would fail. */
+    {
+      const sink = await startSink();
+      t.after(() => sink.close());
+      const { host, dispatch } = createHost(sink, { observations: [observation, observation] });
+      const accepted = host.sendPoint;
+      const owner = { sender: null };
+      let calls = 0;
+      let cancels = 0;
+      host.sendPoint = Object.freeze({
+        waitUntilReady: accepted.waitUntilReady,
+        observe: () => {
+          calls += 1;
+          // The last observation is where the host acts last. Everything it does here is queued, so it
+          // cannot interleave with the dispatch point's own synchronous turn.
+          if (calls === 2) {
+            queueMicrotask(() => {
+              sink.order.push('cancel');
+              cancels += 1;
+              owner.sender.cancel();
+            });
+          }
+          return observation;
+        },
+        sendExact: accepted.sendExact,
+      });
+      const sender = createOpenAiTextSender(host);
+      owner.sender = sender;
+      assert.deepEqual(await bounded(send(sender), 'cancel queued from the last observation'),
+        { status: 'SENT' }, 'the queued cancellation ran on a LATER turn than the write');
+      assert.equal(calls, 2, 'the final observation really was the one that queued the cancel');
+      assert.equal(cancels, 1, 'the queued cancellation really ran once');
+      assert.equal(sender.state, 'CANCELLED', 'the queued cancellation really cancelled this sender');
+      assert.deepEqual(sink.order, ['write', 'cancel'],
+        'the captured native write label precedes the real queued cancellation');
+      assert.equal(sink.writes, 1, 'exactly one native write left this process');
+      assert.equal(sink.connections, 1, 'readiness opened exactly one real connection');
+      assert.equal(sink.captures.length, 1, 'and the exact request really crossed that connection');
+      assert.equal(sink.captures[0].equals(expectedImage()), true, 'the declared image, byte for byte');
+      assert.equal(dispatch.length, 1, 'exactly one trusted transport dispatch');
+    }
+
+    /* Case 2: a cancellation raised INSIDE the last observation, in that same synchronous turn. This is
+       a real guard on its own - the sender re-reads sticky cancellation after the callback - but it is
+       a DIFFERENT intervention from case 1, and it is named for what it does. */
     {
       const sink = await startSink();
       t.after(() => sink.close());
@@ -750,15 +798,15 @@ test('the migrated real transport writes in its first synchronous turn, never af
       });
       const sender = createOpenAiTextSender(host);
       owner.sender = sender;
-      assert.deepEqual(await bounded(send(sender), 'cancel queued from the last observation'),
+      assert.deepEqual(await bounded(send(sender), 'cancel inside the last observation'),
         { status: 'REFUSED', code: 'CANCELLED' });
       assert.equal(calls, 2, 'the refusal came after the final observation');
-      assert.deepEqual(sink.order, ['cancel'], 'no native write was ever dispatched after the cancellation');
-      assert.equal(sink.connections, 1, 'readiness opened exactly one real connection');
+      assert.deepEqual(sink.order, ['cancel'], 'no native write was dispatched after that cancellation');
+      assert.equal(sink.connections, 1, 'readiness opened the one connection this transport owns');
       assertNoByteSent(sink, dispatch);
     }
 
-    /* Case 2: the same transport with nothing queued. One connected native write, one exact request
+    /* Case 3: the same transport with nothing queued. One connected native write, one exact request
        off that connection, and the write label is the first and only effect label. */
     {
       const point = await harness(t);
@@ -770,8 +818,10 @@ test('the migrated real transport writes in its first synchronous turn, never af
       assert.equal(sink.captures[0].equals(expectedImage()), true, 'the declared image, byte for byte');
     }
 
-    /* Case 3: a cancellation queued DURING readiness, after the real child ALLOWed. Readiness
-       connects but sends nothing, so zero writes, zero requests and zero connections. */
+    /* Case 4: a cancellation raised DURING readiness, in that same synchronous turn, after the real
+       child ALLOWed. Readiness connects but sends nothing here, so zero writes, zero requests and zero
+       connections - an outcome the queued cancellation of case 1 cannot produce, because that one lands
+       strictly after a real write. */
     {
       const owner = { sender: null };
       let order = null;
@@ -792,17 +842,16 @@ test('the migrated real transport writes in its first synchronous turn, never af
       assert.equal(point.sender.state, 'CANCELLED');
     }
 
-    /* Case 4: the ordering claim itself, with no sender in the way. The write happens inside the
-       call, so a cancel queued in the SAME turn by the caller lands strictly after it. This is the
-       observation a "no deferred write" claim needs: a real effect, then the queued callback. */
+    /* Case 5: the same write-then-queued-callback ordering observed on the raw transport, with NO
+       sender in the way. It is what the labels above mean at the transport, not a sender claim. */
     {
       const sink = await startSink();
       t.after(() => sink.close());
       await bounded(sink.waitUntilReady(), 'direct readiness');
       const pending = sink.write(Buffer.from(expectedImage(), 'utf8'));
-      sink.order.push('cancel');
+      queueMicrotask(() => { sink.order.push('cancel'); });
       await bounded(pending, 'direct exchange');
-      assert.deepEqual(sink.order, ['write', 'cancel'], 'the native write precedes a cancel queued after it');
+      assert.deepEqual(sink.order, ['write', 'cancel'], 'the native write precedes a queued cancel');
       assert.equal(sink.captures.length, 1, 'the exact request really crossed the wire');
     }
   });

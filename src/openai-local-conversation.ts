@@ -487,6 +487,16 @@ export function createOpenAiLocalConversation(host: unknown): OpenAiLocalConvers
     },
   });
 
+  // Both composed owners exist before this one is handed back, and their OWN public state decides
+  // admission here. Each of them closes its own host validation and answers a host it cannot own with a
+  // permanently FAILED owner and no fixed worker, which is a construction-time fact and not a per-exchange
+  // refusal: an exchange admitted to one of those would really connect, really write a real request and
+  // then release nothing at all. Only that public state getter is read - no request or reply is parsed,
+  // no inspection or policy decision runs, no sentinel child is requested and no release point is
+  // called - and nothing here re-implements, duplicates or second-guesses either owner's own validation,
+  // which is exactly what decides this.
+  if (senderOwner.state === 'FAILED' || receiverOwner.state === 'FAILED') return restrictive('HOST_INVALID');
+
   const run = async (input: unknown): Promise<LocalConversationResult> => {
     const call = declared(input, ARGUMENT_KEYS);
     if (call === null) return refused('INVALID_ARGUMENTS');

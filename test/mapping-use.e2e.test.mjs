@@ -575,6 +575,49 @@ test('a grant revoked between the audit and the effect is refused and nothing is
   assert.equal(built.ledger.entries.length, 2);
 });
 
+test('the authorization reads an owned grant snapshot, never the host object behind it', async () => {
+  // The host hands over a shallow copy whose nested grant records it still shares, and then edits
+  // one of those shared records from inside a synchronous registry callback - after this call has
+  // already normalized the answer and before the authorization reads it. The decision must be taken
+  // on the snapshot this executor owns, so the run still spends; a reader that carried the host's
+  // nested records by reference would see the foreign purpose and refuse.
+  const FOREIGN_PURPOSE = 'other-bound-use.invalid';
+  const built = createHost({ hooks: { onAuthority(count, fixture) {
+    // The next observation is genuine again, so the only difference under test is the mid-call edit.
+    if (count === 2) fixture.state.grant.context.purpose = PURPOSE;
+  } } });
+  const real = built.scenario.registry;
+  let edited = false;
+  built.host.registry = Object.freeze({ version: 1, current(request, clock) {
+    if (!edited) {
+      edited = true;
+      built.state.grant.context.purpose = FOREIGN_PURPOSE;
+    }
+    return real.current(request, clock);
+  } });
+  assert.equal((await createBoundMappingUse(createHost({}).host).use()).code, 'USED');
+  const result = await createBoundMappingUse(built.host).use();
+  assertFixedShape(result);
+  assert.equal(result.code, 'USED');
+  assert.equal(edited, true);
+  assert.equal(built.backend.state.calls, 1);
+  assert.equal(built.counters.material, 1);
+  assert.equal(built.ledger.entries.length, 2);
+  assert.equal(built.ledger.entries.every((entry) => entry.event.outcome === 'ALLOWED'), true);
+
+  // The control: the same edit, made before the answer is built, is a genuine misbound authority and
+  // withholds with no effect and no evidence. Without an owned snapshot the run above would be here.
+  const bound = createHost({ hooks: { onAuthority(count, fixture) {
+    fixture.state.grant.context.purpose = FOREIGN_PURPOSE;
+  } } });
+  const refused = await createBoundMappingUse(bound.host).use();
+  assert.equal(refused.code, 'WITHHELD');
+  assert.equal(bound.counters.material, 0);
+  assert.equal(bound.backend.state.calls, 0);
+  assert.equal(bound.ledger.entries.length, 0);
+  assert.equal(cleared(bound.backend.state.retained), false);
+});
+
 /* ---------- 7. A stale key, a stale revision and a moved clock ---------- */
 
 test('a rotated key, a stale revision and a moving clock each withhold before the resource', async () => {

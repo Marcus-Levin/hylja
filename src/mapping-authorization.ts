@@ -214,6 +214,36 @@ function parseGrant(value: unknown): TrustedMappingGrant {
     destination: parseDestination(v.destination),
     operation: member(v.operation, MAPPING_AUTHORIZATION_OPERATIONS), expiresAt: instant(v.expiresAt) };
 }
+/**
+ * The one authoritative grant-shape normalizer: a complete, valid grant becomes an owned, frozen
+ * record built only from primitives this module validated, and every other value is `null`.
+ *
+ * This is **structural normalization and nothing else**. A `null` means only that the value is not a
+ * grant of the schema above; it says nothing about authority, provenance, currentness, scope
+ * congruence, lifecycle, expiry or whether an effect would have been valid, and a record it accepts
+ * is not evidence that any of those hold. Callers still own their own refusals, their own order and
+ * their own vocabulary: the seam below answers `INVALID_CONTEXT`, and a boundary that cannot name a
+ * lifecycle about a value it never proved it holds names nothing at all.
+ *
+ * Sharing one reader is the point. It is what stops a second copy of this schema from drifting out of
+ * step with the first and silently reading a different set of fields, so no consumer of a grant can
+ * accept, reject or attribute one differently from another.
+ *
+ * The returned record owns every nested principal, context and destination: each is a new record of
+ * this module's own making, never an alias into the source, so a caller that edits its own object
+ * afterwards cannot reach into what a later check reads. A reflection, enumeration, descriptor or
+ * index fault inside the read is caught here, so this function never throws and never carries
+ * exception text back to its caller.
+ */
+export function normalizeMappingGrant(value: unknown): TrustedMappingGrant | null {
+  try {
+    return Object.freeze(parseGrant(value));
+  } catch {
+    // An absent value, a value of another type, and a hostile value that faults mid-read are all
+    // the same answer here: no record, no partial record, and nothing that names a planted value.
+    return null;
+  }
+}
 function parseClock(value: unknown): MappingHostClock {
   const v = fields(value, ['now']);
   return { now: instant(v.now) };
@@ -251,8 +281,11 @@ export function authorizeMappingOperation(requestValue: unknown, hostValue: unkn
     // so a malformed grant names INVALID_CONTEXT even when a later check would also fail. A grant that
     // is simply absent is not malformed: it keeps its own NO_GRANT check after the mapping checks.
     let grant: TrustedMappingGrant | undefined;
-    try { grant = grantValue === undefined ? undefined : parseGrant(grantValue); }
-    catch { return denied('INVALID_CONTEXT'); }
+    if (grantValue !== undefined) {
+      const normalized = normalizeMappingGrant(grantValue);
+      if (normalized === null) return denied('INVALID_CONTEXT');
+      grant = normalized;
+    }
     const authenticated = host.authenticated;
     // The untrusted request may only restate what the host authenticated and observed.
     if (!equal(request.subject, authenticated.subject) ||

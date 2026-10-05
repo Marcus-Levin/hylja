@@ -50,6 +50,16 @@ Exactly six own **data** properties, where `sender` and `receiver` are the two a
 socket or the application sink after construction. Any unknown key, accessor, symbol key, missing member,
 non-function member or hostile trap (a revoked Proxy included) is `HOST_INVALID` and opens nothing.
 
+**Both composed owners are constructed before this one is handed back, and their own state admits the
+exchange.** The outer shape above is not the whole contract: each composed owner closes its own host
+validation, and a nested host it cannot own yields a permanently `FAILED` owner rather than a
+per-exchange refusal. This owner reads only those two public state getters, and an owner that reports
+`FAILED` ends construction here as a permanently restrictive `FAILED` owner with code `HOST_INVALID` - no
+socket, no connection, no payload, no fixed-worker child and no release. No request or reply is parsed, no
+inspection or policy decision runs and no sentinel check is requested to decide it, and no part of either
+owner's validation is duplicated here: `createOpenAiTextSender` and `createOpenAiKeepReceiver` remain the
+only authority on whether their own host is usable.
+
 | Member | Meaning |
 |---|---|
 | `port` | the one numeric loopback TCP port, `1`-`65535`; anything else is `ENDPOINT_REFUSED` at construction |
@@ -171,7 +181,7 @@ part of the input, and no result carries bytes, a digest or a handle.
 
 | Code | Meaning |
 |---|---|
-| `HOST_INVALID` | the trusted host is not the exact declared shape, or the deadline is out of range |
+| `HOST_INVALID` | the trusted host is not the exact declared shape, the deadline is out of range, or a composed owner reports itself `FAILED` |
 | `ENDPOINT_REFUSED` | no usable numeric loopback port was bound at construction |
 | `INVALID_ARGUMENTS` | the call was not exactly `{ body }` |
 | `CONVERSATION_BUSY` | one exchange is already in flight; no queue, pool or replay |
