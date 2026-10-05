@@ -37,3 +37,5 @@ The reference implementation is TypeScript on Node.js. The core remains provider
 ## Security posture
 
 Hylja is designed as an enforcement system, not an advisory filter. Production guarantees must be backed by deterministic policy, cryptographic controls, auditable authorization, bounded failure behavior, and continuous evaluation. Jev or another semantic model may supply judgments, but it never grants authority by itself.
+
+Synthetic engineering-reference admission: [contract](docs/contracts/synthetic-engineering-admission.md), [accepted decision 012](docs/decisions/012-synthetic-engineering-custody-preconditions.md). This pure prerequisite grants no mapping or effect authority.

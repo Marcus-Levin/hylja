@@ -48,9 +48,10 @@ A core module is not an enforcement boundary by itself. A pure policy, audit, or
 
 ## Commands
 
-Install exactly as CI does: `npm ci --ignore-scripts --no-fund` (Node 22, lockfile-driven, no lifecycle scripts).
+Install exactly as CI does: `npm ci --ignore-scripts --no-fund` (Node 24, npm 10, lockfile-driven, no lifecycle scripts).
 
 - `npm run check:fixtures` — tracked-path and synthetic-fixture guard. Run it before committing anything touching `test/fixtures/**`, `.gitignore`, or generated output.
+- `npm run check:diagnostic-assertions` — refuses assertion shapes whose printed value could carry captured subprocess output into a test log. See [docs/development/diagnostic-assertion-guard.md](docs/development/diagnostic-assertion-guard.md).
 - `npm run build` — compiles `src/**/*.ts` into `dist/`. Tests import `../dist/*.js`, so build before running any test.
 - `npm run typecheck` — `tsc --noEmit` under the same strict config.
 - `npm test` — fixture guard, build, then `node --test` over the suite list in [package.json](package.json). Read the script before quoting a count; the suite list changes.

@@ -154,6 +154,30 @@ test('review: pattern spans expand over the whole identifier token, never coveri
   }
 });
 
+test('review: a candidate reports one boolean whole-scan-unit match beside its unchanged coverage', () => {
+  // Synthetic only: a made-up namespace and a one-digit template that matches it exactly.
+  const exact = createCandidateConfig(A, { patterns: [{ template: 'SYNTHETIC-ASSET-{9:1}',
+    semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ASSET_TAG', sensitivity: 'INTERNAL' }] });
+  const reported = (text) => {
+    const [candidate] = detectConfigured({ text, inputRef: 'x', scope: A, config: exact }).candidates;
+    return { coverage: [candidate.start, candidate.end], whole: candidate.wholeUnitMatch,
+      offsets: Object.hasOwn(candidate, 'matchStart') || Object.hasOwn(candidate, 'matchEnd') };
+  };
+  assert.deepEqual(reported('SYNTHETIC-ASSET-1'), { coverage: [0, 17], whole: true, offsets: false },
+    'a template that matched the whole scanned unit says so, and coverage is unchanged');
+  assert.deepEqual(reported('SYNTHETIC-ASSET-1UNCONFIGURED'), { coverage: [0, 29], whole: false, offsets: false },
+    'coverage extends over the unconfigured tail; the match does not follow it');
+  // A term, a field hint and the generic key rule never extend: the match is the unit they scanned.
+  assert.equal(run('Northwind Synthetic AB').candidates[0].wholeUnitMatch, true, 'a dictionary match is whole');
+  assert.equal(run('anything-synthetic', { fieldPath: ['asset', 'tag'] }).candidates[0].wholeUnitMatch, true,
+    'a field hint covers the whole trimmed value it was given');
+  assert.equal(run('part_number: SYN-P-1', { config: undefined }).candidates[0].wholeUnitMatch, true,
+    'a generic key value is the unit that rule scanned');
+  // The fact is about the scanned unit, never a claim that the match is the whole text.
+  assert.deepEqual(reported('x.SYNTHETIC-ASSET-1 y'), { coverage: [2, 19], whole: true, offsets: false },
+    'a match nested in longer text is still whole for the unit it scanned');
+});
+
 test('review: the generic engineering-key rule reads quoted, full-line, dotted and Swedish keys without prose hits', () => {
   for (const [text, value] of [['plc_tag: %I0.1', '%I0.1'], ['plc_address=%MW100', '%MW100'], ['opc_node: ns=2;s=Line1.Pump.Speed', 'ns=2;s=Line1.Pump.Speed'],
     ['scada_tag: "Line 1 Pump Speed"', 'Line 1 Pump Speed'], ['part_number: ABC+123', 'ABC+123'], ['drawing_no: DWG 1234 A', 'DWG 1234 A'],

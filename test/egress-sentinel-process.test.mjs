@@ -307,7 +307,9 @@ test('under an instrumented test child a healthy fixed-worker check still return
     const env = { ...process.env };
     delete env.NODE_TEST_CONTEXT;
     delete env.NODE_TEST_WORKER_ID;
-    const child = spawn(process.execPath, ['--test', '--experimental-test-coverage', driver], {
+    // The reporter is pinned rather than inherited: Node's default test reporter changed between the
+    // pinned Node versions, and the two counts below are asserted against this run's TAP output.
+    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', '--experimental-test-coverage', driver], {
       stdio: ['ignore', 'pipe', 'ignore'], env,
     });
     let out = '';

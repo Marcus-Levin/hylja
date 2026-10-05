@@ -474,6 +474,56 @@ test('real seam reason codes are carried through unchanged', () => {
   assert.equal(secret.location.original.coverage, 'EXACT');
 });
 
+test('#10 whole-scan-unit match composes, and a foreign or malformed match fact is still refused', () => {
+  // Paired control: the same configured detection the seam always composed, now carrying the boolean #6
+  // reports beside the unchanged coverage span, still reaches a unit with the same placement.
+  const detection = detect('Northwind Synthetic AB signed for pump PMP-0042');
+  const configured = detection.candidates.filter((item) => item.source === 'CONFIGURED');
+  assert.ok(configured.length > 0, 'the detection carries configured candidates');
+  assert.ok(configured.every((item) => typeof item.wholeUnitMatch === 'boolean'),
+    'every configured candidate reports one boolean whole-scan-unit match');
+  const paired = compose(detection);
+  assert.equal(paired.status, 'COMPLETE');
+  assert.ok(paired.units.length > 0, 'the match fact does not cost the detection any unit');
+
+  // An extended coverage whose matcher never reached the end is reported false, and the fact changes no
+  // grouping: the same detection without it composes to the same units in the same places.
+  const extended = detect('pump PMP-0042-UNCONFIGURED');
+  const tail = extended.candidates.filter((item) => item.source === 'CONFIGURED');
+  assert.ok(tail.length > 0 && tail.every((item) => item.wholeUnitMatch === false),
+    'a template plus an unconfigured tail is not a whole-scan-unit match');
+  const stripped = { ...extended, candidates: extended.candidates.map((item) => {
+    const copy = { ...item };
+    delete copy.wholeUnitMatch;
+    return copy;
+  }) };
+  const withFact = compose(extended);
+  const without = compose(stripped);
+  assert.equal(withFact.units.length, without.units.length, 'the fact merges no unit and drops none');
+  assert.deepEqual(JSON.parse(JSON.stringify(withFact.units)), JSON.parse(JSON.stringify(without.units)),
+    'unit grouping, placement and evidence are unchanged by the fact');
+  // The unit keeps no match member: composition places by the occurrence span, so the fact is evidence only.
+  assert.equal(JSON.stringify(paired.units).includes('wholeUnitMatch'), false, 'a unit never carries the match fact');
+
+  // Fault controls: a non-boolean fact, a fact on a source with no configured matcher behind it, and the
+  // numeric offset members this seam accepted before are all malformed records, not hints.
+  const foreign = [...detect('password=synthetic-pass.invalid').candidates,
+    ...detect('build.tenant-a.invalid:443').candidates].filter((item) => item.source !== 'CONFIGURED');
+  const contact = detect('Orla Synthetica', { names }).candidates.find((item) => item.source === 'CONTACT');
+  assert.ok(foreign.length > 0 && contact, 'the non-configured controls exist');
+  const composed = (candidates) => composeClassificationUnits({ detection: { ...detection, candidates },
+    inputRef: 'input-a.invalid', scope: A, context }).reasons;
+  for (const malformed of [{ wholeUnitMatch: 'true' }, { wholeUnitMatch: 1 }, { wholeUnitMatch: null },
+    { matchStart: 0, matchEnd: 17 }, { matchStart: 0, matchEnd: Number.MAX_SAFE_INTEGER },
+    { matchEnd: 17 }, { matchStart: 0 }]) {
+    assert.deepEqual(composed([{ ...configured[0], ...malformed }]), ['INVALID_DETECTION'], JSON.stringify(malformed));
+  }
+  for (const candidate of [...foreign, contact]) {
+    assert.deepEqual(composed([{ ...candidate, wholeUnitMatch: true }]), ['INVALID_DETECTION'],
+      `${candidate.source} has no configured matcher behind it`);
+  }
+});
+
 test('an unknown key inside a detection record is refused, and a planted reason is replaced, not echoed', () => {
   const real = detect('Orla Synthetica', { names });
   const extraClaimKey = { ...real, candidates: [syntheticCandidate(0, 0, 4)] };

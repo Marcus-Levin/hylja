@@ -33,8 +33,16 @@
  * dictionaries, engineering templates and #7 key-path field hints join the same per-occurrence candidates under
  * the same tenant and project, so a configured claim keeps exactly the provenance every other source gets here:
  * an exact span for text written verbatim in a string root, a covering span for folded, escaped or decoded
- * text, and the encoded envelope for a decoded view. Without a handle nothing from #10 runs and no reason is
- * added, because the integration simply configured no configured source. A forged or foreign handle is PARTIAL
+ * text, and the encoded envelope for a decoded view. Beside that unchanged coverage a configured candidate also
+ * carries `wholeUnitMatch`, the one fact about the text unit #10 itself scanned: whether its own matcher matched
+ * that whole unit, rather than only the part coverage then extended over. It is a boolean precisely because this
+ * seam relocates coverage after folding, parsing and decoding while the scanned unit does not move: a #7 field
+ * hint matches the decoded value it was handed, whose offset is not the offset of its coverage in the view. The
+ * member comes from the compiled trusted configuration, never from caller text or a host assertion, so
+ * whole-value corroboration can be required of a genuine matcher without widening what any detector sees and
+ * without claiming that a nested, folded or decoded match sits at the same coordinates as its coverage.
+ * Without a handle nothing from #10
+ * runs and no reason is added, because the integration simply configured no configured source. A forged or foreign handle is PARTIAL
  * with its own opaque location and no configured claim; only #10's tenant-independent engineering-key rule
  * still runs. A #7 field whose value is verbatim in its view is read here for its trusted key-path hint only,
  * exactly like the #8 key hint above, because the view scan already covered that text.
@@ -130,6 +138,16 @@ export interface NormalizedCandidate {
   readonly evidence: CandidateEvidence;
   readonly view: ViewLocation;
   readonly original: OriginalLocation;
+  /**
+   * For a `CONFIGURED` candidate: whether #10's own matcher matched the **whole text unit it scanned**, which
+   * `view.span` and `original` cannot show on their own because #10 extends a template match forward over the
+   * rest of the identifier. `view.span` and `original` stay that wider coverage, unchanged, in every base;
+   * this flag answers about the scanned unit alone and is deliberately not a coordinate, so a folded, parsed
+   * or decoded placement never turns it into a claim that the match sits at the coverage's offsets. It is
+   * `false` when coverage extended past the match, and `true` for a `DICTIONARY`, `FIELD_HINT` or `CONTEXT`
+   * basis, which never extend. Absent for every source other than `CONFIGURED`.
+   */
+  readonly wholeUnitMatch?: boolean;
   /** Present when the candidate came from a #7 parsed field rather than from scanning a whole view. */
   readonly field?: ParsedFieldLocation;
 }
@@ -190,6 +208,8 @@ export interface NormalizedDetectionRequest {
 interface Detected {
   start: number;
   end: number;
+  /** #10's one boolean fact about the unit its own matcher scanned. Never an offset. */
+  wholeUnitMatch?: boolean;
   subtype?: string;
   rule?: string;
   basis: string;
@@ -455,6 +475,7 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
       counts[source]++;
       candidates.push(Object.freeze({ source, ...(item.subtype ? { subtype: item.subtype } : {}),
         ...(item.rule ? { rule: item.rule } : {}), basis: item.basis,
+        ...(item.wholeUnitMatch === undefined ? {} : { wholeUnitMatch: item.wholeUnitMatch }),
         ...(item.fidelity ? { fidelity: item.fidelity } : {}),
         ...(item.fingerprint ? { fingerprint: item.fingerprint } : {}), evidence: item.evidence,
         ...at }));
@@ -479,8 +500,8 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
     }
     if (result.status === 'FAILURE') return;
     const items = (fieldHintsOnly ? result.candidates.filter((item) => item.basis === 'FIELD_HINT') : result.candidates)
-      .map((item) => ({ start: item.start, end: item.end, ...(item.subtype ? { subtype: item.subtype } : {}),
-        rule: item.rule, basis: item.basis, evidence: item.evidence }));
+      .map((item) => ({ start: item.start, end: item.end, wholeUnitMatch: item.wholeUnitMatch,
+        ...(item.subtype ? { subtype: item.subtype } : {}), rule: item.rule, basis: item.basis, evidence: item.evidence }));
     accept(view, 'CONFIGURED', items, place);
   };
 
