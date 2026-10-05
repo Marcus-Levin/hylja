@@ -646,6 +646,19 @@ export async function runNativeLane(argv, deps = {}) {
 const invokedDirectly = process.argv[1] !== undefined
 	&& resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (invokedDirectly) {
-	const result = await runNativeLane(process.argv.slice(2), { log: (record) => console.log(JSON.stringify(record)) });
+	// A refusal that happens before any child is launched logs no verification record, so the process
+	// would otherwise exit with a code and no output at all, and root cannot tell that setup apart
+	// from a run that never happened. Exactly one bounded record is printed for it: the fixed verdict
+	// and the fixed setup code, never a config path, a task, a declared reference, a detail or a
+	// thrown message. A launched lane already logs its own full record above, so the flag keeps that
+	// run at exactly one record and never adds a second line to it.
+	let logged = false;
+	const result = await runNativeLane(process.argv.slice(2), {
+		log: (record) => {
+			logged = true;
+			console.log(JSON.stringify(record));
+		},
+	});
+	if (!logged) console.log(JSON.stringify({ verdict: result.verdict, reason: result.reason }));
 	process.exitCode = result.ok === true ? 0 : result.reason === SETUP_FAILURES.status ? 3 : 2;
 }
