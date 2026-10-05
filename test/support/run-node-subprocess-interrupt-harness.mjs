@@ -8,7 +8,8 @@
  * OS, whether the descendant survived this process. It prints nothing.
  *
  *   wait F   run the stalled fixture, publish its descendant pid to F, and wait to be interrupted
- *   exit F   the same, then call `process.exit(0)` once the descendant pid is published
+ *   exit F   the same, then call `process.exit(0)` once the test has created the file `F.go`, which it does
+ *            only after it has observed the descendant running
  */
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +23,7 @@ if ((mode !== 'wait' && mode !== 'exit') || typeof file !== 'string' || rest.len
   runNodeFixture({ entry: FIXTURE, args: ['descendant', file], boundMs: 60_000 }).then(() => {});
   if (mode === 'exit') {
     const poll = setInterval(() => {
-      if (!existsSync(file)) return;
+      if (!existsSync(`${file}.go`)) return;
       clearInterval(poll);
       process.exit(0);
     }, 5);

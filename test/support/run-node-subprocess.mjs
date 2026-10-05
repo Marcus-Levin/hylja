@@ -16,10 +16,19 @@
  * it and never reports `close`.
  *
  * Stopping is of the child's whole PROCESS GROUP: the child leads its own group, a stop signals the group,
- * and the helper does not return until the OS reports the group empty (or a bounded wait expires, which
- * is still the fixed failure or the reported stall, never success). That covers a run that fails, a run
- * that stalls and a run that exits normally but leaves a descendant behind. A descendant that moves into
- * its own session is out of reach, and is the one thing this does not claim.
+ * and the helper does not return until the OS reports the group empty. If the group is still not empty
+ * when the bounded wait expires, the outcome is the fixed failure (or the reported stall), never the
+ * child's own exit code and never success. That covers a run that fails, a run that stalls and a run that
+ * exits normally but leaves a descendant behind. A descendant that moves into a new process group or a
+ * new session leaves the group and is out of reach; that is the one thing this does not claim.
+ *
+ * Interruption is covered as well, within limits. The helper tracks the groups it owns while they are live;
+ * if THIS process exits, or receives SIGINT or SIGTERM, they are killed synchronously before it goes, and
+ * for a signal its default behaviour is then re-raised (unless another listener of the test's own is
+ * installed, which then decides). Because the children are detached from the runner's group, a terminal
+ * Ctrl-C no longer reaches them directly - this hook is what stands in for it. SIGKILL of this process,
+ * SIGHUP and a crash of the node runtime cannot run a hook, so those leave the groups running until the
+ * fixtures' own self-bounds (ten seconds) or the operator stop them.
  *
  * Retention is bounded and closable: each stream keeps at most `MAX_CAPTURE_BYTES`, a stream that crosses
  * it fails the run closed, and a failed or settled run keeps no chunk that an open pipe delivers later.
@@ -59,6 +68,48 @@ const FIXED_FAILURE = Object.freeze({
 });
 
 /**
+ * Process groups this process owns right now, by group id, and the hooks that kill them when this process
+ * is interrupted. The hooks are installed while at least one group is live and removed when none is, so an
+ * idle process keeps the default behaviour of every signal.
+ */
+const ownedGroups = new Set();
+let hooked = false;
+const SIGNALS = Object.freeze(['SIGINT', 'SIGTERM']);
+
+function killOwnedGroups() {
+  for (const group of ownedGroups) {
+    try { process.kill(-group, 'SIGKILL'); } catch { /* already gone */ }
+  }
+  ownedGroups.clear();
+}
+
+const onExitHook = () => { killOwnedGroups(); };
+const signalHooks = new Map(SIGNALS.map((signal) => [signal, () => {
+  killOwnedGroups();
+  unhook();
+  // Restore the default: with no listener left the re-raised signal ends this process as it would have.
+  // A listener that belongs to someone else is left to decide.
+  if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+}]));
+
+function hook() {
+  if (hooked) return;
+  hooked = true;
+  process.on('exit', onExitHook);
+  for (const [signal, handler] of signalHooks) process.on(signal, handler);
+}
+
+function unhook() {
+  if (!hooked) return;
+  hooked = false;
+  process.off('exit', onExitHook);
+  for (const [signal, handler] of signalHooks) process.off(signal, handler);
+}
+
+function trackGroup(group) { ownedGroups.add(group); hook(); }
+function untrackGroup(group) { ownedGroups.delete(group); if (ownedGroups.size === 0) unhook(); }
+
+/**
  * One stream's retained chunks, bounded and closable. It retains at most `limit` bytes; the chunk that would
  * cross the bound closes the collector, drops everything it held and reports the overflow, and from then on
  * nothing is ever retained again. `stop()` does the same on demand, so a failed or settled run keeps no
@@ -95,8 +146,8 @@ function createCollector(limit, onOverflow) {
  * so a stop reaches every descendant it started - the demo's fixed workers are its grandchildren - and
  * the helper does not return until the group is observed empty or the cleanup bound expires. That is
  * checked against the OS (a signal-0 probe of the group), not inferred from a counter. Limits, stated
- * rather than implied: a descendant that leaves the group on purpose (its own session) is out of reach,
- * and a terminated descendant that nothing has reaped yet still counts as a group member until the bound.
+ * rather than implied: a descendant that leaves the group on purpose (a new process group or a new
+ * session) is out of reach, and a terminated descendant that nothing has reaped yet still counts as a group member until the bound.
  */
 function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null, seams = {}) {
   return new Promise((resolve) => {
@@ -128,15 +179,18 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null
       };
       stdout.stop();
       stderr.stop();
+      // A group the OS reports empty is no longer owned. One that is not stays tracked for the exit hook.
+      if (groupLeader && Number.isInteger(child?.pid) && !osGroupExists()) untrackGroup(child.pid);
       resolve(outcome);
     };
 
     /** Whether any member of the owned child's process group still exists, from the OS. */
-    const groupExists = () => {
-      if (typeof seams.groupProbe === 'function') return seams.groupProbe() === true;
+    const osGroupExists = () => {
       if (!groupLeader || child === null || !Number.isInteger(child.pid)) return false;
       try { process.kill(-child.pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
     };
+    /** The same, unless a test supplies its own probe through the fixture seam. */
+    const groupExists = () => (typeof seams.groupProbe === 'function' ? seams.groupProbe() === true : osGroupExists());
 
     /** SIGKILL the owned child, and its whole group when it leads one. No other process is signalled. */
     const killOwned = () => {
@@ -186,7 +240,9 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null
       if (deadline !== null) { clearTimeout(deadline); owned.delete(deadline); }
       if (!groupExists()) { settle(code, signal); return; }
       killOwned();
-      armCleanupBound(() => settle(code, signal));
+      // A group the OS still reports after the bounded wait is an unconfirmed stop: the fixed failure,
+      // never the child's own exit code, which would read as success for a run that left a member behind.
+      armCleanupBound(() => { failing = true; settle(code, signal); });
       const poll = () => {
         if (settled) return;
         if (!groupExists()) { settle(code, signal); return; }
@@ -206,6 +262,7 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null
       return;
     }
     child = spawned;
+    if (groupLeader && Number.isInteger(child.pid)) trackGroup(child.pid);
 
     // The child itself is contained BEFORE anything else is looked at. A spawn that fails after the
     // child object exists - a descriptor-exhaustion `EMFILE`, for one - reports it as an asynchronous

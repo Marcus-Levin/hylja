@@ -17,7 +17,7 @@
 // this repository's own invented material.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -236,7 +236,8 @@ for (const how of ['sigint', 'sigterm', 'exit']) {
         for (let attempt = 0; attempt < 600 && publishedPid(file) === null; attempt += 1) await sleep(10);
         pid = publishedPid(file);
         const aliveBefore = pid !== null && isRunning(pid);
-        if (how !== 'exit') harness.kill(how === 'sigint' ? 'SIGINT' : 'SIGTERM');
+        if (how === 'exit') writeFileSync(`${file}.go`, 'go\n');
+        else harness.kill(how === 'sigint' ? 'SIGINT' : 'SIGTERM');
         const ended = await closed;
         let aliveAfter = pid !== null && isRunning(pid);
         for (let attempt = 0; attempt < 200 && aliveAfter; attempt += 1) {
