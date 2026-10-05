@@ -48,7 +48,12 @@ missing. **Explicit reading is the mechanism; automatic injection is neither fix
    version) is unchanged, and returns every actionable finding of the round at once, separating an
    introduced regression from a pre-existing follow-up. A blocker cites a contract clause, a source
    location or a reproduction; no open-ended probe sweep. A wider panel only for a concrete contested
-   design question.
+   design question. **Reviewed surface:** review binds the final clean source SHA and the scoped
+   base-to-head diff. Unpublished intermediate document history is not a publication gate: root does
+   not amend, squash, rebase or reopen a settled decision just to polish intermediate commits when the
+   final artifact and its acceptance proof are correct. A real merge conflict, a lost blob or an
+   unmet acceptance criterion still blocks. Source refs and failed-round evidence are preserved either
+   way, and the exact-head, green-CI and owned-cleanup requirements of step 8 are unchanged.
 6. **Verdict.** `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE`. The run deadline is terminal, so an
    expired review has no verdict and the coordinator records INCOMPLETE. Silence, a timeout or an
    unresolved provider error is never approval.
@@ -65,8 +70,10 @@ missing. **Explicit reading is the mechanism; automatic injection is neither fix
    worktrees; setup never resumes product work.
 8. **Publish and close.** Root publishes alone. An authorized reviewable draft pull request is created
    and published for review before approval and CI; merging or releasing it still requires the user's
-   explicit authorization, approval of the exact head and green CI at that head. Close an issue only when
-   its acceptance criteria are satisfied. After the merged content is verified to have landed, root
+   explicit authorization, approval of the exact head and green CI at that head. That approval binds
+   the whole published tree at that head, not the shape of the commits underneath it. Close an issue
+   only when its acceptance criteria are satisfied. After the merged content is verified to have
+   landed, root
    removes only the branches and worktrees it owns, preserving commits, evidence and needed commit
    references, and leaving unmerged work in place.
 9. **Report.** Record in the pull request evidence: author and reviewer minutes, command durations,
