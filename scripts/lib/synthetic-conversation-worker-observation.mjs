@@ -285,6 +285,9 @@ function observe(args, child) {
     closed: false, exitedZero: false, closedBySignal: false,
     complete: false, decision: 'NONE', knownOriginalReason: false, registeredRefNamed: false,
     binding: null, frameRefused: false,
+    // The operating-system id of this child, so its liveness can be read from the OS later. It is a
+    // number the OS already shows to every process on the host, and it is never printed.
+    pid: Number.isInteger(child.pid) ? child.pid : null,
     // A fault belongs to ONE ordinal: the request-side child is never faulted, so it still really runs
     // and really answers, which is what makes a faulted run comparable to a working one.
     fault: injected !== null && records.length + 1 === injected.ordinal ? injected.fault : null,
@@ -352,6 +355,23 @@ export function installWorkerObservation() {
 
 /** Whether the capture is in place. The case module checks this at import, so a wrong order fails loudly. */
 export const workerObservationInstalled = () => installed;
+
+/**
+ * How many of the real fixed-worker children still EXIST, asked of the operating system with a signal-0
+ * probe of each recorded process id (no signal is delivered). This is real process liveness, not a
+ * handle or listener count: a child whose handle this process released, or whose `close` was never
+ * observed, is still reported here for as long as the OS has it. A child this process spawned and has
+ * been told exited is reaped by the runtime, so the OS no longer knows it. A probe the OS refuses
+ * permission for still counts as live.
+ */
+export function workersStillRunning() {
+  let running = 0;
+  for (const record of records) {
+    if (record.pid === null) continue;
+    try { process.kill(record.pid, 0); running += 1; } catch (error) { if (error.code === 'EPERM') running += 1; }
+  }
+  return running;
+}
 
 /**
  * What the real children did, as fixed counters. Read after cleanup; a second read of the same run

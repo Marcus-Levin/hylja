@@ -26,16 +26,19 @@
  * fixed vocabulary and refused without echo before any peer, owner or child exists, and an unexpected
  * failure prints one fixed line and nothing else.
  *
- * Cleanup is unconditional on every outcome, including a refusal, a thrown failure and a stalled bound:
- * the owner is cancelled, every peer socket is destroyed, the server is closed, the retained request
- * bytes are dropped and every worker child is drained inside one bounded wait. There is no blanket kill
- * and no erasure step; what is still standing when the bound expires is reported as it really is, and the
- * case then fails its declared behaviour.
+ * Cleanup runs on every outcome, including a refusal, a thrown failure and a stalled bound: the owner is
+ * cancelled, every peer socket is destroyed, the server is closed and the retained request bytes are
+ * dropped. The fixed-worker children are WAITED for, not killed: this module sends no signal to any
+ * process and has no blanket kill. What it does is measure, inside one bounded wait, whether each worker
+ * process it recorded still exists according to the operating system (plus the child-process handles this
+ * process still holds), and report what is still standing when the bound expires exactly as it is. The
+ * case then fails its declared behaviour. Terminating a stalled worker is the accepted runner's own
+ * deadline, not this module's.
  */
 import http from 'node:http';
 import { DEMO_ARGUMENT_REFUSED, DEMO_DECLINED } from './synthetic-conversation-demo-text.mjs';
 import {
-  noteRegisteredOriginal, workerObservation, workerObservationInstalled,
+  noteRegisteredOriginal, workerObservation, workerObservationInstalled, workersStillRunning,
 } from './synthetic-conversation-worker-observation.mjs';
 import { createOpenAiLocalConversation } from '../../dist/openai-local-conversation.js';
 import {
@@ -158,8 +161,15 @@ function bounded(promise, label) {
   return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
 }
 
-/** Fixed-worker child processes this process still holds a live handle to. */
-const liveChildren = () => process.getActiveResourcesInfo().filter((kind) => kind === 'ProcessWrap').length;
+/**
+ * Fixed-worker children still standing: the larger of the child-process handles this process holds and
+ * the recorded worker processes the operating system still reports as existing. The second is real
+ * liveness of the very processes that were spawned; the first catches a handle with no recorded process.
+ */
+const liveChildren = () => Math.max(
+  process.getActiveResourcesInfo().filter((kind) => kind === 'ProcessWrap').length,
+  workersStillRunning(),
+);
 
 /** One bounded poll, so a stalled socket or a lingering handle fails the run instead of hanging it. */
 const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -168,8 +178,8 @@ const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
  * Drain what the case left behind and measure it. Every fixed-worker child has already been observed
  * `close` by its own runner before the exchange settled, so only the handle that close releases
  * asynchronously is left; a peer socket is retired by its own `close` event. Both are polled to zero
- * inside one bound, and whatever is still standing when the bound expires is reported as it really is
- * rather than rounded to zero.
+ * inside one bound, the children by real process liveness, and whatever is still standing when the
+ * bound expires is reported as it really is rather than rounded to zero.
  */
 async function drain(peer) {
   const deadline = Date.now() + CLEANUP_BOUND_MS;

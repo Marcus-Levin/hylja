@@ -40,7 +40,9 @@ records and the tracked paths.
 ([openai-local-conversation.md](../contracts/openai-local-conversation.md)) over a real standard HTTP
 peer on `127.0.0.1` and prints one fixed human-readable summary of the real owner result and the real
 peer, release, detector and fixed-worker counters. No original value, key, model traffic, argument,
-signal name or native error is ever printed.
+signal name or native error is ever printed, on any exit path: a runtime that cannot load, a summary
+that cannot be built and an output pipe that is broken all end in the same fixed decline line and exit 1,
+and the subprocess evidence proves the broken-pipe case by closing the reader of stdout before the demo writes.
 
 ```sh
 npm run build && node scripts/synthetic-conversation-demo.mjs                    # one masked request, one guarded release

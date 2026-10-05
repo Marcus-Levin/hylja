@@ -11,10 +11,18 @@
  * asynchronous `error` from the spawn itself, a child whose required pipes are missing and an error on
  * one of those pipes all settle exactly once with the same fixed restrictive outcome: no exit code, no
  * signal, no captured text, and `transportFailure` set. Nothing from the failure - no native message, no
- * code, no stack, no checkout path - reaches the caller, and only the one child this helper spawned is
- * ever signalled, with a bounded stop whose unconfirmed outcome is still the fixed failure. The child
- * itself is contained before its streams are inspected, because a spawn that fails after the child
- * object exists reports an asynchronous `error` on it and never reports `close`.
+ * code, no stack, no checkout path - reaches the caller. The child is contained before its streams are
+ * inspected, because a spawn that fails after the child object exists reports an asynchronous `error` on
+ * it and never reports `close`.
+ *
+ * Stopping is of the child's whole PROCESS GROUP: the child leads its own group, a stop signals the group,
+ * and the helper does not return until the OS reports the group empty (or a bounded wait expires, which
+ * is still the fixed failure or the reported stall, never success). That covers a run that fails, a run
+ * that stalls and a run that exits normally but leaves a descendant behind. A descendant that moves into
+ * its own session is out of reach, and is the one thing this does not claim.
+ *
+ * Retention is bounded and closable: each stream keeps at most `MAX_CAPTURE_BYTES`, a stream that crosses
+ * it fails the run closed, and a failed or settled run keeps no chunk that an open pipe delivers later.
  *
  * An ordinary NON-ZERO exit is not a transport failure. The exit code, the signal and both captured
  * streams survive it, which is what lets the confidentiality evidence read a real failing TAP report
@@ -32,7 +40,10 @@ import { fileURLToPath } from 'node:url';
 export const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 /** Bound every invocation, so a stalled peer or child fails the suite loudly instead of hanging it. */
 export const BOUND_MS = 60_000;
-/** Placeholder for the red checkpoint: the current helper has no retention bound. */
+/**
+ * The most one stream of one invocation may retain. The demo prints a few kilobytes and a TAP report is of
+ * the same order, so this is far above any legitimate run; a stream that crosses it fails the run closed.
+ */
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 /** The bound is a deadline, not a kill policy for valid work: only a stalled owned child is stopped. */
 export const TEST_TIMEOUT_MS = 180_000;
@@ -48,68 +59,139 @@ const FIXED_FAILURE = Object.freeze({
 });
 
 /**
- * The one lifecycle helper: spawn one owned child, collect its two streams inside a bound, stop only
- * that child, and settle exactly once. `spawnOptions` is passed to the native spawn unchanged, so a
- * fixture can hand the native call a genuinely bad option and observe the real failure it raises.
+ * One stream's retained chunks, bounded and closable. It retains at most `limit` bytes; the chunk that would
+ * cross the bound closes the collector, drops everything it held and reports the overflow, and from then on
+ * nothing is ever retained again. `stop()` does the same on demand, so a failed or settled run keeps no
+ * chunk that a still-open pipe delivers afterwards.
+ */
+function createCollector(limit, onOverflow) {
+  const chunks = [];
+  let bytes = 0;
+  let open = true;
+  return {
+    push(chunk) {
+      if (!open) return;
+      bytes += chunk.byteLength;
+      if (bytes > limit) {
+        this.stop();
+        onOverflow();
+        return;
+      }
+      chunks.push(chunk);
+    },
+    stop() { open = false; chunks.length = 0; bytes = 0; },
+    text() { return Buffer.concat(chunks).toString('utf8'); },
+    retained() { return chunks.length; },
+  };
+}
+
+/**
+ * The one lifecycle helper: spawn one owned child, collect its two streams inside a bound, stop the
+ * child's whole process group, and settle exactly once. `spawnOptions` is passed to the native spawn
+ * unchanged, so a fixture can hand the native call a genuinely bad option and observe the real failure it
+ * raises.
+ *
+ * The child is spawned as the leader of its OWN process group (`detached`, where the OS has such a thing),
+ * so a stop reaches every descendant it started - the demo's fixed workers are its grandchildren - and
+ * the helper does not return until the group is observed empty or the cleanup bound expires. That is
+ * checked against the OS (a signal-0 probe of the group), not inferred from a counter. Limits, stated
+ * rather than implied: a descendant that leaves the group on purpose (its own session) is out of reach,
+ * and a terminated descendant that nothing has reaped yet still counts as a group member until the bound.
  */
 function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null) {
   return new Promise((resolve) => {
-    const stdout = [];
-    const stderr = [];
-    /** Every timer this invocation owns. None of them outlives the outcome they exist for. */
-    const owned = new Set();
     let child = null;
     let settled = false;
     let failing = false;
     let stalled = false;
-
+    /** Whether the cleanup bound is already armed, so it is armed once whichever path gets there first. */
+    let bounded = false;
+    /** The deadline timer. A child that is already gone can no longer stall. */
+    let deadline = null;
+    /** Every timer this invocation owns. None of them outlives the outcome they exist for. */
+    const owned = new Set();
     const clearOwnedTimers = () => { for (const timer of owned) clearTimeout(timer); owned.clear(); };
-
     const own = (fn, ms) => { const timer = setTimeout(fn, ms); owned.add(timer); return timer; };
+    const groupLeader = spawnOptions.detached === true && process.platform !== 'win32';
 
-    const settle = (outcome) => {
+    // Overflow is a failure to RUN, not a truncated capture: it fails the run closed.
+    const stdout = createCollector(MAX_CAPTURE_BYTES, () => failTheRun());
+    const stderr = createCollector(MAX_CAPTURE_BYTES, () => failTheRun());
+
+    /** Every outcome funnels through here once. Collection ends with it: nothing is retained afterwards. */
+    const settle = (code, signal) => {
       if (settled) return;
       settled = true;
       clearOwnedTimers();
+      const outcome = failing ? FIXED_FAILURE : {
+        code, signal, stalled, transportFailure: false, stdout: stdout.text(), stderr: stderr.text(),
+      };
+      stdout.stop();
+      stderr.stop();
       resolve(outcome);
     };
 
-    /** Bounded stop of the ONE child this invocation spawned. No other process is ever signalled. */
-    const stopOwnedChild = () => {
-      if (child === null || typeof child.kill !== 'function') return;
-      try { child.kill('SIGKILL'); } catch { /* already gone: its own `close` still decides */ }
+    /** Whether any member of the owned child's process group still exists, from the OS. */
+    const groupExists = () => {
+      if (!groupLeader || child === null || !Number.isInteger(child.pid)) return false;
+      try { process.kill(-child.pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
+    };
+
+    /** SIGKILL the owned child, and its whole group when it leads one. No other process is signalled. */
+    const killOwned = () => {
+      if (child === null) return;
+      if (groupLeader && Number.isInteger(child.pid)) {
+        try { process.kill(-child.pid, 'SIGKILL'); return; } catch { /* no such group: fall through */ }
+      }
+      if (typeof child.kill === 'function') {
+        try { child.kill('SIGKILL'); } catch { /* already gone: its own `close` still decides */ }
+      }
+    };
+
+    const armCleanupBound = (fn) => {
+      if (bounded) return;
+      bounded = true;
+      own(fn, CLEANUP_BOUND_MS);
+    };
+
+    /** Stop what this invocation owns, with the cleanup bound as the fallback if nothing confirms it. */
+    const stopOwned = () => {
+      killOwned();
+      armCleanupBound(() => settle(null, null));
     };
 
     /**
-     * The run itself failed. Stop the owned child, keep nothing the failure produced, and settle with the
-     * one fixed outcome - immediately if the child really closes, and at the cleanup bound if it does
+     * The run itself failed. Stop collecting and keep nothing, stop the owned tree, and settle with the one
+     * fixed outcome - once the child and its group are really gone, and at the cleanup bound if they are
      * not, so an unconfirmed stop can never leave this promise pending or read as success.
      */
     const failTheRun = () => {
       if (settled || failing) return;
       failing = true;
+      stdout.stop();
+      stderr.stop();
       clearOwnedTimers();
-      stdout.length = 0;
-      stderr.length = 0;
-      stopOwnedChild();
-      own(() => settle(FIXED_FAILURE), CLEANUP_BOUND_MS);
+      bounded = false;
+      stopOwned();
     };
 
     /**
-     * The child is really gone. A run that already failed reports the fixed outcome whatever this close
-     * says; an observed close is the only thing that may report an exit code or captured text at all.
+     * The child itself is really gone. Whatever else of its group is still standing is stopped and awaited
+     * before anything is reported, so a normal exit, a stall and a failure all return with no running
+     * descendant. A run that already failed reports the fixed outcome whatever this close says.
      */
     const onClose = (code, signal) => {
-      if (failing) { settle(FIXED_FAILURE); return; }
       if (settled) return;
-      settle({
-        code,
-        signal,
-        stalled,
-        transportFailure: false,
-        stdout: Buffer.concat(stdout).toString('utf8'),
-        stderr: Buffer.concat(stderr).toString('utf8'),
-      });
+      if (deadline !== null) { clearTimeout(deadline); owned.delete(deadline); }
+      if (!groupExists()) { settle(code, signal); return; }
+      killOwned();
+      armCleanupBound(() => settle(code, signal));
+      const poll = () => {
+        if (settled) return;
+        if (!groupExists()) { settle(code, signal); return; }
+        own(poll, 10);
+      };
+      poll();
     };
 
     let spawned;
@@ -118,7 +200,8 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null
     } catch {
       // A synchronous spawn exception: the native call refused the arguments and no child exists, so
       // there is nothing to stop and nothing to capture. The fixed outcome is the whole report.
-      settle(FIXED_FAILURE);
+      failing = true;
+      settle(null, null);
       return;
     }
     child = spawned;
@@ -141,24 +224,27 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null
     child.stderr.on('error', failTheRun);
     // TEST-ONLY seam: a fixture may look at the real child and at how many chunks are retained right now.
     if (typeof inspect === 'function') {
-      try { inspect({ child, retainedChunks: () => stdout.length + stderr.length }); } catch { /* a probe never decides the run */ }
+      try {
+        inspect({ child, retainedChunks: () => stdout.retained() + stderr.retained() });
+      } catch { /* a probe never decides the run */ }
     }
-    // The bound is a deadline on this invocation. It stops only the owned child, and whether the child
-    // really goes away is decided by its own `close`, with this bound as the fallback.
-    own(() => {
+    // The bound is a deadline on this invocation. It stops the owned child and its group, and whether
+    // they really go away is decided by the child's own `close` and the group probe, with the cleanup
+    // bound as the fallback.
+    deadline = own(() => {
       stalled = true;
-      stopOwnedChild();
-      own(() => settle({
-        code: null, signal: null, stalled: true, transportFailure: false,
-        stdout: Buffer.concat(stdout).toString('utf8'),
-        stderr: Buffer.concat(stderr).toString('utf8'),
-      }), CLEANUP_BOUND_MS);
+      stopOwned();
     }, boundMs);
   });
 }
 
 /** The stdio discipline every invocation of this helper uses, so both streams are observable. */
-const ownChildOptions = Object.freeze({ cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+const ownChildOptions = Object.freeze({
+  cwd: REPO_ROOT,
+  stdio: ['ignore', 'pipe', 'pipe'],
+  // The child leads its own process group, so a stop reaches its descendants too.
+  detached: process.platform !== 'win32',
+});
 
 /**
  * Run one entry point in a real child process and resolve once it is gone. The child's own stdout and

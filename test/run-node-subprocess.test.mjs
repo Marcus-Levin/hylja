@@ -188,6 +188,25 @@ test('a stalled run takes down its whole process tree before it returns', { time
   }
 });
 
+test('a run that exits normally leaves no running descendant behind either', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'hylja-run-node-'));
+  const file = join(directory, 'orphan.pid');
+  let pid = null;
+  try {
+    const run = await runNodeFixture({ entry: FIXTURE, args: ['orphan', file] });
+    pid = publishedPid(file);
+    const aliveAtReturn = pid !== null && isRunning(pid);
+    assert.equal(run.transportFailure, false, 'a normal exit is not a transport failure');
+    assert.equal(run.code, 0, 'the run reported its own exit code');
+    assert.equal(run.stalled, false, 'the run did not stall');
+    assert.equal(pid !== null, true, 'the fixture really spawned a descendant');
+    assert.equal(aliveAtReturn, false, 'the descendant it left running is stopped before the helper returns');
+  } finally {
+    reap(pid);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('a failed run stops retaining output at once, even while a process out of its reach keeps writing',
   { timeout: TEST_TIMEOUT_MS }, async () => {
     const directory = mkdtempSync(join(tmpdir(), 'hylja-run-node-'));

@@ -14,6 +14,7 @@
  *   stall          a stall: holds itself well past any bound the suite uses, until it is stopped
  *   descriptors    reports whether this process really hit EMFILE, then really runs one child
  *   descendant F   spawns one real idle grandchild in this process group, publishes its pid to file F, stalls
+ *   orphan F       spawns one real idle grandchild in this process group, publishes its pid to F, exits 0 at once
  *   stray F        spawns one real chattering grandchild in its OWN session, publishes its pid to F, stalls
  *   flood          writes more stdout than the helper may retain, then exits normally
  *
@@ -33,6 +34,7 @@ const MODES = Object.freeze({
   DESCRIPTORS: 'descriptors',
   DESCENDANT: 'descendant',
   STRAY: 'stray',
+  ORPHAN: 'orphan',
   FLOOD: 'flood',
 });
 const KNOWN = new Set(Object.values(MODES));
@@ -41,7 +43,7 @@ const REFUSED = 'run-node-subprocess fixture: argument refused\n';
 /** The arguments after the entry point: exactly one fixed mode word, or none. */
 const requested = process.argv.slice(2);
 /** `descendant` and `stray` take exactly one more argument: where to publish the descendant's pid. */
-const TAKES_PID_FILE = new Set([MODES.DESCENDANT, MODES.STRAY]);
+const TAKES_PID_FILE = new Set([MODES.DESCENDANT, MODES.STRAY, MODES.ORPHAN]);
 const refused = requested.length === 0 ? false
   : !KNOWN.has(requested[0]) || requested.length !== (TAKES_PID_FILE.has(requested[0]) ? 2 : 1);
 const mode = refused ? null : requested[0] ?? MODES.WORKING;
@@ -76,6 +78,12 @@ if (refused) {
   const grandchild = spawn(process.execPath, ['-e', IDLE_DESCENDANT], { stdio: 'ignore' });
   publishPid(requested[1], grandchild.pid);
   setTimeout(() => { process.exitCode = 0; }, 10_000);
+} else if (mode === MODES.ORPHAN) {
+  // The same idle grandchild, but this process exits NORMALLY at once and leaves it running: a run that
+  // ends well must not leave a descendant behind either.
+  const grandchild = spawn(process.execPath, ['-e', IDLE_DESCENDANT], { stdio: 'ignore' });
+  publishPid(requested[1], grandchild.pid);
+  grandchild.unref();
 } else if (mode === MODES.STRAY) {
   // A real grandchild that is OUT OF REACH of a process-group stop (its own session), and that keeps
   // writing to the stderr pipe it inherited after its parent is gone. It stops on its own after 1.5 s.
