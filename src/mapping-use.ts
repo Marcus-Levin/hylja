@@ -64,10 +64,12 @@
  * call, or an opener refusal - is one fixed `WITHHELD`. The internal reason never reaches the caller.
  * `FAILED` is reserved for the one thing a refusal cannot describe: the sealed effect segment was
  * reached and could not be completed, which is an opener or a backend that threw. A reflection,
- * enumeration or index fault anywhere **before** that segment is a `WITHHELD` like any other guard
- * refusal, never an escape and never a `FAILED`. A backend that answers with anything but a
- * primitive boolean is a `WITHHELD` too: a claim is never bought by a malformed answer. Neither
- * `WITHHELD` nor `FAILED` ever performs, claims or reports a `USE`.
+ * enumeration or index fault out of any host value is a `WITHHELD` like any other guard refusal,
+ * never an escape and never a `FAILED`; that holds inside the sealed segment too, because its whole
+ * final guard is normalized as well and only the opener and the backend themselves are not. A
+ * backend that answers with anything but a primitive boolean is a `WITHHELD` too: a claim is never
+ * bought by a malformed answer. Neither `WITHHELD` nor `FAILED` ever performs, claims or reports a
+ * `USE`.
  *
  * What this is not
  * - **Not a broker, vault, store or index.** It resolves no original, holds no mapping table, exposes
@@ -157,9 +159,19 @@ export interface MappingUseAudit {
 
 /**
  * The private synchronous resource. One primitive boolean in, nothing out. The object **and** its
- * `lookup` method are bound at construction, and a `lookup` installed afterwards is never invoked:
- * this module overwrites its own copy immediately after the call and cannot do anything about a
- * retained one.
+ * `lookup` method are bound at construction, and a `lookup` installed afterwards is never invoked.
+ *
+ * **Host obligation, mandatory.** The backend must not retain, copy, log or forward the bytes it is
+ * handed: it decides and returns. It must not keep a reference to that buffer, must not store its
+ * contents anywhere, must not write them to a log, a metric, a trace or an error message, and must
+ * not pass them on to another party, process or transport. The recovered plaintext exists here for
+ * the duration of one call and this module overwrites its own copy in the same continuation, in a
+ * `finally`, whether the call returned `true` or `false`; a copy the backend kept survives that.
+ *
+ * That obligation is on the host, not something this module can verify, and this interface makes no
+ * custody or zeroization claim: nothing here can observe what the backend did with the buffer after
+ * it returned, cannot reach a copy it kept, and cannot force native memory to be zeroed. The
+ * executor states the duty and, in the limits above, that it is unproven.
  */
 export interface MappingUseBackend { lookup(identifier: Uint8Array): boolean }
 
@@ -312,12 +324,21 @@ function equal(left: unknown, right: unknown): boolean {
  * One owned, immutable copy of the audit actor identity. The ledger takes the actor from the trusted
  * context, so the executor owns the value it hands over: a host that mutates its own actor object
  * mid-flight cannot re-attribute a decision this executor recorded.
+ *
+ * The **whole** read is normalized as one guard, not just the property access: the prototype check,
+ * the key enumeration and the descriptor reads that `fields` performs are inside that guard too.
+ * This function runs again inside the sealed effect segment, where the live actor is the last
+ * host-owned read before the fresh registry read, so a trap raised by a hostile actor object there
+ * would otherwise leave the segment as an unbranded exception and be reported as a reached effect.
+ * A trap anywhere in the read is one refusal like any other, never an escape.
  */
 interface AuditActor { readonly principalId: string; readonly workloadId?: string }
 function auditActor(value: AuditTrustedContext): AuditActor {
-  const v = fields(attempt(() => value.actor), ['principalId'], ['workloadId']);
-  return Object.freeze({ principalId: text(v.principalId, 256),
-    ...(Object.hasOwn(v, 'workloadId') ? { workloadId: text(v.workloadId, 256) } : {}) });
+  return attempt((): AuditActor => {
+    const v = fields(value.actor, ['principalId'], ['workloadId']);
+    return Object.freeze({ principalId: text(v.principalId, 256),
+      ...(Object.hasOwn(v, 'workloadId') ? { workloadId: text(v.workloadId, 256) } : {}) });
+  });
 }
 
 /** One owned copy of one byte source. The declared length is validated before any allocation. */

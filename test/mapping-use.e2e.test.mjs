@@ -882,6 +882,48 @@ test('the effect segment resolves no mutable function property and re-reads no c
     assert.equal(cleared(matchedPin.backend.state.retained), true);
   });
 
+test('the final observation swaps in a reflection-faulting actor and withholds before any effect',
+  async () => {
+    // Control on the identical timing: the fourth observation replaces the live audit actor with a
+    // congruent plain object, and the run still spends. Only the reflection fault below changes, so
+    // the refusal afterwards cannot be attributed to the rewrite itself or to that observation.
+    const congruent = createHost({ hooks: { onAuthority(count, fixture) {
+      if (count === 4) fixture.auditContext.actor = { principalId: WORKLOAD.principalId,
+        workloadId: WORKLOAD.workloadId };
+    } } });
+    const congruentResult = await createBoundMappingUse(congruent.host).use();
+    assertFixedShape(congruentResult);
+    assert.equal(congruent.counters.authority, 4);
+    assert.equal(congruentResult.code, 'USED');
+    assert.equal(congruent.backend.state.calls, 1);
+    assert.equal(congruent.ledger.entries.length, 2);
+    assert.equal(cleared(congruent.backend.state.retained), true);
+
+    // The same replacement with an actor whose own key enumeration throws. The final guard re-reads
+    // the live actor inside the sealed segment, so this reflection fault is raised after the last
+    // awaited answer and after the material load. It is a guard, so it is one `WITHHELD` like any
+    // other refusal: `FAILED` is reserved for an effect that was really invoked and threw.
+    const trapped = createHost({ hooks: { onAuthority(count, fixture) {
+      if (count === 4) fixture.auditContext.actor = new Proxy(
+        { principalId: WORKLOAD.principalId, workloadId: WORKLOAD.workloadId },
+        { ownKeys() { throw new Error('synthetic actor reflection fault'); } });
+    } } });
+    const result = await createBoundMappingUse(trapped.host).use();
+    assertFixedShape(result);
+    assert.equal(trapped.counters.authority, 4);
+    assert.equal(result.code, 'WITHHELD');
+    // Zero opener and backend effects. The backend is the only route past the opener this file can
+    // observe, and it is never called, so no recovered identifier was ever handed to the resource.
+    assert.equal(trapped.backend.state.calls, 0);
+    assert.equal(cleared(trapped.backend.state.retained), false);
+    // The run reached the final observation, so both decisions were already recorded from the
+    // captured identity; the faulting actor is never handed to the append.
+    assert.equal(trapped.counters.material, 1);
+    assert.equal(trapped.ledger.entries.length, 2);
+    assert.equal(trapped.ledger.entries[0].event.kind, 'AUTHORIZATION_ATTEMPT');
+    assert.equal(trapped.ledger.entries[1].event.kind, 'POLICY_DECISION');
+  });
+
 test('an effect is spent only while the registry record is still ACTIVE at the backend', async () => {
   // The actual gap control, and the cheap way to see it. The live audit actor is the last host-owned
   // read before the fresh registry read, so a host that queues one finite revocation from it queues
