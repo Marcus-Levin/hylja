@@ -155,17 +155,20 @@ const CONFIG_DECODER = new TextDecoder('utf-8', { fatal: true });
  * carries rather than from a second look at the path: metadata first, then one non-blocking read-only
  * open, then the opened descriptor's own fstat, then exactly one read of at most `MAX_CONFIG_BYTES + 1`
  * bytes, then a close on every path. Returns the admitted bytes, or `null` for the fixed refusal:
- * absent, denied, non-regular, raced past the fstat, oversized, unreadable or undecodable. No path, byte
- * count, OS error, task or thrown message ever leaves this function.
+ * absent, denied, non-regular, raced past the fstat, oversized, short, unreadable or undecodable. No
+ * path, byte count, OS error, task or thrown message ever leaves this function.
  *
  * The descriptor, not the path this reader stat'd, decides the file type, so a substitution between the
  * two is caught rather than admitted; there is deliberately no second open of the path by name, which
  * would reopen the very window the check exists to close. The window is a byte count rather than a
  * decoded length, and the single byte past it is the oversize signal: a config that only fits by
- * character count, or one whose tail was cut off, is refused instead of parsed as if it were whole.
- * Exactly one read of one deterministically allocated buffer is issued, so the allocation and the bytes
- * this process holds from an operator-supplied path are both bounded; a short read is refused rather
- * than repaired, because only what that read actually delivered is admitted.
+ * character count is refused instead of parsed as if it were whole. Exactly one read of one
+ * deterministically allocated buffer is issued, and it must deliver every byte that descriptor reports:
+ * a short read is refused with no retry, because a truncated config can still be a parseable JSON
+ * prefix, and admitting one would admit a file that is not a config at all. The close is attempted on
+ * every path and belongs to that same admission: a descriptor this process could not close is not one it
+ * may claim it cleaned up, so a failed close withholds the bytes it had read. Withholding is a refusal
+ * of the read, never a claim that the descriptor was closed anyway.
  */
 export function readLaneConfigBytes(path) {
 	let stats;
@@ -178,23 +181,34 @@ export function readLaneConfigBytes(path) {
 	// Refused before it is opened, on any platform: the open is the only unbounded step here.
 	if (!stats.isFile() || stats.isDirectory()) return null;
 	let handle;
+	let bytes = null;
 	try {
 		handle = openSync(path, CONFIG_READ_OPEN_FLAGS);
-		if (!fstatSync(handle).isFile()) return null;
+		// The opened descriptor carries both the type and the size this read is judged against, so a
+		// substitution between the stat and the open is caught by the same call.
+		const opened = fstatSync(handle);
+		if (!opened.isFile()) return null;
 		const buffer = Buffer.alloc(MAX_CONFIG_BYTES + 1);
 		const read = readSync(handle, buffer, 0, buffer.length, 0);
-		return read > MAX_CONFIG_BYTES ? null : buffer.subarray(0, read);
+		// Complete or nothing. A read that delivered less than the size the descriptor itself reports
+		// truncated the config, and a truncated config can still be a parseable JSON prefix, so it is
+		// refused rather than retried, re-read or repaired. One read stays one read.
+		if (read <= MAX_CONFIG_BYTES && read === opened.size) bytes = buffer.subarray(0, read);
 	} catch {
 		return null;
 	} finally {
+		// The close is attempted on every path, and its outcome is part of the admission: a descriptor
+		// this process could not close is not one it may claim it cleaned up, so the pending bytes are
+		// withheld. That is a refusal of the read, not a proof that the descriptor is now closed.
 		if (handle !== undefined) {
 			try {
 				closeSync(handle);
 			} catch {
-				// A descriptor this process cannot close is not one it claims it opened.
+				bytes = null;
 			}
 		}
 	}
+	return bytes;
 }
 
 /**

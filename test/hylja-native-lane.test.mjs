@@ -2464,6 +2464,136 @@ test('the default config reader admits one bounded byte window, not a character 
 });
 
 /**
+ * Two faults a reader cannot see from its own happy path, both injected into the shipped default
+ * reader over a real temporary config. A fault handed only to a fake adapter would prove the fake.
+ *
+ * The short read is driven over a file that is a complete valid JSON config followed by bytes that
+ * are not JSON at all, so the only way to parse it is to parse a prefix and call that the file: the
+ * descriptor still reports the full size, and the delivered bytes stop inside the config.
+ */
+test('a short config read is refused without a retry, never admitted as a JSON prefix', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	const realOpen = nodeFs.openSync;
+	const realRead = nodeFs.readSync;
+	const realClose = nodeFs.closeSync;
+	const owned = new Set();
+	const reads = [];
+	let prefixBytes = 0;
+	try {
+		const valid = JSON.stringify({ ...config, key: PLANTED_CLI_KEY, task: PLANTED_CLI_TASK }, null, 2);
+		const trailing = '\nnot-a-json-config-synthetic-trailing.invalid\n';
+		writeFileSync(configPath, `${valid}${trailing}`);
+		prefixBytes = Buffer.byteLength(valid, 'utf8');
+		// The prefix is a whole valid config and the file is not: only a short read can admit the one
+		// while refusing the other.
+		assert.equal(JSON.parse(valid).key, PLANTED_CLI_KEY, 'the delivered prefix is complete valid JSON');
+		assert.throws(() => JSON.parse(readFileSync(configPath, 'utf8')), 'the config file as a whole is not valid JSON');
+		assert.equal(prefixBytes < statSync(configPath).size, true, 'the prefix stops inside the file');
+		nodeFs.openSync = (path, ...rest) => {
+			const fd = realOpen(path, ...rest);
+			if (path === configPath) owned.add(fd);
+			return fd;
+		};
+		// The fault: the descriptor delivers those bytes and reports only as many of them, which is
+		// what a short read looks like from inside the reader. Nothing else in this lane is patched.
+		nodeFs.readSync = (fd, buffer, offset, length, position) => {
+			if (!owned.has(fd)) return realRead(fd, buffer, offset, length, position);
+			const delivered = realRead(fd, buffer, offset, length, position);
+			const reported = Math.min(delivered, prefixBytes);
+			reads.push({ requested: length, reported });
+			return reported;
+		};
+		nodeFs.closeSync = (fd) => {
+			owned.delete(fd);
+			return realClose(fd);
+		};
+		syncBuiltinESMExports();
+		const record = [];
+		const result = await runNativeLane(['--config', configPath], { spawn: fakeSpawn({ record }) });
+		assert.equal(result.reason, SETUP_FAILURES.config, 'a short read is the fixed config refusal');
+		assert.equal(record.length, 0, 'a short read launches nothing');
+		assert.equal(reads.length, 1, `the read is issued once and never retried, got ${reads.length}`);
+		assert.equal(reads[0].requested, MAX_CONFIG_BYTES + 1, 'still one bounded window request, never a smaller one');
+		assert.equal(JSON.stringify(result).includes(PLANTED_CLI_KEY), false, 'no planted key in the refusal');
+		assert.equal(JSON.stringify(result).includes(PLANTED_CLI_TASK), false, 'no planted task in the refusal');
+		for (const written of [config.receipt, config.verification, config.progress, config.dispatch]) {
+			assert.equal(existsSync(written), false, `nothing was written to ${written}`);
+		}
+	} finally {
+		nodeFs.openSync = realOpen;
+		nodeFs.readSync = realRead;
+		nodeFs.closeSync = realClose;
+		syncBuiltinESMExports();
+		cleanup();
+	}
+});
+
+/**
+ * A close that fails is the other half of the same ownership claim. The descriptor is real and the
+ * bytes really were read, so the reader must still refuse: it may not report cleanup it did not get.
+ * The failed close leaves the descriptor open, so this test closes what it handed over rather than
+ * claiming the lane left nothing behind.
+ */
+test('a config close that fails withholds admission and launches no child', async () => {
+	const { config, configPath, cleanup } = tempConfig();
+	const realOpen = nodeFs.openSync;
+	const realClose = nodeFs.closeSync;
+	const owned = new Set();
+	const leaked = new Set();
+	try {
+		writeFileSync(configPath, JSON.stringify({ ...config, key: PLANTED_CLI_KEY, task: PLANTED_CLI_TASK }, null, 2));
+		nodeFs.openSync = (path, ...rest) => {
+			const fd = realOpen(path, ...rest);
+			if (path === configPath) owned.add(fd);
+			return fd;
+		};
+		// The fault: only the close of the descriptor the reader owns fails, and it fails before the
+		// descriptor is released, so the descriptor number stays valid and this test can close it.
+		nodeFs.closeSync = (fd) => {
+			if (!owned.has(fd)) return realClose(fd);
+			owned.delete(fd);
+			leaked.add(fd);
+			throw Object.assign(new Error('synthetic close failure'), { code: 'EIO' });
+		};
+		syncBuiltinESMExports();
+		const record = [];
+		const result = await runNativeLane(['--config', configPath], { spawn: fakeSpawn({ record }) });
+		// This test owns the descriptor the failed close left open, so it closes it here. That is
+		// cleanup the reader attempted and did not complete, not proof that it had closed anything.
+		const unclosed = [...leaked];
+		for (const fd of unclosed) {
+			try {
+				realClose(fd);
+			} catch {
+				// Already gone: nothing of this test's is left behind either way.
+			}
+		}
+		assert.equal(result.reason, SETUP_FAILURES.config, 'a failed close is the fixed config refusal');
+		assert.equal(record.length, 0, 'a failed close launches nothing');
+		assert.equal(unclosed.length, 1, 'exactly one descriptor was left for this test to close');
+		assert.equal(JSON.stringify(result).includes(PLANTED_CLI_KEY), false, 'no planted key in the refusal');
+		assert.equal(JSON.stringify(result).includes(PLANTED_CLI_TASK), false, 'no planted task in the refusal');
+		for (const written of [config.receipt, config.verification, config.progress, config.dispatch]) {
+			assert.equal(existsSync(written), false, `nothing was written to ${written}`);
+		}
+		// The control: the identical config over a close that works really launches the owned child,
+		// so the refusal above is the failed close and not a config this lane would never have run.
+		nodeFs.openSync = realOpen;
+		nodeFs.closeSync = realClose;
+		syncBuiltinESMExports();
+		const control = [];
+		const launched = await runNativeLane(['--config', configPath], { spawn: fakeSpawn({ record: control }) });
+		assert.equal(control.length, 1, 'a close that works admits the same config and launches the owned child');
+		assert.equal(launched.reason, SETUP_FAILURES.receipt, 'the synthetic child leaves no leaf evidence behind');
+	} finally {
+		nodeFs.openSync = realOpen;
+		nodeFs.closeSync = realClose;
+		syncBuiltinESMExports();
+		cleanup();
+	}
+});
+
+/**
  * The refusals that need this process to hand the reader a descriptor it did not admit: an open that
  * resolves to a directory, a read that fails, and a path that turns into a writer-less FIFO between
  * the metadata check and the open. That last one blocks for as long as it has to, so all three run in
