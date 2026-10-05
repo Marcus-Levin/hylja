@@ -18,6 +18,7 @@ command. Tests import `../dist/*.js`, so build once before any of them.
 | Request send point ([#174](https://github.com/Marcus-Levin/hylja/issues/174)) | [`test/openai-request-sendpoint.e2e.test.mjs`](../../test/openai-request-sendpoint.e2e.test.mjs) | [openai-request-sendpoint-e2e.md](../contracts/openai-request-sendpoint-e2e.md) | `node --test test/openai-request-sendpoint.e2e.test.mjs` |
 | Complete-response inspection ([#175](https://github.com/Marcus-Levin/hylja/issues/175)) | [`test/openai-response-inspection.e2e.test.mjs`](../../test/openai-response-inspection.e2e.test.mjs) | [openai-response-inspection-e2e.md](../contracts/openai-response-inspection-e2e.md) | `node --test test/openai-response-inspection.e2e.test.mjs` |
 | Mapping round trip ([#176](https://github.com/Marcus-Levin/hylja/issues/176)) | [`test/mapping-roundtrip.e2e.test.mjs`](../../test/mapping-roundtrip.e2e.test.mjs) | [mapping-roundtrip-e2e.md](../contracts/mapping-roundtrip-e2e.md) | `node --test test/mapping-roundtrip.e2e.test.mjs` |
+| HTTP framing round trip ([#209](https://github.com/Marcus-Levin/hylja/issues/209)) | [`test/openai-http-roundtrip.e2e.test.mjs`](../../test/openai-http-roundtrip.e2e.test.mjs) | [openai-keep-sender.md](../contracts/openai-keep-sender.md), [openai-text-response.md](../contracts/openai-text-response.md) | `node --test test/openai-http-roundtrip.e2e.test.mjs` |
 | Egress send point, earlier fixture evidence | [`test/egress-sendpoint.e2e.test.mjs`](../../test/egress-sendpoint.e2e.test.mjs) | [egress-sendpoint-e2e.md](egress-sendpoint-e2e.md) | `node --test test/egress-sendpoint.e2e.test.mjs` |
 
 ```sh
@@ -26,10 +27,11 @@ npm run build                        # required once: every test above imports d
 node --test test/openai-request-sendpoint.e2e.test.mjs
 node --test test/openai-response-inspection.e2e.test.mjs
 node --test test/mapping-roundtrip.e2e.test.mjs
+node --test test/openai-http-roundtrip.e2e.test.mjs
 node --test test/egress-sendpoint.e2e.test.mjs
 ```
 
-All four files match the `test/*.test.mjs` glob in the [`npm test`](../../package.json) script, so the
+All five files match the `test/*.test.mjs` glob in the [`npm test`](../../package.json) script, so the
 same files also run in the full suite. `npm run check:docs` and `npm run check:fixtures` cover the
 evidence records and the tracked paths.
 
