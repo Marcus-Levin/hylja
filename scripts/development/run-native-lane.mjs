@@ -12,6 +12,11 @@
  * child has settled; this process never retries, re-routes or carries a prior attempt forward, and
  * leaves every earlier artifact where it is.
  *
+ * The lane config is the one input read before any watchdog exists, so it is read through one bounded,
+ * owned descriptor rather than a second look at the path: a writer-less FIFO, a directory, a path that
+ * changes type between the metadata check and the open, a config past the byte window, bytes that are
+ * not UTF-8 and a failed read are each the fixed config refusal with zero children.
+ *
  * Every evidence path must be fresh, so a previous run's receipt, dispatch tuple, progress file or
  * verification record can never be reused as this run's evidence. The dispatch tuple the controller
  * persisted before emitting its request is mandatory: a receipt from a different attempt, a nonzero
@@ -24,7 +29,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -47,7 +52,11 @@ import {
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const ARTIFACT_SUFFIXES = ['_meta.json', '_output.md'];
-const MAX_CONFIG_BYTES = 65_536;
+/**
+ * The byte window one lane config may occupy. The shipped reader asks for one byte past it, so a config
+ * that does not fit is refused on the byte that proves it, instead of being truncated and parsed.
+ */
+export const MAX_CONFIG_BYTES = 65_536;
 const MAX_TASK_CHARS = 1_048_576;
 /** Extra wall clock over the native request timeout before the watchdog stops the owned child. */
 export const WATCHDOG_GRACE_MS = 60_000;
@@ -126,8 +135,87 @@ export function readRoleProfile(agent, fs = defaultFs) {
 	return { model, timeoutMs };
 }
 
+/**
+ * The config read open: read-only, and non-blocking wherever the platform carries that flag, which is
+ * the same open the shipped reference probe uses. It is what keeps a path that becomes a FIFO between
+ * this reader's metadata check and its open from parking this host on a writer that may never arrive.
+ * Where the platform has no such flag the open is an ordinary read-only one, and the descriptor type
+ * check below is the only guard left; that limit is stated rather than assumed.
+ */
+const CONFIG_READ_OPEN_FLAGS = constants.O_RDONLY | (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0);
+
+/**
+ * A fatal decode, because a config byte that is not UTF-8 is a refusal and never a repaired
+ * replacement character inside a task, a path or a declared reference.
+ */
+const CONFIG_DECODER = new TextDecoder('utf-8', { fatal: true });
+
+/**
+ * Reads the lane config through one descriptor this process owns, from the bytes that descriptor
+ * carries rather than from a second look at the path: metadata first, then one non-blocking read-only
+ * open, then the opened descriptor's own fstat, then exactly one read of at most `MAX_CONFIG_BYTES + 1`
+ * bytes, then a close on every path. Returns the admitted bytes, or `null` for the fixed refusal:
+ * absent, denied, non-regular, raced past the fstat, oversized, unreadable or undecodable. No path, byte
+ * count, OS error, task or thrown message ever leaves this function.
+ *
+ * The descriptor, not the path this reader stat'd, decides the file type, so a substitution between the
+ * two is caught rather than admitted; there is deliberately no second open of the path by name, which
+ * would reopen the very window the check exists to close. The window is a byte count rather than a
+ * decoded length, and the single byte past it is the oversize signal: a config that only fits by
+ * character count, or one whose tail was cut off, is refused instead of parsed as if it were whole.
+ * Exactly one read of one deterministically allocated buffer is issued, so the allocation and the bytes
+ * this process holds from an operator-supplied path are both bounded; a short read is refused rather
+ * than repaired, because only what that read actually delivered is admitted.
+ */
+export function readLaneConfigBytes(path) {
+	let stats;
+	try {
+		stats = statSync(path);
+	} catch {
+		// No readable metadata at all: absent, a broken link, or a denied path component.
+		return null;
+	}
+	// Refused before it is opened, on any platform: the open is the only unbounded step here.
+	if (!stats.isFile() || stats.isDirectory()) return null;
+	let handle;
+	try {
+		handle = openSync(path, CONFIG_READ_OPEN_FLAGS);
+		if (!fstatSync(handle).isFile()) return null;
+		const buffer = Buffer.alloc(MAX_CONFIG_BYTES + 1);
+		const read = readSync(handle, buffer, 0, buffer.length, 0);
+		return read > MAX_CONFIG_BYTES ? null : buffer.subarray(0, read);
+	} catch {
+		return null;
+	} finally {
+		if (handle !== undefined) {
+			try {
+				closeSync(handle);
+			} catch {
+				// A descriptor this process cannot close is not one it claims it opened.
+			}
+		}
+	}
+}
+
+/**
+ * The seam the shipped reader sits behind. A host that injects its own reader owns what it admits and
+ * answers with those bytes; anything else it returns, including a string decoded somewhere else, is the
+ * fixed refusal, because a repaired string is exactly what this bound exists to remove.
+ */
+const readConfigBytes = (fs, path) => {
+	try {
+		const reader = typeof fs.readConfig === 'function' ? fs.readConfig : readLaneConfigBytes;
+		const bytes = reader(path);
+		return Buffer.isBuffer(bytes) ? bytes : null;
+	} catch {
+		// An injected reader that fails is contained here, exactly like the shipped one.
+		return null;
+	}
+};
+
 const defaultFs = {
 	readFile: (path) => readFileSync(path, 'utf8'),
+	readConfig: readLaneConfigBytes,
 	exists: existsSync,
 	// Bounded metadata over one declared reference path: stat plus one open that reads nothing and is
 	// closed immediately. Absent, broken and denied paths answer null and are never admitted, and a
@@ -580,10 +668,15 @@ export async function runNativeLane(argv, deps = {}) {
 	if (argv[0] !== '--config' || typeof configArg !== 'string' || !configArg.startsWith('/')) return fail(SETUP_FAILURES.argv);
 	context.configPath = configArg;
 	if (context.fs.exists(configArg) === false) return fail(SETUP_FAILURES.install);
-	if (context.fs.readFile(configArg).length > MAX_CONFIG_BYTES) return fail(SETUP_FAILURES.config);
+	// One owned, bounded read of exactly the bytes the descriptor carried. Absent, denied, non-regular,
+	// raced, oversized, unreadable and undecodable are all the same fixed refusal here, with zero
+	// children, because no watchdog exists yet to bound anything a config path could otherwise make
+	// this process wait on.
 	let raw;
 	try {
-		raw = JSON.parse(context.fs.readFile(configArg));
+		const bytes = readConfigBytes(context.fs, configArg);
+		if (bytes === null) return fail(SETUP_FAILURES.config);
+		raw = JSON.parse(CONFIG_DECODER.decode(bytes));
 	} catch {
 		return fail(SETUP_FAILURES.config);
 	}
