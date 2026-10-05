@@ -8,9 +8,9 @@
  * whether one whole-value configured `ENGINEERING_IDENTIFIER` corroborates a value that matches the
  * synthetic-only grammar `^SYNTHETIC-ASSET-[A-Z0-9]{1,64}$` inside at most 128 ASCII bytes.
  *
- * "Whole value" is a matched span, not a covered one: #10 extends a template match over the rest of an
- * identifier, and this seam requires the offsets #10 actually matched to be the whole value as well, so an
- * unconfigured tail that coverage reached is refused instead of admitted
+ * "Whole value" is a matched unit, not a covered one: #10 extends a template match over the rest of an
+ * identifier, and this seam additionally requires the genuine matcher to report that it matched the whole
+ * unit it scanned, so an unconfigured tail that coverage reached is refused instead of admitted
  * ([decision 012](../../docs/decisions/012-synthetic-engineering-custody-preconditions.md) 1).
  *
  * On success it returns owned classification and digest evidence plus a **reversible session
@@ -31,12 +31,13 @@
  * original, not anonymized customer data and not authority.
  *
  * The byte boundary is honest rather than defensive prose: the `Uint8Array` length accessor validates the
- * internal slot a `Proxy` never has, so proxied bytes are refused by the engine before any element is read,
- * and the at most 128 elements that are read are each read once as a plain ASCII integer. Every caller
- * supplied member - including the nested scope and the optional `fieldKey` - is an own enumerable data
- * descriptor, and every failure inside the boundary leaves as one fixed refusal code rather than an
- * exception carrying planted text. The owned copy is zero-filled on every exit, including a failure thrown
- * part-way through copying it.
+ * internal slot a `Proxy` never has and is the **first** thing that touches the caller's bytes - no brand
+ * check, prototype read or trap runs before it - so proxied bytes are refused by the engine itself before
+ * any element is read, and the at most 128 elements that are read are each read once as a plain ASCII
+ * integer. Every caller supplied member - including the nested scope and the optional `fieldKey` - is an own
+ * enumerable data descriptor, and every failure inside the boundary leaves as one fixed refusal code rather
+ * than an exception carrying planted text. The owned copy is zero-filled on every exit, including a failure
+ * thrown part-way through copying it.
  */
 import { createHash } from 'node:crypto';
 import { composeClassification, type ClassificationClaim, type ClassificationContext, type Sensitivity } from './classification.js';
@@ -85,7 +86,7 @@ const DOMAIN = 'hylja.synthetic-engineering-admission.source.v1\0';
 /** A lone surrogate is not a UTF-16 string, so it never belongs in a reference, a key path or a digest. */
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
 
-type TypedArrayLength = (this: Uint8Array) => number;
+type TypedArrayLength = (this: unknown) => number;
 /**
  * `%TypedArray%.prototype.length`. This accessor validates the typed-array internal slot, which a `Proxy`
  * never carries: calling it on a proxy is a plain host `TypeError` from the engine itself, with no trap and
@@ -139,11 +140,15 @@ function snapshot(value: unknown): { request: SyntheticAdmissionRequest | Admiss
   } catch { return { request: 'INVALID_REQUEST' }; }
 }
 /**
- * One owned copy of the original. The length comes from the `Uint8Array` intrinsic accessor, so a `Proxy`
- * around caller bytes never reaches the copy at all: there is no trap to run, no trap to throw and no
- * element that could be answered twice with different values. Each element is then read exactly once and
- * accepted only as a plain ASCII integer, so no coercion, comparison or text construction can ever turn one
- * value into another.
+ * One owned copy of the original. The **intrinsic length accessor is the first** thing that touches the
+ * caller's value: it validates the typed-array internal slot, which a `Proxy` never carries, so a proxied
+ * look-alike is refused by the engine itself. Nothing runs before that refusal - no `instanceof`, no
+ * prototype read, no trap - and only after it does the `Uint8Array` brand check run, on a value the engine
+ * has just proved is a genuine typed array with no `Proxy` behaviour. A `Proxy` around caller bytes
+ * therefore never reaches the copy at all: there is no trap to run, no trap to throw and no element that
+ * could be answered twice with different values. Each element is then read exactly once and accepted only
+ * as a plain ASCII integer, so no coercion, comparison or text construction can ever turn one value into
+ * another.
  *
  * Allocation and copying share **one** cleanup path. The buffer is allocated before a single byte is read,
  * so every partial state - a rejected byte, a thrown conversion, an out-of-memory allocation - is covered by
@@ -153,9 +158,17 @@ function snapshot(value: unknown): { request: SyntheticAdmissionRequest | Admiss
 function ownCopy(original: unknown): { bytes: Uint8Array; text: string } | AdmissionRefusal {
   let owned: Uint8Array | undefined;
   try {
-    if (!(original instanceof Uint8Array) || !TYPED_ARRAY_LENGTH) return 'INVALID_ORIGINAL';
-    const length = TYPED_ARRAY_LENGTH.call(original);
-    if (!Number.isSafeInteger(length) || length < 1 || length > MAX_SYNTHETIC_BYTES) return 'INVALID_ORIGINAL';
+    // The intrinsic length accessor is the FIRST thing that touches the caller's value. It validates the
+    // typed-array internal slot, which a `Proxy` never carries, so a proxied look-alike is refused by the
+    // engine itself before any brand check, prototype read or trap can run at all.
+    if (!TYPED_ARRAY_LENGTH) return 'INVALID_ORIGINAL';
+    const length: unknown = TYPED_ARRAY_LENGTH.call(original);
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 1 || length > MAX_SYNTHETIC_BYTES) {
+      return 'INVALID_ORIGINAL';
+    }
+    // Past that refusal the value is a genuine typed array that carries no `Proxy` behaviour, so this brand
+    // check is a plain type guard: the prototype it reads cannot answer with a caller trap.
+    if (!(original instanceof Uint8Array)) return 'INVALID_ORIGINAL';
     owned = new Uint8Array(length);
     let text = '';
     for (let index = 0; index < length; index += 1) {
@@ -209,9 +222,11 @@ export function inspectSyntheticEngineeringReference(value: unknown): SyntheticA
       }
       // #10 extends a template match over the rest of the identifier so a value is never covered in part.
       // That wider span is coverage, not corroboration: decision 012 requires the genuine source to have
-      // matched the **whole** value, so the matched offsets #6 reports beside the coverage must be the
-      // whole value too. A pattern candidate with no reported match cannot be shown to be one.
-      if (candidate.matchStart !== 0 || candidate.matchEnd !== text.length) return refused('PARTIAL_CANDIDATE');
+      // matched the **whole unit it scanned**, so the boolean #6 reports beside the coverage must be true.
+      // A candidate with no reported fact, or a false one, cannot be shown to be a whole-value match, and
+      // the flag is only ever read from a configured candidate this call itself produced: the caller
+      // supplies bytes, scope and a handle, never candidate evidence.
+      if (candidate.wholeUnitMatch !== true) return refused('PARTIAL_CANDIDATE');
       const claim = candidate.evidence.claim;
       if (claim.sensitivity === undefined) return refused('UNKNOWN_SENSITIVITY');
       if (claim.semanticType !== 'ENGINEERING_IDENTIFIER' || !claim.subtype) return refused('PARTIAL_CANDIDATE');

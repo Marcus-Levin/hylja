@@ -37,13 +37,17 @@ Grouping can only keep what the #6/#7 seam reports, so the seam's de-duplication
 
 A #6 **decoded view** keeps its own accepted representation instead: identical disjoint copies of one decoded run collapse into a single view whose `ENCODED_RUNS` envelope names every outer occurrence, and the in-view span of a match inside that view is its position in the decoded text. Two occurrences of one protected value *inside* that view text are two candidates, two units and two references.
 
-## Matched offsets beside coverage (#10 templates)
+## One whole-scan-unit match beside coverage (#10)
 
-#10 extends a template match forward over the rest of the identifier (`expand`) so a value is never covered in part. That widened span is **coverage**, not corroboration: `view.span` and `original` keep reporting it exactly as before. Beside it, a `CONFIGURED` candidate carries `matchStart`/`matchEnd` — the offsets the configured matcher itself matched. A `DICTIONARY`, `FIELD_HINT` or `CONTEXT` candidate never extends, so both members are present and equal to its coverage span; the members are absent for every other source.
+#10 extends a template match forward over the rest of the identifier (`expand`) so a value is never covered in part. That widened span is **coverage**, not corroboration: `view.span` and `original` keep reporting it exactly as before. Beside it, a `CONFIGURED` candidate carries `wholeUnitMatch` — one boolean, not offsets.
 
-Both members come from the registry-compiled configuration inside #10, never from caller text and never from a host assertion, so a consumer can require **whole-value corroboration** (`matchStart`/`matchEnd` equal to the whole value) instead of whole-value coverage. Adding them changes no span, no identity and no grouping rule in this contract; it is the same fact reported twice, once as what was seen and once as what was matched.
+`wholeUnitMatch` answers exactly one question: did #10's own matcher match the **whole scanned unit** it ran over? For `PATTERN` the scanned unit is the extended identifier and the flag is true only when the template match reached that unit's end, so a template plus an unconfigured tail that coverage happens to reach is false. `DICTIONARY`, `FIELD_HINT` and `CONTEXT` never extend: their match *is* their scanned unit, so the flag is true there. The member is absent for every source other than `CONFIGURED`.
 
-Composition reads the pair through the same closed-descriptor boundary as every other candidate member and requires it, when present, to be one bounded `start < end` pair of safe integers; a half-present, out-of-range or non-numeric pair is a malformed detection record and is refused like any other unknown member. The pair is then deliberately **not** kept on the unit: grouping places by the occurrence span, so a host that supplied its own match offsets changes nothing here.
+It is a fact about the unit #10 scanned and **not** a coordinate in the same domain as `view.span` or `original`. Those are derived after normalization: a `FIELD_HINT` on a parsed JSON value matches the decoded value it was handed while its coverage sits at that field's offset in the view, a folded match is mapped back to a covering span, and a decoded view reports an envelope. Only the boolean survives all of that unchanged, and only a consumer that already holds the coverage and its own original location can combine the two. Nothing here states that a nested, folded or decoded match sits at the same offsets as its coverage.
+
+The flag comes from the registry-compiled configuration inside #10, never from caller text and never from a host assertion, so a consumer can require **whole-value corroboration** instead of whole-value coverage. It changes no span, no identity and no grouping rule in this contract.
+
+Composition reads it through the same closed-descriptor boundary as every other candidate member: it must be a boolean, and it may appear only on a `CONFIGURED` candidate, since no other source has a configured matcher behind it. A non-boolean value, the same fact on a foreign source, or the numeric offset members an earlier draft of this seam accepted is a malformed detection record and is refused with `INVALID_DETECTION`, exactly like any other unknown member. The flag is then deliberately **not** kept on the unit: grouping places by the occurrence span, so a host that supplied its own fact changes nothing here.
 
 ## Configured contact sensitivity
 
@@ -74,4 +78,4 @@ Sensitivity is policy metadata. A payload never asserts one, no semantic model i
 3. read `unit.classification` for decisions, not `unit.detectorEvidence[].claim`, which is the detector's raw record and is retained for provenance only;
 4. decide **every** unit, including those a whole-value field hint or an over-covering detector match deliberately left separate;
 5. treat `PARTIAL`, `FAILURE` and any non-empty `uninspected` as opaque input to deterministic policy, never as clean content;
-6. when a decision needs whole-value corroboration rather than whole-value coverage, read the configured candidate's own `matchStart`/`matchEnd` beside `view.span`, and require the matched offsets to be the whole value.
+6. when a decision needs whole-value corroboration rather than whole-value coverage, require the configured candidate's own `wholeUnitMatch` to be `true`, beside the `view.span` and `original` location you already hold — and read it as what the matcher saw in its own scanned unit, never as an offset that must equal the coverage.

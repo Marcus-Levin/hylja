@@ -149,7 +149,9 @@ test('a caller getter is never invoked: the record is read through descriptors o
 test('caller byte changes after the call cannot change the evidence already returned', () => {
   const original = bytes(GOOD);
   const captured = inspect(original);
-  assert.deepEqual([...original], [...bytes(GOOD)], 'the caller keeps its own buffer');
+  // Boolean comparison only: a failed assertion here must never print the caller's byte array.
+  const unchanged = original.length === GOOD.length && original.every((byte, index) => byte === GOOD.charCodeAt(index));
+  assert.equal(unchanged, true, 'the caller keeps its own buffer');
   original.fill(0x41);
   assert.deepEqual(inspect(bytes(GOOD)), captured);
   assert.notEqual(inspect(original).sourceDigest, captured.sourceDigest);
@@ -175,7 +177,9 @@ test('review: only a genuine whole configured match corroborates; coverage alone
   assert.equal(inspect(bytes('SYNTHETIC-ASSET-1'), {}, exactConfig).outcome, 'CLASSIFIED');
   assert.equal(inspect(bytes('SYNTHETIC-ASSET-0042'), {}, rangeConfig).outcome, 'CLASSIFIED');
   // #10 extends a pattern match over the rest of the identifier. That is coverage, not corroboration:
-  // the unconfigured tail was never matched by the genuine source, so it cannot be admitted.
+  // the unconfigured tail was never matched by the genuine source, so it cannot be admitted. Both refusals
+  // below are the same fact seen through the real seam: a coverage of `0..length` and a matcher that
+  // stopped short of it, reported as one boolean and never as a coordinate this seam could verify.
   assert.equal(inspect(bytes('SYNTHETIC-ASSET-1UNCONFIGURED'), {}, exactConfig).reason, 'PARTIAL_CANDIDATE');
   assert.equal(inspect(bytes('SYNTHETIC-ASSET-12'), {}, exactConfig).reason, 'PARTIAL_CANDIDATE');
   assert.equal(inspect(bytes('SYNTHETIC-ASSET-1UNCONFIGURED'), {}, config).outcome, 'CLASSIFIED',
@@ -241,6 +245,17 @@ test('review: a proxied element is never read, so nothing is coerced and nothing
   assert.equal(result.sourceDigest, createHash('sha256')
     .update(`hylja.synthetic-engineering-admission.source.v1\0${GOOD}`).digest('hex'),
   'the owned bytes, the owned text and the source digest are one congruent value');
+});
+
+test('review: no brand check or prototype trap runs before the byte refusal', () => {
+  // A `Proxy` trap throws when the host brand-checks with `instanceof` or reads a prototype, so the refusal
+  // is only truthful when the intrinsic length accessor is reached first and the engine refuses it itself.
+  const trapped = new Proxy(bytes(GOOD), { getPrototypeOf: () => { throw new Error('planted-prototype'); } });
+  let prototypeTraps = 0;
+  const counted = new Proxy(bytes(GOOD), { getPrototypeOf: () => { prototypeTraps += 1; return Uint8Array.prototype; } });
+  assert.equal(refuse({ ...RECORD, original: trapped }).reason, 'INVALID_ORIGINAL');
+  assert.equal(refuse({ ...RECORD, original: counted }).reason, 'INVALID_ORIGINAL');
+  assert.equal(prototypeTraps, 0, 'the typed-array internal slot refuses a Proxy before any prototype trap runs');
 });
 
 test('review: a copy failure part-way through the loop still zero-fills the allocation', () => {

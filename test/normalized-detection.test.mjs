@@ -11,18 +11,41 @@ const b64 = (value) => Buffer.from(value, 'utf8').toString('base64');
 const hex = (value) => Buffer.from(value, 'utf8').toString('hex');
 const pct = (value) => [...Buffer.from(value, 'utf8')].map((byte) => `%${byte.toString(16).padStart(2, '0')}`).join('');
 
-test('review: #6 carries #10 matched spans beside coverage spans without changing either span', () => {
-  // Synthetic only: a made-up namespace, a one-digit template and an unconfigured tail.
-  const configured = createCandidateConfig(scope, { patterns: [{ template: 'SYNTHETIC-ASSET-{9:1}',
-    semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ASSET_TAG', sensitivity: 'INTERNAL' }] });
-  const at = (text) => run(text, { configured }).candidates.find((item) => item.source === 'CONFIGURED');
-  const whole = at('SYNTHETIC-ASSET-1');
-  assert.deepEqual([whole.matchStart, whole.matchEnd, whole.view.span.start, whole.view.span.end], [0, 17, 0, 17]);
-  assert.equal(whole.original.kind, 'ORIGINAL_EXACT');
-  const covered = at('SYNTHETIC-ASSET-1UNCONFIGURED');
-  assert.deepEqual([covered.matchStart, covered.matchEnd], [0, 17]);
-  assert.deepEqual([covered.view.span.start, covered.view.span.end, covered.original.span.end], [0, 29, 29],
-    'coverage still reaches the end of the identifier');
+test('review: #6 carries one boolean whole-scan-unit match beside coverage, in every base', () => {
+  // Synthetic only: a made-up namespace, a one-digit template, an unconfigured tail and an invented hint.
+  const configured = createCandidateConfig(scope, {
+    patterns: [{ template: 'SYNTHETIC-ASSET-{9:1}',
+      semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ASSET_TAG', sensitivity: 'INTERNAL' }],
+    fieldHints: [{ path: 'asset.tag', semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ASSET_TAG', sensitivity: 'INTERNAL' }],
+  });
+  const bases = (input) => run(input, { configured }).candidates.filter((item) => item.source === 'CONFIGURED');
+  const one = (input, basis) => bases(input).find((item) => item.basis === basis);
+  // RAW root text: a full template match is whole, coverage stays exact, and no numeric offset survives.
+  const whole = one('SYNTHETIC-ASSET-1', 'PATTERN');
+  assert.deepEqual([whole.wholeUnitMatch, whole.view.span.start, whole.view.span.end, whole.original.kind,
+    Object.hasOwn(whole, 'matchStart'), Object.hasOwn(whole, 'matchEnd')], [true, 0, 17, 'ORIGINAL_EXACT', false, false],
+  'the whole-value control keeps exact coverage and carries one boolean instead of offsets');
+  const covered = one('SYNTHETIC-ASSET-1UNCONFIGURED', 'PATTERN');
+  assert.deepEqual([covered.wholeUnitMatch, covered.view.span.start, covered.view.span.end, covered.original.span.end],
+    [false, 0, 29, 29], 'coverage still reaches the end of the identifier; the match flag does not follow it');
+  // FOLDED view: coverage is mapped back through the fold and stays a covering span; the flag answers for
+  // the folded unit the matcher actually scanned, so no coordinate equality with coverage is claimed.
+  const folded = one('Ｎｏｒｔｈｗｉｎｄ Synthetic AB and ＳＹＮＴＨＥＴＩＣ-ＡＳＳＥＴ-1UNCONFIGURED', 'PATTERN');
+  assert.deepEqual([folded.wholeUnitMatch, folded.view.representation, folded.view.span.start, folded.view.span.end,
+    folded.original.kind], [false, 'FOLDED', 27, 56, 'ORIGINAL_COVER'],
+  'a folded scan keeps its mapped covering coverage and says the tail was not matched');
+  // PARSED field: the hint matched the decoded value in full while coverage sits at the field's own offset,
+  // which is exactly the case a coordinate claim could not survive and a boolean does.
+  const parsed = one('{"asset":{"tag":"SYNTHETIC-ASSET-1"}}', 'FIELD_HINT');
+  assert.deepEqual([parsed.wholeUnitMatch, parsed.view.span.start, parsed.view.span.end, parsed.original.kind],
+    [true, 17, 34, 'ORIGINAL_EXACT'], 'a parsed field hint is whole for the value it matched');
+  // DECODED view: the same value inside a decoded view keeps its envelope and its relocated coverage.
+  const decoded = one(b64('{"asset":{"tag":"SYNTHETIC-ASSET-1"}}'), 'FIELD_HINT');
+  assert.deepEqual([decoded.wholeUnitMatch, decoded.view.span.start, decoded.view.span.end, decoded.original.kind],
+    [true, 17, 34, 'ENCODED_RUNS'], 'a decoded view keeps its encoded envelope and an honest match flag');
+  const decodedTail = one(b64('{"asset":{"tag":"SYNTHETIC-ASSET-1UNCONFIGURED"}}'), 'PATTERN');
+  assert.deepEqual([decodedTail.wholeUnitMatch, decodedTail.view.span.start, decodedTail.view.span.end,
+    decodedTail.original.kind], [false, 17, 46, 'ENCODED_RUNS'], 'a decoded tail is still not part of the match');
 });
 
 test('raw text candidates have exact root offsets and source-specific evidence', () => {
