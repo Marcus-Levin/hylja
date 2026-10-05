@@ -33,9 +33,10 @@ Minimal integration edits: `src/node-net.d.ts`, `src/node-crypto.d.ts` only for 
 native declarations; `package.json` only if a focused script is necessary;
 `docs/capabilities.md`, `docs/development/synthetic-e2e.md`, `docs/README.md` for honest routing.
 These are proposed scope, not permission granted by this packet. No dependency/lockfile change.
-Prerequisites: net-server declarations are absent; crypto declares only hex hash output,
-not timingSafeEqual/randomBytes. Verify native API shapes and add narrow declarations for
-server lifecycle and constant-time fixed-length digest comparison; never guess APIs.
+Prerequisites: net-server declarations and `timingSafeEqual` are absent.
+`randomBytes` already exists in `src/node-mapping-crypto.d.ts`; this listener does not need
+it because the host provisions the capability. Verify native API shapes and add only the
+narrow missing declarations for server lifecycle and constant-time digest comparison.
 Reuse conversation, sender, receiver, codecs, real policy and sentinel modules unchanged.
 Reuse synthetic fixture patterns without importing a test that schedules tests.
 
