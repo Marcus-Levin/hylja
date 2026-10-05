@@ -127,23 +127,44 @@ function policyBundle(decision = 'KEEP') {
  * The synthetic trusted local resource: a lookup over the handle its own record owns, provisioned out
  * of band. It returns one primitive boolean and nothing else. `retained` deliberately keeps the
  * buffer reference so this file can prove the executor's `finally` overwrote the bytes it owns; the
- * assertion reads only a boolean over those bytes, never the bytes themselves.
+ * assertion reads only a boolean over those bytes, never the bytes themselves. `bound` makes the
+ * method depend on its own receiver, and `applyFault` wraps it in a callable proxy whose invocation
+ * trap throws, so a caller that resolved a mutable property of the function instead of invoking it
+ * would be observed rather than trusted.
  */
-function createBackend({ handle = ORIGINAL, behaviour = 'match' } = {}) {
+function createBackend({ handle = ORIGINAL, behaviour = 'match', bound = false,
+  applyFault = false } = {}) {
   const provisioned = new TextEncoder().encode(handle);
   const state = { calls: 0, retained: undefined };
-  const lookup = (identifier) => {
-    state.calls += 1;
-    state.retained = identifier;
-    if (behaviour === 'throw') throw new Error('synthetic resource fault');
-    if (behaviour === 'non-boolean') return { matched: true };
-    let matched = identifier.byteLength === provisioned.byteLength;
-    for (let index = 0; index < provisioned.byteLength && matched; index += 1) {
-      matched = identifier[index] === provisioned[index];
-    }
-    return matched;
+  const backend = {
+    state,
+    lookup(identifier) {
+      if (bound && this !== backend) throw new Error('synthetic receiver fault');
+      state.calls += 1;
+      state.retained = identifier;
+      if (behaviour === 'throw') throw new Error('synthetic resource fault');
+      if (behaviour === 'non-boolean') return { matched: true };
+      let matched = identifier.byteLength === provisioned.byteLength;
+      for (let index = 0; index < provisioned.byteLength && matched; index += 1) {
+        matched = identifier[index] === provisioned[index];
+      }
+      return matched;
+    },
   };
-  return { lookup, state };
+  if (applyFault) {
+    const trapped = new Proxy(backend.lookup, { apply() {
+      throw new Error('synthetic invocation fault');
+    } });
+    return Object.freeze({ ...backend, lookup: trapped });
+  }
+  return backend;
+}
+/** A byte source that throws on one index read, so a copy of it is interrupted part-way through. */
+function interruptedBytes(bytes, faultAt = 5) {
+  return new Proxy(bytes, { get(target, property, receiver) {
+    if (property === String(faultAt)) throw new Error('synthetic byte fault');
+    return Reflect.get(target, property, receiver);
+  } });
 }
 function cleared(buffer) {
   if (buffer === undefined) return false;
@@ -161,6 +182,7 @@ function cleared(buffer) {
 function createHost(options = {}) {
   const scenario = options.scenario ?? buildScenario();
   const bundle = options.bundle ?? policyBundle('KEEP');
+  const classification = options.classification ?? EVIDENCE;
   const backend = options.backend ?? createBackend();
   const ledger = options.ledger ?? createInMemoryAuditLedger(
     { tenantId: scenario.scope.tenantId, projectId: scenario.scope.projectId });
@@ -179,8 +201,9 @@ function createHost(options = {}) {
     keyVersion: KEY_VERSION, now: USE_NOW };
   const counters = { authority: 0, material: 0 };
   const hooks = options.hooks ?? {};
+  const order = [];
   const fixture = { host: undefined, state, counters, scenario, backend, ledger, auditContext,
-    bundle, hooks };
+    bundle, hooks, order, source: scenario.envelope.ciphertext };
   const report = () => ({ version: 1, subject: { ...state.subject }, context: { ...state.context },
     destination: { ...state.destination },
     grant: state.grant === undefined ? undefined : { ...state.grant },
@@ -195,8 +218,8 @@ function createHost(options = {}) {
       components: [{ id: 'CLASSIFICATION_POLICY', version: '1' },
         { id: 'AUTHORIZATION_POLICY', version: '1' }] },
     policy: { version: 1, interactionRef: INTERACTION_REF, candidateRef: CANDIDATE_REF,
-      source: { ...SOURCE, trust: TRUST }, classification: EVIDENCE,
-      classificationDigest: digestClassification(EVIDENCE),
+      source: { ...SOURCE, trust: TRUST }, classification,
+      classificationDigest: digestClassification(classification),
       policy: { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(bundle) }, bundle },
     backend,
     authority: options.authority ?? (() => {
@@ -206,13 +229,47 @@ function createHost(options = {}) {
     }),
     material() {
       counters.material += 1;
+      order.push('material');
       if (typeof hooks.onMaterial === 'function') hooks.onMaterial(fixture);
-      return { version: 1, envelope: scenario.envelope,
+      const ciphertext = options.interruptedCiphertext
+        ? interruptedBytes(scenario.envelope.ciphertext) : scenario.envelope.ciphertext;
+      return { version: 1, envelope: { ...scenario.envelope, ciphertext },
         key: keyBytes(options.keyFill ?? 0x11),
         mappingRevision: options.materialRevision ?? String(record.revision),
         keyVersion: options.materialKeyVersion ?? state.keyVersion };
     },
   };
+  if (options.asyncAuthority) {
+    // A host callback documented as possibly asynchronous answers with a promise. The executor must
+    // await it before it is read, and every observation must settle inside the one `use()` call.
+    host.authority = async () => {
+      counters.authority += 1;
+      order.push('authority:start');
+      await new Promise((resolve) => { setTimeout(resolve, 1); });
+      if (typeof hooks.onAuthority === 'function') hooks.onAuthority(counters.authority, fixture);
+      order.push('authority:settled');
+      if (options.asyncAuthority === 'reject') throw new Error('synthetic authority fault');
+      return report();
+    };
+  }
+  if (options.receiverDependent) {
+    // Both callbacks read their own receiver's bound configuration, the way a real host method does.
+    const owner = host;
+    const answer = host.authority;
+    const supply = host.material;
+    host.authority = function () {
+      if (this !== owner || this.scope.tenantId !== SCOPE.tenantId || this.entityId !== ENTITY_ID) {
+        throw new Error('synthetic receiver fault');
+      }
+      return answer.call(this);
+    };
+    host.material = function () {
+      if (this !== owner || this.scope.sessionId !== SCOPE.sessionId || this.entityId !== ENTITY_ID) {
+        throw new Error('synthetic receiver fault');
+      }
+      return supply.call(this);
+    };
+  }
   fixture.host = host;
   return fixture;
 }
@@ -616,3 +673,195 @@ test('the recorded evidence carries pseudonyms and codes, never the recovered id
   assert.equal(manual.status, 'RECORDED');
   assert.equal(built.ledger.entries.length, 3);
 });
+
+/* ---------- 13. The recorded identity is owned, not read live from the host ---------- */
+
+test('an audit actor swapped during the material callback withholds before anything is recorded',
+  async () => {
+    // Positive control on the identical scenario: the congruent actor records both decisions.
+    const control = createHost();
+    assert.equal((await createBoundMappingUse(control.host).use()).code, 'USED');
+    assert.equal(control.ledger.entries.length, 2);
+
+    // The material callback re-points the trusted context's actor at another workload. The recorded
+    // decisions belong to this executor's reference, so an identity that changes in flight is a
+    // refusal, not a decision recorded under somebody else.
+    const swapped = createHost({ hooks: { onMaterial(fixture) {
+      fixture.auditContext.actor = { principalId: OTHER_WORKLOAD.principalId,
+        workloadId: OTHER_WORKLOAD.workloadId };
+    } } });
+    const afterSwap = await createBoundMappingUse(swapped.host).use();
+    assertFixedShape(afterSwap);
+    assert.equal(afterSwap.code, 'WITHHELD');
+    assert.equal(swapped.counters.material, 1);
+    assert.equal(swapped.backend.state.calls, 0);
+    // Nothing was written under either identity: the append is never handed the drifted actor.
+    assert.equal(swapped.ledger.entries.length, 0);
+    assert.equal(cleared(swapped.backend.state.retained), false);
+
+    // The same swap after the first decision is recorded: the one entry that exists was written from
+    // the captured identity, the second is never written, and the resource is never spent.
+    const late = createHost({ hooks: { onAuthority(count, fixture) {
+      if (count === 3) {
+        fixture.auditContext.actor = { principalId: OTHER_WORKLOAD.principalId,
+          workloadId: OTHER_WORKLOAD.workloadId };
+      }
+    } } });
+    const afterLateSwap = await createBoundMappingUse(late.host).use();
+    assert.equal(afterLateSwap.code, 'WITHHELD');
+    assert.equal(late.backend.state.calls, 0);
+    assert.equal(late.ledger.entries.length, 1);
+    assert.equal(late.ledger.entries[0].event.kind, 'AUTHORIZATION_ATTEMPT');
+  });
+
+/* ---------- 14. The sealed effect segment consults nothing of the host's ---------- */
+
+test('the effect segment resolves no mutable function property and re-reads no classification',
+  async () => {
+    // A captured backend method whose own `call` property is trapped. An effect segment that
+    // resolved `.call` would run the trap and never touch the resource; invoking the captured
+    // function on its captured receiver cannot reach the trap at all.
+    const provisioned = new TextEncoder().encode(ORIGINAL);
+    let realCalls = 0;
+    let trappedCalls = 0;
+    const genuine = function (identifier) {
+      realCalls += 1;
+      let same = identifier.byteLength === provisioned.byteLength;
+      for (let index = 0; index < provisioned.byteLength && same; index += 1) {
+        same = identifier[index] === provisioned[index];
+      }
+      return same;
+    };
+    const trap = () => { trappedCalls += 1; return true; };
+    const backend = { lookup: new Proxy(genuine, { get(target, property, receiver) {
+      if (property === 'call' || property === 'apply') { trappedCalls += 1; return trap; }
+      return Reflect.get(target, property, receiver);
+    } }) };
+    const built = createHost({ backend });
+    const result = await createBoundMappingUse(built.host).use();
+    // Ordering first: the backend saw the recovered bytes at all, so the segment ran, and it ran
+    // without resolving `call` or `apply` on the captured function.
+    assert.equal(trappedCalls, 0);
+    assert.equal(result.code, 'USED');
+    assert.equal(realCalls, 1);
+
+    // Two hosts whose only difference is that one reached the effect and the other was refused at
+    // its final policy decision. Reaching the effect reads nothing further from the host's own
+    // classification object, so the two read it exactly as often - one read apart would mean the
+    // sealed segment consulted it.
+    const counting = () => {
+      const counter = { reads: 0 };
+      const classification = new Proxy(EVIDENCE, { get(target, property, receiver) {
+        if (property === 'semanticType') counter.reads += 1;
+        return Reflect.get(target, property, receiver);
+      } });
+      return { counter, classification };
+    };
+    const served = counting();
+    const servedHost = createHost({ classification: served.classification });
+    const servedResult = await createBoundMappingUse(servedHost.host).use();
+    assert.equal(servedResult.code, 'USED');
+    const refused = counting();
+    const refusedHost = createHost({ classification: refused.classification,
+      hooks: { onAuthority(count, fixture) {
+        if (count === 4) fixture.bundle.rules[0].decision = 'BLOCK';
+      } } });
+    const refusedResult = await createBoundMappingUse(refusedHost.host).use();
+    assert.equal(refusedResult.code, 'WITHHELD');
+    assert.equal(refusedHost.backend.state.calls, 0);
+    // Like for like: both runs made every observation and recorded both decisions, and the only
+    // difference is the effect segment one of them entered.
+    assert.equal(servedHost.counters.authority, refusedHost.counters.authority);
+    assert.equal(servedHost.ledger.entries.length, refusedHost.ledger.entries.length);
+    assert.equal(served.counter.reads > 0, true);
+    assert.equal(served.counter.reads, refused.counter.reads);
+
+    // A classification that changes after the material load is refused before the resource, whether
+    // the change arrives as a value or as a revocation of the record it names.
+    const mutated = counting();
+    const mutatedHost = createHost({ classification: mutated.classification,
+      hooks: { onMaterial(fixture) {
+        fixture.host.registry.transition({ version: 1, mappingRef: fixture.host.mappingRef,
+          scope: { ...fixture.host.scope }, expectedRevision: 2, action: 'REVOKE' }, { now: USE_NOW });
+      } } });
+    const afterMutation = await createBoundMappingUse(mutatedHost.host).use();
+    assert.equal(afterMutation.code, 'WITHHELD');
+    assert.equal(mutatedHost.backend.state.calls, 0);
+    assert.equal(mutatedHost.counters.material, 1);
+  });
+
+/* ---------- 15. Host callbacks keep their own receiver and may answer asynchronously ---------- */
+
+test('a host method runs on its own receiver, and a promised answer is awaited before it is read',
+  async () => {
+    // Both host callbacks read their own receiver's bound scope and entity id, so an invocation that
+    // drops the receiver cannot answer at all.
+    const bound = createHost({ receiverDependent: true, backend: createBackend({ bound: true }) });
+    const boundResult = await createBoundMappingUse(bound.host).use();
+    assertFixedShape(boundResult);
+    assert.equal(boundResult.code, 'USED');
+    assert.equal(bound.counters.authority, 4);
+    assert.equal(bound.counters.material, 1);
+    assert.equal(bound.backend.state.calls, 1);
+    assert.equal(bound.ledger.entries.length, 2);
+
+    // A host that answers each observation with a promise settles every one of them inside the call,
+    // before the material is loaded and long before any byte is spent.
+    const promised = createHost({ asyncAuthority: 'resolve' });
+    const promisedResult = await createBoundMappingUse(promised.host).use();
+    assertFixedShape(promisedResult);
+    assert.equal(promisedResult.code, 'USED');
+    assert.equal(promised.counters.authority, 4);
+    assert.equal(promised.counters.material, 1);
+    assert.equal(promised.backend.state.calls, 1);
+    assert.equal(promised.ledger.entries.length, 2);
+    assert.deepEqual(promised.order.slice(0, 2), ['authority:start', 'authority:settled']);
+    assert.equal(promised.order.length, 9);
+    assert.equal(promised.order.indexOf('material') > 1, true);
+    assert.equal(promised.order.lastIndexOf('authority:settled') > promised.order.indexOf('material'),
+      true);
+
+    // A rejected promise is one refusal like any other: no material, no record, no effect, and
+    // nothing of it survives the call that awaited it.
+    const refused = createHost({ asyncAuthority: 'reject' });
+    const refusedResult = await createBoundMappingUse(refused.host).use();
+    assert.equal(refusedResult.code, 'WITHHELD');
+    assert.equal(refused.counters.material, 0);
+    assert.equal(refused.backend.state.calls, 0);
+    assert.equal(refused.ledger.entries.length, 0);
+  });
+
+/* ---------- 16. Exceptional paths before the effect are refusals, not reached effects ---------- */
+
+test('a byte source that throws mid-copy, and a host fault before the effect, both withhold',
+  async () => {
+    const torn = createHost({ interruptedCiphertext: true });
+    const tornResult = await createBoundMappingUse(torn.host).use();
+    assertFixedShape(tornResult);
+    // An index read that throws part-way through a copy never reaches the resource and is never
+    // reported as a reached effect: the interruption is a refusal, and the copied bytes it left
+    // behind are this module's own to overwrite.
+    assert.equal(tornResult.code, 'WITHHELD');
+    assert.equal(torn.counters.material, 1);
+    assert.equal(torn.backend.state.calls, 0);
+    assert.equal(torn.ledger.entries.length, 0);
+    assert.equal(cleared(torn.backend.state.retained), false);
+    // The host's own buffers belong to the host: this module overwrites only what it copied.
+    assert.notEqual(torn.source[0], 0);
+
+    const faulting = createHost({ authority: () => { throw new Error('synthetic host fault'); } });
+    const faulted = await createBoundMappingUse(faulting.host).use();
+    assert.equal(faulted.code, 'WITHHELD');
+    assert.equal(faulting.counters.material, 0);
+    assert.equal(faulting.backend.state.calls, 0);
+    assert.equal(faulting.ledger.entries.length, 0);
+  });
+
+test('an invocation that faults inside the reached effect segment is FAILED and clears the bytes',
+  async () => {
+    const trapped = createBackend({ applyFault: true });
+    const result = await createBoundMappingUse(createHost({ backend: trapped }).host).use();
+    assertFixedShape(result);
+    assert.equal(result.code, 'FAILED');
+    assert.equal(trapped.state.calls, 0);
+  });

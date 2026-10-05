@@ -21,28 +21,39 @@
  *   3. require an actual `AUTHORIZED` decision from `authorizeMappingOperation` for `USE`;
  *   4. require an actual `SELECTED`/`KEEP` decision from `decidePolicy` for `USE`;
  *   5. require the audit substrate's recorded actor to be this authenticated subject;
- *   6. load the sealed material and the DEK - the only awaits, and no plaintext exists yet;
- *   7. after that callback, and after **every** later external callback, re-observe the coherent
- *      authority, re-read the real registry, reauthorize and rerun the real policy, requiring an
- *      unchanged revision and key version and congruence with the actor, scope, classification,
- *      destination and policy decision already recorded;
- *   8. record the authorization attempt and the policy decision through the real
+ *   6. capture the owned immutable audit identity: the trusted context's actor is read once into a
+ *      frozen snapshot that must be congruent with the authenticated subject, and the append below
+ *      is handed that snapshot rather than the host's live actor;
+ *   7. load the sealed material and the DEK into owned copies. Every authority answer and the
+ *      material answer may be a promise and is awaited before it is read, and no plaintext exists at
+ *      any of those awaits;
+ *   8. after that callback, and after **every** later external callback, re-observe the coherent
+ *      authority, re-read the real registry, reauthorize and rerun the real policy, require the live
+ *      audit actor to still be the captured one, and require an unchanged revision and key version
+ *      and congruence with the actor, scope, classification, destination and policy decision already
+ *      recorded;
+ *   9. record the authorization attempt and the policy decision through the real
  *      `appendAuditEvent`, gating each one on `gateHighRiskEffect` applied to the value that
  *      `appendAuditEvent` itself returned, then re-observe again;
- *   9. from the last guard to the effect there is no await, no host property lookup and no dynamic
- *      function lookup: the real `openMappingPayload` opens an independently established expected
- *      AAD and the **captured** synchronous backend decides on the recovered bytes;
- *  10. only a primitive boolean from that backend becomes `USED` or `NOT_FOUND`. Every owned byte
- *      buffer - the envelope copies, the DEK copy and the recovered plaintext - is overwritten in one
- *      `finally` on the success path and on every exceptional path.
+ *  10. from the last guard to the effect there is no await, no host property lookup and no dynamic
+ *      function lookup: captured classification primitives and one captured `Reflect.apply` feed the
+ *      real `openMappingPayload` on an independently established expected AAD, and the **captured**
+ *      synchronous backend is invoked on its own receiver with the recovered bytes;
+ *  11. only a primitive boolean from that backend becomes `USED` or `NOT_FOUND`. Every owned byte
+ *      buffer - each envelope copy, the DEK copy and the recovered plaintext - is enrolled the
+ *      moment it comes into existence and overwritten in one `finally` on the success path and on
+ *      every exceptional path, including a copy interrupted by a throwing byte read.
  *
  * Refusal vocabulary. Every internal refusal - a refused registry read, a denied authorization, a
  * `BLOCK` or `HELD` policy decision, an absent audit record, a superseded revision, a rotated key, an
  * expired instant, a changed actor or route, an opaque hostile callback, a reentrant or overlapping
  * call, or an opener refusal - is one fixed `WITHHELD`. The internal reason never reaches the caller.
- * `FAILED` is reserved for the one thing a refusal cannot describe: the effect was reached and could
- * not be completed, which is a backend that threw or returned something other than a primitive
- * boolean. Neither `WITHHELD` nor `FAILED` ever performs, claims or reports a `USE`.
+ * `FAILED` is reserved for the one thing a refusal cannot describe: the sealed effect segment was
+ * reached and could not be completed, which is an opener or a backend that threw. A reflection,
+ * enumeration or index fault anywhere **before** that segment is a `WITHHELD` like any other guard
+ * refusal, never an escape and never a `FAILED`. A backend that answers with anything but a
+ * primitive boolean is a `WITHHELD` too: a claim is never bought by a malformed answer. Neither
+ * `WITHHELD` nor `FAILED` ever performs, claims or reports a `USE`.
  *
  * What this is not
  * - **Not a broker, vault, store or index.** It resolves no original, holds no mapping table, exposes
@@ -183,9 +194,30 @@ function isRefusal(error: unknown): boolean {
   } catch { return false; }
 }
 function fail(code: Denial): never { throw new Refusal(code); }
-/** Runs one host call site. A throwing host callback is a refusal, never an escaped exception. */
+/** Runs one synchronous call site. A throwing host callback is a refusal, never an escaped exception. */
 function attempt<T>(invoke: () => T): T {
   try { return invoke(); } catch (error) { if (isRefusal(error)) throw error; fail('HOST_FAULT'); }
+}
+
+/**
+ * One captured `Reflect.apply`, read once at module load. `fn.call(recv, x)` and `fn.apply(recv, xs)`
+ * resolve a mutable property of the function object at the moment they run, which is exactly the
+ * dynamic lookup the sealed effect segment forbids; this reference cannot be re-pointed afterwards.
+ */
+const REFLECT_APPLY = Reflect.apply;
+/** One captured opener reference. The effect segment invokes this binding, never a lookup. */
+const OPEN_PAYLOAD = openMappingPayload;
+/** Invokes one captured function on its own receiver. No `.call`, no `.apply`, no property lookup. */
+function invoke<T>(fn: (...args: never[]) => T, thisArg: unknown, args: readonly unknown[]): T {
+  return REFLECT_APPLY(fn, thisArg, args);
+}
+/**
+ * One host answer, awaited: a value or a promise, because a callback that is documented as possibly
+ * asynchronous is awaited before anything reads it. A throw and a rejection are the same refusal, so
+ * no rejected promise escapes this module and no promise outlives the call that awaited it.
+ */
+async function ask<T>(call: () => T | PromiseLike<T>): Promise<T> {
+  try { return await call(); } catch (error) { if (isRefusal(error)) throw error; fail('HOST_FAULT'); }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -258,6 +290,17 @@ function grant(value: unknown): TrustedMappingGrant {
 function equal(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
+/**
+ * One owned, immutable copy of the audit actor identity. The ledger takes the actor from the trusted
+ * context, so the executor owns the value it hands over: a host that mutates its own actor object
+ * mid-flight cannot re-attribute a decision this executor recorded.
+ */
+interface AuditActor { readonly principalId: string; readonly workloadId?: string }
+function auditActor(value: AuditTrustedContext): AuditActor {
+  const v = fields(attempt(() => value.actor), ['principalId'], ['workloadId']);
+  return Object.freeze({ principalId: text(v.principalId, 256),
+    ...(Object.hasOwn(v, 'workloadId') ? { workloadId: text(v.workloadId, 256) } : {}) });
+}
 
 /** One owned copy of one byte source. The declared length is validated before any allocation. */
 function snapshotBytes(value: unknown, maximum: number): Uint8Array {
@@ -266,13 +309,22 @@ function snapshotBytes(value: unknown, maximum: number): Uint8Array {
   if (typeof declared !== 'number' || !Number.isSafeInteger(declared) || declared < 0 ||
     declared > maximum) fail('MATERIAL_INVALID');
   const copy = new Uint8Array(declared);
-  for (let index = 0; index < declared; index += 1) {
-    const byte: unknown = value[index];
-    if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 0xff) {
-      copy.fill(0);
-      fail('MATERIAL_INVALID');
+  try {
+    for (let index = 0; index < declared; index += 1) {
+      const byte: unknown = value[index];
+      if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 0xff) {
+        copy.fill(0);
+        fail('MATERIAL_INVALID');
+      }
+      copy[index] = byte;
     }
-    copy[index] = byte;
+  } catch (error) {
+    // A byte source that throws mid-copy - a trapping proxy, a torn buffer - leaves a partial copy
+    // behind. That copy is already owned, so it is overwritten here rather than abandoned; a
+    // hostile source never gets an uncleaned DEK or envelope buffer and never an escaped exception.
+    copy.fill(0);
+    if (isRefusal(error)) throw error;
+    fail('MATERIAL_INVALID');
   }
   return copy;
 }
@@ -294,6 +346,8 @@ interface PolicyBinding {
 interface AuditBinding { ledger: AuditLedger; context: AuditTrustedContext; components: readonly { id: AuditBundleComponent; version: string }[] }
 interface FixedBindings {
   mappingRef: string; scope: MappingUseScope; entityId: string;
+  /** The validated host object itself, kept only as the receiver for its own callback methods. */
+  host: object;
   registry: MappingMetadataRegistry; readCurrent: MappingMetadataRegistry['current'];
   audit: AuditBinding; policy: PolicyBinding; backend: MappingUseBackend;
   authority: () => unknown; material: () => unknown;
@@ -347,6 +401,7 @@ function bindings(hostValue: unknown): FixedBindings {
     const authority = host.authority as () => unknown;
     const material = host.material as () => unknown;
     return Object.freeze({ mappingRef: text(host.mappingRef, 256), scope, entityId,
+      host: hostValue as object,
       registry, readCurrent: registry.current,
       audit: Object.freeze({ ledger, context: contextValue, components }),
       policy, backend, authority, material });
@@ -385,8 +440,8 @@ export function createBoundMappingUse(hostValue: unknown): BoundMappingUse {
     try {
       return await run(fixed);
     } catch (error) {
-      // A refusal is `WITHHELD`. Anything else escaped a host callback inside the effect segment -
-      // a backend that threw is the honest case - so the effect was reached and never completed.
+      // A refusal is `WITHHELD`. Anything else escaped the sealed effect segment itself - an opener
+      // or a backend that threw is the honest case - so the effect was reached and never completed.
       return isRefusal(error) ? WITHHELD : FAILED;
     } finally {
       busy = false;
@@ -400,11 +455,18 @@ export function createBoundMappingUse(hostValue: unknown): BoundMappingUse {
 // ---------------------------------------------------------------------------------------------
 interface Captured {
   fixed: FixedBindings;
+  /** The host object, and therefore the receiver every one of its own callback methods runs with. */
+  host: object;
   authority: () => unknown;
   material: () => unknown;
   /** The backend method and its receiver, captured together before any guard runs. */
   lookup: (identifier: Uint8Array) => boolean;
   receiver: MappingUseBackend;
+  /** The classification primitives this call governs, read once. The host object is not re-read. */
+  classification: { readonly semanticType: string; readonly sensitivity: string };
+  /** The owned immutable audit identity, and the frozen context the append is actually handed. */
+  actor: AuditActor;
+  auditContext: AuditTrustedContext;
 }
 interface Observation {
   now: number; subject: WorkloadSubject; context: RequestContext; destination: Destination;
@@ -417,15 +479,26 @@ interface Material {
   keyVersion: string;
 }
 interface State { observation: Observation; revision: number; decision: PolicyDecision }
+interface SealedEffect {
+  captured: Captured;
+  material: Material;
+  state: State;
+  /** The cleanup list, established by the load and extended by the opener's plaintext. */
+  owned: Uint8Array[];
+}
 
 /**
  * Captures every callback function and every receiver this call will use, once, before the first
- * guard. A method swapped, re-pointed or re-targeted after this point cannot change what runs, and no
- * property of the host is read again after the last guard below.
+ * guard. A method swapped, re-pointed or re-targeted after this point cannot change what runs, a
+ * host callback method runs with the host as its receiver, and no property of the host is read again
+ * after the last guard below.
  */
 function capture(fixed: FixedBindings): Captured {
+  const classification = fixed.policy.classification;
+  const actor = auditActor(fixed.audit.context);
   return Object.freeze({
     fixed,
+    host: fixed.host,
     authority: attempt(() => fixed.authority),
     material: attempt(() => fixed.material),
     lookup: attempt(() => {
@@ -435,12 +508,21 @@ function capture(fixed: FixedBindings): Captured {
       return lookup;
     }),
     receiver: fixed.backend,
+    classification: Object.freeze({
+      semanticType: attempt(() => text(classification.semanticType, 64)),
+      sensitivity: attempt(() => text(classification.sensitivity, 64)) }),
+    actor,
+    auditContext: Object.freeze({ ...fixed.audit.context, actor }),
   });
 }
 
-/** One coherent authority observation, normalized once. The bound scope is a structural gate. */
-function observe(captured: Captured): Observation {
-  const raw = attempt(() => captured.authority());
+/**
+ * One coherent authority observation, normalized once. The bound scope is a structural gate. The
+ * answer may be a promise because a host callback is documented as possibly asynchronous: it is
+ * awaited here, before anything reads it, and never outside the call that awaited it.
+ */
+async function observe(captured: Captured): Promise<Observation> {
+  const raw = await ask(() => invoke(captured.authority, captured.host, []));
   if (raw === null || typeof raw !== 'object') fail('INVALID_AUTHORITY');
   const v = fields(raw, ['version', 'subject', 'context', 'destination', 'grant', 'keyVersion', 'now']);
   if (v.version !== 1) fail('INVALID_AUTHORITY');
@@ -458,9 +540,9 @@ function observe(captured: Captured): Observation {
 function liveRecord(captured: Captured, now: number): MappingMetadataRecord {
   const { registry, readCurrent, mappingRef, scope } = captured.fixed;
   return attempt(() => {
-    const found = readCurrent.call(registry, { version: 1, mappingRef,
+    const found = invoke(readCurrent, registry, [{ version: 1, mappingRef,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId } },
-    { now });
+    { now }]);
     if (found === null || typeof found !== 'object' || found.state !== 'FOUND') fail('NOT_CURRENT');
     const record = found.metadata;
     if (record === null || typeof record !== 'object' || record.state !== 'ACTIVE') fail('NOT_ACTIVE');
@@ -470,15 +552,15 @@ function liveRecord(captured: Captured, now: number): MappingMetadataRecord {
 
 /** The real purpose-bound authorization seam, for `USE` only, on the grant this observation read. */
 function authorize(captured: Captured, observed: Observation, record: MappingMetadataRecord): void {
-  const { mappingRef, policy: pinned } = captured.fixed;
-  const semanticType = pinned.classification.semanticType;
+  const { mappingRef } = captured.fixed;
+  const { semanticType, sensitivity } = captured.classification;
   const decision = attempt(() => authorizeMappingOperation(
     { version: 1, mappingRef, subject: { ...observed.subject }, context: { ...observed.context },
       destination: { ...observed.destination }, operation: 'USE' },
     { authenticated: { subject: { ...observed.subject }, context: { ...observed.context } },
       observed: { destination: { ...observed.destination } } },
     { version: 1, mappingRef: record.mappingRef, scope: { ...record.scope },
-      lifecycle: record.state, semanticType, sensitivity: pinned.classification.sensitivity,
+      lifecycle: record.state, semanticType, sensitivity,
       revision: record.revision, expiresAt: record.expiresAt },
     observed.grant, { now: observed.now }));
   if (decision.state !== 'AUTHORIZED') fail('UNAUTHORIZED');
@@ -506,26 +588,24 @@ function selectPolicy(captured: Captured, observed: Observation): PolicyDecision
 }
 
 /**
- * The recorded actor must be the authenticated subject. The audit ledger takes the actor from its
- * trusted context and never from a draft, so a host recording someone else's USE under this
- * executor's reference is refused before anything is written.
+ * The recorded actor must be the authenticated subject, and must still be that actor. The ledger
+ * takes the actor from its trusted context and never from a draft, so the executor hands the append
+ * its own frozen snapshot of that actor; the host's live actor is re-read at every recheck and a
+ * host that swaps its actor mid-flight is refused before anything it would misattribute is written.
  */
 function bindAuditActor(captured: Captured, observed: Observation): void {
-  const contextValue = captured.fixed.audit.context;
-  const actor = attempt(() => contextValue.actor as { principalId: unknown; workloadId?: unknown });
-  if (actor === null || typeof actor !== 'object' || actor.principalId !== observed.subject.principalId) {
+  const actor = captured.actor;
+  if (actor.principalId !== observed.subject.principalId ||
+    (actor.workloadId ?? null) !== observed.subject.workloadId) fail('AUDIT_ACTOR');
+  const live = auditActor(captured.fixed.audit.context);
+  if (live.principalId !== actor.principalId || (live.workloadId ?? null) !== (actor.workloadId ?? null)) {
     fail('AUDIT_ACTOR');
   }
-  if ((actor.workloadId ?? null) !== observed.subject.workloadId) fail('AUDIT_ACTOR');
 }
 
-/** Loads the sealed record and the DEK into owned copies. This is the only awaiting boundary. */
+/** Loads the sealed record and the DEK into owned copies. This is the material awaiting boundary. */
 async function loadMaterial(captured: Captured, owned: Uint8Array[]): Promise<Material> {
-  let raw: unknown;
-  try { raw = await captured.material(); } catch (error) {
-    if (isRefusal(error)) throw error;
-    fail('HOST_FAULT');
-  }
+  const raw = await ask(() => invoke(captured.material, captured.host, []));
   const v = fields(raw, ['version', 'envelope', 'key', 'mappingRevision', 'keyVersion']);
   if (v.version !== 1) fail('MATERIAL_INVALID');
   const revision = text(v.mappingRevision, 12);
@@ -533,25 +613,28 @@ async function loadMaterial(captured: Captured, owned: Uint8Array[]): Promise<Ma
   if (!REVISION.test(revision) || !KEY_VERSION.test(keyVersion)) fail('MATERIAL_INVALID');
   const envelope = fields(v.envelope, ['version', 'nonce', 'ciphertext', 'tag']);
   if (envelope.version !== 1) fail('MATERIAL_INVALID');
+  // Each copy is enrolled in cleanup the moment it exists, never after the whole load succeeds: a
+  // failure on a later copy cannot abandon the DEK or envelope bytes an earlier copy already holds.
   const nonce = snapshotBytes(envelope.nonce, MAPPING_AEAD_LIMITS.nonceBytes);
+  owned.push(nonce);
   const tag = snapshotBytes(envelope.tag, MAPPING_AEAD_LIMITS.tagBytes);
+  owned.push(tag);
   const ciphertext = snapshotBytes(envelope.ciphertext, MAPPING_AEAD_LIMITS.ciphertextBytes);
-  if (ciphertext.byteLength === 0) {
-    nonce.fill(0); tag.fill(0);
-    fail('MATERIAL_INVALID');
-  }
+  owned.push(ciphertext);
+  if (ciphertext.byteLength === 0) fail('MATERIAL_INVALID');
   const key = snapshotBytes(v.key, MAPPING_AEAD_LIMITS.keyBytes);
-  owned.push(nonce, tag, ciphertext, key);
+  owned.push(key);
   return { envelope: Object.freeze({ version: 1, nonce, ciphertext, tag }), key,
     revision, keyVersion };
 }
 
 /**
  * The recheck that runs after every external callback: authority, clock, registry, authorization and
- * policy are all read again, and the material must still be the material this instant would use.
+ * policy are all read again, the audit actor must still be the captured one, and the material must
+ * still be the material this instant would use.
  */
-function recheck(captured: Captured, material: Material, previous: State): State {
-  const observed = observe(captured);
+async function recheck(captured: Captured, material: Material, previous: State): Promise<State> {
+  const observed = await observe(captured);
   if (observed.now < previous.observation.now) fail('CLOCK');
   if (!equal(observed.subject, previous.observation.subject) ||
     !equal(observed.context, previous.observation.context) ||
@@ -562,6 +645,7 @@ function recheck(captured: Captured, material: Material, previous: State): State
   authorize(captured, observed, record);
   const decision = selectPolicy(captured, observed);
   if (decision.decisionRef !== previous.decision.decisionRef) fail('NOT_CONGRUENT');
+  bindAuditActor(captured, observed);
   if (material.revision !== String(record.revision) || material.keyVersion !== observed.keyVersion) {
     fail('MATERIAL_STALE');
   }
@@ -571,7 +655,7 @@ function recheck(captured: Captured, material: Material, previous: State): State
 /** Appends one decision and gates the effect on the value the real append itself returned. */
 function appendDecision(captured: Captured, observed: Observation, state: State, kind: 'attempt'
   | 'policy'): void {
-  const { ledger, context: auditContext, components } = captured.fixed.audit;
+  const { ledger, components } = captured.fixed.audit;
   const pinned = captured.fixed.policy;
   const base = {
     version: 1 as const,
@@ -584,53 +668,74 @@ function appendDecision(captured: Captured, observed: Observation, state: State,
   const draft = kind === 'attempt'
     ? { ...base, kind: 'AUTHORIZATION_ATTEMPT' as const, reason: 'RESOLUTION_AUTHORIZED' as const,
       entityRef: captured.fixed.mappingRef, interactionRef: pinned.interactionRef,
-      classification: { semanticType: pinned.classification.semanticType,
-        sensitivity: pinned.classification.sensitivity } }
+      classification: { semanticType: captured.classification.semanticType,
+        sensitivity: captured.classification.sensitivity } }
     : { ...base, kind: 'POLICY_DECISION' as const, reason: 'POLICY_ALLOWED' as const,
       candidateRef: pinned.candidateRef,
       decision: { state: state.decision.state, treatment: state.decision.treatment,
         digest: state.decision.decisionRef ?? '0'.repeat(64) } };
-  const appended = attempt(() => appendAuditEvent(ledger, draft, auditContext));
+  const appended = attempt(() => appendAuditEvent(ledger, draft, captured.auditContext));
   const gate = attempt(() => gateHighRiskEffect(appended));
   if (!gate.permitted) fail('AUDIT_REFUSED');
 }
 
-/** The whole ordered path. Every owned byte buffer is overwritten in the `finally` below. */
-async function run(fixed: FixedBindings): Promise<MappingUseResult> {
-  const captured = capture(fixed);
-  const owned: Uint8Array[] = [];
+/**
+ * Everything that happens while a guard may still run. A reflection, enumeration or index fault out
+ * of a host value in here is one refusal - `WITHHELD` - and never an escaped exception that would
+ * be reported as a reached effect.
+ */
+async function prepare(fixed: FixedBindings, owned: Uint8Array[]): Promise<SealedEffect> {
   try {
-    const observed = observe(captured);
+    const captured = capture(fixed);
+    const observed = await observe(captured);
     const record = liveRecord(captured, observed.now);
     authorize(captured, observed, record);
     const decision = selectPolicy(captured, observed);
     bindAuditActor(captured, observed);
 
     const material = await loadMaterial(captured, owned);
-    let state = recheck(captured, material, { observation: observed, revision: record.revision,
-      decision });
+    let state = await recheck(captured, material, { observation: observed,
+      revision: record.revision, decision });
 
     appendDecision(captured, state.observation, state, 'attempt');
-    state = recheck(captured, material, state);
+    state = await recheck(captured, material, state);
     appendDecision(captured, state.observation, state, 'policy');
-    state = recheck(captured, material, state);
+    state = await recheck(captured, material, state);
+    return { captured, material, state, owned };
+  } catch (error) {
+    if (isRefusal(error)) throw error;
+    fail('HOST_FAULT');
+  }
+}
 
-    // ---- Sealed effect segment. No await, no host property lookup and no dynamic function lookup
-    // from here to the backend call: every value below was established before the last guard. ----
-    const { tenantId, projectId } = captured.fixed.scope;
-    const scope = Object.freeze({ tenantId, projectId, entityId: captured.fixed.entityId,
-      classification: captured.fixed.policy.classification.semanticType,
-      mappingRevision: String(state.revision), keyVersion: material.keyVersion });
-    const { envelope, key } = material;
-    const { lookup, receiver } = captured;
-    const opened = openMappingPayload({ scope, envelope, key });
-    if (opened.status !== 'OPENED') fail('OPEN_REFUSED');
-    const plaintext = opened.plaintext;
-    owned.push(plaintext);
-    const outcome = lookup.call(receiver, plaintext);
-    if (outcome === true) return USED;
-    if (outcome === false) return NOT_FOUND;
-    return fail('BACKEND_CONTRACT');
+/**
+ * The sealed effect segment. No await, no host property lookup and no dynamic function lookup from
+ * here to the backend call: the scope, the classification primitive, the invocation mechanics and
+ * both buffers were all established while guards could still run, and the only host object touched
+ * is the backend, through the captured function and its captured receiver.
+ */
+function effect(sealed: SealedEffect): MappingUseResult {
+  const { captured, material, state } = sealed;
+  const { tenantId, projectId } = captured.fixed.scope;
+  const scope = Object.freeze({ tenantId, projectId, entityId: captured.fixed.entityId,
+    classification: captured.classification.semanticType,
+    mappingRevision: String(state.revision), keyVersion: material.keyVersion });
+  const { envelope, key } = material;
+  const opened = OPEN_PAYLOAD({ scope, envelope, key });
+  if (opened.status !== 'OPENED') fail('OPEN_REFUSED');
+  const plaintext = opened.plaintext;
+  sealed.owned.push(plaintext);
+  const outcome = invoke(captured.lookup, captured.receiver, [plaintext]);
+  if (outcome === true) return USED;
+  if (outcome === false) return NOT_FOUND;
+  return fail('BACKEND_CONTRACT');
+}
+
+/** The whole ordered path. Every owned byte buffer is overwritten in the `finally` below. */
+async function run(fixed: FixedBindings): Promise<MappingUseResult> {
+  const owned: Uint8Array[] = [];
+  try {
+    return effect(await prepare(fixed, owned));
   } finally {
     for (const buffer of owned) buffer.fill(0);
     owned.length = 0;
