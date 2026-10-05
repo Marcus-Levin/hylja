@@ -456,34 +456,39 @@ function draftMessages(draft: InteractionDraft): readonly DraftMessage[] {
  * allowlisted: the caller contributes the endpoint (matched literally by the codec), the model and the
  * message texts, and nothing else. `Content-Length` is the only field derived from the body, so a
  * rebuilt body is the only thing that can change a header, and the trusted codec owns that bound.
+ *
+ * The body is encoded exactly once. That single buffer is both the body half of the framed image and
+ * the source of the `Content-Length` field, so no second copy of the wire bytes is ever allocated here
+ * for a length alone.
  */
 function frameImage(messages: readonly DraftMessage[], model: string, hostLabel: string): SendImage {
   const modelLiteral = JSON.stringify(model);
   const body = `{"model":${modelLiteral},"messages":[${messages
     .map((message) => `{"role":${JSON.stringify(message.role)},"content":${message.literal}}`).join(',')}]}`;
-  const head = [
-    `POST ${OPENAI_TEXT_REQUEST_ENDPOINT} HTTP/1.1`,
-    `Host: ${hostLabel}`,
-    `Content-Type: ${CONTENT_TYPE}`,
-    `Content-Length: ${encoder.encode(body).byteLength}`,
-    '', '',
-  ].join('\r\n');
-  // The two encode buffers exist only to be copied into the framed image, so they are this function's own
-  // temporaries and are zeroed before it returns. The framed `bytes` itself is owned by whoever built
-  // this image - the ORIGINAL image or the derivation - and is enrolled there instead.
-  const headBytes = encoder.encode(head);
+  // The body buffer is allocated first and is this function's own, so its own `finally` covers every
+  // step after it: encoding the head, allocating the framed image, and returning. The head buffer has
+  // the same status and is zeroed inside that window. The framed `bytes` itself is owned by whoever
+  // built this image - the ORIGINAL image or the derivation - and is enrolled there instead.
+  const bodyBytes = encoder.encode(body);
   try {
-    const bodyBytes = encoder.encode(body);
-    const bytes = new Uint8Array(headBytes.byteLength + bodyBytes.byteLength);
+    const head = [
+      `POST ${OPENAI_TEXT_REQUEST_ENDPOINT} HTTP/1.1`,
+      `Host: ${hostLabel}`,
+      `Content-Type: ${CONTENT_TYPE}`,
+      `Content-Length: ${bodyBytes.byteLength}`,
+      '', '',
+    ].join('\r\n');
+    const headBytes = encoder.encode(head);
     try {
+      const bytes = new Uint8Array(headBytes.byteLength + bodyBytes.byteLength);
       bytes.set(headBytes, 0);
       bytes.set(bodyBytes, headBytes.byteLength);
-    } finally { bodyBytes.fill(0); }
-    return Object.freeze({
-      bytes, metadataLength: headBytes.byteLength, hostLabel, body, model, modelLiteral, messages,
-      messageLiterals: Object.freeze(messages.map((message) => message.literal)),
-    });
-  } finally { headBytes.fill(0); }
+      return Object.freeze({
+        bytes, metadataLength: headBytes.byteLength, hostLabel, body, model, modelLiteral, messages,
+        messageLiterals: Object.freeze(messages.map((message) => message.literal)),
+      });
+    } finally { headBytes.fill(0); }
+  } finally { bodyBytes.fill(0); }
 }
 
 /** The ORIGINAL image: what the caller's body says, with no treatment applied anywhere. */
