@@ -132,7 +132,7 @@ import { AUDIT_BUNDLE_COMPONENTS, appendAuditEvent, gateHighRiskEffect } from '.
 import type { AuditBundleComponent, AuditLedger, AuditReasonCode, AuditTrustedContext } from './audit-ledger.js';
 import { decidePolicy } from './policy.js';
 import type { PolicyBundle, PolicyDecision } from './policy.js';
-import { authorizeMappingOperation } from './mapping-authorization.js';
+import { authorizeMappingOperation, MAPPING_AUTHORIZATION_OPERATIONS } from './mapping-authorization.js';
 import type { TrustedMappingGrant, WorkloadSubject } from './mapping-authorization.js';
 import { MAPPING_METADATA_REASONS } from './mapping-metadata-registry.js';
 import type { MappingMetadataCurrentResult, MappingMetadataRecord,
@@ -312,6 +312,14 @@ async function ask<T>(call: () => T | PromiseLike<T>): Promise<T> {
 type Fields = Record<string, unknown>;
 const MAX_KEYS = 16;
 const REF_LIMIT = 2048;
+/**
+ * Every authorization string this module hands to - or reads back out of - the purpose-bound seam is
+ * bounded the way **that seam** bounds it, not by this module's own wider reference limit: 256
+ * characters for an identity, a context or a destination profile, and only a destination `ref` gets
+ * the wider 2048. A value the seam would refuse as `INVALID_CONTEXT` is refused here as a boundary
+ * refusal instead, and - like every other malformed authority - records nothing.
+ */
+const AUTH_STRING_LIMIT = 256;
 /** The AEAD identifier shape. An entity id is a bounded token, never an email, URL or free text. */
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._=-]{0,127}$/u;
 const REVISION = /^\d{1,12}$/u;
@@ -338,6 +346,12 @@ function text(value: unknown, limit = REF_LIMIT): string {
     /[\u0000-\u001f\u007f]/u.test(value)) fail('INVALID_AUTHORITY');
   return value;
 }
+/** An authorization revision: a positive safe integer, the floor the authorization seam itself sets. */
+function revision(value: unknown): number {
+  const parsed = instant(value);
+  if (parsed < 1) fail('INVALID_AUTHORITY');
+  return parsed;
+}
 function member<T extends string>(value: unknown, choices: readonly T[],
   code: Denial = 'INVALID_AUTHORITY'): T {
   if (typeof value !== 'string' || !choices.includes(value as T)) fail(code);
@@ -347,35 +361,52 @@ function instant(value: unknown): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) fail('INVALID_AUTHORITY');
   return value;
 }
+/** The nested identity, context and destination readers share the authorization string limit. */
 function subject(value: unknown): WorkloadSubject {
   const v = fields(value, ['principalId', 'workloadId']);
-  return { principalId: text(v.principalId), workloadId: text(v.workloadId) };
+  return { principalId: text(v.principalId, AUTH_STRING_LIMIT),
+    workloadId: text(v.workloadId, AUTH_STRING_LIMIT) };
 }
 function context(value: unknown): RequestContext {
   const v = fields(value, ['tenantId', 'sessionId', 'purpose'], ['projectId']);
-  return { tenantId: text(v.tenantId),
-    ...(Object.hasOwn(v, 'projectId') ? { projectId: text(v.projectId) } : {}),
-    sessionId: text(v.sessionId), purpose: text(v.purpose) };
+  return { tenantId: text(v.tenantId, AUTH_STRING_LIMIT),
+    ...(Object.hasOwn(v, 'projectId') ? { projectId: text(v.projectId, AUTH_STRING_LIMIT) } : {}),
+    sessionId: text(v.sessionId, AUTH_STRING_LIMIT), purpose: text(v.purpose, AUTH_STRING_LIMIT) };
 }
 function destination(value: unknown): Destination {
   const v = fields(value, ['kind', 'ref', 'trustZone', 'profileId']);
-  return { kind: text(v.kind, 256), ref: text(v.ref), trustZone: text(v.trustZone, 256),
-    profileId: text(v.profileId, 256) };
+  return { kind: text(v.kind, AUTH_STRING_LIMIT), ref: text(v.ref),
+    trustZone: text(v.trustZone, AUTH_STRING_LIMIT),
+    profileId: text(v.profileId, AUTH_STRING_LIMIT) };
 }
 /**
- * A defensive copy of the host's grant. Shape is normalized here so repeated reads cannot see a
- * changed object; the authoritative semantic check stays with `authorizeMappingOperation`.
+ * A defensive, owned copy of the host's grant, read as **the authorization seam's own private
+ * `parseGrant` reads it** and not as a subset of it: exactly its eight fields, none optional, its
+ * own `version` 1, a positive safe-integer revision and expiry, its own operation vocabulary, and its
+ * three nested records each read by the same bounded own-key snapshot the observation itself uses.
+ *
+ * This runs on **every** observation, before anything else is asked of the answer, because this is
+ * the only place a malformed grant can be told apart from a genuine one. A cast would let a grant
+ * that names no valid version, revision, operation or instant reach the lifecycle guard, which then
+ * recorded a `LIFECYCLE_DENIED` about a record on the strength of authority this call never proved it
+ * held. The semantic check itself stays with `authorizeMappingOperation`: this reader decides shape
+ * only, refuses without evidence, and never moves the seam earlier in the call.
+ *
+ * An omitted grant, and a grant carried as the absent value, are both handed on as absent so the
+ * seam owns that `NO_GRANT` row; a grant that is present and structurally wrong is this boundary's
+ * `WITHHELD`, with no evidence, no actor and no lifecycle named.
  */
 function grant(value: unknown): TrustedMappingGrant {
   const v = fields(value, ['version', 'mappingRef', 'revision', 'principal', 'context',
     'destination', 'operation', 'expiresAt']);
+  if (v.version !== 1) fail('INVALID_AUTHORITY');
   // The nested identities are normalized here too, not carried by reference: the authorization seam
   // reads them later, and a grant whose inner objects stayed host-owned would be a host property read
   // inside the sealed effect segment.
-  return Object.freeze({ version: v.version as 1, mappingRef: text(v.mappingRef, 256),
-    revision: v.revision as number, principal: subject(v.principal), context: context(v.context),
+  return Object.freeze({ version: 1, mappingRef: text(v.mappingRef, AUTH_STRING_LIMIT),
+    revision: revision(v.revision), principal: subject(v.principal), context: context(v.context),
     destination: destination(v.destination),
-    operation: v.operation as TrustedMappingGrant['operation'], expiresAt: v.expiresAt as number });
+    operation: member(v.operation, MAPPING_AUTHORIZATION_OPERATIONS), expiresAt: instant(v.expiresAt) });
 }
 function equal(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);

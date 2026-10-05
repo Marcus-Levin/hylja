@@ -23,7 +23,7 @@ import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { composeClassification, TRUST_LEVELS } from '../dist/classification.js';
 import {
-  digestClassification, digestPolicyBundle, KNOWN_POLICY_BUNDLE,
+  decidePolicy, digestClassification, digestPolicyBundle, KNOWN_POLICY_BUNDLE,
 } from '../dist/policy.js';
 import { createOpenAiTextSender, OPENAI_TEXT_SENDER_REFUSALS } from '../dist/openai-text-sender.js';
 import { OPENAI_TEXT_REQUEST_ENDPOINT } from '../dist/openai-text-request.js';
@@ -276,7 +276,10 @@ async function harness(t, options = {}) {
   const sink = options.sink === null ? null : await startSink();
   if (sink !== null) t.after(() => sink.close());
   const { host, dispatch } = createHost(sink, options);
-  return { sink, host, dispatch, sender: createOpenAiTextSender(host) };
+  // `options.create` selects the sender factory. It exists so the instrumentation section below can
+  // drive a FRESH sender module instance; every other test keeps the one imported at the top.
+  const create = options.create ?? createOpenAiTextSender;
+  return { sink, host, dispatch, sender: create(host) };
 }
 
 /** The whole withholding invariant in one helper: no dispatch, no connection, no byte, no capture. */
@@ -1408,4 +1411,254 @@ test('a masked rebuild that outgrows the strict codec byte bound withholds the w
     }), 'rebuild over the codec byte bound'), { status: 'REFUSED', code: 'SENDER_FAILED' });
     assertNothingSent(point.sink, point.dispatch);
     assert.equal(point.sender.state, 'IDLE');
+  });
+
+/* ---------- Sender-owned encode allocations (#231): the buffers a length alone would leak ---------- */
+
+/**
+ * The native constructor, captured once at module load. Every restoration assertion below compares
+ * against this one and not against whatever happens to be installed when it runs.
+ */
+const NATIVE_TEXT_ENCODER = globalThis.TextEncoder;
+/** An obviously synthetic fault label. It is swallowed by the sender's own catch and reaches no assertion. */
+const ENCODER_FAULT = 'synthetic-encode-fault.invalid';
+
+/**
+ * The number of NON-ZERO bytes across every captured buffer. A count only: a failing assertion prints
+ * a number, so no byte of a buffer, no image and no planted value can reach the TAP output. This is a
+ * statement about the buffers this sender allocated, and about nothing else - it claims no erasure of
+ * the runtime's memory, of a heap dump, or of any other process's copies.
+ */
+const unclearedBytes = (buffers) => buffers.reduce(
+  (total, buffer) => total + buffer.reduce((count, byte) => count + (byte === 0 ? 0 : 1), 0), 0);
+
+/** One distinct module URL per probe, so every probe re-evaluates the sender rather than reusing a cache hit. */
+let probeSerial = 0;
+
+/**
+ * Install a global `TextEncoder` subclass for the duration of one callback and restore the native
+ * constructor in a `finally`. No production hook, injection point or dependency is involved: the
+ * sender builds its one module-scope encoder at import time, so a constructor installed around a
+ * fresh import is the only way to observe the buffers that encoder owns.
+ *
+ * Attribution is the entire point of this instrument, so it is deliberately narrow:
+ *
+ * - Only encoders CONSTRUCTED while that fresh import is being evaluated are tracked. The sender
+ *   holds exactly one module-scope encoder. Every other `new TextEncoder()` reachable from a send
+ *   belongs either to a module that was already cached at this module's own import, or to a
+ *   per-call `utf8Bytes` helper in the codec or the envelope - and those bytes are never attributed
+ *   here, so a passing count says nothing about a buffer this sender does not own.
+ * - The fresh import re-evaluates the sender and nothing else; the test below proves that by
+ *   comparing one dependency export by identity.
+ * - `encode` delegates to the native method, so the bytes are the native bytes and only the returned
+ *   buffer is retained by this test. `encodeInto` writes into a caller-owned array and allocates
+ *   nothing, so it is deliberately left alone.
+ *
+ * `failEncodeAt(n)` makes the n-th TRACKED - that is, sender-owned - encode throw a synthetic
+ * allocation failure. That is how the "failed after a body encode, before the image was completed"
+ * window is entered deterministically, at the sender's own allocation point, without changing a line
+ * of production code. The fault is gated on the same ownership set as the counter, so an armed fault
+ * can never land on an encoder this sender does not own while the probe is installed globally.
+ */
+async function withEncoderProbe(run) {
+  const native = globalThis.TextEncoder;
+  const owned = new WeakSet();
+  const constructed = [];
+  const allocations = [];
+  let importing = false;
+  let faultAt = 0;
+  class ProbedTextEncoder extends native {
+    constructor(...args) {
+      super(...args);
+      if (importing) { owned.add(this); constructed.push(this); }
+    }
+    encode(input = '') {
+      // The fault is injected into SENDER-OWNED encodes only, and only OWNED encodes are counted, so
+      // an encoder constructed after the import - untracked, belonging to no part of this sender - can
+      // neither trip the fault nor move it. Without the ownership gate on the fault condition itself
+      // the counter, which is shared by every encoder while the probe is installed globally, would make
+      // the fault land on an unrelated encoder's encode instead.
+      if (!owned.has(this)) return super.encode(input);
+      if (faultAt > 0 && allocations.length + 1 === faultAt) throw new TypeError(ENCODER_FAULT);
+      const bytes = super.encode(input);
+      allocations.push(bytes);
+      return bytes;
+    }
+  }
+  globalThis.TextEncoder = ProbedTextEncoder;
+  try {
+    importing = true;
+    probeSerial += 1;
+    const fresh = await import(`../dist/openai-text-sender.js?encoder-probe=${probeSerial}`);
+    importing = false;
+    return await run({
+      create: fresh.createOpenAiTextSender, probed: ProbedTextEncoder, native, constructed, allocations,
+      failEncodeAt: (n) => { faultAt = n; },
+    });
+  } finally {
+    importing = false;
+    globalThis.TextEncoder = native;
+  }
+}
+
+/** The one masked image the probe tests assert against, declared here as a literal, as everywhere else. */
+const PROBE_MASKED_BODY = '{"model":"fixture-model-keep-sender","messages":['
+  + `{"role":"user","content":${JSON.stringify(MASKED)}}]}`;
+
+test('the encoder probe attributes only this sender module and restores the native constructor',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // Astral, combining and CJK text, so the byte-identity claim below is over real UTF-8 encoding.
+    const sample = 'café \u{1F600} 诊断';
+    const nativeBytes = Buffer.from(new TextEncoder().encode(sample));
+
+    await withEncoderProbe(async (probe) => {
+      assert.notEqual(probe.create, createOpenAiTextSender, 'a fresh sender module instance was imported');
+      // The probe is a pass-through: it encodes exactly what the native constructor encodes.
+      assert.equal(Buffer.from(new probe.probed().encode(sample)).equals(nativeBytes), true,
+        'instrumentation does not change a single encoded byte');
+      // The fresh import re-evaluated the sender and nothing else. Without this, an allocation made
+      // inside a re-evaluated dependency could be attributed to the sender.
+      const shared = await import('../dist/policy.js');
+      assert.equal(shared.decidePolicy, decidePolicy, 'the sender dependencies were already cached');
+      assert.equal(probe.constructed.length, 1,
+        'the sender built exactly its own module-scope encoder under the probe');
+      assert.equal(probe.allocations.length, 0, 'no send has run yet, so nothing was allocated');
+    });
+
+    // Restored by the probe's `finally`, and checked from outside it rather than from inside.
+    assert.equal(globalThis.TextEncoder, NATIVE_TEXT_ENCODER, 'the native constructor is back in place');
+    assert.equal(Buffer.from(new TextEncoder().encode(sample)).equals(nativeBytes), true);
+    // The sender every other test in this file uses is unaffected by the probe having run at all.
+    const { sender, dispatch } = await harness(t);
+    assert.deepEqual(await bounded(sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    }), 'post-probe send'), { status: 'SENT' });
+    assert.equal(dispatch.length, 1);
+  });
+
+test('every sender-owned encode allocation is zeroed after a successful masked send',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const leaky = `Escalate to ${PLANTED_ORIGINAL} before the window opens.`;
+    await withEncoderProbe(async (probe) => {
+      const point = await harness(t, {
+        create: probe.create,
+        policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']),
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+      });
+      assert.deepEqual(await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT,
+        body: requestBody([{ role: 'user', content: leaky }]),
+      }), 'masked send'), { status: 'SENT' });
+
+      // The real effect happened: one trusted dispatch and one loopback capture of the declared image.
+      assert.equal(point.dispatch.length, 1, 'exactly one trusted transport dispatch');
+      assert.equal(point.sink.connections, 1);
+      assert.equal(point.sink.captures.length, 1);
+      assert.equal(point.sink.captures[0].equals(maskedImage(PROBE_MASKED_BODY)), true,
+        'the sink received the declared masked image');
+      assert.equal(point.sink.captures[0].includes(PLANTED_ORIGINAL), false, 'no planted value reached the sink');
+
+      // Attribution is not vacuous: this send really allocated the sender its own encode buffers -
+      // the ORIGINAL and FINAL head and body encodes plus a buffer behind every unit digest.
+      assert.equal(probe.allocations.length >= 6, true,
+        'the send allocated several sender-owned encode buffers');
+      assert.equal(unclearedBytes(probe.allocations), 0,
+        'every sender-owned encode allocation is zero once the send ended');
+      assert.equal(point.sender.state, 'IDLE');
+    });
+  });
+
+test('every sender-owned encode allocation is zeroed after a restrictive refusal',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    await withEncoderProbe(async (probe) => {
+      // A planted original in a KEEP unit reaches the real fixed child, which finds it in the FINAL
+      // bytes and withholds the whole send. This is the latest restrictive refusal on the path, so
+      // by the time it returns both images have been framed and every unit digest encoded.
+      const point = await harness(t, { create: probe.create });
+      assert.deepEqual(await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: LEAKY_REQUEST_BODY,
+      }), 'sentinel refusal'), { status: 'REFUSED', code: 'SENTINEL_BLOCKED' });
+      assertNothingSent(point.sink, point.dispatch);
+
+      assert.equal(probe.allocations.length >= 6, true,
+        'the refused send allocated several sender-owned encode buffers');
+      assert.equal(unclearedBytes(probe.allocations), 0,
+        'a refusal clears every sender-owned encode allocation, not only the accepted path');
+      assert.equal(point.sender.state, 'IDLE');
+    });
+  });
+
+test('a sender-owned body encode is zeroed when a later encode fails before the image completes',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    await withEncoderProbe(async (probe) => {
+      // The synthetic fault is raised at the sender's SECOND own encode. The first is the body buffer
+      // the framed image is built from and the head encode is the step that follows it, so this enters
+      // exactly the window where an already-allocated body buffer can still escape its own cleanup.
+      probe.failEncodeAt(2);
+      const point = await harness(t, {
+        create: probe.create,
+        policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']),
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+      });
+      assert.deepEqual(await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: LEAKY_REQUEST_BODY,
+      }), 'encode fault'), { status: 'REFUSED', code: 'SENDER_FAILED' });
+      assertNothingSent(point.sink, point.dispatch);
+
+      // One buffer, and it is the body encode the fault interrupted: not the faulted call itself,
+      // which allocated nothing because it threw.
+      assert.equal(probe.allocations.length, 1, 'the fault landed after exactly one sender-owned encode');
+      assert.equal(unclearedBytes(probe.allocations), 0,
+        'the body encode buffer is zero after the head encode failed');
+      assert.equal(point.sender.state, 'IDLE');
+    });
+  });
+
+test('an armed encode fault reaches only the sender: an untracked encoder encodes natively',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // Astral, combining and CJK text, so the byte-identity claim below is over real UTF-8 encoding.
+    const sample = 'café \u{1F600} 诊断';
+    const nativeBytes = Buffer.from(new TextEncoder().encode(sample));
+
+    await withEncoderProbe(async (probe) => {
+      // The synthetic fault stays armed at the sender's SECOND own encode across everything below.
+      probe.failEncodeAt(2);
+
+      // Armed, with no tracked allocation yet: an encoder constructed AFTER the import is not the
+      // sender's module-scope encoder, so a sender-only fault has nothing to say about it.
+      const early = new probe.probed();
+      assert.equal(probe.constructed.length, 1, 'the post-import encoder was not attributed to the sender');
+      assert.equal(Buffer.from(early.encode(sample)).equals(nativeBytes), true,
+        'an untracked encoder encodes natively while the fault is armed');
+      assert.equal(probe.allocations.length, 0, 'an untracked encoder allocation is not counted');
+
+      // The real sender, under that same armed fault, still faults at its own second encode, and the
+      // buffer it had already allocated is wiped rather than left behind by the thrown allocation.
+      const point = await harness(t, {
+        create: probe.create,
+        policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']),
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+      });
+      assert.deepEqual(await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: LEAKY_REQUEST_BODY,
+      }), 'armed encode fault'), { status: 'REFUSED', code: 'SENDER_FAILED' });
+      assertNothingSent(point.sink, point.dispatch);
+      assert.equal(probe.allocations.length, 1, 'the armed fault landed after exactly one sender-owned encode');
+      assert.equal(unclearedBytes(probe.allocations), 0, 'the owned buffer is zero after the armed fault');
+      assert.equal(point.sender.state, 'IDLE');
+
+      // The counter now sits exactly where an ungated injection would trip: one owned allocation is
+      // recorded, so the next encode of ANY encoder built while the probe is installed would throw
+      // under a fault condition that never asked about ownership.
+      const late = new probe.probed();
+      assert.equal(probe.constructed.length, 1, 'the post-fault encoder was not attributed to the sender');
+      assert.equal(Buffer.from(late.encode(sample)).equals(nativeBytes), true,
+        'an untracked encoder encodes natively after the armed fault has landed');
+      assert.equal(probe.allocations.length, 1, 'an untracked encode after the fault is still uncounted');
+      assert.equal(unclearedBytes(probe.allocations), 0, 'the sender-owned buffer is still zero');
+    });
+
+    // Restored by the probe's `finally`, and checked from outside it rather than from inside.
+    assert.equal(globalThis.TextEncoder, NATIVE_TEXT_ENCODER, 'the native constructor is back in place');
+    assert.equal(Buffer.from(new TextEncoder().encode(sample)).equals(nativeBytes), true);
   });

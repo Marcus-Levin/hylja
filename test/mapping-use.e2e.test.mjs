@@ -203,6 +203,18 @@ function cleared(buffer) {
   for (let index = 0; index < buffer.byteLength; index += 1) if (buffer[index] !== 0) return false;
   return true;
 }
+/**
+ * Whole-buffer survival as one boolean: equal length and every index equal. The answer is a boolean
+ * and never a byte, so no planted value is ever an assertion operand here, and a run that overwrote
+ * exactly one byte cannot pass a length-only check.
+ */
+function unchanged(before, after) {
+  if (before.byteLength !== after.byteLength) return false;
+  for (let index = 0; index < before.byteLength; index += 1) {
+    if (before[index] !== after[index]) return false;
+  }
+  return true;
+}
 
 /* ---------- One host, assembled from the real seams ---------- */
 
@@ -1039,7 +1051,14 @@ test('a host method runs on its own receiver, and a promised answer is awaited b
 
 test('a byte source that throws mid-copy, and a host fault before the effect, both withhold',
   async () => {
+    // The host's own ciphertext is the host's to choose and this path never opens it: the copy is
+    // interrupted before the AEAD seam is reached at all. Its first byte is therefore fixed to zero
+    // here, deterministically, so the survival assertion below can never rest on a random byte that
+    // AES-GCM happened not to leave as zero - a valid ciphertext that begins with one is a normal
+    // outcome, and sampling one byte is not a proof that the host's buffer came back untouched.
     const torn = createHost({ interruptedCiphertext: true });
+    torn.source[0] = 0;
+    const before = Uint8Array.from(torn.source);
     const tornResult = await createBoundMappingUse(torn.host).use();
     assertFixedShape(tornResult);
     // An index read that throws part-way through a copy never reaches the resource and is never
@@ -1053,8 +1072,17 @@ test('a byte source that throws mid-copy, and a host fault before the effect, bo
     // The copy really was interrupted: the fault index was reached, not refused before allocation.
     assert.equal(torn.interrupted.reached, true);
     assert.equal(torn.interrupted.reads, torn.interrupted.faultAt + 1);
-    // The host's own buffers belong to the host: this module overwrites only what it copied.
-    assert.notEqual(torn.source[0], 0);
+    // The host's own buffers belong to the host: this module overwrites only what it copied, so the
+    // whole source comes back byte-identical - asserted as one boolean over the length and every
+    // index, never as a dump and never as one sampled byte.
+    assert.equal(unchanged(before, torn.source), true);
+    // Non-vacuity of that comparison: the same buffer with one non-leading byte changed is not
+    // unchanged, so the assertion above is about this executor's overwrite and not about a helper
+    // that answers `true` for anything at all.
+    assert.equal(before.byteLength > 1, true);
+    const altered = Uint8Array.from(before);
+    altered[1] = (altered[1] + 1) & 0xff;
+    assert.equal(unchanged(before, altered), false);
 
     const faulting = createHost({ authority: () => { throw new Error('synthetic host fault'); } });
     const faulted = await createBoundMappingUse(faulting.host).use();
@@ -1653,3 +1681,299 @@ test('the genuine lifecycle states still record their own evidence and the effec
     assert.equal(revokedHost.counters.material, 0);
     assert.equal(revokedBackend.state.calls, 0);
   });
+
+/* ---------- 21. Authority and grant shape: nothing malformed is ever attributed ---------- */
+
+/** Deletes a planted member instead of carrying it as an absent value, which is a different answer. */
+const OMIT = Symbol('omit');
+const TRAPPED_KEYS = { ownKeys() { throw new Error('synthetic grant reflection fault'); } };
+const TRAPPED_DESCRIPTOR = { getOwnPropertyDescriptor() {
+  throw new Error('synthetic grant descriptor fault'); } };
+
+/**
+ * Re-points a host's authority at exactly the planted observation. Without `whole` the answer is the
+ * host's own accepted one with the named members replaced, and each replacement is handed over
+ * untouched: a hostile value is never spread, cloned or normalized by this fixture on its way in.
+ * With `whole` the answer is the planted object itself, so an observation this file wants to hand
+ * over exactly as built is not rebuilt first.
+ */
+function plant(built, overrides, whole) {
+  built.host.authority = () => {
+    if (whole !== undefined) return whole;
+    const answer = { version: 1, subject: { ...WORKLOAD }, context: { ...SCOPE, purpose: PURPOSE },
+      destination: { ...DESTINATION }, keyVersion: KEY_VERSION, now: USE_NOW,
+      grant: { ...built.state.grant } };
+    for (const key of Object.keys(overrides)) {
+      if (overrides[key] === OMIT) delete answer[key];
+      else answer[key] = overrides[key];
+    }
+    return answer;
+  };
+  return built;
+}
+
+/** One fresh ledger per host, over this scenario's own stream, so no row inherits another's entries. */
+function freshLedger() {
+  return createInMemoryAuditLedger({ tenantId: SCOPE.tenantId, projectId: SCOPE.projectId });
+}
+
+/**
+ * A revoked record, revoked by the shipped reducer: the host is assembled while its own registry read
+ * is still genuine, and the revocation is applied afterwards, so the answer this world reports is the
+ * shipped registry's own `ABSENT` / `NOT_LIVE` and not a fixture's.
+ */
+function revokedWorld() {
+  const scenario = buildScenario();
+  const built = createHost({ backend: createBackend(), ledger: freshLedger(), scenario });
+  const record = scenario.registry.current({ version: 1, mappingRef: scenario.mappingRef,
+    scope: { ...scenario.scope } }, { now: USE_NOW }).metadata;
+  const applied = scenario.registry.transition({ version: 1, mappingRef: scenario.mappingRef,
+    scope: { ...scenario.scope }, expectedRevision: record.revision, action: 'REVOKE' },
+    { now: USE_NOW });
+  assert.equal(applied.state, 'CHANGED');
+  const gone = scenario.registry.current({ version: 1, mappingRef: scenario.mappingRef,
+    scope: { ...scenario.scope } }, { now: USE_NOW });
+  assert.equal(gone.state, 'ABSENT');
+  assert.equal(gone.reason, 'NOT_LIVE');
+  return built;
+}
+
+/**
+ * The three real lifecycle worlds every planted row below is measured in, each rebuilt per row: a
+ * complete `ACTIVE` record, the genuine `CREATED` record the shipped registry still reports as
+ * current, and a genuine revoked record the registry no longer reports at all. The lifecycle guard is
+ * the only one that can leave evidence, so a malformed authority answer is provably unattributable
+ * only if it is unattributable in the two worlds where a real lifecycle class would otherwise land.
+ */
+const WORLDS = [
+  ['ACTIVE', () => createHost({ backend: createBackend(), ledger: freshLedger() })],
+  ['CREATED', () => createHost({ backend: createBackend(), ledger: freshLedger(),
+    scenario: buildScenario({ activate: false }) })],
+  ['REVOKED', revokedWorld]];
+
+/**
+ * One planted observation: a fixed `WITHHELD` and exactly the evidence the row owes - nothing for a
+ * malformed value, one attributable decision with its own class for a genuine refusal, and in both
+ * cases no sealed read, no private effect and no recovered bytes at all.
+ */
+async function assertPlanted(built, entries, reason, name) {
+  const refused = await createBoundMappingUse(built.host).use();
+  assertFixedShape(refused);
+  assert.equal(refused.code, 'WITHHELD', name);
+  assert.equal(built.counters.material, 0, name);
+  assert.equal(built.backend.state.calls, 0, name);
+  assert.equal(cleared(built.backend.state.retained), false, name);
+  assert.equal(built.ledger.entries.length, entries, name);
+  assert.equal(JSON.stringify(built.ledger.entries).includes('DENIED'), entries === 1, name);
+  if (entries === 1) assertAttributableDenial(built, built.ledger.entries[0].event, reason);
+  return built;
+}
+
+/** Walks one table of planted observations against every real lifecycle world. */
+async function eachWorld(rows) {
+  for (const [worldName, world] of WORLDS) {
+    for (const [name, overrides, whole] of rows) {
+      await assertPlanted(plant(world(), overrides, whole), 0, undefined, `${worldName}: ${name}`);
+    }
+  }
+}
+
+test('the genuine outcomes in every real lifecycle world are unchanged', async () => {
+  // `ACTIVE` is the control for every refusal below: the accepted path still spends its own private
+  // resource once and still records exactly the two `ALLOWED` decisions and no denial at all.
+  const accepted = WORLDS[0][1]();
+  const acceptedResult = await createBoundMappingUse(accepted.host).use();
+  assertFixedShape(acceptedResult);
+  assert.equal(acceptedResult.code, 'USED');
+  assert.equal(accepted.counters.authority, 4);
+  assert.equal(accepted.counters.material, 1);
+  assert.equal(accepted.backend.state.calls, 1);
+  assert.equal(accepted.ledger.entries.length, 2);
+  assert.equal(accepted.ledger.entries.every((entry) => entry.event.outcome === 'ALLOWED'), true);
+  assert.equal(accepted.ledger.entries.some((entry) => entry.event.outcome === 'DENIED'), false);
+
+  // The refusals the authorization seam itself names, on a live `ACTIVE` record: a grant carried as
+  // absent and a grant carried as the absent value are both its `NO_GRANT` row, and a grant whose own
+  // expiry has passed is its `GRANT_EXPIRED` row. A grant for either other operation is the actor's
+  // own misbound authority, so it stays `OPERATION_NOT_GRANTED` and records nothing.
+  const template = { ...WORLDS[0][1]().state.grant };
+  await assertPlanted(plant(WORLDS[0][1](), { grant: OMIT }), 1, 'RESOLUTION_DENIED', 'ACTIVE: absent');
+  await assertPlanted(plant(WORLDS[0][1](), { grant: undefined }), 1, 'RESOLUTION_DENIED',
+    'ACTIVE: the absent value');
+  await assertPlanted(plant(WORLDS[0][1](), { grant: { ...template, expiresAt: T0 + 30_000 } }), 1,
+    'RESOLUTION_DENIED', 'ACTIVE: expired');
+  for (const operation of ['DISPLAY', 'EXPORT']) {
+    await assertPlanted(plant(WORLDS[0][1](), { grant: { ...template, operation } }), 0, undefined,
+      `ACTIVE: a grant for ${operation}`);
+  }
+
+  // The two lifecycle worlds still record their own class, and it still wins over every grant row -
+  // including an absent or an expired one, because the lifecycle guard runs before the seam.
+  for (const [worldName, world] of [[WORLDS[1][0], WORLDS[1][1]], [WORLDS[2][0], WORLDS[2][1]]]) {
+    const grant = { ...world().state.grant };
+    await assertPlanted(plant(world(), {}), 1, 'LIFECYCLE_DENIED', `${worldName}: a valid grant`);
+    await assertPlanted(plant(world(), { grant: OMIT }), 1, 'LIFECYCLE_DENIED',
+      `${worldName}: an absent grant`);
+    await assertPlanted(plant(world(), { grant: undefined }), 1, 'LIFECYCLE_DENIED',
+      `${worldName}: the absent value`);
+    await assertPlanted(plant(world(), { grant: { ...grant, expiresAt: T0 + 30_000 } }), 1,
+      'LIFECYCLE_DENIED', `${worldName}: an expired grant`);
+  }
+});
+
+test('a grant outside the authorization schema is attributed in no real lifecycle world', async () => {
+  const valid = { ...WORLDS[0][1]().state.grant };
+  const principal = { ...valid.principal };
+  const context = { ...valid.context };
+  const destination = { ...valid.destination };
+  const without = (record, key) => { const copy = { ...record }; delete copy[key]; return copy; };
+  const long = (length) => 'x'.repeat(length);
+  const accessorGrant = () => { const copy = { ...valid };
+    Object.defineProperty(copy, 'expiresAt', { enumerable: true, configurable: true,
+      get() { throw new Error('synthetic grant accessor fault'); } });
+    return copy; };
+  await eachWorld([
+    // The grant answer itself: exactly the fields its own private parser reads, none of them optional.
+    ['a grant that is not an object', { grant: 'grant-bound-use.invalid' }],
+    ['a grant that is an array', { grant: [] }],
+    ['a wrong grant version', { grant: { ...valid, version: 2 } }],
+    ['no grant version', { grant: without(valid, 'version') }],
+    ['no mappingRef', { grant: without(valid, 'mappingRef') }],
+    ['no revision', { grant: without(valid, 'revision') }],
+    ['no principal', { grant: without(valid, 'principal') }],
+    ['no context', { grant: without(valid, 'context') }],
+    ['no destination', { grant: without(valid, 'destination') }],
+    ['no operation', { grant: without(valid, 'operation') }],
+    ['no expiresAt', { grant: without(valid, 'expiresAt') }],
+    ['an unknown grant key', { grant: { ...valid, note: 'x' } }],
+    ['an empty mappingRef', { grant: { ...valid, mappingRef: '' } }],
+    ['a padded mappingRef', { grant: { ...valid, mappingRef: ' grant.invalid ' } }],
+    ['a mappingRef with a control character', { grant: { ...valid, mappingRef: 'grant\u0000.invalid' } }],
+    ['a mappingRef over its own limit', { grant: { ...valid, mappingRef: long(257) } }],
+    ['a revision below one', { grant: { ...valid, revision: 0 } }],
+    ['a negative revision', { grant: { ...valid, revision: -1 } }],
+    ['a fractional revision', { grant: { ...valid, revision: 2.5 } }],
+    ['a revision carried as text', { grant: { ...valid, revision: '2' } }],
+    ['an unsafe revision', { grant: { ...valid, revision: Number.MAX_SAFE_INTEGER + 1 } }],
+    ['a revision that is not a number', { grant: { ...valid, revision: null } }],
+    ['an operation outside the vocabulary', { grant: { ...valid, operation: 'DELETE' } }],
+    ['an operation that is not a string', { grant: { ...valid, operation: 7 } }],
+    ['an operation that is not this case', { grant: { ...valid, operation: 'use' } }],
+    ['an expiry at zero', { grant: { ...valid, expiresAt: 0 } }],
+    ['a negative expiry', { grant: { ...valid, expiresAt: -1 } }],
+    ['a fractional expiry', { grant: { ...valid, expiresAt: T0 + 0.5 } }],
+    ['an expiry carried as text', { grant: { ...valid, expiresAt: String(T0) } }],
+    ['an unsafe expiry', { grant: { ...valid, expiresAt: Number.MAX_SAFE_INTEGER + 1 } }],
+    ['an expiry that is not a number', { grant: { ...valid, expiresAt: undefined } }],
+    // The nested principal, context and destination are read the same way, one bounded own-key
+    // snapshot each, and their string limits are the authorization strings' own limits.
+    ['a principal that is not an object', { grant: { ...valid, principal: 'workload.invalid' } }],
+    ['a principal with no principalId', { grant: { ...valid,
+      principal: without(principal, 'principalId') } }],
+    ['a principal with no workloadId', { grant: { ...valid,
+      principal: without(principal, 'workloadId') } }],
+    ['a principal with an unknown key', { grant: { ...valid,
+      principal: { ...principal, note: 'x' } } }],
+    ['an empty principalId', { grant: { ...valid, principal: { ...principal, principalId: '' } } }],
+    ['a padded principalId', { grant: { ...valid,
+      principal: { ...principal, principalId: ' principal.invalid ' } } }],
+    ['a principalId with a control character', { grant: { ...valid,
+      principal: { ...principal, principalId: 'p\u0000q' } } }],
+    ['an oversized principalId', { grant: { ...valid,
+      principal: { ...principal, principalId: long(257) } } }],
+    ['an oversized workloadId', { grant: { ...valid,
+      principal: { ...principal, workloadId: long(257) } } }],
+    ['a principal on an inherited prototype', { grant: { ...valid,
+      principal: Object.assign(Object.create({ workloadId: 'workload.invalid' }), principal) } }],
+    ['a context that is not an object', { grant: { ...valid, context: 'tenant.invalid' } }],
+    ['a context with no tenantId', { grant: { ...valid, context: without(context, 'tenantId') } }],
+    ['a context with no sessionId', { grant: { ...valid, context: without(context, 'sessionId') } }],
+    ['a context with no purpose', { grant: { ...valid, context: without(context, 'purpose') } }],
+    ['a context with an unknown key', { grant: { ...valid, context: { ...context, note: 'x' } } }],
+    ['an empty tenantId', { grant: { ...valid, context: { ...context, tenantId: '' } } }],
+    ['an oversized tenantId', { grant: { ...valid, context: { ...context, tenantId: long(257) } } }],
+    ['an oversized purpose', { grant: { ...valid, context: { ...context, purpose: long(257) } } }],
+    ['an oversized projectId', { grant: { ...valid, context: { ...context, projectId: long(257) } } }],
+    ['a context on an inherited prototype', { grant: { ...valid,
+      context: Object.assign(Object.create({ purpose: PURPOSE }), context) } }],
+    ['a destination that is not an object', { grant: { ...valid, destination: 'sink.invalid' } }],
+    ['a destination with no kind', { grant: { ...valid,
+      destination: without(destination, 'kind') } }],
+    ['a destination with no ref', { grant: { ...valid,
+      destination: without(destination, 'ref') } }],
+    ['a destination with no trustZone', { grant: { ...valid,
+      destination: without(destination, 'trustZone') } }],
+    ['a destination with no profileId', { grant: { ...valid,
+      destination: without(destination, 'profileId') } }],
+    ['a destination with an unknown key', { grant: { ...valid,
+      destination: { ...destination, note: 'x' } } }],
+    ['an empty kind', { grant: { ...valid, destination: { ...destination, kind: '' } } }],
+    ['an oversized kind', { grant: { ...valid, destination: { ...destination, kind: long(257) } } }],
+    ['an oversized ref', { grant: { ...valid, destination: { ...destination, ref: long(2049) } } }],
+    ['an oversized trustZone', { grant: { ...valid, destination: { ...destination,
+      trustZone: long(257) } } }],
+    ['an oversized profileId', { grant: { ...valid, destination: { ...destination,
+      profileId: long(257) } } }],
+    // Hostile shapes: a symbol, a hidden field, an accessor, a trapped reflection, a prototype.
+    ['a symbol key', { grant: { ...valid, [Symbol('note')]: 'x' } }],
+    ['a hidden field', { grant: Object.defineProperty({ ...valid }, 'revision',
+      { enumerable: false, value: valid.revision, configurable: true }) }],
+    ['an accessor', { grant: accessorGrant() }],
+    ['an ownKeys trap', { grant: new Proxy({ ...valid }, TRAPPED_KEYS) }],
+    ['a descriptor trap', { grant: new Proxy({ ...valid }, TRAPPED_DESCRIPTOR) }],
+    ['an inherited prototype', { grant: Object.assign(Object.create({ operation: 'USE' }), valid) }]]);
+});
+
+test('an authority answer outside its own schema is attributed in no real lifecycle world', async () => {
+  const observation = { version: 1, subject: { ...WORKLOAD }, context: { ...SCOPE, purpose: PURPOSE },
+    destination: { ...DESTINATION }, keyVersion: KEY_VERSION, now: USE_NOW };
+  const without = (key) => { const copy = { ...observation }; delete copy[key]; return copy; };
+  const long = (length) => 'x'.repeat(length);
+  const accessorAnswer = () => { const copy = { ...observation };
+    Object.defineProperty(copy, 'now', { enumerable: true, configurable: true,
+      get() { throw new Error('synthetic answer accessor fault'); } });
+    return copy; };
+  await eachWorld([
+    // Only `grant` is optional on this answer; everything else is settled before anything reads it,
+    // and none of it may name a lifecycle when it is not this module's own schema.
+    ['no answer at all', undefined, null],
+    ['an answer that is not an object', undefined, 'bound-use.invalid'],
+    ['an answer that is an array', undefined, []],
+    ['an empty answer', undefined, {}],
+    ['a wrong answer version', undefined, { ...observation, version: 2 }],
+    ['no answer version', undefined, without('version')],
+    ['no subject', undefined, without('subject')],
+    ['a subject that is not an object', undefined, { ...observation, subject: 'workload.invalid' }],
+    ['a subject with no workloadId', undefined, { ...observation,
+      subject: { principalId: WORKLOAD.principalId } }],
+    ['an oversized subject principalId', undefined, { ...observation,
+      subject: { ...WORKLOAD, principalId: long(257) } }],
+    ['no context', undefined, without('context')],
+    ['a context with no purpose', undefined, { ...observation, context: { ...SCOPE } }],
+    ['an oversized context purpose', undefined, { ...observation,
+      context: { ...SCOPE, purpose: long(257) } }],
+    ['no destination', undefined, without('destination')],
+    ['a destination with no profileId', undefined, { ...observation, destination: {
+      kind: DESTINATION.kind, ref: DESTINATION.ref, trustZone: DESTINATION.trustZone } }],
+    ['an oversized destination ref', undefined, { ...observation,
+      destination: { ...DESTINATION, ref: long(2049) } }],
+    ['an unknown answer key', undefined, { ...observation, note: 'x' }],
+    ['a keyVersion over its own limit', undefined, { ...observation, keyVersion: long(49) }],
+    ['a keyVersion that is not its own shape', undefined, { ...observation, keyVersion: 'v1' }],
+    ['a padded keyVersion', undefined, { ...observation, keyVersion: ' 1.0' }],
+    ['a keyVersion carried as a number', undefined, { ...observation, keyVersion: 1 }],
+    ['no now', undefined, without('now')],
+    ['a now at zero', undefined, { ...observation, now: 0 }],
+    ['a negative now', undefined, { ...observation, now: -1 }],
+    ['a fractional now', undefined, { ...observation, now: USE_NOW + 0.5 }],
+    ['a now carried as text', undefined, { ...observation, now: String(USE_NOW) }],
+    ['an unsafe now', undefined, { ...observation, now: Number.MAX_SAFE_INTEGER + 1 }],
+    ['a symbol key', undefined, { ...observation, [Symbol('note')]: 'x' }],
+    ['a hidden field', undefined, Object.defineProperty({ ...observation }, 'now',
+      { enumerable: false, value: USE_NOW, configurable: true })],
+    ['an accessor', undefined, accessorAnswer()],
+    ['an ownKeys trap', undefined, new Proxy({ ...observation }, TRAPPED_KEYS)],
+    ['a descriptor trap', undefined, new Proxy({ ...observation }, TRAPPED_DESCRIPTOR)],
+    ['an inherited prototype', undefined,
+      Object.assign(Object.create({ now: USE_NOW }), observation)]]);
+});

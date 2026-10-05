@@ -73,8 +73,9 @@ Prerequisite: native Pi with `pi-subagents` loaded (`pi list`). Role configurati
 [`.pi/agents/hylja-implementer-sol61.md`](../../.pi/agents/hylja-implementer-sol61.md);
 `~/.agents/pstack-models.md` is untouched. Tested installation: pi-subagents 0.75.0 on Pi 1.0.0, whose release notes record the fix for
 background children failing on Pi 1.0.0 with a missing `@earendil-works/pi-agent-core/node` export;
-0.74.0 does not work on Pi 1.0.0. Foreground children do not depend on that fix. No extra script or
-package is added to this repository.
+0.74.0 does not work on Pi 1.0.0. Foreground children do not depend on that fix. Nothing is added to
+install: the workflow guard and the optional native lane CLI are already tracked in this repository,
+they live outside the tracked build and typecheck scope, and they add no new package dependency.
 
 - Interactive: `/skill:hylja-development` forces the project skill; `/reload` after editing it.
 - Headless: `--no-skills --skill .agents/skills/hylja-development` loads only that skill; without
@@ -294,105 +295,32 @@ worktree, receipt, dispatch, progress and artifact files for recovery, and is ne
 recovery handoff must name the exact source SHA whose tree the resumed lane runs, so a resumed lane is
 provably the same code and not a re-implementation of it.
 
-Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
-real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (60 tests, 50 of them in the lane file). The dedicated writer fallback's own cases cover the
-four bounds it could have loosened: its exact role/model pair is admitted while a foreign route or a
-different budget is refused in both model checks, the default writer and the reviewer keep their own
-`:max` requirement, the fallback writer reports `writerAcceptanceGate` and
-`acceptanceProvesApproval` the way any writer does, a full fallback lane verifies end to end through
-the shipped CLI, and a configured soft budget gives that role the writer closing move instead of
-refusing the config. Two of them fake only the child transport, so the shipped default platform is what
-runs: the default filesystem
-must read the progress tail with bounded positional descriptor reads and close every descriptor it
-opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
-removed on completion. Faking those two adapters had passed while the defaults read the whole progress
-file and registered no listener at all. One case injects only the clock, so the real watchdog is fired
-by its recorded timer rather than by waiting out a ten-minute budget, and proves that identical
-completed approval evidence is refused after expiry and verified without it. The optional soft budget
-is driven by an injected `now` and `arm` pair whose cancel closure is recorded, so a case can fire,
-repeat, refuse and drain a soft budget deterministically; the shipped default `arm` has its own case
-so the fake clock is not the only path that can warn. One case fires that warning and then pushes more
-owned updates than the file keeps, settles, and reads the file back through the shipped `readProgress`,
-because the warning only matters if root's own reader still finds exactly one of it. Two further
-cases drive the same real controller and the same shipped reader with the longest metadata the
-contract accepts: one at 4096-character model and runId values, one with a JSON-escaped and a
-multibyte field, each pushing more owned updates past both bounds. They assert the persisted file
-stays inside both halves of the window, that exactly one warning reaches the reader with a finite
-elapsed count, that the newest update and chronological order survive, and that reader and writer
-clamp to the same constant. The retained RED shows what they caught first: a 2,116,489-byte file
-holding 256 records against a 131,072-byte reader window, and 9,427,849 bytes of escaped and multibyte
-metadata. A window counted in characters rather than serialized bytes fails the second case, so the
-escape and multibyte cases are what keep the byte count honest. The lane file
-keeps a planted candidate note and
-the leaf's own evidence and proves a hard deadline leaves both untouched, reports INCOMPLETE and arms
-no surviving timer. The required-reference cases use a real temporary file: the positive case admits a
-real readable file and asserts that the exact generated label and path reach the fake native request
-and the one effective task, while every negative case — bare string, map, primitive entry, unknown
-field, empty or overbound label, relative or overbound path, overbound count, missing path, directory,
-unreadable, non-regular, and an absent metadata seam — is refused with zero dispatch, no preflight
-call, no armed timer and the planted artifact preserved. The unreadable branch is driven through the
-injected metadata probe in both readers, because a mode-000 file is genuinely readable to a root
-process and a permission bit would prove nothing there; the real-fs branches (missing, directory,
-regular readable file) run the shipped probe unpatched.
-One case refuses the structured `{ label: "", path }` shape over a real readable file — not the
-primitive `['']` entry — in both readers, then drives the shipped entry point with that exact config
-path and asserts it emits nothing, and runs the CLI to assert zero spawns and nothing written; the
-identical file under a non-empty label is admitted by both readers, so the label is what is refused.
-A FIFO-without-writer cannot be probed in the test runner itself without an unbounded wait there, so
-one bounded subprocess control does it instead: the child imports the real controller, runs the real
-probe over a real `mkfifo` FIFO that no writer ever opens, and then builds the real controller around
-it with the probe unpatched, under a 15 s wall clock. The retained RED is that control hitting the
-bound — `ETIMEDOUT` at 15,000 ms, killed mid-probe — because the shipped probe opened before it
-checked regularity; after the fix the same control reports non-regular metadata refused, zero preflight
-calls, zero dispatch and no persisted dispatch record, in about 90 ms. The root process never opens
-that FIFO. A platform without a named pipe reports a skip with the reason, never a silent pass.
-The config read gets the same treatment, because it happens before any watchdog exists. One case spawns
-the shipped CLI over a writer-less FIFO, a character device and a directory: each exits 2 at once with
-one fixed refusal line, nothing planted echoed, zero dispatch and nothing written, while the identical
-platform over one regular config really launches. One case drives the shipped default reader and
-asserts that a config past the byte window but inside the character count and bytes that are not UTF-8
-are each refused with zero children while a valid regular config still launches, that the single
-positional read and its allocation stay inside the window, that the config is never read as a whole
-file, and that every descriptor it opened is closed. One bounded child hands that reader a descriptor it
-did not admit — an open that resolves to a directory, a read that throws, and a path renamed into a
-writer-less FIFO between the metadata check and the open — so each is the fixed refusal with its
-descriptor closed and nothing launched; the root process never opens that FIFO either. Two further
-cases drive the shipped default reader with one fault each, over a real temporary config. A read that
-delivers fewer bytes than the opened descriptor reports is refused with no retry and no launch: the
-config behind it is a complete valid JSON object followed by bytes that are not JSON, so only a reader
-that admitted the prefix could parse it, and the case asserts the single read is still requested at the
-full 65,537-byte window. A close that fails withholds the bytes already read and launches no child, and
-the test closes the descriptor it handed over itself, because a failed close is a refusal of the read
-and not a proof that the lane released anything; its control is the identical config over a close that
-works, which really launches the owned child. The retained RED
-is the shape the probe control caught: the real CLI process hitting its own bound, `ETIMEDOUT`, killed
-with no child and no record at all; an open that resolves to a directory admitted and launching a child;
-a config past the byte window but inside the character count admitted for the same reason; and no
-seam at all for a config reader, because the config went through the same injected `readFile` as every
-other artifact. Both new controls retained the same RED against the shipped reader before the fix: each
-admitted its bytes, launched exactly one child and returned `SETUP_FAILED_MISSING_RECEIPT` instead of
-the config refusal, which is what a config prefix parsed as a whole config looks like from outside. An
-injected config reader is trusted with its own bytes, which is a statement about an
-adapter a host supplies, not a widening of the default reader's guarantee.
-Metadata admission proves neither later availability nor content approval, and the retained control
-covers one POSIX FIFO rather than every non-regular file type.
-One case spawns the shipped CLI itself, because every other case drives the exported function
-in-process and therefore cannot observe what root actually receives: a missing config, a config
-declaring no `sessionDir` and a config whose declared session directory does not exist each exit 2,
-print exactly one bounded `verdict`/`reason` line with nothing planted echoed into it, launch nothing
-and write nothing, while the identical platform with every declared path present really launches the
-owned child and still logs exactly one full verification record. Its synthetic `pi` records its own
-launch, so zero dispatch is proved at the process boundary instead of asserted about an injected
-spawn.
-A read-only
-smoke on root's own installed Pi ran from
-`/tmp/hylja-overnight-2026-10-04/native-helper-live-smoke` (receipt, dispatch, progress and
-verification records beside it). It exercised launch and evidence plumbing on a reviewer lane, and its
-`receipt.json`, `verification.json`, and the `subagent-artifacts/` `*_0_meta.json` and `*_output.md`
-next to them are the public schema those fixtures and refusals are written against. It is not code
-approval, and independent review of this helper is still pending. No throughput claim has been
-measured.
+**Evidence.** Focused checks for this branch, run from the worktree root with this repository's
+dependencies installed:
+
+```bash
+node --test test/hylja-native-lane.test.mjs
+node --test test/hylja-workflow-guard.test.mjs
+```
+
+Both files are in `npm test`, so a green CI run at the reviewed head already contains them. The
+normative contract is the section above; its executable evidence is:
+[`hylja-native-lane.test.mjs`](../../test/hylja-native-lane.test.mjs) writes config admission,
+evidence binding, the deadline and progress window, and the fallback role as cases over the real
+controller, CLI, filesystem and signal adapters, a fake Pi event API, a fake preflight module, a fake
+native transport and synthetic temporary directories, plus bounded subprocess controls over a real
+`mkfifo` FIFO and real spawned CLI processes;
+[`hylja-workflow-guard.test.mjs`](../../test/hylja-workflow-guard.test.mjs) writes the guard's two
+guarantees, its fixed reasons and each role profile's declared extension path. Counts, durations and
+retained RED logs belong to the run that produced them and the pull request that reports them; this
+page caches none.
+
+Honest limits: no case needs a local Pi installation, calls a provider, reaches the network or reads a
+session transcript; one case type-checks the controller with the repository's own TypeScript because
+`tsconfig.json` does not cover `.pi/`; the FIFO control covers one non-regular file type, and a
+platform without a named pipe reports a named skip rather than a silent pass. A green run proves the
+paths those cases drive and nothing beyond them: not an installed Pi, not a real lane, not throughput,
+and not approval.
 
 ## Evidence lookup
 
