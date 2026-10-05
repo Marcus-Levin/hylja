@@ -78,6 +78,11 @@ function openDescriptors() {
 
 const ORIGINAL = 'synthetic-bound-presence-original.invalid';
 const ORIGINAL_BYTES = new TextEncoder().encode(ORIGINAL);
+/**
+ * A second private identifier of exactly the same length, differing in one byte. It is the
+ * provisioned identifier of a target that must be refused, and it is never an assertion operand.
+ */
+const OTHER_BYTES = new TextEncoder().encode(ORIGINAL.replace('original', 'originaL'));
 const KEY_VERSION = '1.0';
 const CLASS = 'PERSON';
 const SENSITIVITY = 'CONFIDENTIAL';
@@ -211,18 +216,35 @@ function createHost(scenario, options = {}) {
       source: { ...SOURCE, trust: TRUST }, classification: EVIDENCE,
       classificationDigest: digestClassification(EVIDENCE),
       policy: { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(bundle) }, bundle },
-    authority: options.authority ?? (() => {
+    // Written as `function` expressions on purpose: `this` inside them is the receiver the shipped
+    // executor actually applies them with, which is what the private-backend probe below inspects.
+    authority: options.authority ?? function authority() {
       counters.authority += 1;
       if (typeof hooks.onAuthority === 'function') hooks.onAuthority(counters.authority);
+      if (typeof options.onReceiver === 'function') options.onReceiver('authority', this);
       return report();
-    }),
-    material: options.material ?? (() => {
+    },
+    material: options.material ?? function material() {
       counters.material += 1;
+      if (typeof options.onReceiver === 'function') options.onReceiver('material', this);
       return { version: 1, envelope: { ...scenario.envelope }, key: keyBytes(0x11),
         mappingRevision: String(scenario.revision), keyVersion: KEY_VERSION };
-    }),
+    },
   };
   return { host, counters, ledger, state };
+}
+/**
+ * The injected values really are the host's own, so a denial case can never pass by silently
+ * dropping what it planted: the pinned bundle and its digest, the ledger, and the exact grant object
+ * the case claims to be exercising.
+ */
+function assertInjected(built, expected) {
+  if (expected.bundle !== undefined) {
+    assert.equal(built.host.policy.bundle, expected.bundle);
+    assert.equal(built.host.policy.policy.digest, digestPolicyBundle(expected.bundle));
+  }
+  if (expected.grant !== undefined) assert.equal(built.state.grant, expected.grant);
+  assert.equal(built.host.audit.ledger, built.ledger);
 }
 function makeGrant(scenario, operation, overrides = {}) {
   return { version: 1, mappingRef: scenario.mappingRef, revision: scenario.revision,
@@ -299,78 +321,122 @@ test('a genuine absent target yields NOT_FOUND from one real open that returns E
 /* ---------- 3. Refusals cost zero native effects, against a same-target control ---------- */
 
 /**
- * One denial and its control. The control spends the effect on the exact target the denial refuses,
- * so a zero-open count on the denial cannot be a broken instrument: the same instrument, in the same
- * process and on the same path, registers the real open for the control.
+ * One denial and its mandatory paired control. The control is not optional and is not a shared
+ * fixture: each denial gets its own freshly built scenario whose `use()` must return `USED` and
+ * spend one real open, one real fstat and one real close. A zero-open count on the denial therefore
+ * cannot be a broken instrument, a dead target or a silently dropped input - the same instrument,
+ * the same process and the same construction path register the effect for the control.
  */
 async function assertZeroOpenDenied(name, denial, control) {
+  assert.equal(typeof denial, 'function', name);
+  assert.equal(typeof control, 'function', name);
   const denied = mark();
   const result = await denial();
   const refused = since(denied);
   assertFixedShape(result);
   assert.equal(result.code, 'WITHHELD', name);
-  assert.equal(refused.opens, 0, name);
-  assert.equal(refused.stats, 0, name);
-  assert.equal(refused.closes, 0, name);
-  if (!control) return;
+  assert.deepEqual(refused, { opens: 0, stats: 0, closes: 0, lstats: 0, realpaths: 0 }, name);
   const controlMark = mark();
   const spent = await control();
-  const observed = since(controlMark);
   assert.equal(spent.code, 'USED', name);
-  assert.equal(observed.opens, 1, name);
-  assert.equal(observed.stats, 1, name);
-  assert.equal(observed.closes, 1, name);
+  assert.deepEqual(since(controlMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 },
+    name);
 }
-
-test('a revoked mapping, a blocked policy, a foreign grant and a malformed target open nothing', async () => {
-  const control = (async () => {
-    const fresh = createHost(buildScenario());
-    const created = createBoundFilePresence(fresh.host, target());
+/** A genuinely working same-target control: fresh host, fresh scenario, the real present file. */
+function sameTargetControl() {
+  const built = createHost(buildScenario());
+  const created = createBoundFilePresence(built.host, target());
+  return async () => {
     const result = await created.handle.use();
     created.dispose();
     return result;
+  };
+}
+
+test('a revoked mapping, a blocked policy, a foreign grant and a malformed grant open nothing',
+  async () => {
+    const revokedScenario = buildScenario();
+    const revokedHost = createHost(revokedScenario);
+    assertInjected(revokedHost, {});
+    const revoked = revokedScenario.registry.transition({ version: 1,
+      mappingRef: revokedScenario.mappingRef, scope: { ...SCOPE }, expectedRevision: 2,
+      action: 'REVOKE' }, { now: USE_NOW });
+    assert.equal(revoked.state, 'CHANGED');
+    const revokedPresence = createBoundFilePresence(revokedHost.host, target());
+    await assertZeroOpenDenied('revoked', () => revokedPresence.handle.use(),
+      sameTargetControl());
+    assert.equal(revokedHost.counters.material, 0);
+    revokedPresence.dispose();
+
+    const blockedBundle = policyBundle('BLOCK');
+    const blockedScenario = buildScenario();
+    const blockedHost = createHost(blockedScenario, { bundle: blockedBundle });
+    // The planted bundle is the host's own bundle, under its own pinned digest.
+    assertInjected(blockedHost, { bundle: blockedBundle });
+    assert.equal(blockedHost.host.policy.bundle.rules[0].decision, 'BLOCK');
+    const blocked = createBoundFilePresence(blockedHost.host, target());
+    await assertZeroOpenDenied('blocked policy', () => blocked.handle.use(), sameTargetControl());
+    // The real Policy Engine really ran over the injected bundle before it refused.
+    assert.equal(blockedHost.counters.authority, 1);
+    assert.equal(blockedHost.counters.material, 0);
+    assert.equal(blockedHost.ledger.entries.length, 0);
+    blocked.dispose();
+
+    // A **foreign** USE grant: the operation is the right one, but the principal and the tenant scope
+    // the grant itself names are not this mapping's. This is a scope/principal denial, not a
+    // "USE was requested as DISPLAY" denial.
+    const foreignScenario = buildScenario();
+    const foreignGrant = makeGrant(foreignScenario, 'USE', {
+      principal: { principalId: 'principal-bound-presence-foreign.invalid',
+        workloadId: 'workload-bound-presence-foreign.invalid' },
+      context: { ...SCOPE, tenantId: 'tenant-bound-presence-foreign.invalid', purpose: PURPOSE },
+    });
+    const foreignHost = createHost(foreignScenario, { grant: foreignGrant });
+    assertInjected(foreignHost, { grant: foreignGrant });
+    assert.equal(foreignHost.state.grant.operation, 'USE');
+    assert.equal(foreignHost.state.grant.principal.principalId, 'principal-bound-presence-foreign.invalid');
+    assert.equal(foreignHost.state.grant.context.tenantId, 'tenant-bound-presence-foreign.invalid');
+    const foreign = createBoundFilePresence(foreignHost.host, target());
+    await assertZeroOpenDenied('foreign USE grant', () => foreign.handle.use(),
+      sameTargetControl());
+    assert.equal(foreignHost.counters.material, 0);
+    // A foreign misbinding is not an attributable refusal, so it records nothing.
+    assert.equal(foreignHost.ledger.entries.length, 0);
+    foreign.dispose();
+
+    // `USE` never implies `DISPLAY`: a correct principal, scope and revision on the wrong operation.
+    const displayScenario = buildScenario();
+    const displayGrant = makeGrant(displayScenario, 'DISPLAY');
+    const displayHost = createHost(displayScenario, { grant: displayGrant });
+    assertInjected(displayHost, { grant: displayGrant });
+    const display = createBoundFilePresence(displayHost.host, target());
+    await assertZeroOpenDenied('DISPLAY grant', () => display.handle.use(), sameTargetControl());
+    assert.equal(displayHost.counters.material, 0);
+    assert.equal(displayHost.ledger.entries.length, 0);
+    display.dispose();
+
+    const malformedScenario = buildScenario();
+    const malformedGrant = makeGrant(malformedScenario, 'USE',
+      { principal: { principalId: WORKLOAD.principalId } });
+    const malformedHost = createHost(malformedScenario, { grant: malformedGrant });
+    assertInjected(malformedHost, { grant: malformedGrant });
+    const malformed = createBoundFilePresence(malformedHost.host, target());
+    await assertZeroOpenDenied('malformed grant', () => malformed.handle.use(),
+      sameTargetControl());
+    assert.equal(malformedHost.counters.material, 0);
+    assert.equal(malformedHost.ledger.entries.length, 0);
+    malformed.dispose();
+
+    const unusableScenario = buildScenario();
+    const unusableHost = createHost(unusableScenario);
+    assertInjected(unusableHost, {});
+    const unusable = createBoundFilePresence({ ...unusableHost.host, registry: undefined },
+      target());
+    await assertZeroOpenDenied('unusable host', () => unusable.handle.use(), sameTargetControl());
+    assert.equal(unusableHost.counters.authority, 0);
+    assert.equal(unusableHost.counters.material, 0);
+    unusable.dispose();
   });
-
-  const revokedScenario = buildScenario();
-  const revokedHost = createHost(revokedScenario);
-  const revoked = revokedScenario.registry.transition({ version: 1,
-    mappingRef: revokedScenario.mappingRef, scope: { ...SCOPE }, expectedRevision: 2,
-    action: 'REVOKE' }, { now: USE_NOW });
-  assert.equal(revoked.state, 'CHANGED');
-  const revokedPresence = createBoundFilePresence(revokedHost.host, target());
-  await assertZeroOpenDenied('revoked', () => revokedPresence.handle.use());
-  assert.equal(revokedHost.counters.material, 0);
-  revokedPresence.dispose();
-
-  const blockedScenario = buildScenario();
-  const blockedHost = createHost(blockedScenario, { bundle: policyBundle('BLOCK') });
-  const blocked = createBoundFilePresence(blockedHost.host, target());
-  await assertZeroOpenDenied('blocked policy', () => blocked.handle.use());
-  blocked.dispose();
-
-  const foreignScenario = buildScenario();
-  const foreignHost = createHost(foreignScenario, { grant: makeGrant(foreignScenario, 'DISPLAY') });
-  const foreign = createBoundFilePresence(foreignHost.host, target());
-  await assertZeroOpenDenied('foreign grant', () => foreign.handle.use());
-  assert.equal(foreignHost.counters.material, 0);
-  foreign.dispose();
-
-  const malformedScenario = buildScenario();
-  const malformedHost = createHost(malformedScenario, { grant: makeGrant(malformedScenario, 'USE',
-    { principal: { principalId: WORKLOAD.principalId } }) });
-  const malformed = createBoundFilePresence(malformedHost.host, target());
-  await assertZeroOpenDenied('malformed grant', () => malformed.handle.use());
-  malformed.dispose();
-
-  const unusableScenario = buildScenario();
-  const unusableHost = createHost(unusableScenario);
-  const unusable = createBoundFilePresence({ ...unusableHost.host, registry: undefined },
-    target());
-  await assertZeroOpenDenied('unusable host', () => unusable.handle.use());
-  unusable.dispose();
-
-  await control();
-});
 
 test('an expired grant is refused, recorded once, and still opens nothing', async () => {
   const scenario = buildScenario();
@@ -398,6 +464,101 @@ test('an expired grant is refused, recorded once, and still opens nothing', asyn
   control.dispose();
   created.dispose();
 });
+
+/* ---------- 8. A recovered identifier that is not the private one is not an absence ---------- */
+
+test('a recovered identifier that differs from the private one refuses before any native effect',
+  async () => {
+    const scenario = buildScenario();
+    const built = createHost(scenario);
+    // The very same genuine file, the very same sealed material, but the target record was
+    // provisioned with a different private identifier of the same length.
+    assert.equal(OTHER_BYTES.byteLength, ORIGINAL_BYTES.byteLength);
+    const created = createBoundFilePresence(built.host, target({ identifier: OTHER_BYTES }));
+    const before = mark();
+    const descriptors = openDescriptors();
+    const result = await created.handle.use();
+    const refused = since(before);
+
+    assertFixedShape(result);
+    // The comparison happens before the first native function, so a mismatch is a reached effect that
+    // could not be completed - never an `ENOENT`, and never the `NOT_FOUND` of an absent target.
+    assert.equal(result.code, 'FAILED');
+    assert.deepEqual(refused, { opens: 0, stats: 0, closes: 0, lstats: 0, realpaths: 0 });
+    assert.equal(descriptors === openDescriptors() || descriptors === -1, true);
+    // The material really was loaded and decrypted: the comparison is over recovered bytes, not a
+    // refusal that skipped the effect's own inputs.
+    assert.equal(built.counters.material, 1);
+    assert.equal(built.ledger.entries.length, 2);
+    created.dispose();
+
+    // Same-target control with the matching identifier: this exact target really does open.
+    const controlHost = createHost(buildScenario());
+    const control = createBoundFilePresence(controlHost.host, target());
+    const controlMark = mark();
+    assert.equal((await control.handle.use()).code, 'USED');
+    assert.deepEqual(since(controlMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 });
+    assert.equal(seen.openPath === PRESENT_PATH, true);
+    control.dispose();
+  });
+
+/* ---------- 9. The private backend never escapes into a host callback's receiver ---------- */
+
+test('a blocked call never exposes the private backend through a host callback receiver',
+  async () => {
+    // A genuine core call that is refused: BLOCK over the pinned bundle, real executor, real policy.
+    const refusedReceivers = [];
+    const blockedBundle = policyBundle('BLOCK');
+    const blockedHost = createHost(buildScenario(), { bundle: blockedBundle,
+      onReceiver: (which, receiver) => refusedReceivers.push([which, receiver]) });
+    assertInjected(blockedHost, { bundle: blockedBundle });
+    const blocked = createBoundFilePresence(blockedHost.host, target());
+    const before = mark();
+    const result = await blocked.handle.use();
+    const refused = since(before);
+
+    assertFixedShape(result);
+    assert.equal(result.code, 'WITHHELD');
+    // Genuine `WITHHELD`: no effect and no audit entry at all on this path.
+    assert.deepEqual(refused, { opens: 0, stats: 0, closes: 0, lstats: 0, realpaths: 0 });
+    assert.equal(blockedHost.ledger.entries.length, 0);
+    assert.equal(blockedHost.counters.authority, 1);
+    blocked.dispose();
+
+    // The callback ran, and the object it was handed as its receiver is the caller's own host object
+    // - never the copy this module decorated with the private backend.
+    const authorities = refusedReceivers.filter(([which]) => which === 'authority');
+    assert.equal(authorities.length, 1);
+    const receivers = new Set(refusedReceivers.map(([, receiver]) => receiver));
+    assert.equal(receivers.size, 1);
+    for (const receiver of receivers) {
+      assert.equal(receiver === blockedHost.host, true);
+      assert.equal(Object.hasOwn(receiver, 'backend'), false);
+      assert.equal(receiver.backend, undefined);
+      assert.equal(typeof receiver.backend?.lookup, 'undefined');
+    }
+    // Nothing usable escaped: the object in the callback's hands is the caller's own host, which
+    // carries no backend and can spend no effect on its own.
+    assert.equal(Object.hasOwn(blockedHost.host, 'backend'), false);
+    assert.equal(blockedHost.host.backend, undefined);
+
+    // Positive receiver check on the accepted path, where the material callback really is invoked:
+    // its receiver is that same caller-owned object, and the effect is spent exactly once.
+    const acceptedReceivers = [];
+    const acceptedHost = createHost(buildScenario(),
+      { onReceiver: (which, receiver) => acceptedReceivers.push([which, receiver]) });
+    const accepted = createBoundFilePresence(acceptedHost.host, target());
+    const acceptedMark = mark();
+    assert.equal((await accepted.handle.use()).code, 'USED');
+    assert.deepEqual(since(acceptedMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 });
+    const materials = acceptedReceivers.filter(([which]) => which === 'material');
+    assert.equal(materials.length, 1);
+    assert.equal(acceptedHost.counters.material, 1);
+    assert.equal(materials[0][1] === acceptedHost.host, true);
+    assert.equal(Object.hasOwn(materials[0][1], 'backend'), false);
+    assert.equal(acceptedReceivers.every(([, receiver]) => receiver === acceptedHost.host), true);
+    accepted.dispose();
+  });
 
 /* ---------- 4. The closed target record: shape refusals touch no native function at all ---------- */
 
@@ -435,6 +596,16 @@ test('a malformed, traversing or multi-component target record yields a restrict
     assert.equal(built.ledger.entries.length, 0, name);
     created.dispose();
     assert.equal((await created.handle.use()).code, 'WITHHELD', name);
+
+    // Same-target control for this exact case: the instrument is live in this loop, and a genuine
+    // bound file at the very same target spends the effect, so the zero above cannot be a counter
+    // that stopped counting. The control is constructed before the window opens, so its trusted
+    // setup metadata is not counted as an effect.
+    const control = sameTargetControl();
+    const controlMark = mark();
+    assert.equal((await control()).code, 'USED', name);
+    assert.deepEqual(since(controlMark), { opens: 1, stats: 1, closes: 1, lstats: 0, realpaths: 0 },
+      name);
   }
 });
 
@@ -561,6 +732,8 @@ test('disposal blocks later calls and clears the owned configuration it created'
   const created = createBoundFilePresence(built.host, target({ identifier: callerBytes }));
 
   const beforeDispose = mark();
+  // The paired same-target control for every zero-count below, in this same test and at this same
+  // target: the genuine present file really opens before anything is disposed.
   assert.equal((await created.handle.use()).code, 'USED');
   assert.equal(since(beforeDispose).opens, 1);
 

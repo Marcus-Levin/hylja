@@ -21,7 +21,9 @@
  * owned buffer. `root` is one absolute trusted directory; `leaf` is exactly one component. Traversal
  * (`..`), an absolute leaf, a multi-component leaf, an empty or control-character leaf, a relative or
  * traversing root and an inherited or accessor-carrying record are all refused before any native
- * function runs, so a malformed record costs no metadata stat and no effect.
+ * function runs, so a malformed record costs no metadata stat and no effect. A root that is *linked*
+ * is the one shape-valid record that costs a native call: its own trusted setup `lstat` runs first,
+ * the root is refused as a link, and nothing is canonicalized, bound, opened or spent.
  *
  * Trusted-directory limit, stated plainly: standard Node 22 `fs` has no portable ancestor-relative
  * `openat` boundary, so this module requires the root's own ancestors to be trusted and stable. The
@@ -32,14 +34,24 @@
  * guarantee is made or implied.
  *
  * The bound identity is established at construction: the leaf is `lstat`ed once and, if it is a
- * regular file, its `(dev, ino)` is kept. The per-call effect opens that one construction-bound path
- * with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, `fstat`s the descriptor, requires a regular file, and
- * requires the observed identity to be the one bound at construction - so a link, a directory, a
- * device, a socket or a **substituted** inode at the same name is refused rather than reported. Only
- * then are the recovered bytes compared with the private identifier, byte by byte, with no decoding,
- * no retention, no logging and no forwarding. `ENOENT` is the one native answer that is an honest
- * absence (`NOT_FOUND`); a nonregular or substituted target and every other fault are a reached
- * effect that could not be completed, which the executor already reports as `FAILED`.
+ * regular file, its `(dev, ino)` is kept. The per-call effect first compares the recovered bytes with
+ * the private identifier, byte by byte, with no decoding, no retention, no logging and no forwarding -
+ * a mismatch is therefore a reached effect that could not be completed, never an absence - and only
+ * then opens that one construction-bound path with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, `fstat`s
+ * the descriptor, requires a regular file, and requires the observed identity to be the one bound at
+ * construction, so a link, a directory, a device, a socket or a **substituted** inode at the same
+ * name is refused rather than reported. `ENOENT` is the one native answer that is an honest absence
+ * (`NOT_FOUND`); a nonregular or substituted target, an identifier that is not the private one, and
+ * every other fault are a reached effect that could not be completed, which the executor already
+ * reports as `FAILED`.
+ *
+ * The private backend is never reachable from anything a host callback can see. The executor applies
+ * every host callback method with its own copy of the host as the receiver, so this module captures
+ * the caller's own `authority` and `material` methods and hands the executor synchronous forwarders
+ * that invoke those captured methods on the caller's own host object. The object carrying the backend
+ * is the executor's internal copy; it is never passed as an argument and never applied as a receiver.
+ * Each forwarder returns the answer exactly as the method returned it, a value or a promise alike, so
+ * no extra await and no second normalization sits between the host and the executor.
  *
  * The native functions are captured **at module load**, before any guard runs, so a property
  * replaced on `node:fs` later - or a host that re-points its own callbacks after construction - can
@@ -116,6 +128,12 @@ const CLOSE = closeSync;
 const STAT = lstatSync;
 const CANONICALIZE = realpathSync;
 const READ_ONLY = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+/**
+ * One captured `Reflect.apply`, read once at module load. `fn.call(recv)` and `fn.apply(recv, xs)`
+ * resolve a mutable property of the function object at the moment they run; this reference cannot be
+ * re-pointed afterwards, so the forwarding below invokes the captured host method directly.
+ */
+const REFLECT_APPLY = Reflect.apply;
 
 const PATH_LIMIT = 4096;
 const LEAF_LIMIT = 255;
@@ -256,17 +274,25 @@ function absent(error: unknown): boolean {
 
 /**
  * The whole per-call native effect, in one synchronous continuation with no `await`, no host
- * property read and no dynamic function lookup. The order is fixed: open with `O_NOFOLLOW` so a
- * link is refused by the kernel, `fstat` the descriptor that was actually opened, require a regular
- * file, require the construction-bound identity, close in a `finally`, and only then compare. The
+ * property read and no dynamic function lookup. The order is fixed and it is the honest one: compare
+ * the recovered bytes with the private identifier **before** the first native function runs, so a
+ * recovered identifier that is not the private one is a reached effect that could not be completed -
+ * never an `ENOENT` and never the `NOT_FOUND` this module reserves for one. Only then open with
+ * `O_NOFOLLOW` so a link is refused by the kernel, `fstat` the descriptor that was actually opened,
+ * require a regular file, require the construction-bound identity, and close in a `finally`. The
  * recovered bytes are read once and dropped; nothing here decodes, stores, logs or forwards them.
  *
- * A nonregular or substituted target, and every fault other than `ENOENT`, throw. The backend has no
- * vocabulary of its own: the executor already reports a throwing backend inside its sealed segment as
- * a reached effect that could not be completed, which is exactly the honest code, and never a `USE`.
+ * A nonregular or substituted target, an identifier that is not the private one, and every fault
+ * other than `ENOENT`, throw. The backend has no vocabulary of its own: the executor already reports a
+ * throwing backend inside its sealed segment as a reached effect that could not be completed, which is
+ * exactly the honest code, and never a `USE`. Every message below is a fixed literal: no path, no
+ * identifier, no byte and no native text is ever carried out of this function.
  */
 function probe(path: string, identity: BoundIdentity | null, provisioned: Uint8Array,
   recovered: Uint8Array): boolean {
+  if (!matches(recovered, provisioned)) {
+    throw new Error('recovered identifier is not the provisioned one');
+  }
   let descriptor: number;
   try {
     descriptor = OPEN(path, READ_ONLY);
@@ -280,7 +306,7 @@ function probe(path: string, identity: BoundIdentity | null, provisioned: Uint8A
     if (identity === null || observed.dev !== identity.dev || observed.ino !== identity.ino) {
       throw new Error('not the bound target');
     }
-    return matches(recovered, provisioned);
+    return true;
   } finally {
     CLOSE(descriptor);
   }
@@ -290,6 +316,14 @@ function probe(path: string, identity: BoundIdentity | null, provisioned: Uint8A
  * The private host. Shape is checked here so a caller cannot smuggle a key past the executor; the
  * values themselves are the host's own, and `createBoundMappingUse` re-reads and re-validates all of
  * them, in full, before any effect can exist.
+ *
+ * The executor applies every host callback method with **its own** copy of the host as the receiver,
+ * so the object that reaches an external callback would be this decorated copy - backend and all. The
+ * two callbacks are therefore captured here as the caller's own methods and handed over as
+ * synchronous forwarders over the captured `Reflect.apply`: each one invokes its captured method on
+ * the caller's own host object and returns that answer unchanged, a value or a promise alike. No
+ * extra await and no re-normalization is introduced, and the decorated copy - the only object that
+ * carries the private backend - is never an argument and never a receiver.
  * ------------------------------------------------------------------------------------------- */
 const HOST_KEYS = ['version', 'mappingRef', 'scope', 'entityId', 'registry', 'audit', 'policy',
   'authority', 'material'] as const;
@@ -297,6 +331,10 @@ const HOST_KEYS = ['version', 'mappingRef', 'scope', 'entityId', 'registry', 'au
 function privateHost(value: unknown, backend: MappingUseBackend) {
   const v = snapshot(value, HOST_KEYS);
   if (v.version !== 1) refuse();
+  const authority = v.authority;
+  const material = v.material;
+  if (typeof authority !== 'function' || typeof material !== 'function') refuse();
+  const receiver = value as object;
   return Object.freeze({
     version: 1 as const,
     mappingRef: v.mappingRef as string,
@@ -306,8 +344,8 @@ function privateHost(value: unknown, backend: MappingUseBackend) {
     audit: v.audit as MappingUseAudit,
     policy: v.policy as MappingUsePolicy,
     backend,
-    authority: v.authority as () => unknown,
-    material: v.material as () => unknown,
+    authority: (): unknown => REFLECT_APPLY(authority as () => unknown, receiver, []),
+    material: (): unknown => REFLECT_APPLY(material as () => unknown, receiver, []),
   });
 }
 

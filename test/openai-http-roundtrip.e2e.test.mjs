@@ -326,29 +326,61 @@ function splitResponse(bytes) {
 /* ---------- The trusted raw-socket transport owned by this test file ---------- */
 
 /**
- * Writes the exact bytes the sender hands it onto one real loopback socket and captures the COMPLETE
- * reply off that same socket. A rejected promise here becomes `DISPATCH_FAILED` in the sender, so the
- * socket is a real effect boundary and not a recording of an in-memory call.
+ * One private transport lifecycle per exchange, split the way the sender's own accepted path is
+ * split. `waitUntilReady()` opens the one real loopback connection, confirms it, installs the
+ * response, error and close listeners and captures the socket's own `write` and `end` functions. It
+ * sends no byte and approves nothing. `sendExact` then invokes that captured write in its FIRST
+ * synchronous turn, before its own first `await`, so no callback and no promise continuation can sit
+ * between the sender's last guard and the byte. `dispose()` destroys a socket that was prepared and
+ * never dispatched; the send wrapper below calls it from its own `finally`, so teardown stays a
+ * fallback rather than the mechanism that closes a leak.
  */
 function rawSocketTransport(state) {
-  return async (image) => {
-    const socket = net.connect(state.port, '127.0.0.1');
-    state.sockets.add(socket);
-    socket.on('error', () => {});
-    const received = [];
-    socket.on('data', (chunk) => received.push(chunk));
-    await bounded(new Promise((resolve, reject) => {
-      socket.once('connect', resolve);
-      socket.once('error', reject);
-    }), 'loopback connect');
-    socket.write(Buffer.from(image));
-    await bounded(new Promise((resolve) => socket.once('close', resolve)), 'exchange close');
-    state.sockets.delete(socket);
-    state.responses.push(Buffer.concat(received));
+  let prepared = null;
+  const dispose = () => {
+    const owned = prepared;
+    prepared = null;
+    if (owned !== null) { try { owned.socket.destroy(); } catch { /* already closed */ } }
+  };
+  return {
+    waitUntilReady: async () => {
+      dispose();
+      const socket = net.connect(state.port, '127.0.0.1');
+      state.sockets.add(socket);
+      socket.on('error', () => {});
+      const received = [];
+      socket.on('data', (chunk) => received.push(chunk));
+      await bounded(new Promise((resolve, reject) => {
+        socket.once('connect', resolve);
+        socket.once('error', reject);
+      }), 'loopback connect');
+      // Captured on the confirmed connection and invoked from here afterwards, so the dispatch turn
+      // reads no socket property between its own guards and the write.
+      const writeMethod = socket.write;
+      const endMethod = socket.end;
+      prepared = {
+        socket, received,
+        write: (bytes) => { writeMethod.call(socket, Buffer.from(bytes)); },
+        end: () => { endMethod.call(socket); },
+      };
+    },
+    sendExact: async (image) => {
+      const owned = prepared;
+      prepared = null;
+      if (owned === null) throw new Error('the transport was never prepared');
+      // Synchronous, before this function's first `await` - the whole point of the split.
+      owned.write(image);
+      owned.end();
+      await bounded(new Promise((resolve) => owned.socket.once('close', resolve)), 'exchange close');
+      state.sockets.delete(owned.socket);
+      state.responses.push(Buffer.concat(owned.received));
+    },
+    dispose,
   };
 }
 
 function createSender(state) {
+  const transport = rawSocketTransport(state);
   const host = {
     boundary: BOUNDARY,
     sourceTrust: SOURCE_TRUST,
@@ -359,10 +391,21 @@ function createSender(state) {
     inspectOriginal: inspectWholeImage,
     sendPoint: {
       observe: () => OBSERVATION,
-      sendExact: rawSocketTransport(state),
+      // Readiness is a required member, and here it owns a real connection: it prepares the socket
+      // and sends nothing, so the dispatch-point guards the sender reads after it are read against a
+      // transport that will really write now.
+      waitUntilReady: transport.waitUntilReady,
+      sendExact: transport.sendExact,
     },
   };
-  return createOpenAiTextSender(host);
+  const owner = createOpenAiTextSender(host);
+  // The outer send `finally` this transport owns: whatever the sender decides, a socket prepared and
+  // never dispatched is destroyed here rather than left to the test teardown.
+  return {
+    send: (input) => owner.send(input).finally(() => { transport.dispose(); }),
+    cancel: () => { owner.cancel(); },
+    get state() { return owner.state; },
+  };
 }
 
 /** The whole withholding invariant: no connection, no parsed request and no byte reached the server. */
@@ -528,12 +571,17 @@ test('the framing and codec checks bite: a control one header or one character o
   { timeout: TEST_TIMEOUT_MS }, async (t) => {
     const state = await startServer(t);
     const transport = rawSocketTransport(state);
+    /** One direct exchange over this file's own transport: readiness, then the immediate handoff. */
+    const exchange = async (image) => {
+      await bounded(transport.waitUntilReady(), 'direct readiness');
+      await bounded(transport.sendExact(image), 'direct exchange');
+    };
 
     /* Control 1: correct body and correct Content-Length, but the content type is not the exact
        declared one. The server still parses the request, and the exact framing verdict rejects it. */
     const wrongType = `${EXPECTED_REQUEST_LINE}\r\nHost: ${HOST_LABEL}\r\n`
       + `Content-Type: application/json\r\nContent-Length: ${EXPECTED_BODY_BYTES}\r\n\r\n${EXPECTED_BODY}`;
-    await bounded(transport(Buffer.from(wrongType, 'utf8')), 'control 1 exchange');
+    await bounded(exchange(Buffer.from(wrongType, 'utf8')), 'control 1 exchange');
     assert.equal(state.requests.length, 1, 'the control request really was parsed off the wire');
     assert.equal(state.connections, 1);
     const wrongTypeRecord = state.requests[0];
@@ -549,7 +597,7 @@ test('the framing and codec checks bite: a control one header or one character o
       'the mutated body keeps the declared byte length');
     const wrongByte = `${EXPECTED_REQUEST_LINE}\r\nHost: ${HOST_LABEL}\r\n`
       + `Content-Type: application/json; charset=utf-8\r\nContent-Length: ${EXPECTED_BODY_BYTES}\r\n\r\n${mutatedBody}`;
-    await bounded(transport(Buffer.from(wrongByte, 'utf8')), 'control 2 exchange');
+    await bounded(exchange(Buffer.from(wrongByte, 'utf8')), 'control 2 exchange');
     assert.equal(state.requests.length, 2);
     const wrongByteRecord = state.requests[1];
     assert.equal(wrongByteRecord.contentLength, String(EXPECTED_BODY_BYTES));
@@ -559,10 +607,12 @@ test('the framing and codec checks bite: a control one header or one character o
 
     /* Control 3: a complete reply in a shape the strict codec must refuse by name, delivered as real
        socket bytes. The codec refuses it; nothing narrows, drops or forwards it. */
-    const streaming = await startServer(t, STREAMING_RESPONSE_BODY);
-    await bounded(rawSocketTransport(streaming)(Buffer.from(wrongType, 'utf8')), 'control 3 exchange');
-    assert.equal(streaming.responses.length, 1);
-    const streamingReply = splitResponse(streaming.responses[0]);
+    const streamingState = await startServer(t, STREAMING_RESPONSE_BODY);
+    const streaming = rawSocketTransport(streamingState);
+    await bounded(streaming.waitUntilReady(), 'control 3 readiness');
+    await bounded(streaming.sendExact(Buffer.from(wrongType, 'utf8')), 'control 3 exchange');
+    assert.equal(streamingState.responses.length, 1);
+    const streamingReply = splitResponse(streamingState.responses[0]);
     assert.equal(streamingReply === null, false, 'the control reply is framed');
     assert.deepEqual(translateOpenAiTextResponse({
       endpoint: OPENAI_TEXT_RESPONSE_ENDPOINT, body: streamingReply.body.toString('utf8'),
