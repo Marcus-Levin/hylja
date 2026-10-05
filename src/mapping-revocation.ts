@@ -30,9 +30,9 @@
  *      and require both the ledger and the trusted context to carry the bound tenant/project, so a
  *      revocation is never written into a foreign stream. That identity and scope are captured as an
  *      owned immutable snapshot the append is actually handed;
- *   4. read the real registry `current`; require `FOUND` and `ACTIVE` and take the pinned revision
- *      from that read as an owned copy rather than a live host object, so the compare-and-set is
- *      decided by the registry's own record;
+ *   4. read the real registry `current`; require a closed version-1 `FOUND` answer whose own record is
+ *      `ACTIVE`, and take the pinned revision from that read as an owned copy rather than a live host
+ *      object, so the compare-and-set is decided by the registry's own record;
  *   5. record the authorized intent through the real `appendAuditEvent` and gate it on
  *      `gateHighRiskEffect` applied to the value `appendAuditEvent` itself returned. An audit
  *      outage here withholds **before** the mutation, so nothing is revoked without evidence;
@@ -46,15 +46,24 @@
  *   7. mark the mutation attempted immediately before invoking `transition`, so from that instant on
  *      no fault can leave through a path that claims zero mutation, and record the applied result
  *      only after the registry confirmed it, gated the same way. A fault after an attempted mutation
- *      is `UNRECORDED`: the mapping stays revoked, nothing is revived, and no audited success is
- *      claimed.
+ *      is `UNRECORDED`: the completion is **unknown**, nothing is rolled back or revived, and no
+ *      audited success is claimed. It is not a claim that the record is revoked.
  *
- * The registry's actual answer shapes are what the applied evidence is built from: a confirmed
+ * The registry's actual answer shapes are what the applied evidence is built from, and they are
+ * discriminated from one bounded owned snapshot of the answer envelope taken **before** any branch
+ * reads it, never from an ordinary property read of the answer object. A confirmed
  * `{version: 1, state: 'REFUSED', reason}` is the registry confirming that it applied nothing, so
  * that call is `WITHHELD` with no applied event; only a confirmed `CHANGED` carrying the bound
  * reference and scope, `REVOKED`, at exactly the pinned revision plus one earns `APPLIED`; and a
- * throw, a malformed answer, or any unconfirmed application - including `UNCHANGED` - is
- * `UNRECORDED` with no applied event.
+ * throw, a malformed answer, an answer whose own descriptors and ordinary reads disagree, or any
+ * unconfirmed application - including `UNCHANGED` - is `UNRECORDED` with no applied event. The same
+ * holds for every `current` read on this path: a registry read this module cannot read whole is
+ * refused before the mutation, at the initial read and at the last one alike.
+ *
+ * A record's own `createdAt` and `expiresAt` are read as the nonnegative instants the shipped
+ * registry and lifecycle reducer define them to be, so a record created at epoch zero is an ordinary
+ * record. The administrative `now` and `expiresAt` stay strictly positive, so no decision's
+ * freshness is relaxed by that.
  *
  * Retry and idempotency semantics are the **registry's own**, and this module adds none. The
  * registry is monotonic: the first successful call moves the record to `REVOKED` at
@@ -94,8 +103,9 @@ import type { RequestContext } from './interaction-envelope.js';
 
 /**
  * The closed outcome vocabulary. `REVOKED` is the only claim that the registry applied the
- * transition **and** that its result was recorded; `UNRECORDED` is the honest answer for a mutation
- * whose audited completion cannot be proved; `WITHHELD` claims zero mutation.
+ * transition **and** that its result was recorded; `UNRECORDED` is the honest answer for an attempted
+ * mutation whose audited completion cannot be proved - the completion is unknown, not confirmed
+ * either way, and nothing is rolled back; `WITHHELD` claims zero mutation.
  */
 export const MAPPING_REVOCATION_CODES = ['REVOKED', 'UNRECORDED', 'WITHHELD'] as const;
 export type MappingRevocationCode = (typeof MAPPING_REVOCATION_CODES)[number];
@@ -247,6 +257,19 @@ function instant(value: unknown): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) fail('INVALID_AUTHORITY');
   return value;
 }
+/**
+ * One **record** instant, which is not the same reader. The shipped registry and lifecycle reducer
+ * both define an instant as a nonnegative safe integer and create records from a caller-supplied
+ * clock, so a record really can carry `createdAt = 0`. Reading that record through a reader that
+ * demands a positive value would refuse an ordinary record of the shipped registry's own making, and
+ * with it the compare-and-set this owner exists to drive. Only this reader accepts zero: the
+ * administrative `now` and `expiresAt` above stay strictly positive, so a decision's freshness is
+ * not relaxed by any of this.
+ */
+function recordInstant(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) fail('INVALID_AUTHORITY');
+  return value;
+}
 function revision(value: unknown): number {
   const parsed = instant(value);
   if (parsed < 1) fail('INVALID_AUTHORITY');
@@ -311,10 +334,22 @@ function ownedRecord(value: unknown, mappingRef: string, bound: MappingRevocatio
   }
   // `createdAt` and `expiresAt` are required keys and are normalized here once, so a record that
   // cannot be read whole is refused rather than partially accepted.
-  const createdAt = instant(v.createdAt);
-  const expiresAt = instant(v.expiresAt);
+  const createdAt = recordInstant(v.createdAt);
+  const expiresAt = recordInstant(v.expiresAt);
   if (createdAt >= expiresAt) fail('INVALID_AUTHORITY');
   return Object.freeze({ mappingRef, scope: recordScope, revision: revision(v.revision) });
+}
+
+/**
+ * One closed branch shape, compared against one owned snapshot's own keys.
+ *
+ * The registry answers in two shapes that differ in which payload they carry, and neither may carry
+ * the other's key. A pure predicate, because this runs inside the mutation segment where a refusal is
+ * `UNRECORDED` rather than a thrown code.
+ */
+function closedBranch(snapshot: Fields, shape: readonly string[]): boolean {
+  const keys = Reflect.ownKeys(snapshot);
+  return keys.length === shape.length && shape.every((name) => Object.hasOwn(snapshot, name));
 }
 
 /**
@@ -565,10 +600,13 @@ function bindAudit(captured: Captured, observed: Observation): void {
 }
 
 /**
- * A real registry read. Only a `FOUND` record reaches anything else, and only an `ACTIVE` one can be
- * revoked: a tombstone is already terminal, so a repeat call is refused with zero mutation instead
- * of claiming a second effect. What this returns is an owned copy of the record's own identity, so
- * a later guard in the same continuation compares values this module holds, not a live host object.
+ * A real registry read. Its **own** answer envelope is normalized as one closed owned snapshot before
+ * anything reads its state, exactly as the mutation segment does: only a version-1 `FOUND` answer
+ * whose record is this bound reference's own is accepted here, and a read whose ordinary property
+ * reads disagree with its own descriptors cannot be read as found. Only an `ACTIVE` record can be
+ * revoked: a tombstone is already terminal, so a repeat call is refused with zero mutation instead of
+ * claiming a second effect. What this returns is an owned copy of the record's own identity, so a
+ * later guard in the same continuation compares values this module holds, not a live host object.
  */
 function liveRecord(captured: Captured, now: number): OwnedRecord {
   const { registry, readCurrent, mappingRef, scope } = captured.fixed;
@@ -576,8 +614,9 @@ function liveRecord(captured: Captured, now: number): OwnedRecord {
     const found = invoke(readCurrent, registry, [{ version: 1, mappingRef,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId } },
     { now }]);
-    if (found === null || typeof found !== 'object' || found.state !== 'FOUND') fail('NOT_CURRENT');
-    return ownedRecord(found.metadata, mappingRef, scope, 'ACTIVE', 'NOT_ACTIVE');
+    const v = fields(found, ['version', 'state', 'metadata']);
+    if (v.version !== 1 || v.state !== 'FOUND') fail('NOT_CURRENT');
+    return ownedRecord(v.metadata, mappingRef, scope, 'ACTIVE', 'NOT_ACTIVE');
   });
 }
 
@@ -674,15 +713,21 @@ function sealed(captured: Captured, previous: Observation, observed: Observation
   return applyRevocation(captured, observed, pinned, phase);
 }
 
+/** The two closed shapes the registry's own transition answers take, one payload each. */
+const REFUSAL_SHAPE = ['version', 'state', 'reason'] as const;
+const CHANGE_SHAPE = ['version', 'state', 'metadata'] as const;
+
 /**
  * The mutation segment, and the only place `attempted` is set.
  *
- * The registry's own answer shapes decide the code: a closed `REFUSED` is the registry confirming
- * that it applied nothing, so that call is `WITHHELD`; only a confirmed `CHANGED` carrying the bound
- * reference and scope, `REVOKED`, at exactly the pinned revision plus one earns an applied event
- * and `REVOKED`; anything else - a throw, a malformed answer, an `UNCHANGED` repeat, a record that
- * does not match what was pinned - leaves this owner unable to confirm what happened, so it is
- * `UNRECORDED`. Nothing is revived, rolled back or second-guessed in any of those cases.
+ * The registry's own answer shapes decide the code, and they are decided **from one owned snapshot**
+ * taken before any branch reads the answer. A closed `REFUSED` is the registry confirming that it
+ * applied nothing, so that call is `WITHHELD`; only a confirmed `CHANGED` carrying the bound
+ * reference and scope, `REVOKED`, at exactly the pinned revision plus one earns an applied event and
+ * `REVOKED`; anything else - a throw, a malformed answer, an answer whose own descriptors and
+ * ordinary reads disagree, an `UNCHANGED` repeat, a record that does not match what was pinned -
+ * leaves this owner unable to confirm what happened, so it is `UNRECORDED`. Nothing is revived,
+ * rolled back or second-guessed in any of those cases, and none of them claims an applied success.
  */
 function applyRevocation(captured: Captured, observed: Observation, pinned: number,
   phase: Phase): MappingRevocationResult {
@@ -696,17 +741,21 @@ function applyRevocation(captured: Captured, observed: Observation, pinned: numb
     const answer = invoke(applyTransition, registry, [{ version: 1, mappingRef,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId },
       expectedRevision: pinned, action: 'REVOKE' }, { now: observed.now }]);
-    if (answer === null || typeof answer !== 'object') return UNRECORDED;
-    const reported = (answer as Fields).state;
+    // One bounded owned snapshot of the whole answer envelope, taken before any branch reads it. Every
+    // read below is of that snapshot, so an answer whose ordinary property reads answer something
+    // other than its own data descriptors cannot decide this call's code: a self-contradicting
+    // refusal is not a confirmation, and a self-contradicting change is not an application.
+    const v = fields(answer, ['version', 'state'], ['reason', 'metadata']);
+    if (v.version !== 1) return UNRECORDED;
+    const reported = v.state;
     if (reported === 'REFUSED') {
-      // The shipped refusal is closed, so a reason outside its own vocabulary is not a confirmation.
-      const v = fields(answer, ['version', 'state', 'reason']);
-      if (v.version !== 1) return UNRECORDED;
+      // The shipped refusal is closed, so a reason outside its own vocabulary is not a confirmation,
+      // and a payload it does not carry is not its answer at all.
+      if (!closedBranch(v, REFUSAL_SHAPE)) return UNRECORDED;
       member(v.reason, MAPPING_METADATA_REASONS);
       confirmed = true;
     } else if (reported === 'CHANGED' || reported === 'UNCHANGED') {
-      const v = fields(answer, ['version', 'state', 'metadata']);
-      if (v.version !== 1) return UNRECORDED;
+      if (!closedBranch(v, CHANGE_SHAPE)) return UNRECORDED;
       const record = ownedRecord(v.metadata, mappingRef, scope, 'REVOKED', 'INVALID_AUTHORITY');
       // An `UNCHANGED` repeat is the registry's idempotent answer, not proof that this call applied
       // the transition, and a revision other than `pinned + 1` is a record this call did not pin.
@@ -721,7 +770,8 @@ function applyRevocation(captured: Captured, observed: Observation, pinned: numb
   if (confirmed) return WITHHELD;
   if (after === undefined) return UNRECORDED;
   // The applied result is recorded only after the registry confirmed it, and never before: a fault
-  // here leaves the mapping revoked and reports `UNRECORDED`, which revives nothing.
+  // here leaves the confirmed record exactly as the registry left it and reports `UNRECORDED`,
+  // which revives nothing.
   try {
     appendLifecycle(captured, observed.now, 'applied');
   } catch {

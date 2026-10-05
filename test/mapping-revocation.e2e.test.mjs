@@ -91,6 +91,30 @@ function aadScope(scope, revision) {
     classification: CLASS, mappingRevision: String(revision), keyVersion: KEY_VERSION };
 }
 
+/**
+ * The same ephemeral mapping created at **epoch zero**. The shipped registry and reducer both define
+ * an instant as a nonnegative safe integer, so `createdAt = 0` is an ordinary record rather than an
+ * edge case a reader is entitled to refuse.
+ */
+function buildEpochZeroScenario() {
+  const derived = deriveScopedEntityReference({ scope: 'SESSION', tenantId: SCOPE.tenantId,
+    projectId: SCOPE.projectId, sessionId: SCOPE.sessionId, entityId: ENTITY_ID,
+    semanticType: CLASS, keyVersion: KEY_VERSION, key: keyBytes(0x44) });
+  assert.equal(derived.state, 'DERIVED');
+  const registry = createMappingMetadataRegistry({ capacity: CAPACITY });
+  const mappingRef = derived.token;
+  const expiresAt = TTL_MS;
+  const inserted = registry.insert({ version: 1, mappingRef, scope: { ...SCOPE }, expiresAt },
+    { now: 0 });
+  assert.equal(inserted.state, 'INSERTED');
+  assert.equal(inserted.metadata.createdAt, 0);
+  const activated = registry.transition({ version: 1, mappingRef, scope: { ...SCOPE },
+    expectedRevision: 1, action: 'ACTIVATE' }, { now: 0 });
+  assert.equal(activated.state, 'CHANGED');
+  assert.equal(activated.metadata.revision, 2);
+  return { registry, mappingRef, scope: SCOPE, expiresAt, revision: 2 };
+}
+
 const EVIDENCE = composeClassification({ detectorEvidence: [{
   version: 1, id: 'detector-revocation-fixture.invalid', status: 'FOUND',
   provenance: { inputRef: 'field-revocation-fixture.invalid',
@@ -125,9 +149,13 @@ function createBackend() {
 }
 
 /**
- * A delegating view of the real registry, so a test can count or fault the seam calls this owner
- * actually made. The owner binds the view's own `current` and `transition` at construction, exactly
- * as it binds the real registry object's, so the view is the object it must call through.
+ * A delegating view of the real registry, so a test can count, fault or replace the seam calls this
+ * owner actually made. The owner binds the view's own `current` and `transition` at construction,
+ * exactly as it binds the real registry object's, so the view is the object it must call through.
+ *
+ * `afterCurrent(n, answer)` runs after each read; whatever it returns, when that is not `undefined`,
+ * is the answer the owner is handed instead of the registry's own. That is how a malformed or
+ * self-contradicting `FOUND` envelope is injected at a chosen observation point.
  */
 function countingRegistry(registry, { afterCurrent, wrapTransition } = {}) {
   const counters = { current: 0, transition: 0 };
@@ -135,8 +163,9 @@ function countingRegistry(registry, { afterCurrent, wrapTransition } = {}) {
     current: (...args) => {
       counters.current += 1;
       const answer = registry.current(...args);
-      if (typeof afterCurrent === 'function') afterCurrent(counters.current, answer);
-      return answer;
+      if (typeof afterCurrent !== 'function') return answer;
+      const replacement = afterCurrent(counters.current, answer);
+      return replacement === undefined ? answer : replacement;
     },
     transition: (...args) => {
       counters.transition += 1;
@@ -191,7 +220,9 @@ function createUseHost({ scenario, backend, ledger, auditContext, record }) {
 /**
  * The revocation host. `decision` is the closed administrative answer the owner must validate, and
  * `hooks.onAuthority(n)` runs at exactly the observation points so a test can change the world
- * between two of them. `state` holds what the next observation reports.
+ * between two of them. `hooks.fulfil(n, fixture, buildAnswer)` may return a promise instead of the
+ * answer, which is what lets a test hold the **raw** answer back and let a genuinely queued callback
+ * change the world before that answer is fulfilled. `state` holds what the next observation reports.
  */
 function createRevocationHost({ scenario, ledger, auditContext, overrides = {}, hooks = {} }) {
   const bundle = policyBundle();
@@ -215,15 +246,24 @@ function createRevocationHost({ scenario, ledger, auditContext, overrides = {}, 
     authority: () => {
       counters.authority += 1;
       if (typeof hooks.onAuthority === 'function') hooks.onAuthority(counters.authority, fixture);
-      // `authorityScope` overrides the decision's own scope only; the context it carries stays at
-      // the bound scope. That separation is what makes a foreign or absent decision scope
-      // observable at all: a host cannot hide a foreign scope behind a matching context.
-      const answer = { version: 1, subject: { ...state.subject },
-        context: { ...state.scope, purpose: state.purpose }, decision: state.decision,
-        role: state.role, mappingRef: state.mappingRef,
-        scope: Object.hasOwn(state, 'authorityScope') ? state.authorityScope : { ...state.scope },
-        revision: state.revision, expiresAt: state.expiresAt, now: state.now };
-      return Object.hasOwn(state, 'extra') ? { ...answer, ...state.extra } : answer;
+      // Built as a closure, so a held-back answer is composed after whatever a queued callback did,
+      // and every field is read from `state` at the moment the answer is actually built.
+      const buildAnswer = () => {
+        // `authorityScope` overrides the decision's own scope only; the context it carries stays at
+        // the bound scope. That separation is what makes a foreign or absent decision scope
+        // observable at all: a host cannot hide a foreign scope behind a matching context.
+        const answer = { version: 1, subject: { ...state.subject },
+          context: { ...state.scope, purpose: state.purpose }, decision: state.decision,
+          role: state.role, mappingRef: state.mappingRef,
+          scope: Object.hasOwn(state, 'authorityScope') ? state.authorityScope : { ...state.scope },
+          revision: state.revision, expiresAt: state.expiresAt, now: state.now };
+        return Object.hasOwn(state, 'extra') ? { ...answer, ...state.extra } : answer;
+      };
+      if (typeof hooks.fulfil === 'function') {
+        const deferred = hooks.fulfil(counters.authority, fixture, buildAnswer);
+        if (deferred !== undefined) return deferred;
+      }
+      return buildAnswer();
     },
   };
   fixture.host = host;
@@ -702,48 +742,92 @@ test('an authority callback that throws or answers with a boolean refuses with z
     }
   });
 
-test('a denial or an expiry queued at the last guard refuses before the mutation', async () => {
-  for (const queued of [(state) => { state.decision = 'DENY'; },
-    (state) => { state.expiresAt = state.now; }]) {
-    const built = fullScenario({ hooks: { onAuthority: (n, fixture) => {
-      // Queued on the final observation: the answer this owner acts on is normalized and fully
-      // guarded in the continuation that reads it, so a decision revoked or expired while that
-      // answer was pending still withholds - the authority cannot be stale at the mutation.
-      if (n === 2) queued(fixture.state);
-    } } });
-    const owner = createBoundMappingRevocation(built.revocation.host);
+test('a denial or an expiry applied while the final answer is built refuses before the mutation',
+  async () => {
+    for (const queued of [(state) => { state.decision = 'DENY'; },
+      (state) => { state.expiresAt = state.now; }]) {
+      const built = fullScenario({ hooks: { onAuthority: (n, fixture) => {
+        // Applied **synchronously**, while the host is still building its final answer: nothing is
+        // queued here, so this case is about the answer this owner reads, not about scheduling.
+        if (n === 2) queued(fixture.state);
+      } } });
+      const { view, counters } = countingRegistry(built.scenario.registry);
+      const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
 
-    assert.equal((await owner.revoke()).code, 'WITHHELD');
-    // Exactly two observations: the initial one and the last awaited answer.
-    assert.equal(built.revocation.counters.authority, 2);
-    assert.deepEqual(lifecycleOf(built.scenario), { state: 'ACTIVE', revision: built.scenario.revision });
-    const evidence = revokeEvidence(built.ledger);
-    assert.equal(evidence.length, 1);
-    assert.equal(evidence[0].reason, 'RESOLUTION_AUTHORIZED');
-  }
-});
+      assert.equal((await owner.revoke()).code, 'WITHHELD');
+      // Exactly two observations: the initial one and the last awaited answer.
+      assert.equal(built.revocation.counters.authority, 2);
+      assert.deepEqual(counters, { current: 1, transition: 0 });
+      assert.deepEqual(lifecycleOf(built.scenario), { state: 'ACTIVE', revision: built.scenario.revision });
+      const evidence = revokeEvidence(built.ledger);
+      assert.equal(evidence.length, 1);
+      assert.equal(evidence[0].reason, 'RESOLUTION_AUTHORIZED');
+    }
+  });
+
+test('a denial or an expiry queued before the last answer is fulfilled refuses with zero mutation',
+  async () => {
+    for (const queued of [(state) => { state.decision = 'DENY'; },
+      (state) => { state.expiresAt = state.now; }]) {
+      const trace = { scheduled: 0, fired: 0, fulfilled: 0 };
+      const built = fullScenario({ hooks: { fulfil: (n, fixture, buildAnswer) => {
+        // Genuinely queued, not applied in place. The host returns a promise for the raw answer, and
+        // the denial or the expiry lands in the microtask queued **first**, so the answer the owner
+        // finally normalizes is the one the queued callback changed - the trigger is a real
+        // scheduling event between the callback returning and its answer being read.
+        if (n !== 2) return undefined;
+        trace.scheduled += 1;
+        return new Promise((resolve) => {
+          queueMicrotask(() => { trace.fired += 1; queued(fixture.state); });
+          queueMicrotask(() => { trace.fulfilled += 1; resolve(buildAnswer()); });
+        });
+      } } });
+      const { view, counters } = countingRegistry(built.scenario.registry);
+      const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+
+      assert.equal((await owner.revoke()).code, 'WITHHELD');
+      // The trigger was really scheduled and really ran, once, and the answer it changed is the one
+      // the owner read.
+      assert.deepEqual(trace, { scheduled: 1, fired: 1, fulfilled: 1 });
+      assert.equal(built.revocation.counters.authority, 2);
+      // The authority the owner finally normalized is the denied or expired one, so the final
+      // registry read never ran and the compare-and-set was never attempted at all.
+      assert.deepEqual(counters, { current: 1, transition: 0 });
+      assert.deepEqual(lifecycleOf(built.scenario), { state: 'ACTIVE', revision: built.scenario.revision });
+      const evidence = revokeEvidence(built.ledger);
+      assert.equal(evidence.length, 1);
+      assert.equal(evidence[0].reason, 'RESOLUTION_AUTHORIZED');
+    }
+  });
 
 test('a revocation queued by a host callback is observed before the mutation and never claimed',
   async () => {
-    const raced = { queued: 0, answer: undefined };
+    const raced = { queued: 0, fired: 0, order: [], answer: undefined };
     const built = fullScenario({ hooks: { onAuthority: (n) => {
       // Queued by the last authority answer: the awaited answer resumes only after the microtask
       // queue drains, so this racing mutation has already moved the record by the time the final
       // guards run - and the owner's own compare-and-set is never reached.
       if (n === 2) {
         raced.queued += 1;
-        queueMicrotask(() => { raced.answer = competitor(built); });
+        queueMicrotask(() => {
+          raced.fired += 1;
+          raced.order.push('queued-callback');
+          raced.answer = competitor(built);
+        });
       }
     } } });
-    const owner = createBoundMappingRevocation(built.revocation.host);
+    const { view, counters } = countingRegistry(built.scenario.registry);
+    const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
 
     const result = await owner.revoke();
     fixedShape(result);
     assert.equal(result.code, 'WITHHELD');
-    // The trigger really fired, on the final observation and exactly once, and its real transition
-    // really applied.
-    assert.equal(raced.queued, 1);
+    // The trigger really fired, on the final observation and exactly once, its real transition
+    // really applied, and this owner's own compare-and-set was never even attempted.
+    assert.deepEqual({ queued: raced.queued, fired: raced.fired }, { queued: 1, fired: 1 });
     assert.equal(built.revocation.counters.authority, 2);
+    assert.equal(counters.transition, 0);
+    assert.deepEqual(raced.order, ['queued-callback']);
     assert.equal(raced.answer.state, 'CHANGED');
     assert.deepEqual(lifecycleOf(built.scenario), { state: 'ABSENT', revision: undefined,
       finding: 'NOT_LIVE' });
@@ -756,21 +840,35 @@ test('a revocation queued by a host callback is observed before the mutation and
 test('a revocation queued at the last registry read cannot land between that read and the mutation',
   async () => {
     const built = fullScenario();
-    const raced = { queued: 0, answer: undefined };
-    const { view, counters } = countingRegistry(built.scenario.registry, { afterCurrent: (n) => {
-      // Queued by the last registry read of the whole call: the final guard and the compare-and-set
-      // share one continuation, so this racing mutation is queued behind the entire effect rather
-      // than inside it.
-      if (n === 2) {
-        raced.queued += 1;
-        queueMicrotask(() => { raced.answer = competitor(built); });
-      }
-    } });
+    const raced = { queued: 0, fired: 0, order: [], answer: undefined };
+    const { view, counters } = countingRegistry(built.scenario.registry, {
+      afterCurrent: (n) => {
+        // Queued by the last registry read of the whole call: the final guard and the compare-and-set
+        // share one continuation, so this racing mutation is queued behind the entire effect rather
+        // than inside it.
+        if (n === 2) {
+          raced.queued += 1;
+          queueMicrotask(() => {
+            raced.fired += 1;
+            raced.order.push('queued-callback');
+            raced.answer = competitor(built);
+          });
+        }
+      },
+      wrapTransition: (request, clock) => {
+        raced.order.push('transition');
+        return built.scenario.registry.transition(request, clock);
+      },
+    });
     const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
 
     assert.equal((await owner.revoke()).code, 'REVOKED');
     assert.deepEqual(counters, { current: 2, transition: 1 });
-    assert.equal(raced.queued, 1);
+    // The trigger really fired, exactly once, and it fired **after** the compare-and-set: the order
+    // is the claim, because a guard only ever decides at its own instant and cannot watch a later
+    // change that had not happened yet.
+    assert.deepEqual({ queued: raced.queued, fired: raced.fired }, { queued: 1, fired: 1 });
+    assert.deepEqual(raced.order, ['transition', 'queued-callback']);
     assert.deepEqual(lifecycleOf(built.scenario), { state: 'ABSENT', revision: undefined,
       finding: 'NOT_LIVE' });
     assert.equal(raced.answer.state, 'REFUSED');
@@ -786,7 +884,235 @@ test('an overlapping call is refused immediately, before any host call', async (
   assert.equal((await held).code, 'REVOKED');
 });
 
-/* ---------- 7. Construction, privacy and the module's own silence ---------- */
+/* ---------- 7. The registry's own answer, discriminated through its own descriptors ---------- */
+
+/**
+ * One revocation whose real compare-and-set runs first and whose answer is then replaced by
+ * `makeAnswer(applied)`. The record is genuinely `REVOKED` in every case, so no code may be claimed
+ * from anything the registry did not confirm.
+ */
+async function revokedWithAnswer(makeAnswer) {
+  const built = fullScenario();
+  const answers = [];
+  const { view, counters } = countingRegistry(built.scenario.registry,
+    { wrapTransition: (request, clock) => {
+      const answer = makeAnswer(built.scenario.registry.transition(request, clock));
+      answers.push(answer);
+      return answer;
+    } });
+  const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+  const result = await owner.revoke();
+  return { answers, built, counters, result };
+}
+
+test('an answer whose own descriptors and ordinary reads disagree is UNRECORDED, never WITHHELD or REVOKED',
+  async () => {
+    const contradictions = [
+      { ownState: 'NOT_A_REGISTRY_STATE', read: 'REFUSED',
+        own: () => ({ version: 1, state: 'NOT_A_REGISTRY_STATE', reason: 'STALE_REVISION' }) },
+      { ownState: 'UNCHANGED', read: 'CHANGED',
+        own: (applied) => ({ version: 1, state: 'UNCHANGED', metadata: applied.metadata }) },
+    ];
+    for (const contradiction of contradictions) {
+      // The plain object is both the control and the proxy target: the only difference between the
+      // two runs is that one of them also disagrees with itself through an ordinary property read.
+      const plain = await revokedWithAnswer(contradiction.own);
+      const contradictory = await revokedWithAnswer((applied) => new Proxy(
+        contradiction.own(applied), { get(target, key, receiver) {
+          return key === 'state' ? contradiction.read : Reflect.get(target, key, receiver);
+        } }));
+
+      // The contradiction is real, and provable without the module's cooperation: on that one answer
+      // an ordinary read and an own data descriptor disagree.
+      const answer = contradictory.answers[0];
+      assert.equal(answer.state, contradiction.read);
+      assert.equal(Object.getOwnPropertyDescriptor(answer, 'state').value, contradiction.ownState);
+
+      // The record really was revoked before either answer was formed, so `WITHHELD` would claim
+      // zero mutation for a terminal tombstone and `REVOKED` would claim a confirmation this owner
+      // never read. Neither side of a self-contradicting answer may decide the code.
+      assert.deepEqual(lifecycleOf(plain.built.scenario),
+        { state: 'ABSENT', revision: undefined, finding: 'NOT_LIVE' });
+      assert.deepEqual(lifecycleOf(contradictory.built.scenario),
+        { state: 'ABSENT', revision: undefined, finding: 'NOT_LIVE' });
+      assert.equal(contradictory.result.code, 'UNRECORDED');
+      assert.equal(plain.result.code, contradictory.result.code);
+      assert.equal(plain.counters.transition, 1);
+      assert.equal(contradictory.counters.transition, 1);
+      for (const run of [plain, contradictory]) {
+        const evidence = revokeEvidence(run.built.ledger);
+        assert.deepEqual(evidence.map((event) => event.outcome), ['ALLOWED']);
+        assert.equal(evidence.some((event) => event.outcome === 'APPLIED'), false);
+      }
+    }
+  });
+
+test('a complete answer is confirmed through its own descriptors with zero ordinary property reads',
+  async () => {
+    const reads = { count: 0 };
+    // The shipped registry's own frozen answer, with an ordinary property read that always throws.
+    // Every value the owner needs is an own data descriptor, so the answer stays confirmable.
+    const run = await revokedWithAnswer((applied) => new Proxy(applied, { get() {
+      reads.count += 1;
+      throw new Error('synthetic ordinary read fault');
+    } }));
+
+    assert.equal(run.result.code, 'REVOKED');
+    assert.equal(reads.count, 0, 'the confirmed answer must not be read as an ordinary property');
+    assert.deepEqual(run.counters, { current: 2, transition: 1 });
+    assert.deepEqual(lifecycleOf(run.built.scenario), { state: 'ABSENT', revision: undefined,
+      finding: 'NOT_LIVE' });
+    assert.deepEqual(revokeEvidence(run.built.ledger).map((event) => [event.outcome, event.reason]), [
+      ['ALLOWED', 'RESOLUTION_AUTHORIZED'],
+      ['APPLIED', 'ADMIN_APPLIED'],
+    ]);
+  });
+
+test('every registry answer branch is closed, and a malformed one is UNRECORDED with no applied event',
+  async () => {
+    const malformed = [
+      ['a refusal without its reason', () => ({ version: 1, state: 'REFUSED' })],
+      ['a refusal carrying a record', () => ({ version: 1, state: 'REFUSED', reason: 'STALE_REVISION',
+        metadata: null })],
+      ['a refusal at another version', () => ({ version: 2, state: 'REFUSED', reason: 'NOT_LIVE' })],
+      ['a refusal with a reason outside the registry vocabulary',
+        () => ({ version: 1, state: 'REFUSED', reason: 'NOT_A_REGISTRY_REASON' })],
+      ['a change without its record', () => ({ version: 1, state: 'CHANGED' })],
+      ['a change carrying a refusal reason', (a) => ({ version: 1, state: 'CHANGED',
+        reason: 'STALE_REVISION', metadata: a.metadata })],
+      ['a change at another version', (a) => ({ version: 2, state: 'CHANGED', metadata: a.metadata })],
+      ['a change whose record advanced one revision too far', (a) => ({ version: 1, state: 'CHANGED',
+        metadata: { ...a.metadata, revision: a.metadata.revision + 1 } })],
+      ['a change whose record is still ACTIVE', (a) => ({ version: 1, state: 'CHANGED',
+        metadata: { ...a.metadata, state: 'ACTIVE' } })],
+      ['a change whose record names another reference', (a) => ({ version: 1, state: 'CHANGED',
+        metadata: { ...a.metadata, mappingRef: 'other-reference.invalid' } })],
+      ['a change whose record carries a foreign scope', (a) => ({ version: 1, state: 'CHANGED',
+        metadata: { ...a.metadata, scope: { ...FOREIGN_SCOPE } } })],
+      ['a change whose record omits an instant', (a) => {
+        const metadata = { ...a.metadata };
+        delete metadata.createdAt;
+        return { version: 1, state: 'CHANGED', metadata };
+      }],
+      ['a change whose record carries an extra key', (a) => ({ version: 1, state: 'CHANGED',
+        metadata: { ...a.metadata, extra: 'synthetic-extra.invalid' } })],
+      ['an unchanged answer without its record', () => ({ version: 1, state: 'UNCHANGED' })],
+      ['an unchanged answer at another version', (a) => ({ version: 2, state: 'UNCHANGED',
+        metadata: a.metadata })],
+      ['an answer outside the registry vocabulary', (a) => ({ version: 1, state: 'REVOKED',
+        metadata: a.metadata })],
+      ['a bare boolean', () => true],
+      ['a bare string', () => 'CHANGED'],
+    ];
+    for (const [name, makeAnswer] of malformed) {
+      const run = await revokedWithAnswer(makeAnswer);
+      // The record is terminal whatever the answer said, and no shape but a confirmed `CHANGED` at
+      // exactly the pinned revision plus one may ever be recorded as an applied success.
+      assert.equal(run.result.code, 'UNRECORDED', `${name} must be UNRECORDED`);
+      assert.equal(run.result.code === 'REVOKED', false, `${name} must never be REVOKED`);
+      assert.equal(run.counters.transition, 1, `${name} still reached the compare-and-set`);
+      assert.deepEqual(lifecycleOf(run.built.scenario), { state: 'ABSENT', revision: undefined,
+        finding: 'NOT_LIVE' }, `${name} still ran the real transition`);
+      const evidence = revokeEvidence(run.built.ledger);
+      assert.deepEqual(evidence.map((event) => event.outcome), ['ALLOWED'], `${name} recorded no success`);
+      assert.equal(evidence.some((event) => event.outcome === 'APPLIED'), false, `${name}`);
+    }
+  });
+
+test('a malformed or self-contradicting registry read withholds at either observation with zero mutation',
+  async () => {
+    const at = [
+      ['a read at another version', (answer) => ({ ...answer, version: 2 })],
+      ['a read carrying an extra key', (answer) => ({ ...answer, extra: 'synthetic-extra.invalid' })],
+      ['a read without its record', () => ({ state: 'FOUND' })],
+      ['a read whose own descriptors are NOT_LIVE while an ordinary read says FOUND', (answer) => {
+        const absent = { version: 1, state: 'NOT_LIVE', reason: 'NOT_LIVE' };
+        assert.notEqual(answer.state, absent.state);
+        return new Proxy(absent, { get(target, key, receiver) {
+          return key === 'state' ? 'FOUND' : Reflect.get(target, key, receiver);
+        } });
+      }],
+    ];
+    for (const [name, corrupt] of at) {
+      for (const observation of [1, 2]) {
+        const built = fullScenario();
+        const { view, counters } = countingRegistry(built.scenario.registry,
+          { afterCurrent: (n, answer) => (n === observation ? corrupt(answer) : undefined) });
+        const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+
+        assert.equal((await owner.revoke()).code, 'WITHHELD', `${name} at observation ${observation}`);
+        // A read this owner cannot read whole, and a read whose own descriptors do not describe this
+        // bound record at all, are both refused before the mutation, at the initial read and at the
+        // last one alike, so the compare-and-set is never attempted.
+        assert.equal(counters.transition, 0, `${name} at observation ${observation}`);
+        assert.deepEqual(lifecycleOf(built.scenario),
+          { state: 'ACTIVE', revision: built.scenario.revision });
+        const evidence = revokeEvidence(built.ledger);
+        // The intent is recorded before the final read and not before the initial one.
+        assert.equal(evidence.length, observation - 1, `${name} at observation ${observation}`);
+      }
+    }
+  });
+
+test('a read whose own descriptors are a closed FOUND answer is read as found, whatever an ordinary read says',
+  async () => {
+    // The stated direction of the reader, so it is asserted rather than inferred: this module reads
+    // the registry's own data descriptors, so a contradiction in the other direction neither grants
+    // nor withholds anything a plain honest `FOUND` would not. That is a claim about the reader, not
+    // an endorsement of a dishonest host, which the module already states it answers as given.
+    for (const observation of [1, 2]) {
+      const built = fullScenario();
+      const { view, counters } = countingRegistry(built.scenario.registry, { afterCurrent: (n, answer) => {
+        if (n !== observation) return undefined;
+        const own = Object.getOwnPropertyDescriptor(answer, 'state').value;
+        assert.equal(own, 'FOUND');
+        return new Proxy(answer, { get(target, key, receiver) {
+          return key === 'state' ? 'NOT_LIVE' : Reflect.get(target, key, receiver);
+        } });
+      } });
+      const owner = createBoundMappingRevocation({ ...built.revocation.host, registry: view });
+
+      assert.equal((await owner.revoke()).code, 'REVOKED', `observation ${observation}`);
+      assert.equal(counters.transition, 1);
+      assert.deepEqual(lifecycleOf(built.scenario), { state: 'ABSENT', revision: undefined,
+        finding: 'NOT_LIVE' });
+    }
+  });
+
+test('a real record created at epoch zero is revoked, and only its zero instant is read as nonnegative',
+  async () => {
+    const scenario = buildEpochZeroScenario();
+    const now = 1_500;
+    const ledger = createInMemoryAuditLedger({ tenantId: SCOPE.tenantId, projectId: SCOPE.projectId });
+    const fixture = createRevocationHost({ scenario, ledger, auditContext: adminContext(),
+      overrides: { now, expiresAt: scenario.expiresAt - 1 } });
+    const owner = createBoundMappingRevocation(fixture.host);
+
+    const result = await owner.revoke();
+    fixedShape(result);
+    assert.equal(result.code, 'REVOKED');
+    assert.deepEqual(lifecycleOf(scenario, now), { state: 'ABSENT', revision: undefined,
+      finding: 'NOT_LIVE' });
+    assert.deepEqual(revokeEvidence(ledger).map((event) => [event.outcome, event.reason]), [
+      ['ALLOWED', 'RESOLUTION_AUTHORIZED'],
+      ['APPLIED', 'ADMIN_APPLIED'],
+    ]);
+
+    // The authority's own clock and expiry stay strictly positive: accepting zero for a record's
+    // creation instant must not relax an administrative decision's freshness.
+    for (const override of [{ now: 0 }, { now: -1 }, { expiresAt: 0 }, { expiresAt: -1 }]) {
+      const other = buildEpochZeroScenario();
+      const otherLedger = createInMemoryAuditLedger({ tenantId: SCOPE.tenantId,
+        projectId: SCOPE.projectId });
+      const otherFixture = createRevocationHost({ scenario: other, ledger: otherLedger,
+        auditContext: adminContext(), override });
+      assert.equal((await createBoundMappingRevocation(otherFixture.host).revoke()).code, 'WITHHELD');
+      assert.deepEqual(lifecycleOf(other, now), { state: 'ACTIVE', revision: 2 });
+      assert.equal(revokeEvidence(otherLedger).length, 0);
+    }
+  });
+
+/* ---------- 8. Construction, privacy and the module's own silence ---------- */
 
 test('an unusable host is refused at construction with one fixed TypeError', () => {
   const built = fullScenario();
