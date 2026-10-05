@@ -21,6 +21,7 @@ import ts from 'typescript';
 import {
 	FIXED_LANE_INPUT,
 	LANE_CONFIG_ENV,
+	LANE_ROLES,
 	LANE_SUBAGENTS_ENV,
 	MAX_PROGRESS_BYTES,
 	MAX_PROGRESS_RECORDS,
@@ -35,6 +36,7 @@ import {
 } from '../.pi/lib/hylja-native-lane.ts';
 import {
 	buildArgv,
+	checkInstall,
 	discoverPublicArtifacts,
 	readProgress,
 	readRoleProfile,
@@ -57,6 +59,12 @@ const REQUEST_ID = '39e040c4-3535-4971-bca8-76a61b08850d';
 const EXPECTED_DIGEST = '5a35ac671887105f555bd11745e682ad7a3ef4410dd12802558cdef74edda96';
 const REVIEWER_MODEL = 'openai-codex/gpt-6.1-sol:max';
 const WRITER_MODEL = 'opencode-go/space-bunny-free:max';
+/**
+ * The dedicated writer fallback: a third role root dispatches explicitly after an actual default
+ * writer provider failure. It is one named profile at one exact model, never a general failover.
+ */
+const FALLBACK_ROLE = 'hylja-implementer-sol61';
+const FALLBACK_MODEL = 'openai-codex/gpt-6.1-sol:medium';
 /** The exact acceptance record the installed extension wrote for a direct-API writer and reviewer. */
 const NATIVE_ACCEPTANCE_NOT_REQUIRED = {
 	status: 'not-required',
@@ -2145,6 +2153,159 @@ test('the real CLI process prints one bounded JSON refusal for a setup it refuse
 		assert.equal(record.nativeExitCode, 0, 'the owned child ran and closed cleanly');
 		assert.deepEqual(JSON.parse(readFileSync(config.verification, 'utf8')), record,
 			'the printed record and the persisted one are the same record');
+	} finally {
+		cleanup();
+	}
+});
+
+/**
+ * The dedicated writer fallback. Root dispatches this role explicitly, in a fresh lane with fresh
+ * evidence paths, only after the default writer route has actually failed and the previous child has
+ * settled: exit 2 and INCOMPLETE are not provider failures, and the CLI never retries or re-routes on
+ * its own. It is one named profile at one exact model, so the change is auditable as a third role
+ * rather than as a general failover.
+ */
+test('the fallback writer is a third profile, admitted only at its exact Sol 6.1 medium model', () => {
+	assert.equal(existsSync(resolve(repoRoot, '.pi', 'agents', `${FALLBACK_ROLE}.md`)), true,
+		'the dedicated fallback profile exists');
+	// The writer's own ceiling is unchanged; only the route moved.
+	assert.deepEqual(readRoleProfile(FALLBACK_ROLE), { model: FALLBACK_MODEL, timeoutMs: 1_200_000 });
+	assert.equal(readRoleProfile('hylja-implementer').model, WRITER_MODEL, 'the default writer pin is unchanged');
+	assert.equal(readRoleProfile('hylja-reviewer').model, REVIEWER_MODEL, 'the reviewer pin is unchanged');
+	assert.equal(readRoleProfile('hylja-implementer').timeoutMs, 1_200_000);
+	assert.equal(readRoleProfile('hylja-reviewer').timeoutMs, 900_000);
+	assert.deepEqual(LANE_ROLES, ['hylja-implementer', 'hylja-reviewer', FALLBACK_ROLE]);
+
+	const { config, cleanup } = tempConfig();
+	try {
+		const fs = { exists: existsSync };
+		const install = (agent, model) => checkInstall({ ...config, agent }, { model, timeoutMs: 1_200_000 }, fs);
+		// Exactly three admitted pairs: each role at the one model its own profile declares.
+		assert.equal(install('hylja-implementer', WRITER_MODEL).ok, true);
+		assert.equal(install('hylja-reviewer', REVIEWER_MODEL).ok, true);
+		assert.equal(install(FALLBACK_ROLE, FALLBACK_MODEL).ok, true, 'the fallback lane installs at its own model');
+		// A foreign route or budget is refused before Pi is spawned, for all three roles alike.
+		for (const [agent, model] of [
+			[FALLBACK_ROLE, 'openai-codex/gpt-6.1-sol:max'],
+			[FALLBACK_ROLE, 'openai-codex/gpt-6.1-sol:high'],
+			[FALLBACK_ROLE, 'openai-codex/gpt-6.1-sol:medium:medium'],
+			[FALLBACK_ROLE, WRITER_MODEL],
+			['hylja-implementer', FALLBACK_MODEL],
+			['hylja-implementer', 'opencode-go/space-bunny-free:medium'],
+			['hylja-reviewer', FALLBACK_MODEL],
+		]) {
+			assert.equal(install(agent, model).reason, SETUP_FAILURES.install, `${agent} at ${model}`);
+		}
+		// No model override option exists for any role, the fallback included.
+		const profile = { model: FALLBACK_MODEL, timeoutMs: 1_200_000 };
+		assert.equal(validateLaneConfig({ ...config, agent: FALLBACK_ROLE }, profile).ok, true);
+		assert.equal(validateLaneConfig({ ...config, agent: FALLBACK_ROLE, model: FALLBACK_MODEL }, profile).reason,
+			SETUP_FAILURES.config);
+	} finally {
+		cleanup();
+	}
+});
+
+test('the fallback lane verifies at Sol 6.1 medium and refuses every other route or budget', () => {
+	const { config, cleanup } = tempConfig();
+	const artifacts = { meta: join(config.sessionDir, 'fallback-meta.json'), output: join(config.sessionDir, 'fallback-output.md') };
+	try {
+		const writer = { ...config, agent: FALLBACK_ROLE };
+		const profile = { model: FALLBACK_MODEL, timeoutMs: 1_200_000 };
+		const own = dispatchRecord(writer).expected;
+		const dispatch = dispatchRecord(writer, { expected: { ...own, model: FALLBACK_MODEL, thinking: 'medium' } });
+		const text = 'Implemented the scoped change.\n';
+		const leaf = receipt({ agent: FALLBACK_ROLE, model: FALLBACK_MODEL, thinking: 'medium', verdict: 'INCOMPLETE', result: { kind: 'text', text } });
+		const withMeta = (value, output = text) => ({
+			exists: () => true, readdir: () => [],
+			readFile: (p) => (p === artifacts.meta ? JSON.stringify(value) : output),
+		});
+		const check = (m, r = leaf, d = dispatch, p = profile) => verifyArtifacts(writer, p, d, r, artifacts, withMeta(m));
+		const ownMeta = meta({ agent: FALLBACK_ROLE, model: FALLBACK_MODEL, requestedModel: FALLBACK_MODEL });
+		const verified = check(ownMeta);
+		assert.equal(verified.ok, true, JSON.stringify(verified));
+		assert.equal(verified.model, FALLBACK_MODEL, 'the model that ran is the one the dispatch expected');
+		// A writer lane is reported honestly: the native gate did not run, and this is not approval.
+		assert.equal(verified.writerAcceptanceGate, 'not-required');
+		assert.equal(verified.acceptanceProvesApproval, false);
+		assert.equal('acceptancePassed' in verified, false);
+		// Every other route or budget is refused at the same bindings the existing roles keep: the
+		// receipt, the public metadata and the profile all have to be the one fallback model.
+		for (const [label, model] of [
+			['a max fallback profile', 'openai-codex/gpt-6.1-sol:max'],
+			['a higher budget', 'openai-codex/gpt-6.1-sol:high'],
+			['the default writer route', WRITER_MODEL],
+			['the reviewer route', REVIEWER_MODEL],
+		]) {
+			assert.equal(check(ownMeta, leaf, dispatch, { ...profile, model }).reason, SETUP_FAILURES.model, label);
+			assert.equal(check({ ...ownMeta, model }, receipt({ ...leaf, model })).reason, SETUP_FAILURES.model, label);
+		}
+		// The existing roles keep their own `:max` requirement: a medium run is not one of their lanes.
+		const reviewer = { ...config };
+		assert.equal(verifyArtifacts(reviewer, { model: REVIEWER_MODEL.replace(':max', ':medium'), timeoutMs: 900_000 },
+			dispatchRecord(reviewer), receipt(), artifacts, withMeta(meta())).reason, SETUP_FAILURES.model);
+	} finally {
+		cleanup();
+	}
+});
+
+test('a fallback writer lane runs end to end and reports its own honest acceptance', async () => {
+	const { config, configPath, cleanup } = tempConfig({ agent: FALLBACK_ROLE, timeoutMs: 1_200_000, softBudgetMs: 360_000 });
+	try {
+		const artifactsDir = join(config.sessionDir, 'subagent-artifacts');
+		mkdirSync(artifactsDir, { recursive: true });
+		writeFileSync(join(artifactsDir, `${RUN_ID}_${FALLBACK_ROLE}_0_meta.json`),
+			JSON.stringify(meta({ agent: FALLBACK_ROLE, model: FALLBACK_MODEL, requestedModel: FALLBACK_MODEL })));
+		writeFileSync(join(artifactsDir, `${RUN_ID}_${FALLBACK_ROLE}_0_output.md`), 'Implemented the scoped change.\n');
+		const result = await runNativeLane(['--config', configPath], {
+			spawn: fakeSpawn({ onLaunch: () => {
+				writeFileSync(config.receipt, JSON.stringify(receipt({
+					agent: FALLBACK_ROLE, model: FALLBACK_MODEL, thinking: 'medium',
+					verdict: 'INCOMPLETE', result: { kind: 'text', text: 'Implemented the scoped change.\n' },
+				}), null, 2));
+				const own = dispatchRecord(config).expected;
+				writeFileSync(config.dispatch,
+					`${JSON.stringify(dispatchRecord(config, { expected: { ...own, model: FALLBACK_MODEL, thinking: 'medium' } }), null, 2)}\n`);
+				writeFileSync(config.progress, `${JSON.stringify({ event: 'dispatch', key: config.key, model: FALLBACK_MODEL })}\n`);
+			} }),
+		});
+		assert.equal(result.ok, true, JSON.stringify(result));
+		const written = JSON.parse(readFileSync(config.verification, 'utf8'));
+		assert.equal(written.agent, FALLBACK_ROLE);
+		assert.equal(written.model, FALLBACK_MODEL);
+		assert.equal(written.verdict, 'INCOMPLETE', 'a writer result declaring no verdict is never an approval');
+		assert.equal(written.writerAcceptanceGate, 'not-required', 'the fallback is reported as a writer lane');
+		assert.equal(written.acceptanceProvesApproval, false);
+		assert.equal(written.expectedLaunchContractDigest, EXPECTED_DIGEST);
+	} finally {
+		cleanup();
+	}
+});
+
+test('the fallback role reads back as a lane config and receives the writer timing guide', async () => {
+	const { config, cleanup } = tempConfig();
+	try {
+		const path = join(config.sessionDir, 'fallback-lane.json');
+		writeFileSync(path, JSON.stringify({ ...config, agent: FALLBACK_ROLE, timeoutMs: 1_200_000, softBudgetMs: 360_000 }, null, 2));
+		const loaded = readLaneConfig(path);
+		assert.equal(loaded.agent, FALLBACK_ROLE);
+		assert.equal(loaded.softBudgetMs, 360_000);
+		const { pi } = fakePi();
+		const preflight = fakePreflight({ guard: config.guard, model: FALLBACK_MODEL, thinking: 'medium' });
+		const controller = await createLaneController(pi, loaded, { delegation, preflight }, { addSignalListener: noSignals });
+		// A configured soft budget needs this role's own closing move, or the config is refused and no
+		// lane can run under it at all.
+		assert.equal(controller.setupFailure, null, String(controller.setupFailure));
+		const guide = String(controller.request.task).slice(loaded.task.length);
+		// The same writer paragraph the default writer gets: checks, then the commit, then the report,
+		// and no review authority this role body does not already carry.
+		assert.equal(/commit/i.test(guide), true);
+		assert.equal(/report/i.test(guide), true);
+		assert.equal(/\bverdict\b/i.test(guide), false);
+		assert.equal(/grant/i.test(guide), true);
+		assert.equal(preflight.calls[0].task, controller.request.task, 'one effective task binds the digest');
+		completeLeaf(pi, controller, 'Implemented the scoped change.\n');
+		await controller.settle();
 	} finally {
 		cleanup();
 	}

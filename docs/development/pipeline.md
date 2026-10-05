@@ -10,8 +10,9 @@ This page is the coordinator procedure. Installation, workflow-guard behaviour, 
 detail and the historical #147 proposal are disclosed in
 [pipeline-reference.md](pipeline-reference.md) and are read only on those branches. Role pins,
 deadlines, tool allowlists and the workflow-guard wiring are the frontmatter of
-[`.pi/agents/hylja-implementer.md`](../../.pi/agents/hylja-implementer.md) and
-[`.pi/agents/hylja-reviewer.md`](../../.pi/agents/hylja-reviewer.md).
+[`.pi/agents/hylja-implementer.md`](../../.pi/agents/hylja-implementer.md),
+[`.pi/agents/hylja-reviewer.md`](../../.pi/agents/hylja-reviewer.md) and the dedicated writer
+fallback [`.pi/agents/hylja-implementer-sol61.md`](../../.pi/agents/hylja-implementer-sol61.md).
 
 ## Roles and principle loading
 
@@ -54,8 +55,13 @@ missing. **Explicit reading is the mechanism; automatic injection is neither fix
 7. **Stop conditions.** Two failed review rounds on one task end the patch loop: reframe, root-cause,
    or take the design question to a human, and keep the failed-round count across a fresh run. A
    transient provider error waits 2.5 s and retries unchanged, same session, provider and model, with
-   no fallback; record an unresolved failure with its message. Root owns the wall clock and stops a
-   command that passes its named budget. A user pause cancels owned work and preserves evidence and
+   no fallback; record an unresolved failure with its message. One exception is authorized and
+   explicit: after the default writer route has actually failed, not merely returned exit 2 or an
+   INCOMPLETE verdict, and the previous child has settled, root may dispatch
+   `subagent({ agent: "hylja-implementer-sol61", ... })` in a fresh lane. It preserves the failed
+   lane's worktree evidence and its uncommitted work, uses fresh context and fresh evidence paths, and
+   never re-routes a run by itself. Root owns the wall clock and stops a command that passes its named
+   budget. A user pause cancels owned work and preserves evidence and
    worktrees; setup never resumes product work.
 8. **Publish and close.** Root publishes alone. An authorized reviewable draft pull request is created
    and published for review before approval and CI; merging or releasing it still requires the user's

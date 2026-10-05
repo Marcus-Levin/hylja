@@ -166,8 +166,8 @@ test('the adapter blocks the known search, sets the timeout, and leaves other to
 	assert.deepEqual(readInput, { path: 'src/policy.ts' });
 });
 
-test('both role profiles resolve their declared guard extension to a file that exists', () => {
-	for (const name of ['hylja-implementer', 'hylja-reviewer']) {
+test('every role profile, fallback included, resolves its declared guard extension to a file that exists', () => {
+	for (const name of ['hylja-implementer', 'hylja-reviewer', 'hylja-implementer-sol61']) {
 		const profilePath = resolve(root, '.pi', 'agents', `${name}.md`);
 		const match = /^extensions:\s*(\S.*)$/m.exec(readFileSync(profilePath, 'utf8'));
 		assert.ok(match, `${name} declares extensions`);

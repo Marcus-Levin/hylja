@@ -55,7 +55,19 @@ export const LANE_CONFIG_ENV = 'HYLJA_NATIVE_LANE_CONFIG';
 /** Root-supplied exact installed `pi-subagents` package directory, never a machine-wide discovery. */
 export const LANE_SUBAGENTS_ENV = 'HYLJA_NATIVE_LANE_SUBAGENTS';
 
-export const LANE_ROLES = ['hylja-implementer', 'hylja-reviewer'];
+/**
+ * The one dedicated writer fallback, and the two writer roles it belongs to. Root names this role
+ * explicitly in a fresh config, with fresh evidence paths, only after the default writer route has
+ * actually failed and the previous child has settled: an exit 2 or an INCOMPLETE verdict is not a
+ * provider outage, and nothing here re-routes a lane by itself. Its model is declared by its own
+ * profile, and the CLI admits exactly that one role/model pair.
+ */
+export const LANE_WRITER_FALLBACK_ROLE = 'hylja-implementer-sol61';
+export const LANE_WRITER_FALLBACK_MODEL = 'openai-codex/gpt-6.1-sol:medium';
+export const LANE_WRITER_ROLES = ['hylja-implementer', LANE_WRITER_FALLBACK_ROLE];
+
+/** The admitted lane roles. The third is the dedicated fallback above, never an automatic reroute. */
+export const LANE_ROLES = ['hylja-implementer', 'hylja-reviewer', LANE_WRITER_FALLBACK_ROLE];
 
 /** The only verdict tokens this file will read out of a leaf result. Anything else is INCOMPLETE. */
 export const LANE_VERDICTS = ['APPROVED', 'CHANGES REQUESTED', 'INCOMPLETE'];
@@ -457,9 +469,13 @@ export function readLaneConfig(path: string): LaneConfig {
  * measured against, that role's own closing move, and an explicit statement that the guide carries no
  * authority the role body does not already have. An unconfigured lane gets its task back unchanged.
  */
+const WRITER_TIMING_GUIDE = 'Finish the scoped checks, commit the scoped paths, then report.';
+
 const TIMING_GUIDE: Record<string, string> = {
-	'hylja-implementer': 'Finish the scoped checks, commit the scoped paths, then report.',
+	'hylja-implementer': WRITER_TIMING_GUIDE,
 	'hylja-reviewer': 'Report one literal verdict line (APPROVED, CHANGES REQUESTED or INCOMPLETE) and stay read-only.',
+	// The fallback writer closes exactly as the default writer does; only its route differs.
+	[LANE_WRITER_FALLBACK_ROLE]: WRITER_TIMING_GUIDE,
 };
 
 /**
