@@ -33,8 +33,11 @@
  * dictionaries, engineering templates and #7 key-path field hints join the same per-occurrence candidates under
  * the same tenant and project, so a configured claim keeps exactly the provenance every other source gets here:
  * an exact span for text written verbatim in a string root, a covering span for folded, escaped or decoded
- * text, and the encoded envelope for a decoded view. Without a handle nothing from #10 runs and no reason is
- * added, because the integration simply configured no configured source. A forged or foreign handle is PARTIAL
+ * text, and the encoded envelope for a decoded view. Beside that unchanged coverage a configured candidate also
+ * carries `matchStart`/`matchEnd`, the offsets #10's own matcher matched. Both members come from the compiled
+ * trusted configuration, never from caller text or a host assertion, so whole-value corroboration can be
+ * required of a genuine matcher without widening what any detector sees. Without a handle nothing from #10
+ * runs and no reason is added, because the integration simply configured no configured source. A forged or foreign handle is PARTIAL
  * with its own opaque location and no configured claim; only #10's tenant-independent engineering-key rule
  * still runs. A #7 field whose value is verbatim in its view is read here for its trusted key-path hint only,
  * exactly like the #8 key hint above, because the view scan already covered that text.
@@ -130,6 +133,16 @@ export interface NormalizedCandidate {
   readonly evidence: CandidateEvidence;
   readonly view: ViewLocation;
   readonly original: OriginalLocation;
+  /**
+   * For a `CONFIGURED` candidate: the offsets that #10's own matcher matched, which `view`/`original` do not
+   * show on their own because #10 extends a template match forward over the rest of the identifier.
+   * `view.span` and `original` stay that wider coverage; these two stay the match, so a consumer can require
+   * whole-value corroboration instead of whole-value coverage. Coverage is unchanged by this member, so every
+   * established span keeps its established meaning. Absent for every source other than `CONFIGURED`; present
+   * and equal to the coverage span for a #10 basis that never extends (`DICTIONARY`, `FIELD_HINT`, `CONTEXT`).
+   */
+  readonly matchStart?: number;
+  readonly matchEnd?: number;
   /** Present when the candidate came from a #7 parsed field rather than from scanning a whole view. */
   readonly field?: ParsedFieldLocation;
 }
@@ -190,6 +203,9 @@ export interface NormalizedDetectionRequest {
 interface Detected {
   start: number;
   end: number;
+  /** #10's matched template offsets, carried beside the coverage offsets above. */
+  matchStart?: number;
+  matchEnd?: number;
   subtype?: string;
   rule?: string;
   basis: string;
@@ -455,6 +471,7 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
       counts[source]++;
       candidates.push(Object.freeze({ source, ...(item.subtype ? { subtype: item.subtype } : {}),
         ...(item.rule ? { rule: item.rule } : {}), basis: item.basis,
+        ...(item.matchStart === undefined ? {} : { matchStart: item.matchStart, matchEnd: item.matchEnd }),
         ...(item.fidelity ? { fidelity: item.fidelity } : {}),
         ...(item.fingerprint ? { fingerprint: item.fingerprint } : {}), evidence: item.evidence,
         ...at }));
@@ -479,8 +496,10 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
     }
     if (result.status === 'FAILURE') return;
     const items = (fieldHintsOnly ? result.candidates.filter((item) => item.basis === 'FIELD_HINT') : result.candidates)
-      .map((item) => ({ start: item.start, end: item.end, ...(item.subtype ? { subtype: item.subtype } : {}),
-        rule: item.rule, basis: item.basis, evidence: item.evidence }));
+      .map((item) => ({ start: item.start, end: item.end,
+        ...(item.matchStart === undefined || item.matchEnd === undefined ? {}
+          : { matchStart: item.matchStart, matchEnd: item.matchEnd }),
+        ...(item.subtype ? { subtype: item.subtype } : {}), rule: item.rule, basis: item.basis, evidence: item.evidence }));
     accept(view, 'CONFIGURED', items, place);
   };
 

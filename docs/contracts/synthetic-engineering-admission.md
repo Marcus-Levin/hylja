@@ -14,6 +14,8 @@ It is **not** authority to create anything. `USE` and `KEEP` never authorize `CR
 
 The whole value must match `^SYNTHETIC-ASSET-[A-Z0-9]{1,64}$` and the owned copy is at most 128 bytes. Ordinary engineering values, real PII, arbitrary credentials, other namespaces and unknown representations are **not** supported and refuse. The grammar is the only thing that makes this helper's recommendation safe to publish at all; it is a narrow, obviously synthetic namespace, not a general identifier format.
 
+The configured corroboration is a **whole-value match**, not a whole-value span. #10 extends a template match forward over the rest of an identifier so a value is never *covered* in part; that wider span is coverage. This seam requires the matched offsets #10 and #6 report beside it (`matchStart`/`matchEnd`, through #6's `NormalizedCandidate`) to be `0..length` as well, so an unconfigured tail that coverage happened to reach refuses instead of being admitted.
+
 ## The input record
 
 A closed version-1 record. Every member is read once, before any downstream call, through **own enumerable data descriptors**: a plain object prototype (or a null prototype), an exact member set, no symbol keys, no accessor, no inherited value. A caller getter is never invoked; a `Proxy` that answers only `get` is therefore answered from descriptors and never runs the trap.
@@ -22,12 +24,14 @@ A closed version-1 record. Every member is read once, before any downstream call
 |---|---|
 | `version` | must be exactly `1` |
 | `original` | the caller's private original bytes, copied into one owned buffer of at most 128 bytes; every byte must be ASCII |
-| `scope` | the detector scope, `tenantRef` and `projectRef` only. There is **no session field** in a detector scope; `session` is the later reversibility recommendation, not detector configuration |
+| `scope` | the detector scope, `tenantRef` and `projectRef` only, itself a closed record read through own enumerable data descriptors: an extra member (`sessionId` above all), an inherited member, an accessor or a non-enumerable property refuses. There is **no session field** in a detector scope; `session` is the later reversibility recommendation, not detector configuration |
 | `configured` | a genuine `CandidateConfigHandle` from `createCandidateConfig`, already bound to one tenant and project. A forged object or a handle from another scope refuses; there is no other way to obtain one |
 | `inputRef` | an opaque source reference. A **fresh** value per request is what keeps evidence ids and path digests unlinkable; a caller that reuses one value correlates its own traffic |
 | `fieldKey` | optional trusted parser key path for the original as a single field value. It is read from the caller, never from the value's own text |
 
-The bytes are read through at most 128 typed-array element reads inside a `try`. A `Proxy` may answer with the caller's own bytes inside those bounds; the copy is still owned, still bounded, and still never trusted as provenance. The caller's own buffer is never modified.
+The bytes are read from `original` only after the `%TypedArray%.prototype.length` accessor has accepted it. That accessor validates the typed-array internal slot, which a `Proxy` never carries, so a proxied look-alike is refused by the engine itself before any element is read: no trap runs, no trap message reaches the caller, and no element can be answered twice with different values. Each element is then read **once** and accepted only as a plain integer in `0x00..0x7f`, so no coercion, comparison or text construction can turn one value into another. A `Proxy` over the record or the scope is a different case: it is answered from descriptors, so a `get`-only proxy runs nothing and an accessor descriptor is refused without being invoked. The caller's own buffer is never modified.
+
+Every reference, key path and scope member is also checked for lone surrogates, and the whole detection and composition step runs inside the boundary that owns the copy. A reflection, coercion or canonical-serialization failure therefore leaves as one fixed refusal code, never as an exception carrying planted text.
 
 ## What actually runs
 
@@ -36,7 +40,7 @@ Real seams only, in this order:
 1. the real `detectSecrets` over the owned text with the trusted `fieldKey`, then the real `detectNormalizedCandidates` with the genuine configured handle, then the real v1 `composeClassification`;
 2. a whole-value grammar detector record, produced by this module with its own producer id, carrying the **configured** sensitivity and a `reversible: true`, `scope: 'session'` claim. The real composer still owns every conflict and reversal gate - this module never supplies a host `valueKind` label, never relabels a secret, and never bypasses a gate.
 
-Admitted means all of: detection `COMPLETE` with **zero** uninspected locations; zero secret or credential findings from `detectSecrets`; every candidate produced by `detectNormalizedCandidates` a configured one that covers the **whole** original exactly (`ORIGINAL_EXACT`, span `0..length`); one agreed subtype and one known, non-`SECRET` sensitivity across all of them; a `RESOLVED` `ENGINEERING_IDENTIFIER` classification; and `reversible: true` with `scope: 'session'` as the composer itself computed them. Ordinary, oversized, non-ASCII, malformed, unconfigured and uninspected values all refuse before any downstream effect.
+Admitted means all of: detection `COMPLETE` with **zero** uninspected locations; zero secret or credential findings from `detectSecrets`; every candidate produced by `detectNormalizedCandidates` a configured one whose **coverage** (`ORIGINAL_EXACT`, span `0..length`) *and* whose **matched** offsets are `0..length`; one agreed subtype and one known, non-`SECRET` sensitivity across all of them; a `RESOLVED` `ENGINEERING_IDENTIFIER` classification; and `reversible: true` with `scope: 'session'` as the composer itself computed them. Ordinary, oversized, non-ASCII, malformed, unconfigured and uninspected values all refuse before any downstream effect.
 
 ## The fixed codes
 
@@ -52,7 +56,7 @@ No original text, no byte buffer, no mutable caller alias and no effect handle i
 
 ## Retention and cleanup
 
-The module owns its temporary byte copy and zero-fills it on every exit path. That is the only cleanup claimed: it makes **no** heap, garbage-collection, string-interning or host-memory-zeroization claim about any other copy the runtime may hold.
+The module owns its temporary byte copy and zero-fills it on **every** exit path: a refusal part-way through copying, a failure thrown while copying or converting, a refusal from detection, and the success path all clean up the same allocated buffer before returning. Ownership is handed to the caller only on the one successful return, so a buffer the caller still owns is never zero-filled and an abandoned one always is. That is the only cleanup claimed: it makes **no** heap, garbage-collection, string-interning or host-memory-zeroization claim about any other copy the runtime may hold.
 
 ## Known limits
 

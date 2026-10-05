@@ -8,6 +8,11 @@
  * whether one whole-value configured `ENGINEERING_IDENTIFIER` corroborates a value that matches the
  * synthetic-only grammar `^SYNTHETIC-ASSET-[A-Z0-9]{1,64}$` inside at most 128 ASCII bytes.
  *
+ * "Whole value" is a matched span, not a covered one: #10 extends a template match over the rest of an
+ * identifier, and this seam requires the offsets #10 actually matched to be the whole value as well, so an
+ * unconfigured tail that coverage reached is refused instead of admitted
+ * ([decision 012](../../docs/decisions/012-synthetic-engineering-custody-preconditions.md) 1).
+ *
  * On success it returns owned classification and digest evidence plus a **reversible session
  * recommendation**. That recommendation is a semantic suggestion for a later owner, not a grant, not a
  * mapping, not a key, not a prepared-effect handle and not an authorization: `USE`/`KEEP` never authorize
@@ -24,6 +29,14 @@
  *
  * Nothing is logged here. `sourceDigest` and `classificationDigest` are evidence bound to one private
  * original, not anonymized customer data and not authority.
+ *
+ * The byte boundary is honest rather than defensive prose: the `Uint8Array` length accessor validates the
+ * internal slot a `Proxy` never has, so proxied bytes are refused by the engine before any element is read,
+ * and the at most 128 elements that are read are each read once as a plain ASCII integer. Every caller
+ * supplied member - including the nested scope and the optional `fieldKey` - is an own enumerable data
+ * descriptor, and every failure inside the boundary leaves as one fixed refusal code rather than an
+ * exception carrying planted text. The owned copy is zero-filled on every exit, including a failure thrown
+ * part-way through copying it.
  */
 import { createHash } from 'node:crypto';
 import { composeClassification, type ClassificationClaim, type ClassificationContext, type Sensitivity } from './classification.js';
@@ -66,61 +79,98 @@ export type SyntheticAdmissionResult =
 const GRAMMAR = /^SYNTHETIC-ASSET-[A-Z0-9]{1,64}$/u;
 const REQUIRED = ['version', 'original', 'scope', 'configured', 'inputRef'] as const;
 const OPTIONAL = ['fieldKey'] as const;
+const SCOPE_MEMBERS = ['tenantRef', 'projectRef'] as const;
 const INTERACTION_REF = 'synthetic-engineering-admission.v1';
 const DOMAIN = 'hylja.synthetic-engineering-admission.source.v1\0';
+/** A lone surrogate is not a UTF-16 string, so it never belongs in a reference, a key path or a digest. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+
+type TypedArrayLength = (this: Uint8Array) => number;
+/**
+ * `%TypedArray%.prototype.length`. This accessor validates the typed-array internal slot, which a `Proxy`
+ * never carries: calling it on a proxy is a plain host `TypeError` from the engine itself, with no trap and
+ * no caller-controlled text. It is therefore the one honest way to tell genuine owned bytes from a
+ * caller-supplied look-alike before any element is read.
+ */
+const TYPED_ARRAY_LENGTH = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype), 'length')?.get as TypedArrayLength | undefined;
 
 function refused(reason: AdmissionRefusal): SyntheticAdmissionResult {
   return Object.freeze({ version: 1, outcome: 'REFUSED', reason });
 }
 function label(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max && value.trim() === value &&
-    !/[\u0000-\u001f\u007f]/u.test(value);
+    !/[\u0000-\u001f\u007f]/u.test(value) && !LONE_SURROGATE.test(value);
+}
+/** The same closed boundary the record has, applied to the nested detector scope: own, enumerable, data-only. */
+function closedData(object: object, allowed: readonly string[]): Record<string, unknown> | null {
+  if (Array.isArray(object)) return null;
+  if (object === null || typeof object !== 'object' || ![Object.prototype, null].includes(Object.getPrototypeOf(object))) {
+    return null;
+  }
+  const keys = Reflect.ownKeys(object);
+  if (keys.length > allowed.length) return null;
+  const fields: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of keys) {
+    // An accessor, a non-enumerable property, a symbol or an unknown member is a malformed record, never
+    // a member to be quietly skipped: the descriptor is refused without the accessor being invoked.
+    if (typeof key !== 'string' || !allowed.includes(key)) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return null;
+    fields[key] = descriptor.value;
+  }
+  return fields;
 }
 /** Everything read from the caller is read here, once, through own enumerable data descriptors. */
 function snapshot(value: unknown): { request: SyntheticAdmissionRequest | AdmissionRefusal } {
   try {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) return { request: 'INVALID_REQUEST' };
-    if (![Object.prototype, null].includes(Object.getPrototypeOf(value))) return { request: 'INVALID_REQUEST' };
-    const keys = Reflect.ownKeys(value);
-    const names: readonly string[] = [...REQUIRED, ...OPTIONAL];
-    if (keys.length < REQUIRED.length || keys.length > names.length ||
-      keys.some((key) => typeof key !== 'string' || !names.includes(key))) {
+    const fields = closedData(value as object, [...REQUIRED, ...OPTIONAL]);
+    if (!fields || Array.isArray(value) || value === null || typeof value !== 'object') {
       return { request: 'INVALID_REQUEST' };
     }
-    const read = (key: string): unknown => {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
-      return descriptor.value;
-    };
-    const fields: Record<string, unknown> = { version: read('version'), original: read('original'),
-      configured: read('configured'), inputRef: read('inputRef') };
-    const scope = read('scope');
-    if (!scope || typeof scope !== 'object') return { request: 'INVALID_REQUEST' };
-    fields.scope = Object.freeze({ tenantRef: (scope as Record<string, unknown>).tenantRef,
-      projectRef: (scope as Record<string, unknown>).projectRef });
-    const fieldKey = read('fieldKey');
-    if (fieldKey !== undefined) fields.fieldKey = fieldKey;
-    return { request: fields as unknown as SyntheticAdmissionRequest };
+    if (REQUIRED.some((key) => !Object.hasOwn(fields, key))) return { request: 'INVALID_REQUEST' };
+    const scope = closedData(fields.scope as object, SCOPE_MEMBERS);
+    if (!scope || SCOPE_MEMBERS.some((key) => !Object.hasOwn(scope, key))) return { request: 'INVALID_REQUEST' };
+    const request = Object.freeze({ version: fields.version, original: fields.original,
+      scope: Object.freeze({ tenantRef: scope.tenantRef, projectRef: scope.projectRef }),
+      configured: fields.configured, inputRef: fields.inputRef,
+      ...(Object.hasOwn(fields, 'fieldKey') ? { fieldKey: fields.fieldKey } : {}) });
+    return { request: request as unknown as SyntheticAdmissionRequest };
   } catch { return { request: 'INVALID_REQUEST' }; }
 }
 /**
- * One owned copy of the original, taken through at most `MAX_SYNTHETIC_BYTES` typed-array element reads
- * inside a `try`. A `Proxy` may answer with the caller's own bytes inside those bounds; the copy is
- * still owned, still bounded and still never trusted as provenance.
+ * One owned copy of the original. The length comes from the `Uint8Array` intrinsic accessor, so a `Proxy`
+ * around caller bytes never reaches the copy at all: there is no trap to run, no trap to throw and no
+ * element that could be answered twice with different values. Each element is then read exactly once and
+ * accepted only as a plain ASCII integer, so no coercion, comparison or text construction can ever turn one
+ * value into another.
+ *
+ * Allocation and copying share **one** cleanup path. The buffer is allocated before a single byte is read,
+ * so every partial state - a rejected byte, a thrown conversion, an out-of-memory allocation - is covered by
+ * the same `finally`; ownership is handed to the caller only by clearing the local reference on the one
+ * successful return, so a buffer the caller owns is never zero-filled and an abandoned one always is.
  */
 function ownCopy(original: unknown): { bytes: Uint8Array; text: string } | AdmissionRefusal {
-  if (!(original instanceof Uint8Array)) return 'INVALID_ORIGINAL';
-  const length = original.length;
-  if (!Number.isSafeInteger(length) || length < 1 || length > MAX_SYNTHETIC_BYTES) return 'INVALID_ORIGINAL';
-  const bytes = new Uint8Array(length);
-  let text = '';
-  for (let index = 0; index < length; index += 1) {
-    const byte = original[index]!;
-    if (byte < 0 || byte > 0x7f) return 'INVALID_ORIGINAL';
-    bytes[index] = byte;
-    text += String.fromCharCode(byte);
-  }
-  return { bytes, text };
+  let owned: Uint8Array | undefined;
+  try {
+    if (!(original instanceof Uint8Array) || !TYPED_ARRAY_LENGTH) return 'INVALID_ORIGINAL';
+    const length = TYPED_ARRAY_LENGTH.call(original);
+    if (!Number.isSafeInteger(length) || length < 1 || length > MAX_SYNTHETIC_BYTES) return 'INVALID_ORIGINAL';
+    owned = new Uint8Array(length);
+    let text = '';
+    for (let index = 0; index < length; index += 1) {
+      const byte: unknown = original[index];
+      // Validated before it is stored **and** before the text is built, so the owned bytes, the owned text
+      // and the digest derived from that text can never describe different values.
+      if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 0x7f) return 'INVALID_ORIGINAL';
+      owned[index] = byte;
+      text += String.fromCharCode(byte);
+    }
+    const copy = { bytes: owned, text };
+    owned = undefined;
+    return copy;
+  } catch { return 'INVALID_ORIGINAL'; }
+  finally { owned?.fill(0); }
 }
 
 /**
@@ -157,6 +207,11 @@ export function inspectSyntheticEngineeringReference(value: unknown): SyntheticA
       if (candidate.original.span.start !== 0 || candidate.original.span.end !== text.length) {
         return refused('PARTIAL_CANDIDATE');
       }
+      // #10 extends a template match over the rest of the identifier so a value is never covered in part.
+      // That wider span is coverage, not corroboration: decision 012 requires the genuine source to have
+      // matched the **whole** value, so the matched offsets #6 reports beside the coverage must be the
+      // whole value too. A pattern candidate with no reported match cannot be shown to be one.
+      if (candidate.matchStart !== 0 || candidate.matchEnd !== text.length) return refused('PARTIAL_CANDIDATE');
       const claim = candidate.evidence.claim;
       if (claim.sensitivity === undefined) return refused('UNKNOWN_SENSITIVITY');
       if (claim.semanticType !== 'ENGINEERING_IDENTIFIER' || !claim.subtype) return refused('PARTIAL_CANDIDATE');
@@ -197,5 +252,8 @@ export function inspectSyntheticEngineeringReference(value: unknown): SyntheticA
     return Object.freeze({ version: 1, outcome: 'CLASSIFIED', semanticType: 'ENGINEERING_IDENTIFIER',
       subtype: classification.subtype, sensitivity: classification.sensitivity,
       reversibility: 'SESSION_RECOMMENDED', sourceDigest, classificationDigest });
+  } catch {
+    // No reflection, coercion or serialization failure may escape as an exception with planted text in it.
+    return refused('INVALID_REQUEST');
   } finally { bytes.fill(0); }
 }
