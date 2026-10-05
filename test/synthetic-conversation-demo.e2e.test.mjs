@@ -36,13 +36,14 @@
 // workload or a control plane, and no detector absence is read as clearance. Every value is invented and
 // non-routable (`*.invalid`, loopback, a made-up token literal).
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   MASKED, PLANTED_ORIGINAL, PLANTED_SECRET,
 } from '../scripts/lib/synthetic-conversation-fixture.mjs';
 import {
-  runNode, runNodeTest, TEST_TIMEOUT_MS,
+  REPO_ROOT, runNode, runNodeTest, TEST_TIMEOUT_MS,
 } from './support/run-node-subprocess.mjs';
 
 const DEMO = fileURLToPath(new URL('../scripts/synthetic-conversation-demo.mjs', import.meta.url));
@@ -329,4 +330,49 @@ test('a real failing TAP run over output carrying the planted values reports non
       'the unsafe string operand really reported the planted secret too');
     assert.equal(leaked.includes(MASKED), false,
       'the mask literal is in no captured stream at all, so neither run could have reported it');
+  });
+
+/**
+ * One real operator run whose OUTPUT PIPE IS REALLY BROKEN: the reader end of stdout is closed in this
+ * process right after the spawn, which is long before the demo (it starts a peer and two real children
+ * first) writes its summary, so the demo's own write really meets a pipe nobody reads and the OS really
+ * reports `EPIPE`. Stderr stays readable, so what the operator would be shown is observable. Nothing is
+ * simulated; only booleans and one exit code leave this function, never a captured byte.
+ */
+function runDemoWithBrokenStdout() {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let settled = false;
+    const done = (outcome) => { if (!settled) { settled = true; clearTimeout(timer); resolve(outcome); } };
+    const child = spawn(process.execPath, [DEMO], { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      done({ code: null, signal: null, stalled: true, fixedDecline: false, nativeText: false });
+    }, 60_000);
+    child.on('error', () => { done({ code: null, signal: null, stalled: false, fixedDecline: false, nativeText: false }); });
+    child.stderr.on('data', (chunk) => { chunks.push(chunk); });
+    child.stdout.destroy();
+    child.on('close', (code, signal) => {
+      const text = Buffer.concat(chunks).toString('utf8');
+      chunks.length = 0;
+      done({
+        code,
+        signal,
+        stalled: false,
+        fixedDecline: text === DECLINED_STDERR,
+        nativeText: text.includes('EPIPE') || text.includes('write ') || text.includes('    at ')
+          || text.includes('node:internal') || text.includes(REPO_ROOT) || text.includes('Error'),
+      });
+    });
+  });
+}
+
+test('a really broken output pipe yields the one fixed decline and no native error, code, stack or path',
+  { timeout: TEST_TIMEOUT_MS }, async () => {
+    const outcome = await runDemoWithBrokenStdout();
+    assert.equal(outcome.stalled, false, 'the run finished inside its bound');
+    assert.equal(outcome.signal, null, 'the run exited on its own, with no signal');
+    assert.equal(outcome.nativeText, false, 'no native error text, error code, stack frame or path was printed');
+    assert.equal(outcome.fixedDecline, true, 'stderr carries exactly the one fixed decline line and nothing else');
+    assert.equal(outcome.code, 1, 'a demonstration that could not report itself exits non-zero');
   });

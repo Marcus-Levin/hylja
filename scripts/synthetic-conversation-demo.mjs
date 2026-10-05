@@ -48,32 +48,75 @@
  * authenticates nobody, it restores nothing, it streams nothing and it is not a held-out or scored
  * result.
  */
-import { installWorkerObservation } from './lib/synthetic-conversation-worker-observation.mjs';
+import { writeSync } from 'node:fs';
+import { DEMO_ARGUMENT_REFUSED, DEMO_DECLINED } from './lib/synthetic-conversation-demo-text.mjs';
 
 /**
- * The native `spawn` is captured BEFORE the accepted runtime is imported, and the import below is
- * therefore dynamic. ESM links a whole module graph before any body in it runs, and a builtin named
- * import is a value snapshot taken at that link step, so a capture installed after that graph was linked
- * would never be seen by the real runner and every run would report zero workers.
+ * EVERY exit path ends in one of three fixed outcomes and nothing else: the summary and exit 0, the fixed
+ * decline and exit 1, or the fixed argument refusal and exit 2. That includes the paths that used to sit
+ * outside the case runner's own catch - loading the accepted runtime, installing the observation, writing
+ * the summary to a broken output pipe, and building the summary - so no native error message, code,
+ * stack or path can reach the operator from any of them.
+ *
+ * - The two modules that need the real runtime are imported DYNAMICALLY, inside the guarded block below.
+ *   The native `spawn` is captured BEFORE the accepted runtime is imported, because ESM links a whole
+ *   module graph before any body in it runs and a builtin named import is a value snapshot taken at that
+ *   link step: a capture installed after that graph was linked would never be seen by the real runner and
+ *   every run would report zero workers.
+ * - Output is written through a callback, with a permanent `error` listener on both streams, so a broken
+ *   pipe (`EPIPE`, a destroyed stream) is an observed boolean here and never an unhandled `error` event.
+ * - Anything that still escapes is caught by the last-resort handlers installed first: they print the
+ *   same fixed decline, synchronously, and exit 1 without looking at what was thrown.
  */
-installWorkerObservation();
-
-const {
-  DEMO_ARGUMENT_REFUSED, DEMO_DECLINED, demoCaseHolds, resolveDemoCase, runDemoCase, summarizeDemoCase,
-} = await import('./lib/synthetic-conversation-demo-cases.mjs');
-
-const name = resolveDemoCase(process.argv.slice(2));
-if (name === null) {
-  // Refused before any effect: no peer, no socket, no owner, no detector, no policy decision, no
-  // child, and no echo of what was actually passed.
-  process.stderr.write(DEMO_ARGUMENT_REFUSED);
-  process.exitCode = 2;
-} else {
-  const seen = await runDemoCase(name);
-  process.stdout.write(`${summarizeDemoCase(name, seen).join('\n')}\n`);
-  if (!demoCaseHolds(name, seen)) {
-    // The case did not behave as declared. One fixed line: no native error, no planted value.
-    process.stderr.write(DEMO_DECLINED);
-    process.exitCode = 1;
-  }
+const failClosed = () => {
+  try { writeSync(2, DEMO_DECLINED); } catch { /* stderr is gone too: the non-zero exit is all that is left */ }
+  process.exit(1);
+};
+process.on('uncaughtException', failClosed);
+process.on('unhandledRejection', failClosed);
+for (const name of ['stdout', 'stderr']) {
+  try { process[name].on('error', () => {}); } catch { /* the stream cannot even be opened: writes fail closed below */ }
 }
+
+/** Write one fixed chunk and report whether the stream really accepted it. Never throws, never echoes. */
+const emit = (stream, text) => new Promise((resolve) => {
+  try {
+    stream.write(text, (error) => { resolve(error === null || error === undefined); });
+  } catch {
+    resolve(false);
+  }
+});
+
+/** Run the demonstration and return its exit code. The one place the fixed outcomes are chosen. */
+async function main() {
+  let outcome;
+  try {
+    const { installWorkerObservation } = await import('./lib/synthetic-conversation-worker-observation.mjs');
+    installWorkerObservation();
+    const cases = await import('./lib/synthetic-conversation-demo-cases.mjs');
+    const name = cases.resolveDemoCase(process.argv.slice(2));
+    if (name === null) {
+      // Refused before any effect: no peer, no socket, no owner, no detector, no policy decision, no
+      // child, and no echo of what was actually passed.
+      outcome = { refused: true };
+    } else {
+      const seen = await cases.runDemoCase(name);
+      outcome = { refused: false, summary: `${cases.summarizeDemoCase(name, seen).join('\n')}\n`, holds: cases.demoCaseHolds(name, seen) };
+    }
+  } catch {
+    // A native error from any of the steps above lands here identically and identically unprinted.
+    await emit(process.stderr, DEMO_DECLINED);
+    return 1;
+  }
+  if (outcome.refused) {
+    await emit(process.stderr, DEMO_ARGUMENT_REFUSED);
+    return 2;
+  }
+  const written = await emit(process.stdout, outcome.summary);
+  if (written && outcome.holds) return 0;
+  // The case did not behave as declared, or the summary could not be delivered: one fixed line.
+  await emit(process.stderr, DEMO_DECLINED);
+  return 1;
+}
+
+process.exitCode = await main().catch(() => 1);

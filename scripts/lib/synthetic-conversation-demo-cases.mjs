@@ -33,6 +33,7 @@
  * case then fails its declared behaviour.
  */
 import http from 'node:http';
+import { DEMO_ARGUMENT_REFUSED, DEMO_DECLINED } from './synthetic-conversation-demo-text.mjs';
 import {
   noteRegisteredOriginal, workerObservation, workerObservationInstalled,
 } from './synthetic-conversation-worker-observation.mjs';
@@ -94,11 +95,12 @@ const EXPECTED = Object.freeze({
   }),
 });
 
-/** The fixed text a malformed invocation gets. Declared here so every entry point prints the same bytes. */
-export const DEMO_ARGUMENT_REFUSED = 'hylja synthetic conversation demo: argument refused\n'
-  + 'expected: no arguments, or --case default | --case blocked-reply | --case unsupported-request\n';
-/** The fixed line an unexpected outcome gets. No native error, no planted value, no signal name. */
-export const DEMO_DECLINED = 'hylja synthetic conversation demo: the case did not match its declared behaviour\n';
+/**
+ * The fixed operator lines are declared in [synthetic-conversation-demo-text.mjs](./synthetic-conversation-demo-text.mjs),
+ * which imports nothing, so the entry point can print them even when this module cannot load. They are
+ * re-exported here so every entry point prints the same bytes.
+ */
+export { DEMO_ARGUMENT_REFUSED, DEMO_DECLINED };
 
 /**
  * Match the caller's arguments against the fixed vocabulary. Anything else - an unknown flag, a missing
