@@ -72,6 +72,9 @@ second concurrent call is refused with `SENDER_BUSY` rather than queued, pooled 
 else — an unknown key, an accessor, a symbol key, a missing member, a non-function `inspect` or
 `sendExact`, a `sourceTrust` that is not a trust level — yields a permanently restrictive sender whose
 state is `FAILED` and whose every `send` is `HOST_INVALID`. Construction never throws and never sends.
+`known` is the one member whose absence is not a neutral default: only a registration object or an
+explicit `null` is accepted, so a missing or `undefined` `known` is `HOST_INVALID` like any other missing
+member, never a silent empty registration.
 
 | Member | Meaning |
 | --- | --- |
@@ -149,6 +152,16 @@ envelope's** context, never to an earlier alias of the host object. An unknown o
 registration, a registration scope that is not the check scope, an unsupported value or a hostile trap is
 `SENTINEL_BLOCKED` here, before any child exists and before any host callback below has run: the same
 fixed refusal the runner's own check returns for the same input.
+
+**That branch has a fixed precedence, and the fallback only ever restricts.** When the snapshot is refused
+at all, the scope is re-read through **own data descriptors only**, so no accessor runs and a hostile or
+revoked Proxy trap is never invoked; a `tenantRef` or `projectRef` the descriptor read cannot supply, or
+supplies as anything other than the bound envelope's context, is `SCOPE_REFUSED`. The refusal stays
+`SENTINEL_BLOCKED` only when that descriptor-only read **does** establish the matching scope. So an
+otherwise valid host whose revoked `scope` Proxy fails the snapshot reports `SCOPE_REFUSED`, not
+`SENTINEL_BLOCKED`. Nothing here can authorize anything: the branch runs only where no child was spawned,
+it can never turn a refusal into a check, a dispatch or a send, and a scope it cannot prove is refused
+rather than assumed.
 
 The per-operation binding token is this send's **own generated interaction identity**, never a fixed global
 id, and the runner still mints the real per-child request id when it spawns. Nothing about the child's own
@@ -279,7 +292,7 @@ name, byte offset, exception message, transport error, sentinel reason or any pa
 | `CANCELLED` | `cancel()` was observed, including inside the final host observation, or this sender was already cancelled |
 | `INTERACTION_REFUSED` | the trusted boundary could not be bound to this interaction, or the evidence it was bound under is no longer current at the dispatch point |
 | `ROUTE_REFUSED` | the observed destination, profile digest or commit is not usable |
-| `SCOPE_REFUSED` | the sentinel scope the child would run under does not belong to the authenticated tenant/project |
+| `SCOPE_REFUSED` | the sentinel scope the child would run under does not belong to the authenticated tenant/project, or could not be established from own data descriptors after a refused snapshot |
 | `INSPECTION_REFUSED` | empty, partial, foreign, unresolved, substituted or unbound inspection evidence |
 | `POLICY_DENIED` | the real policy seam denied: unknown or stale policy, foreign context, profile or rule mismatch |
 | `POLICY_HELD` | the real policy seam held the decision for review |

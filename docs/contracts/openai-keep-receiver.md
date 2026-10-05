@@ -94,7 +94,9 @@ authority that owns it: the envelope validates the boundary, `decidePolicy` vali
 digests and the classification, and the sentinel runner validates its own request. No policy engine, envelope
 rule or sentinel rule is duplicated here. The whole structural refusal is contained: a hostile object that
 throws from its own traps, a revoked Proxy included, yields the permanently restrictive receiver rather than an
-exception out of `createOpenAiKeepReceiver`.
+exception out of `createOpenAiKeepReceiver`. `known` is the one member whose absence is not a neutral
+default: only a registration object or an explicit `null` is accepted, so a missing or `undefined`
+`known` is `HOST_INVALID` like any other missing member, never a silent empty registration.
 
 `observe()` returns `{ destination: { id, profileDigest }, commit: { id, version, digest } }`, is called once
 before the check and once more in the same synchronous turn as the release, and is validated structurally
@@ -139,6 +141,16 @@ finite inspection runs cannot retarget the real child. The scope the child runs 
 oversized registration, a registration scope that is not the check scope, an unsupported value or a
 hostile trap is `SENTINEL_BLOCKED` here, before any child exists and before any host callback below has
 run: the same fixed refusal the runner's own check returns for the same input.
+
+**That branch has a fixed precedence, and the fallback only ever restricts.** When the snapshot is refused
+at all, the scope is re-read through **own data descriptors only**, so no accessor runs and a hostile or
+revoked Proxy trap is never invoked; a `tenantRef` or `projectRef` the descriptor read cannot supply, or
+supplies as anything other than the bound envelope's context, is `SCOPE_REFUSED`. The refusal stays
+`SENTINEL_BLOCKED` only when that descriptor-only read **does** establish the matching scope. So an
+otherwise valid host whose revoked `scope` Proxy fails the snapshot reports `SCOPE_REFUSED`, not
+`SENTINEL_BLOCKED`. Nothing here can authorize anything: the branch runs only where no child was spawned,
+it can never turn a refusal into a check, a dispatch or a release, and a scope it cannot prove is refused
+rather than assumed.
 
 The per-operation binding token is this receive's **own generated interaction identity**, never a fixed
 global id, and the runner still mints the real per-child request id when it spawns. Nothing about the
@@ -249,7 +261,7 @@ byte offset, parser excerpt, exception message, release error, sentinel reason o
 | `IMAGE_REFUSED` | the accepted response cannot be serialized as one canonical image under the fixed serializer bounds (a string or member bound, or a number outside the integer-only form) |
 | `INTERACTION_REFUSED` | the trusted boundary could not be bound to this interaction, or the evidence it was bound under is no longer current at the release point |
 | `ROUTE_REFUSED` | the observed destination, profile digest or commit is not usable |
-| `SCOPE_REFUSED` | the sentinel scope the child would run under does not belong to the authenticated tenant/project |
+| `SCOPE_REFUSED` | the sentinel scope the child would run under does not belong to the authenticated tenant/project, or could not be established from own data descriptors after a refused snapshot |
 | `INSPECTION_REFUSED` | empty, partial, foreign, unresolved, substituted or unbound inspection evidence |
 | `POLICY_DENIED` | the real policy seam denied: unknown or stale policy, foreign context, profile or rule mismatch, or a classification whose trust is not the pinned `UNTRUSTED` |
 | `POLICY_HELD` | the real policy seam held the decision for review |
@@ -293,7 +305,9 @@ Evidence: [`test/openai-keep-receiver.e2e.test.mjs`](../../test/openai-keep-rece
 executable matrix over the accepted path (a real fixed-worker child over the exact private image and an
 in-memory release capture compared against an independently written literal), whole-image unit coverage pinned
 to declared byte ranges, planted originals and a canary in the assistant content, the model metadata and the
-protocol id, every codec refusal, every withholding refusal code, cancellation raised inside the trusted
+protocol id, the codec refusals and withholding refusal codes it exercises (the `RECEIVER_FAILED` catch-all
+and codec codes such as `BODY_TOO_LARGE` and `INVALID_CHOICE` are named above but **not** exercised by this
+suite), cancellation raised inside the trusted
 inspection and inside the final observation, boundary evidence that expires under real elapsed time inside that
 inspection, evidence that cannot be bound at all, a release point that is a Proxy whose `get` trap cancels the
 receiver if the release method is read back off it, the receiver a captured method keeps and the later method
