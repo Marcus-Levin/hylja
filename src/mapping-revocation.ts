@@ -51,14 +51,18 @@
  *
  * The registry's actual answer shapes are what the applied evidence is built from, and they are
  * discriminated from one bounded owned snapshot of the answer envelope taken **before** any branch
- * reads it, never from an ordinary property read of the answer object. A confirmed
+ * reads it. That snapshot is the answer's own data descriptors and is the whole of the decision: no
+ * ordinary property read of an answer is performed anywhere below, so what such a read would report
+ * is never consulted and never has to be detected. A confirmed
  * `{version: 1, state: 'REFUSED', reason}` is the registry confirming that it applied nothing, so
  * that call is `WITHHELD` with no applied event; only a confirmed `CHANGED` carrying the bound
  * reference and scope, `REVOKED`, at exactly the pinned revision plus one earns `APPLIED`; and a
- * throw, a malformed answer, an answer whose own descriptors and ordinary reads disagree, or any
- * unconfirmed application - including `UNCHANGED` - is `UNRECORDED` with no applied event. The same
- * holds for every `current` read on this path: a registry read this module cannot read whole is
- * refused before the mutation, at the initial read and at the last one alike.
+ * throw, an answer whose **own** state is malformed, absent or outside the registry's vocabulary, or
+ * any unconfirmed application - including `UNCHANGED` - is `UNRECORDED` with no applied event. The
+ * same holds for every `current` read on this path: a registry read this module cannot read whole, or
+ * whose own descriptors do not describe this bound live record, is refused before the mutation, at
+ * the initial read and at the last one alike. That is a claim about the reader, not an endorsement of
+ * a dishonest host, which this module states it answers as given.
  *
  * A record's own `createdAt` and `expiresAt` are read as the nonnegative instants the shipped
  * registry and lifecycle reducer define them to be, so a record created at epoch zero is an ordinary
@@ -602,10 +606,11 @@ function bindAudit(captured: Captured, observed: Observation): void {
 /**
  * A real registry read. Its **own** answer envelope is normalized as one closed owned snapshot before
  * anything reads its state, exactly as the mutation segment does: only a version-1 `FOUND` answer
- * whose record is this bound reference's own is accepted here, and a read whose ordinary property
- * reads disagree with its own descriptors cannot be read as found. Only an `ACTIVE` record can be
- * revoked: a tombstone is already terminal, so a repeat call is refused with zero mutation instead of
- * claiming a second effect. What this returns is an owned copy of the record's own identity, so a
+ * whose record is this bound reference's own is accepted here. No ordinary property read of the read
+ * is performed, so a read whose own descriptors do not describe this bound record is refused on
+ * those descriptors alone, and one whose descriptors do describe it is read as found whatever an
+ * ordinary read would answer. Only an `ACTIVE` record can be revoked: a tombstone is already
+ * terminal, so a repeat call is refused with zero mutation instead of claiming a second effect. What this returns is an owned copy of the record's own identity, so a
  * later guard in the same continuation compares values this module holds, not a live host object.
  */
 function liveRecord(captured: Captured, now: number): OwnedRecord {
@@ -721,11 +726,12 @@ const CHANGE_SHAPE = ['version', 'state', 'metadata'] as const;
  * The mutation segment, and the only place `attempted` is set.
  *
  * The registry's own answer shapes decide the code, and they are decided **from one owned snapshot**
- * taken before any branch reads the answer. A closed `REFUSED` is the registry confirming that it
+ * of the answer's own data descriptors taken before any branch reads it, with no ordinary property
+ * read of the answer performed anywhere below. A closed `REFUSED` is the registry confirming that it
  * applied nothing, so that call is `WITHHELD`; only a confirmed `CHANGED` carrying the bound
  * reference and scope, `REVOKED`, at exactly the pinned revision plus one earns an applied event and
- * `REVOKED`; anything else - a throw, a malformed answer, an answer whose own descriptors and
- * ordinary reads disagree, an `UNCHANGED` repeat, a record that does not match what was pinned -
+ * `REVOKED`; anything else - a throw, an answer whose own state is malformed or outside the
+ * registry's vocabulary, an `UNCHANGED` repeat, a record that does not match what was pinned -
  * leaves this owner unable to confirm what happened, so it is `UNRECORDED`. Nothing is revived,
  * rolled back or second-guessed in any of those cases, and none of them claims an applied success.
  */
@@ -741,10 +747,12 @@ function applyRevocation(captured: Captured, observed: Observation, pinned: numb
     const answer = invoke(applyTransition, registry, [{ version: 1, mappingRef,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId },
       expectedRevision: pinned, action: 'REVOKE' }, { now: observed.now }]);
-    // One bounded owned snapshot of the whole answer envelope, taken before any branch reads it. Every
-    // read below is of that snapshot, so an answer whose ordinary property reads answer something
-    // other than its own data descriptors cannot decide this call's code: a self-contradicting
-    // refusal is not a confirmation, and a self-contradicting change is not an application.
+    // One bounded owned snapshot of the whole answer envelope, taken before any branch reads it.
+    // Every read below is of that snapshot, which is the answer's own data descriptors, and no
+    // ordinary property read of the answer happens anywhere in this module: what such a read would
+    // claim is neither consulted nor detected, so a malformed or unconfirmed owned state is no
+    // confirmation, and a well-formed owned `CHANGED` is confirmed even where an ordinary read of
+    // the same answer would have contradicted it.
     const v = fields(answer, ['version', 'state'], ['reason', 'metadata']);
     if (v.version !== 1) return UNRECORDED;
     const reported = v.state;

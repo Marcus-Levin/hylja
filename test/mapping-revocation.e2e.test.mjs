@@ -154,8 +154,9 @@ function createBackend() {
  * exactly as it binds the real registry object's, so the view is the object it must call through.
  *
  * `afterCurrent(n, answer)` runs after each read; whatever it returns, when that is not `undefined`,
- * is the answer the owner is handed instead of the registry's own. That is how a malformed or
- * self-contradicting `FOUND` envelope is injected at a chosen observation point.
+ * is the answer the owner is handed instead of the registry's own. That is how a malformed `FOUND`
+ * envelope, or one whose own descriptors contradict its ordinary reads, is injected at a chosen
+ * observation point.
  */
 function countingRegistry(registry, { afterCurrent, wrapTransition } = {}) {
   const counters = { current: 0, transition: 0 };
@@ -905,38 +906,48 @@ async function revokedWithAnswer(makeAnswer) {
   return { answers, built, counters, result };
 }
 
-test('an answer whose own descriptors and ordinary reads disagree is UNRECORDED, never WITHHELD or REVOKED',
+test('an answer whose own state is malformed or unconfirmed is UNRECORDED whatever an ordinary read says',
   async () => {
-    const contradictions = [
-      { ownState: 'NOT_A_REGISTRY_STATE', read: 'REFUSED',
-        own: () => ({ version: 1, state: 'NOT_A_REGISTRY_STATE', reason: 'STALE_REVISION' }) },
-      { ownState: 'UNCHANGED', read: 'CHANGED',
-        own: (applied) => ({ version: 1, state: 'UNCHANGED', metadata: applied.metadata }) },
+    const ownStates = [
+      { own: () => ({ version: 1, state: 'NOT_A_REGISTRY_STATE', reason: 'STALE_REVISION' }),
+        read: 'REFUSED' },
+      { own: (applied) => ({ version: 1, state: 'UNCHANGED', metadata: applied.metadata }),
+        read: 'CHANGED' },
     ];
-    for (const contradiction of contradictions) {
+    for (const { own, read } of ownStates) {
       // The plain object is both the control and the proxy target: the only difference between the
-      // two runs is that one of them also disagrees with itself through an ordinary property read.
-      const plain = await revokedWithAnswer(contradiction.own);
-      const contradictory = await revokedWithAnswer((applied) => new Proxy(
-        contradiction.own(applied), { get(target, key, receiver) {
-          return key === 'state' ? contradiction.read : Reflect.get(target, key, receiver);
+      // two runs is that one of them also contradicts its own state through an ordinary property
+      // read. The code is decided by the own data descriptors in both runs.
+      const plain = await revokedWithAnswer(own);
+      // The counter records ordinary reads of the answer by the owner, not this file's own look at
+      // the contradiction below, which is what `inspecting` switches off.
+      const reads = { count: 0 };
+      let inspecting = false;
+      const contradictory = await revokedWithAnswer((applied) => new Proxy(own(applied),
+        { get(target, key, receiver) {
+          if (key !== 'state') return Reflect.get(target, key, receiver);
+          if (!inspecting) reads.count += 1;
+          return read;
         } }));
 
       // The contradiction is real, and provable without the module's cooperation: on that one answer
       // an ordinary read and an own data descriptor disagree.
       const answer = contradictory.answers[0];
-      assert.equal(answer.state, contradiction.read);
-      assert.equal(Object.getOwnPropertyDescriptor(answer, 'state').value, contradiction.ownState);
+      inspecting = true;
+      assert.equal(answer.state, read);
+      inspecting = false;
+      assert.notEqual(Object.getOwnPropertyDescriptor(answer, 'state').value, read);
 
       // The record really was revoked before either answer was formed, so `WITHHELD` would claim
-      // zero mutation for a terminal tombstone and `REVOKED` would claim a confirmation this owner
-      // never read. Neither side of a self-contradicting answer may decide the code.
+      // zero mutation for a terminal tombstone and `REVOKED` would claim an application this owner
+      // never confirmed from the owned state. What the owned state itself says is the whole reason.
       assert.deepEqual(lifecycleOf(plain.built.scenario),
         { state: 'ABSENT', revision: undefined, finding: 'NOT_LIVE' });
       assert.deepEqual(lifecycleOf(contradictory.built.scenario),
         { state: 'ABSENT', revision: undefined, finding: 'NOT_LIVE' });
       assert.equal(contradictory.result.code, 'UNRECORDED');
       assert.equal(plain.result.code, contradictory.result.code);
+      assert.equal(reads.count, 0, 'the owned state is read without one ordinary property read');
       assert.equal(plain.counters.transition, 1);
       assert.equal(contradictory.counters.transition, 1);
       for (const run of [plain, contradictory]) {
@@ -946,6 +957,39 @@ test('an answer whose own descriptors and ordinary reads disagree is UNRECORDED,
       }
     }
   });
+
+test('a genuine applied answer is REVOKED even when an ordinary read contradicts it', async () => {
+  const reads = { count: 0 };
+  // The mirror of the case above, and the reason the contradiction there proves nothing: this is the
+  // registry's own confirmed change over a record that really moved, with an ordinary property read
+  // claiming the opposite. The owned state says `CHANGED` at `pinned + 1`, so the mutation applies -
+  // and the ordinary read is never consulted to decide that.
+  const run = await revokedWithAnswer((applied) => {
+    assert.equal(Object.getOwnPropertyDescriptor(applied, 'state').value, 'CHANGED');
+    // The registry's own confirmed change over its own real record, rewrapped as a fresh answer so
+    // its ordinary read may claim the opposite: the record really moved to `pinned + 1` here.
+    const confirmed = { version: 1, state: 'CHANGED', metadata: applied.metadata };
+    return new Proxy(confirmed, { get(target, key, receiver) {
+      if (key === 'state') { reads.count += 1; return 'UNCHANGED'; }
+      return Reflect.get(target, key, receiver);
+    } });
+  });
+
+  // The count is taken before this file touches the answer itself, so it is the owner's count alone.
+  const ownerReads = reads.count;
+  const answer = run.answers[0];
+  assert.equal(Object.getOwnPropertyDescriptor(answer, 'state').value, 'CHANGED');
+  assert.equal(answer.state, 'UNCHANGED');
+  assert.equal(ownerReads, 0, 'the confirmed answer was not read as an ordinary property');
+  assert.equal(run.result.code, 'REVOKED');
+  assert.deepEqual(run.counters, { current: 2, transition: 1 });
+  assert.deepEqual(lifecycleOf(run.built.scenario), { state: 'ABSENT', revision: undefined,
+    finding: 'NOT_LIVE' });
+  assert.deepEqual(revokeEvidence(run.built.ledger).map((event) => [event.outcome, event.reason]), [
+    ['ALLOWED', 'RESOLUTION_AUTHORIZED'],
+    ['APPLIED', 'ADMIN_APPLIED'],
+  ]);
+});
 
 test('a complete answer is confirmed through its own descriptors with zero ordinary property reads',
   async () => {
@@ -1019,7 +1063,7 @@ test('every registry answer branch is closed, and a malformed one is UNRECORDED 
     }
   });
 
-test('a malformed or self-contradicting registry read withholds at either observation with zero mutation',
+test('a malformed registry read, or one whose own descriptors are not a live record, withholds at either observation',
   async () => {
     const at = [
       ['a read at another version', (answer) => ({ ...answer, version: 2 })],
@@ -1099,16 +1143,47 @@ test('a real record created at epoch zero is revoked, and only its zero instant 
     ]);
 
     // The authority's own clock and expiry stay strictly positive: accepting zero for a record's
-    // creation instant must not relax an administrative decision's freshness.
-    for (const override of [{ now: 0 }, { now: -1 }, { expiresAt: 0 }, { expiresAt: -1 }]) {
+    // creation instant must not relax an administrative decision's freshness. Each case is planted
+    // over a baseline a live decision really carries and is asserted to have reached the answer the
+    // owner normalized, so the refusal is the planted value's doing and not the baseline's.
+    const runEpochZero = async (planted) => {
       const other = buildEpochZeroScenario();
       const otherLedger = createInMemoryAuditLedger({ tenantId: SCOPE.tenantId,
         projectId: SCOPE.projectId });
+      const observed = [];
       const otherFixture = createRevocationHost({ scenario: other, ledger: otherLedger,
-        auditContext: adminContext(), override });
-      assert.equal((await createBoundMappingRevocation(otherFixture.host).revoke()).code, 'WITHHELD');
-      assert.deepEqual(lifecycleOf(other, now), { state: 'ACTIVE', revision: 2 });
-      assert.equal(revokeEvidence(otherLedger).length, 0);
+        auditContext: adminContext(),
+        // The hook runs before the answer is composed, so what is observed is the answer this call
+        // is actually handed, planted values included.
+        hooks: { fulfil: (observation, hostFixture, buildAnswer) => {
+          observed.push(buildAnswer());
+        } },
+        overrides: planted });
+      return { observed, scenario: other, ledger: otherLedger,
+        result: await createBoundMappingRevocation(otherFixture.host).revoke() };
+    };
+    const baseline = { now, expiresAt: TTL_MS - 1 };
+
+    // The control first: over that baseline alone the same fixture really applies, so a refusal below
+    // cannot be explained by an already-expired decision.
+    const control = await runEpochZero(baseline);
+    assert.equal(control.result.code, 'REVOKED');
+    assert.deepEqual(control.observed.map((answer) => [answer.now, answer.expiresAt]),
+      [[baseline.now, baseline.expiresAt], [baseline.now, baseline.expiresAt]]);
+    assert.deepEqual(lifecycleOf(control.scenario, now), { state: 'ABSENT', revision: undefined,
+      finding: 'NOT_LIVE' });
+
+    for (const [name, planted] of [['now: 0', { now: 0 }], ['now: -1', { now: -1 }],
+      ['expiresAt: 0', { expiresAt: 0 }], ['expiresAt: -1', { expiresAt: -1 }]]) {
+      const expected = { ...baseline, ...planted };
+      const run = await runEpochZero({ ...baseline, ...planted });
+      assert.equal(run.result.code, 'WITHHELD', name);
+      // The planted value really reached the single observation this call made. A fixture that
+      // dropped it would answer with the baseline and pass for the wrong reason.
+      assert.deepEqual(run.observed.map((answer) => [answer.now, answer.expiresAt]),
+        [[expected.now, expected.expiresAt]], `${name} must reach the observer`);
+      assert.deepEqual(lifecycleOf(run.scenario, now), { state: 'ACTIVE', revision: 2 }, name);
+      assert.equal(revokeEvidence(run.ledger).length, 0, name);
     }
   });
 
