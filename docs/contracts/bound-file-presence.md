@@ -42,7 +42,7 @@ A target that was not a regular file at construction binds no identity, so it ca
 
 ## Trusted-directory limit, stated as a limit
 
-Standard Node 22 `fs` has **no portable ancestor-relative `openat` boundary**. This module therefore requires the root's ancestors to be trusted and stable, and requires the root itself not to be a symbolic link. What is enforced here is path syntax, the linked-path case at the leaf, nonregular targets and inode substitution. What is **not** enforced, and is not claimed: an ancestor directory replaced between construction and the effect, a hostile filesystem mutating the path while the effect runs, or confinement against an attacker who controls the directory tree. A checked path is not a confinement claim.
+Standard Node 24 `fs` has **no portable ancestor-relative `openat` boundary**. This module therefore requires the root's ancestors to be trusted and stable, and requires the root itself not to be a symbolic link. What is enforced here is path syntax, the linked-path case at the leaf, nonregular targets and inode substitution. What is **not** enforced, and is not claimed: an ancestor directory replaced between construction and the effect, a hostile filesystem mutating the path while the effect runs, or confinement against an attacker who controls the directory tree. A checked path is not a confinement claim.
 
 ## Other limits
 

@@ -22,7 +22,12 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22.22.3'
+          node-version: '24.15.0'
+      # npm 11 no longer emits the CycloneDX `cdx:npm:package:path` property that check:sbom keys
+      # component identity on, so the gate cannot match the lockfile under npm 11. Pinned to the npm
+      # 10 release that emits it; moving the gate to npm 11 is a separate, reviewed change.
+      - name: Pin npm to the release that emits the SBOM shape the gate validates
+        run: npm install --global npm@10.9.9
       - name: Reject force-added private paths and non-synthetic fixtures
         run: npm run check:fixtures
       # Offline documentation guardrail: tracked Markdown paths and local heading anchors only.
@@ -55,7 +60,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22.22.3'
+          node-version: '24.15.0'
+      - name: Pin npm to the release that emits the SBOM shape the gate validates
+        run: npm install --global npm@10.9.9
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-fund
       # Same script as before: the fixture guard and build are part of test:coverage.
