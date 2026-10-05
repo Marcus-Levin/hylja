@@ -243,7 +243,30 @@ test('review: a proxied element is never read, so nothing is coerced and nothing
   'the owned bytes, the owned text and the source digest are one congruent value');
 });
 
-test('review: the owned allocation is zero-filled on a copy failure, not only on the success path', () => {
+test('review: a copy failure part-way through the loop still zero-fills the allocation', () => {
+  // A thrown failure inside the copy loop is the one partial path the refusal branch cannot reach, so the
+  // cleanup has to be structural: the buffer is allocated before any byte is read and must be cleaned on
+  // every exit. `String.fromCharCode` is the module's own text construction, so injecting here exercises a
+  // real throw after allocation rather than a caller-shaped input the boundary already rejects earlier.
+  const cleaned = [];
+  const realFill = Uint8Array.prototype.fill;
+  const realFromCharCode = String.fromCharCode;
+  Uint8Array.prototype.fill = function record(value) { cleaned.push(this); return realFill.apply(this, arguments); };
+  String.fromCharCode = () => { throw new Error('planted-copy'); };
+  let result;
+  try {
+    result = inspectSyntheticEngineeringReference({ ...RECORD, original: bytes(GOOD) });
+  } finally { String.fromCharCode = realFromCharCode; Uint8Array.prototype.fill = realFill; }
+  assert.equal(result.outcome, 'REFUSED');
+  assert.equal(result.reason, 'INVALID_ORIGINAL');
+  assert.equal(JSON.stringify(result).includes('planted'), false, 'no planted error text is echoed');
+  assert.ok(cleaned.some((buffer) => buffer.length === GOOD.length),
+    'the partial allocation is zero-filled before the refusal returns');
+  assert.ok(cleaned.every((buffer) => buffer.every((byte) => byte === 0)),
+    'every owned byte observed by the cleanup is zero');
+});
+
+test('review: the owned allocation is zero-filled on a copy refusal, not only on the success path', () => {
   const planted = new Uint8Array([...bytes(GOOD).slice(0, 4), 0xff]);
   const cleaned = [];
   const real = Uint8Array.prototype.fill;

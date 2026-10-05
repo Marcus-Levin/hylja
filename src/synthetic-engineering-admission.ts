@@ -35,7 +35,8 @@
  * and the at most 128 elements that are read are each read once as a plain ASCII integer. Every caller
  * supplied member - including the nested scope and the optional `fieldKey` - is an own enumerable data
  * descriptor, and every failure inside the boundary leaves as one fixed refusal code rather than an
- * exception carrying planted text.
+ * exception carrying planted text. The owned copy is zero-filled on every exit, including a failure thrown
+ * part-way through copying it.
  */
 import { createHash } from 'node:crypto';
 import { composeClassification, type ClassificationClaim, type ClassificationContext, type Sensitivity } from './classification.js';
@@ -142,26 +143,34 @@ function snapshot(value: unknown): { request: SyntheticAdmissionRequest | Admiss
  * around caller bytes never reaches the copy at all: there is no trap to run, no trap to throw and no
  * element that could be answered twice with different values. Each element is then read exactly once and
  * accepted only as a plain ASCII integer, so no coercion, comparison or text construction can ever turn one
- * value into another. Allocation and copying share one cleanup path: a refusal part-way through the copy
- * zero-fills what was already written before it returns.
+ * value into another.
+ *
+ * Allocation and copying share **one** cleanup path. The buffer is allocated before a single byte is read,
+ * so every partial state - a rejected byte, a thrown conversion, an out-of-memory allocation - is covered by
+ * the same `finally`; ownership is handed to the caller only by clearing the local reference on the one
+ * successful return, so a buffer the caller owns is never zero-filled and an abandoned one always is.
  */
 function ownCopy(original: unknown): { bytes: Uint8Array; text: string } | AdmissionRefusal {
+  let owned: Uint8Array | undefined;
   try {
     if (!(original instanceof Uint8Array) || !TYPED_ARRAY_LENGTH) return 'INVALID_ORIGINAL';
     const length = TYPED_ARRAY_LENGTH.call(original);
     if (!Number.isSafeInteger(length) || length < 1 || length > MAX_SYNTHETIC_BYTES) return 'INVALID_ORIGINAL';
-    const bytes = new Uint8Array(length);
+    owned = new Uint8Array(length);
     let text = '';
-    let invalid = false;
     for (let index = 0; index < length; index += 1) {
       const byte: unknown = original[index];
-      if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 0x7f) { invalid = true; break; }
-      bytes[index] = byte;
+      // Validated before it is stored **and** before the text is built, so the owned bytes, the owned text
+      // and the digest derived from that text can never describe different values.
+      if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 0x7f) return 'INVALID_ORIGINAL';
+      owned[index] = byte;
       text += String.fromCharCode(byte);
     }
-    if (invalid) { bytes.fill(0); return 'INVALID_ORIGINAL'; }
-    return { bytes, text };
+    const copy = { bytes: owned, text };
+    owned = undefined;
+    return copy;
   } catch { return 'INVALID_ORIGINAL'; }
+  finally { owned?.fill(0); }
 }
 
 /**

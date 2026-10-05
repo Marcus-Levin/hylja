@@ -37,6 +37,14 @@ Grouping can only keep what the #6/#7 seam reports, so the seam's de-duplication
 
 A #6 **decoded view** keeps its own accepted representation instead: identical disjoint copies of one decoded run collapse into a single view whose `ENCODED_RUNS` envelope names every outer occurrence, and the in-view span of a match inside that view is its position in the decoded text. Two occurrences of one protected value *inside* that view text are two candidates, two units and two references.
 
+## Matched offsets beside coverage (#10 templates)
+
+#10 extends a template match forward over the rest of the identifier (`expand`) so a value is never covered in part. That widened span is **coverage**, not corroboration: `view.span` and `original` keep reporting it exactly as before. Beside it, a `CONFIGURED` candidate carries `matchStart`/`matchEnd` — the offsets the configured matcher itself matched. A `DICTIONARY`, `FIELD_HINT` or `CONTEXT` candidate never extends, so both members are present and equal to its coverage span; the members are absent for every other source.
+
+Both members come from the registry-compiled configuration inside #10, never from caller text and never from a host assertion, so a consumer can require **whole-value corroboration** (`matchStart`/`matchEnd` equal to the whole value) instead of whole-value coverage. Adding them changes no span, no identity and no grouping rule in this contract; it is the same fact reported twice, once as what was seen and once as what was matched.
+
+Composition reads the pair through the same closed-descriptor boundary as every other candidate member and requires it, when present, to be one bounded `start < end` pair of safe integers; a half-present, out-of-range or non-numeric pair is a malformed detection record and is refused like any other unknown member. The pair is then deliberately **not** kept on the unit: grouping places by the occurrence span, so a host that supplied its own match offsets changes nothing here.
+
 ## Configured contact sensitivity
 
 `createContactSensitivity(scope, entries)` binds one configured `Sensitivity` per PERSON subtype (`NAME`, `EMAIL`, `PHONE`) to exactly one tenant and project behind an opaque handle. It is deliberately minimal: not a per-person table, no value, no default, no inheritance. A malformed, unknown, duplicated or out-of-scope entry is refused at construction with a fixed message that contains no configured text.
@@ -65,4 +73,5 @@ Sensitivity is policy metadata. A payload never asserts one, no semantic model i
 2. pass the `detection`, the `scope` and the `contactSensitivity` handle from **one** request: this module cannot verify that a supplied detection belongs to the supplied scope, so cross-pairing a tenant-A detection with a tenant-B scope would mislabel it;
 3. read `unit.classification` for decisions, not `unit.detectorEvidence[].claim`, which is the detector's raw record and is retained for provenance only;
 4. decide **every** unit, including those a whole-value field hint or an over-covering detector match deliberately left separate;
-5. treat `PARTIAL`, `FAILURE` and any non-empty `uninspected` as opaque input to deterministic policy, never as clean content.
+5. treat `PARTIAL`, `FAILURE` and any non-empty `uninspected` as opaque input to deterministic policy, never as clean content;
+6. when a decision needs whole-value corroboration rather than whole-value coverage, read the configured candidate's own `matchStart`/`matchEnd` beside `view.span`, and require the matched offsets to be the whole value.

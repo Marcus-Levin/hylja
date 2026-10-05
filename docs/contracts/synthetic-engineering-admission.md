@@ -56,7 +56,7 @@ No original text, no byte buffer, no mutable caller alias and no effect handle i
 
 ## Retention and cleanup
 
-The module owns its temporary byte copy and zero-fills it on **every** exit path: a refusal part-way through copying, a refusal from detection, and the success path all clean up the same allocated buffer before returning. That is the only cleanup claimed: it makes **no** heap, garbage-collection, string-interning or host-memory-zeroization claim about any other copy the runtime may hold.
+The module owns its temporary byte copy and zero-fills it on **every** exit path: a refusal part-way through copying, a failure thrown while copying or converting, a refusal from detection, and the success path all clean up the same allocated buffer before returning. Ownership is handed to the caller only on the one successful return, so a buffer the caller still owns is never zero-filled and an abandoned one always is. That is the only cleanup claimed: it makes **no** heap, garbage-collection, string-interning or host-memory-zeroization claim about any other copy the runtime may hold.
 
 ## Known limits
 

@@ -474,6 +474,33 @@ test('real seam reason codes are carried through unchanged', () => {
   assert.equal(secret.location.original.coverage, 'EXACT');
 });
 
+test('#10 matched offsets beside coverage compose, and a malformed match pair is still refused', () => {
+  // Paired control: the same configured detection the seam always composed, now carrying the match pair
+  // #6 reports beside the unchanged coverage span, still reaches a unit with the same placement.
+  const detection = detect('Northwind Synthetic AB signed for pump PMP-0042');
+  const configured = detection.candidates.filter((item) => item.source === 'CONFIGURED');
+  assert.ok(configured.length > 0, 'the detection carries configured candidates');
+  assert.ok(configured.every((item) => Number.isSafeInteger(item.matchStart) && Number.isSafeInteger(item.matchEnd)),
+    'every configured candidate reports a genuine matched span');
+  const paired = compose(detection);
+  assert.equal(paired.status, 'COMPLETE');
+  assert.ok(paired.units.length > 0, 'the match pair does not cost the detection any unit');
+
+  // Fault controls: a half-present, reversed or non-numeric pair is a malformed record, not a hint.
+  for (const malformed of [
+    { matchStart: 0 }, { matchEnd: 4 }, { matchStart: 4, matchEnd: 0 }, { matchStart: '0', matchEnd: 4 },
+    { matchStart: 0, matchEnd: 4.5 }]) {
+    const candidate = { ...configured[0] };
+    for (const key of ['matchStart', 'matchEnd']) if (!(key in malformed)) delete candidate[key];
+    const broken = { ...detection, candidates: [{ ...candidate, ...malformed }] };
+    assert.deepEqual(composeClassificationUnits({ detection: broken, inputRef: 'input-a.invalid',
+      scope: A, context }).reasons, ['INVALID_DETECTION']);
+  }
+  // The unit keeps no match member: composition places by the occurrence span, so the pair is evidence only.
+  const serialized = JSON.stringify(paired.units);
+  assert.equal(serialized.includes('matchStart'), false, 'a unit never carries the raw match pair');
+});
+
 test('an unknown key inside a detection record is refused, and a planted reason is replaced, not echoed', () => {
   const real = detect('Orla Synthetica', { names });
   const extraClaimKey = { ...real, candidates: [syntheticCandidate(0, 0, 4)] };
