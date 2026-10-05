@@ -30,14 +30,19 @@
  * Nothing is logged here. `sourceDigest` and `classificationDigest` are evidence bound to one private
  * original, not anonymized customer data and not authority.
  *
- * The byte boundary is honest rather than defensive prose: the `Uint8Array` length accessor validates the
- * internal slot a `Proxy` never has and is the **first** thing that touches the caller's bytes - no brand
- * check, prototype read or trap runs before it - so proxied bytes are refused by the engine itself before
- * any element is read, and the at most 128 elements that are read are each read once as a plain ASCII
- * integer. Every caller supplied member - including the nested scope and the optional `fieldKey` - is an own
- * enumerable data descriptor, and every failure inside the boundary leaves as one fixed refusal code rather
- * than an exception carrying planted text. The owned copy is zero-filled on every exit, including a failure
- * thrown part-way through copying it.
+ * The byte boundary is honest rather than defensive prose, and it never reads a prototype. The
+ * `%TypedArray%.prototype.length` accessor validates the internal slot a `Proxy` never has and is the
+ * **first** thing that touches the caller's value - no brand check, prototype read or trap runs before it -
+ * so proxied bytes are refused by the engine itself before any element is read. The byte **kind** is then
+ * settled by `%TypedArray%.prototype[Symbol.toStringTag]`, likewise captured at module load and applied
+ * directly to the value, so it answers from the same internal slot instead of from a tag a caller can write,
+ * override with a getter or have a `Proxy` answer for. A genuine typed array whose own prototype is a
+ * `Proxy` is therefore admitted exactly as an ordinary one is: an internal slot proves what the value is, and
+ * says nothing at all about its prototype chain, so nothing here walks one. The at most 128 elements that
+ * are read are each read once as a plain ASCII integer. Every caller supplied member - including the nested
+ * scope and the optional `fieldKey` - is an own enumerable data descriptor, and every failure inside the
+ * boundary leaves as one fixed refusal code rather than an exception carrying planted text. The owned copy
+ * is zero-filled on every exit, including a failure thrown part-way through copying it.
  */
 import { createHash } from 'node:crypto';
 import { composeClassification, type ClassificationClaim, type ClassificationContext, type Sensitivity } from './classification.js';
@@ -87,6 +92,7 @@ const DOMAIN = 'hylja.synthetic-engineering-admission.source.v1\0';
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
 
 type TypedArrayLength = (this: unknown) => number;
+type TypedArrayTag = (this: unknown) => unknown;
 /**
  * `%TypedArray%.prototype.length`. This accessor validates the typed-array internal slot, which a `Proxy`
  * never carries: calling it on a proxy is a plain host `TypeError` from the engine itself, with no trap and
@@ -95,6 +101,19 @@ type TypedArrayLength = (this: unknown) => number;
  */
 const TYPED_ARRAY_LENGTH = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype), 'length')?.get as TypedArrayLength | undefined;
+/**
+ * `%TypedArray%.prototype[Symbol.toStringTag]`, captured once at module load and applied **directly to the
+ * value** with `.call`. The engine answers it from the typed-array internal slot it stores for the object
+ * itself: the array-type name for a genuine typed array, and `undefined` for anything that has no such slot
+ * - a `Proxy`, a `DataView`, a plain object. It reads no prototype chain, so no `getPrototypeOf` trap runs
+ * here and none can, and it cannot be redirected by anything a caller controls. That is exactly why neither
+ * of the two readable alternatives is acceptable: `Object.prototype.toString` and an ordinary
+ * `value[Symbol.toStringTag]` both report whatever tag the caller wrote, and either caller getter runs.
+ */
+const TYPED_ARRAY_TAG = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag)?.get as TypedArrayTag | undefined;
+/** The one kind admitted: what the engine itself calls byte storage. A `Buffer` or subclass reports this too. */
+const BYTE_KIND = 'Uint8Array';
 
 function refused(reason: AdmissionRefusal): SyntheticAdmissionResult {
   return Object.freeze({ version: 1, outcome: 'REFUSED', reason });
@@ -143,12 +162,14 @@ function snapshot(value: unknown): { request: SyntheticAdmissionRequest | Admiss
  * One owned copy of the original. The **intrinsic length accessor is the first** thing that touches the
  * caller's value: it validates the typed-array internal slot, which a `Proxy` never carries, so a proxied
  * look-alike is refused by the engine itself. Nothing runs before that refusal - no `instanceof`, no
- * prototype read, no trap - and only after it does the `Uint8Array` brand check run, on a value the engine
- * has just proved is a genuine typed array with no `Proxy` behaviour. A `Proxy` around caller bytes
- * therefore never reaches the copy at all: there is no trap to run, no trap to throw and no element that
- * could be answered twice with different values. Each element is then read exactly once and accepted only
- * as a plain ASCII integer, so no coercion, comparison or text construction can ever turn one value into
- * another.
+ * prototype read, no trap - and the byte kind is then settled by the intrinsic `@@toStringTag` getter
+ * applied directly to the value, which reads that same internal slot rather than any prototype chain. Both
+ * answers come from the engine's own record of the object, so neither is a caller claim and neither walks
+ * anything the caller chose. A `Proxy` around caller bytes therefore never reaches the copy at all: there
+ * is no trap to run, no trap to throw and no element that could be answered twice with different values.
+ * A genuine typed array with a caller-chosen prototype reaches it too, and reaches it identically. Each
+ * element is then read exactly once and accepted only as a plain ASCII integer, so no coercion, comparison
+ * or text construction can ever turn one value into another.
  *
  * Allocation and copying share **one** cleanup path. The buffer is allocated before a single byte is read,
  * so every partial state - a rejected byte, a thrown conversion, an out-of-memory allocation - is covered by
@@ -161,18 +182,27 @@ function ownCopy(original: unknown): { bytes: Uint8Array; text: string } | Admis
     // The intrinsic length accessor is the FIRST thing that touches the caller's value. It validates the
     // typed-array internal slot, which a `Proxy` never carries, so a proxied look-alike is refused by the
     // engine itself before any brand check, prototype read or trap can run at all.
-    if (!TYPED_ARRAY_LENGTH) return 'INVALID_ORIGINAL';
+    if (!TYPED_ARRAY_LENGTH || !TYPED_ARRAY_TAG) return 'INVALID_ORIGINAL';
     const length: unknown = TYPED_ARRAY_LENGTH.call(original);
     if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 1 || length > MAX_SYNTHETIC_BYTES) {
       return 'INVALID_ORIGINAL';
     }
-    // Past that refusal the value is a genuine typed array that carries no `Proxy` behaviour, so this brand
-    // check is a plain type guard: the prototype it reads cannot answer with a caller trap.
-    if (!(original instanceof Uint8Array)) return 'INVALID_ORIGINAL';
+    // The kind, from the engine and never from the caller. A genuine internal slot says what the value is
+    // and says nothing about its prototype chain, so this asks a second captured intrinsic rather than
+    // walking a prototype an `instanceof` would have had to walk: a wrong typed kind, a `DataView` and a
+    // plain object carrying a spoofed `Symbol.toStringTag` all refuse, while a genuine byte array is byte
+    // storage whatever prototype it carries or advertises.
+    const kind: unknown = TYPED_ARRAY_TAG.call(original);
+    if (kind !== BYTE_KIND) return 'INVALID_ORIGINAL';
+    // The `unknown` boundary is kept, not cast away: the engine's two answers are the whole narrowing this
+    // seam accepts, and `typeof` is the only check left that cannot run caller code. `Reflect.get` with an
+    // in-range index is the element read `original[index]` makes - the typed-array internal slot, no
+    // prototype - so nothing about the copy changes.
+    if (typeof original !== 'object' || original === null) return 'INVALID_ORIGINAL';
     owned = new Uint8Array(length);
     let text = '';
     for (let index = 0; index < length; index += 1) {
-      const byte: unknown = original[index];
+      const byte: unknown = Reflect.get(original, index);
       // Validated before it is stored **and** before the text is built, so the owned bytes, the owned text
       // and the digest derived from that text can never describe different values.
       if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 0x7f) return 'INVALID_ORIGINAL';

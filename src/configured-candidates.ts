@@ -45,9 +45,9 @@ export interface ConfiguredCandidate extends Classified {
   end: number;
   /**
    * Did #10's own matcher match the **whole scanned unit** it ran over? `start`/`end` are that unit's
-   * coverage: for every basis except `PATTERN`, #10 extends a template match forward over the rest of the
-   * identifier so a value is never covered in part, and this flag then stays `false` because the match
-   * stopped short of the unit the coverage reached.
+   * coverage: for the `PATTERN` basis, and only for it, #10 extends a template match forward over the rest
+   * of the identifier so a value is never covered in part, and this flag then stays `false` because the
+   * match stopped short of the unit the coverage reached.
    *
    * It is a fact about the scanned unit and nothing else. It is not an offset in any other domain: a
    * later seam may fold, parse or decode this text and relocate coverage, while this one boolean keeps

@@ -258,6 +258,52 @@ test('review: no brand check or prototype trap runs before the byte refusal', ()
   assert.equal(prototypeTraps, 0, 'the typed-array internal slot refuses a Proxy before any prototype trap runs');
 });
 
+test('review: a genuine byte array behind a Proxy prototype is admitted with zero prototype traps', () => {
+  // A real typed-array internal slot does not prove a trap-free prototype chain. Both values below are
+  // genuine `Uint8Array`s whose **prototype** is a `Proxy`, so a brand check that reads a prototype chain
+  // walks that chain: the first trap throws, which refuses a value that is in fact owned bytes, and the
+  // second runs without refusing. Nothing here may walk it, so each shape is admitted exactly as the
+  // ordinary control is, and the only diagnostics are the two fixed booleans below.
+  let thrown = 0;
+  let counted = 0;
+  const refusing = Object.setPrototypeOf(bytes(GOOD), new Proxy(Object.getPrototypeOf(Uint8Array.prototype),
+    { getPrototypeOf: () => { thrown += 1; throw new Error('planted-prototype'); } }));
+  const honest = Object.setPrototypeOf(bytes(GOOD), new Proxy(Object.getPrototypeOf(Uint8Array.prototype),
+    { getPrototypeOf: () => { counted += 1; return Uint8Array.prototype; } }));
+  const ordinary = inspect(bytes(GOOD));
+  assert.equal(ordinary.outcome, 'CLASSIFIED', 'the paired ordinary value is the control');
+  for (const value of [refusing, honest]) {
+    const result = inspect(value);
+    assert.deepEqual(result, ordinary, 'a genuine byte array is admitted whatever its prototype answers');
+    assert.equal(JSON.stringify(result).includes('planted'), false, 'no planted text is echoed');
+  }
+  assert.equal(thrown, 0, 'a throwing prototype trap is never run');
+  assert.equal(counted, 0, 'no caller-controlled prototype chain is walked at any stage');
+});
+
+test('review: the byte kind is the engine kind, never a tag the caller can write', () => {
+  // Both reads this seam must never use accept the object below: an ordinary `value[Symbol.toStringTag]`
+  // returns exactly what the caller wrote, and `Object.prototype.toString` builds `[object Uint8Array]`
+  // out of that same caller-written tag. The intrinsic getter applied directly to the value reports no
+  // byte kind for it, because it answers from the internal slot the engine stores for the object itself.
+  const spoof = { [Symbol.toStringTag]: 'Uint8Array', length: GOOD.length, 0: GOOD.charCodeAt(0) };
+  assert.equal(spoof[Symbol.toStringTag], 'Uint8Array', 'the caller-written tag claims byte storage');
+  assert.equal(Object.prototype.toString.call(spoof), '[object Uint8Array]', 'the forbidden read agrees');
+  assert.equal(refuse({ ...RECORD, original: spoof }).reason, 'INVALID_ORIGINAL');
+  // A genuine `Buffer` and a genuine subclass are byte storage whatever tag they advertise, so they are
+  // admitted exactly as the ordinary value is: the kind is read from the engine, never from the caller.
+  class SpoofedTag extends Uint8Array { get [Symbol.toStringTag]() { return 'Uint8ClampedArray'; } }
+  assert.deepEqual(inspect(Buffer.from(GOOD, 'ascii')), inspect(bytes(GOOD)), 'a Buffer is byte storage');
+  assert.deepEqual(inspect(new SpoofedTag(bytes(GOOD))), inspect(bytes(GOOD)));
+  const wrongKinds = [new Uint8ClampedArray(GOOD.length), new Int8Array(GOOD.length),
+    new Uint16Array(GOOD.length), new Float64Array(GOOD.length), new DataView(new ArrayBuffer(GOOD.length))];
+  for (const value of wrongKinds) {
+    assert.equal(refuse({ ...RECORD, original: value }).reason, 'INVALID_ORIGINAL');
+  }
+  assert.equal(refuse({ ...RECORD, original: new Proxy(bytes(GOOD), { get: () => { throw new Error('planted'); } }) })
+    .reason, 'INVALID_ORIGINAL', 'a proxied look-alike has no internal slot for either intrinsic to find');
+});
+
 test('review: a copy failure part-way through the loop still zero-fills the allocation', () => {
   // A thrown failure inside the copy loop is the one partial path the refusal branch cannot reach, so the
   // cleanup has to be structural: the buffer is allocated before any byte is read and must be cleaned on
