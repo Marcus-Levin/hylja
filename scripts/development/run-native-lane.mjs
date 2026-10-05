@@ -33,6 +33,9 @@ import {
 	LANE_VERDICTS,
 	MAX_PROGRESS_BYTES,
 	MAX_PROGRESS_RECORDS,
+	admitRequiredReferences,
+	checkRequiredReferenceList,
+	probeReferenceMetadata,
 	resolveInstalledModules,
 } from '../../.pi/lib/hylja-native-lane.ts';
 
@@ -56,6 +59,7 @@ export const MAX_RANGE_READ_BYTES = MAX_PROGRESS_BYTES;
 export const SETUP_FAILURES = {
 	argv: 'SETUP_FAILED_ARGUMENTS',
 	config: 'SETUP_FAILED_LANE_CONFIG',
+	references: 'SETUP_FAILED_REQUIRED_REFERENCE',
 	install: 'SETUP_FAILED_INSTALL_CHECK',
 	spawn: 'SETUP_FAILED_SPAWN',
 	stale: 'SETUP_FAILED_STALE_EVIDENCE',
@@ -109,6 +113,10 @@ export function readRoleProfile(agent, fs = defaultFs) {
 const defaultFs = {
 	readFile: (path) => readFileSync(path, 'utf8'),
 	exists: existsSync,
+	// Bounded metadata over one declared reference path: stat plus one open that reads nothing and is
+	// closed immediately. Absent, broken and denied paths answer null and are never admitted, and a
+	// non-regular path is refused before it is opened, so it cannot block this host.
+	file: probeReferenceMetadata,
 	size: (path) => statSync(path).size,
 	read: (path, offset, length) => {
 		// A bounded positional read of exactly the requested window, never a whole-file read: the
@@ -136,6 +144,12 @@ export function validateLaneConfig(value, profile) {
 		return fail(SETUP_FAILURES.config);
 	}
 	if (typeof value.key !== 'string' || value.key.length === 0) return fail(SETUP_FAILURES.config);
+	// One optional bounded structured list of simple labels and absolute paths. Absent and an empty list
+	// are the same assertion of no references; any other shape is the fixed reference refusal rather
+	// than a repaired value, and no declared label or path is echoed into the record.
+	const declared = checkRequiredReferenceList(value.requiredReferences);
+	if (declared.ok !== true) return fail(SETUP_FAILURES.references);
+	const requiredReferences = declared.references ?? [];
 	if (!Number.isInteger(value.timeoutMs) || value.timeoutMs <= 0 || value.timeoutMs > profile.timeoutMs) {
 		return fail(SETUP_FAILURES.config);
 	}
@@ -164,6 +178,7 @@ export function validateLaneConfig(value, profile) {
 			cwd: value.cwd,
 			timeoutMs: value.timeoutMs,
 			...(softBudgetMs === undefined ? {} : { softBudgetMs }),
+			...(requiredReferences.length === 0 ? {} : { requiredReferences }),
 			sessionDir: value.sessionDir,
 			receipt: value.receipt,
 			verification: value.verification,
@@ -175,6 +190,27 @@ export function validateLaneConfig(value, profile) {
 			controller: value.controller,
 		},
 	};
+}
+
+/**
+ * Admits every declared reference by metadata alone, before Pi is spawned: each path must be an
+ * existing regular file this host can open for reading. Nothing is read from the file, no path is
+ * searched for or substituted, and admission is not approval nor a guarantee about later
+ * availability. A non-regular path is refused from its metadata before it is opened, so a writer-less
+ * FIFO cannot make this pre-spawn check wait: the watchdog that would bound the native lane does not
+ * exist yet. Omission runs no probe at all, so the previous behaviour is unchanged.
+ */
+export function checkRequiredReferences(config, fs) {
+	const references = config.requiredReferences ?? [];
+	if (references.length === 0) return { ok: true };
+	// The host's own filesystem view is the seam; a host that cannot answer admits nothing.
+	const probe = typeof fs.file === 'function' ? (path) => fs.file(path) : () => null;
+	try {
+		admitRequiredReferences(references, probe);
+	} catch {
+		return fail(SETUP_FAILURES.references);
+	}
+	return { ok: true };
 }
 
 /** The exact argv. No discovery, no ambient extension discovery, no skills, one fixed message. */
@@ -543,6 +579,9 @@ export async function runNativeLane(argv, deps = {}) {
 	const validated = validateLaneConfig(raw, profile);
 	if (validated.ok !== true) return validated;
 	const config = validated.config;
+	// Declared references are admitted before anything is spawned: a fixed refusal, zero children.
+	const references = checkRequiredReferences(config, context.fs);
+	if (references.ok !== true) return references;
 	const install = checkInstall(config, profile, context.fs, context.resolveModules);
 	if (install.ok !== true) return install;
 

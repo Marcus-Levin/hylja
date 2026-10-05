@@ -26,10 +26,22 @@
  * leaf's own later updates cannot push it out of the tail root reads after the child exits. It is
  * never delivered to the running child, and it never cancels, kills, deletes, resets or approves
  * anything. Without it the lane behaves exactly as before and arms no timer.
+ *
+ * A root may also configure one optional bounded `requiredReferences` list: simple labels paired with
+ * absolute paths the lane is expected to be able to read. It is a structured declaration, never prose
+ * that is parsed or guessed, and there is no search for a replacement when a path is wrong. Every
+ * entry is admitted by file metadata alone - an existing regular file this process can open for
+ * reading, contents never read - before the launch contract is resolved and before any request is
+ * emitted, so a missing, relative, wrong-shaped, directory, unreadable or overbound entry is the fixed
+ * setup refusal with zero dispatch. A non-regular path is refused before it is opened, so no declared
+ * path can make this admission wait on a writer that may never arrive. Admission is exactly that: not approval, and no promise that the
+ * path still exists or is still readable when the leaf reads it. Admitted labels and exact paths are
+ * rendered once into the same effective task the launch contract is resolved for, inside the existing
+ * raw task cap. Omitting the list keeps the previous behaviour exactly, with no probe and no paragraph.
  */
 
 import { randomUUID } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { clearTimeout as cancelTimer, setTimeout as startTimer } from 'node:timers';
 import { pathToFileURL } from 'node:url';
@@ -63,6 +75,11 @@ export const MAX_PROGRESS_BYTES = MAX_PROGRESS_RECORDS * 512;
 /** The raw cap on one task, and the cap the effective task must also stay inside. */
 export const MAX_TASK_CHARS = 1_048_576;
 
+/** Bounds on one optional required-reference list. They are admission bounds, not parsing bounds. */
+export const MAX_REQUIRED_REFERENCES = 16;
+export const MAX_REFERENCE_LABEL_CHARS = 128;
+export const MAX_REFERENCE_PATH_CHARS = 4096;
+
 /**
  * The one bridge value used for both the preflight and the request it is compared against: a lane leaf
  * has no supervisor session to answer it, and a mismatched pair would make digests incomparable.
@@ -74,6 +91,7 @@ export const SETUP_FAILURES = {
 	config: 'SETUP_FAILED_LANE_CONFIG',
 	modules: 'SETUP_FAILED_MODULE_RESOLUTION',
 	contract: 'SETUP_FAILED_LAUNCH_CONTRACT',
+	references: 'SETUP_FAILED_REQUIRED_REFERENCE',
 	dispatch: 'SETUP_FAILED_DISPATCH_PERSIST',
 	progress: 'SETUP_FAILED_PROGRESS_WRITE',
 	receipt: 'SETUP_FAILED_RECEIPT_WRITE',
@@ -83,6 +101,12 @@ export const SETUP_FAILURES = {
 export type LaneSetupFailure = (typeof SETUP_FAILURES)[keyof typeof SETUP_FAILURES];
 export type LaneVerdict = (typeof LANE_VERDICTS)[number];
 
+/** One declared reference: a simple label root chose and the exact absolute path it named. */
+export interface LaneRequiredReference {
+	readonly label: string;
+	readonly path: string;
+}
+
 export interface LaneConfig {
 	readonly key: string;
 	readonly agent: string;
@@ -91,12 +115,27 @@ export interface LaneConfig {
 	readonly timeoutMs: number;
 	/** Optional soft budget. Absent means no warning timer and no timing guide. */
 	readonly softBudgetMs?: number;
+	/** Optional required references. Absent means no probe, no refusal and no rendered block. */
+	readonly requiredReferences?: readonly LaneRequiredReference[];
 	readonly sessionDir: string;
 	readonly receipt: string;
 	readonly dispatch: string;
 	readonly progress: string;
 	readonly guard: string;
 }
+
+/** What one metadata probe may report about a declared path. Nothing else about the file is read. */
+export interface LaneReferenceMetadata {
+	readonly isFile: boolean;
+	readonly isDirectory: boolean;
+	readonly readable: boolean;
+}
+
+/**
+ * One bounded filesystem view over a declared path. `null` means no such readable metadata was
+ * obtained: absent, a broken link, a denied path component, or a seam that could not answer at all.
+ */
+export type LaneReferenceProbe = (path: string) => LaneReferenceMetadata | null;
 
 /** The narrow host surface this adapter uses. Nothing else about Pi is read. */
 export interface LaneEventBus {
@@ -204,6 +243,11 @@ export interface LaneControllerDeps {
 	readonly now?: () => number;
 	/** Arms one bounded warning timer and returns the closure that cancels exactly that timer. */
 	readonly arm?: (handler: () => void, delayMs: number) => () => void;
+	/**
+	 * The metadata view over declared reference paths. Injected so an unreadable reference is provable
+	 * by fault injection rather than by permission bits a root process does not honour anyway.
+	 */
+	readonly referenceProbe?: LaneReferenceProbe;
 }
 
 export interface LaneController {
@@ -218,11 +262,146 @@ export interface LaneController {
 const isSetupFailure = (value: string): value is LaneSetupFailure =>
 	(Object.values(SETUP_FAILURES) as readonly string[]).includes(value);
 
+const isBoolean = (value: unknown): value is boolean => typeof value === 'boolean';
+
 const isText = (value: unknown): value is string => typeof value === 'string';
 const isBoundedText = (value: unknown): value is string => isText(value) && value.length > 0 && value.length <= 4096;
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const record = (value: unknown): Record<string, unknown> | null =>
 	(typeof value === 'object' && value !== null && !Array.isArray(value) ? value : null) as Record<string, unknown> | null;
+
+/**
+ * A label is non-empty short text with no control character, so a rendered line cannot be forged by a
+ * label and cannot be left blank by one. A path is absolute, bounded, and NUL-free: exactly what the
+ * operator declared, never resolved or searched for. Nothing here is inferred from the task prose.
+ */
+const isSimpleLabel = (value: unknown): value is string =>
+	isText(value)
+	&& value.length > 0
+	&& value.length <= MAX_REFERENCE_LABEL_CHARS
+	&& !Array.from(value).some((char) => {
+		const code = char.codePointAt(0) ?? 0;
+		return code < 0x20 || code === 0x7f;
+	});
+
+const isReferencePath = (value: unknown): value is string =>
+	isText(value) && value.length <= MAX_REFERENCE_PATH_CHARS && value.startsWith('/') && !value.includes('\0');
+
+/**
+ * Parses the one optional structured list. Absent stays absent and an empty list asserts no
+ * references. Every other shape - a bare path string, a label-to-path map, a primitive entry, an
+ * unknown field, an empty or control-character label, a relative or overbound path, or more entries
+ * than the bound - is the fixed reference refusal. No planted label, path or entry is ever returned.
+ */
+function parseRequiredReferences(value: unknown): readonly LaneRequiredReference[] | null {
+	if (value === undefined) return null;
+	if (!Array.isArray(value) || value.length > MAX_REQUIRED_REFERENCES) throw new Error(SETUP_FAILURES.references);
+	const references: LaneRequiredReference[] = [];
+	for (const entry of value) {
+		const fields = record(entry);
+		// Exactly the two declared fields. An extra field is refused rather than rendered or ignored.
+		if (fields === null || Object.keys(fields).length !== 2) throw new Error(SETUP_FAILURES.references);
+		if (!isSimpleLabel(fields.label) || !isReferencePath(fields.path)) throw new Error(SETUP_FAILURES.references);
+		references.push({ label: fields.label, path: fields.path });
+	}
+	return references;
+}
+
+export type LaneReferenceList =
+	| { readonly ok: true; readonly references: readonly LaneRequiredReference[] | null }
+	| { readonly ok: false };
+
+/** The shape check both readers share, so a config the CLI admits is one the controller admits. */
+export function checkRequiredReferenceList(value: unknown): LaneReferenceList {
+	try {
+		return { ok: true, references: parseRequiredReferences(value) };
+	} catch {
+		return { ok: false };
+	}
+}
+
+/**
+ * The one open this adapter performs: read-only, never a write, and non-blocking where the platform
+ * carries that flag. A non-blocking read-open is what keeps a path that becomes a FIFO between the
+ * stat and the open from parking this process on a writer that may never arrive. On a platform without
+ * the flag the open is an ordinary read-only one and the descriptor check below is the only guard left,
+ * which is stated rather than assumed: admission there cannot promise a non-blocking open.
+ */
+const READ_OPEN_FLAGS = constants.O_RDONLY | (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0);
+
+/**
+ * The shipped probe: stat metadata plus one non-blocking open-for-read that is closed immediately and
+ * reads nothing. A process that bypasses file permissions admits exactly what it can actually open,
+ * which is the honest answer for the process that will read the path later.
+ *
+ * Non-regular metadata is refused before the open rather than after it, because the open is the only
+ * unbounded step here: a FIFO with no writer makes a blocking read-open wait for one, and this
+ * admission runs before any watchdog exists to bound that wait. The open is repeated only for a
+ * regular file, and the opened descriptor's own fstat decides readability, so a substitution between
+ * the stat and the open is caught instead of admitted. No content is read on any path.
+ */
+export const probeReferenceMetadata: LaneReferenceProbe = (path) => {
+	let stats: ReturnType<typeof statSync>;
+	try {
+		stats = statSync(path);
+	} catch {
+		// No readable metadata at all: absent, a broken link, or a denied path component. The
+		// underlying error text never leaves this adapter.
+		return null;
+	}
+	const isFile = stats.isFile();
+	const isDirectory = stats.isDirectory();
+	let readable = false;
+	if (isFile && !isDirectory) {
+		let handle: number | undefined;
+		try {
+			handle = openSync(path, READ_OPEN_FLAGS);
+			// The descriptor is what a later reader would actually get, not the path this adapter stat'd.
+			readable = fstatSync(handle).isFile();
+		} catch {
+			readable = false;
+		} finally {
+			if (handle !== undefined) {
+				try {
+					closeSync(handle);
+				} catch {
+					// A descriptor this adapter cannot close is not one it claims it opened.
+					readable = false;
+				}
+			}
+		}
+	}
+	return { isFile, isDirectory, readable };
+};
+
+/**
+ * Admits declared references by metadata alone: each path must be an existing regular file this
+ * process can open for reading. Contents are never read, no path is resolved, searched for or
+ * substituted, and admission is neither approval nor a promise about later availability. A non-regular
+ * path is refused before it is opened, so it can never make this admission wait.
+ */
+export function admitRequiredReferences(references: readonly LaneRequiredReference[], probe: LaneReferenceProbe): void {
+	for (const reference of references) {
+		let probed: unknown = null;
+		try {
+			probed = probe(reference.path);
+		} catch {
+			throw new Error(SETUP_FAILURES.references);
+		}
+		const metadata = record(probed);
+		if (
+			metadata === null
+			|| !isBoolean(metadata.isFile)
+			|| !isBoolean(metadata.isDirectory)
+			|| !isBoolean(metadata.readable)
+			|| metadata.isFile !== true
+			|| metadata.isDirectory !== false
+			|| metadata.readable !== true
+		) {
+			throw new Error(SETUP_FAILURES.references);
+		}
+	}
+}
 
 /** Reads and validates the subset of the root-owned lane config this controller owns. */
 export function readLaneConfig(path: string): LaneConfig {
@@ -244,6 +423,8 @@ export function readLaneConfig(path: string): LaneConfig {
 	if (key.length > 128) throw new Error(SETUP_FAILURES.config);
 	const task = text('task');
 	if (task.length > MAX_TASK_CHARS) throw new Error(SETUP_FAILURES.config);
+	// Optional required references: a declaration root owns, never inferred from the task prose.
+	const requiredReferences = parseRequiredReferences(value.requiredReferences);
 	if (!isCount(value.timeoutMs) || !Number.isInteger(value.timeoutMs)) throw new Error(SETUP_FAILURES.config);
 	// Optional soft budget. Present means a positive integer strictly below the finite hard timeout;
 	// anything else is the fixed config refusal. Absent keeps the previous behaviour exactly.
@@ -266,6 +447,7 @@ export function readLaneConfig(path: string): LaneConfig {
 		task,
 		timeoutMs: value.timeoutMs,
 		...(softBudgetMs === undefined ? {} : { softBudgetMs }),
+		...(requiredReferences === null || requiredReferences.length === 0 ? {} : { requiredReferences }),
 		...paths,
 	};
 }
@@ -281,19 +463,38 @@ const TIMING_GUIDE: Record<string, string> = {
 };
 
 /**
- * The exact string the launch contract is resolved for and the exact string that is dispatched. The
- * raw cap still binds it: an effective task past the cap fails restrictively instead of losing its
- * tail, because a truncated task would dispatch a leaf whose digest covers different bytes than the
- * task it was given.
+ * The one paragraph declared references add to the child's task: what admission actually was, what it
+ * is not, and what to do when a path is gone. Labels and exact paths are rendered once, here, and
+ * nowhere else; there is no alternative search and no substitute file.
+ */
+const REFERENCE_GUIDE = 'Root checked each exact path below before launching this lane and admitted it by'
+	+ ' file metadata only. That admission is not approval, and it does not guarantee the path still exists'
+	+ ' or is still readable when you read it. Read each path exactly as written and never substitute another'
+	+ ' file for it; if one is gone, report INCOMPLETE and name which.';
+
+/**
+ * The exact string the launch contract is resolved for and the exact string that is dispatched, with
+ * the declared references and the optional timing guide appended to the raw task. The raw cap still
+ * binds the result: an effective task past the cap fails restrictively instead of losing its tail,
+ * because a truncated task would dispatch a leaf whose digest covers different bytes than the task it
+ * was given. Omitting both optional sections returns the raw task byte for byte.
  */
 export function buildEffectiveTask(config: LaneConfig): string {
-	if (config.softBudgetMs === undefined) return config.task;
-	const role = TIMING_GUIDE[config.agent];
-	if (role === undefined) throw new Error(SETUP_FAILURES.config);
-	const effective = `${config.task}\n\n[Lane timing] Soft budget ${config.softBudgetMs} ms, hard deadline ${config.timeoutMs} ms,`
-		+ ' both counted from dispatch. Root is warned once at the soft budget; that warning is not sent to you,'
-		+ ' cancels nothing and approves nothing. '
-		+ `${role} This guide grants no authority beyond your role body.`;
+	const references = config.requiredReferences ?? [];
+	const sections = [config.task];
+	if (references.length > 0) {
+		sections.push(`[Required references] ${REFERENCE_GUIDE}\n`
+			+ references.map((reference) => `- ${reference.label}: ${reference.path}`).join('\n'));
+	}
+	if (config.softBudgetMs !== undefined) {
+		const role = TIMING_GUIDE[config.agent];
+		if (role === undefined) throw new Error(SETUP_FAILURES.config);
+		sections.push(`[Lane timing] Soft budget ${config.softBudgetMs} ms, hard deadline ${config.timeoutMs} ms,`
+			+ ' both counted from dispatch. Root is warned once at the soft budget; that warning is not sent to you,'
+			+ ' cancels nothing and approves nothing. '
+			+ `${role} This guide grants no authority beyond your role body.`);
+	}
+	const effective = sections.join('\n\n');
 	if (effective.length > MAX_TASK_CHARS) throw new Error(SETUP_FAILURES.config);
 	return effective;
 }
@@ -505,6 +706,7 @@ export async function createLaneController(
 	const addSignalListener = deps.addSignalListener ?? defaultSignalListener;
 	const now = deps.now ?? (() => Date.now());
 	const arm = deps.arm ?? defaultArm;
+	const referenceProbe = deps.referenceProbe ?? probeReferenceMetadata;
 	const request: Record<string, unknown> = {
 		requestId: randomUUID(),
 		ownerRunId: randomUUID(),
@@ -632,6 +834,10 @@ export async function createLaneController(
 		// expected digest always covers exactly the bytes the child is given.
 		const effectiveTask = buildEffectiveTask(config);
 		request.task = effectiveTask;
+		// Declared references are admitted before the launch contract is resolved and before anything
+		// is persisted or emitted, so a broken one reaches no preflight, no child process and no
+		// dispatch record. The probe is one bounded metadata read per declared path and no content.
+		admitRequiredReferences(config.requiredReferences ?? [], referenceProbe);
 		expectation = await resolveExpectation(pi, config, effectiveTask, modules.preflight);
 		const dispatch: LaneDispatchRecord = {
 			...tuple,
