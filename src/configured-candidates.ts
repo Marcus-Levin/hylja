@@ -43,6 +43,14 @@ export interface ConfiguredCandidate extends Classified {
   basis: 'DICTIONARY' | 'PATTERN' | 'FIELD_HINT' | 'CONTEXT';
   start: number;
   end: number;
+  /**
+   * Offsets the rule itself matched, before coverage was extended. Equal to `start`/`end` for every basis
+   * except `PATTERN`, where #10 extends a template match forward over the rest of the identifier so a value
+   * is never covered in part. `start`/`end` stay that coverage; `matchStart`/`matchEnd` stay what the
+   * genuine source actually matched, so a consumer can tell corroboration from coverage.
+   */
+  matchStart: number;
+  matchEnd: number;
   evidence: DetectorEvidenceInput;
 }
 export interface ConfiguredResult {
@@ -276,7 +284,8 @@ function engineeringValue(text: string, at: number, keyStart: number, lines: Lin
 
 /* ---------- Detection ---------- */
 
-interface Found extends Classified { rule: string; basis: ConfiguredCandidate['basis']; start: number; end: number }
+interface Found extends Classified { rule: string; basis: ConfiguredCandidate['basis'];
+  start: number; end: number; matchStart: number; matchEnd: number }
 function failure(reason: string): ConfiguredResult {
   return Object.freeze({ status: 'FAILURE', reasons: Object.freeze([reason]), candidates: Object.freeze([]) });
 }
@@ -339,7 +348,8 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
       if (fieldPath) {
         compiled.hints.forEach(({ path, entry }, index) => {
           const start = text.length - text.trimStart().length, end = text.trimEnd().length;
-          if (end > start && hintMatches(path, fieldPath!)) add({ ...entry, rule: `field-hint.${index}`, basis: 'FIELD_HINT', start, end });
+          if (end > start && hintMatches(path, fieldPath!)) add({ ...entry, rule: `field-hint.${index}`, basis: 'FIELD_HINT',
+            start, end, matchStart: start, matchEnd: end });
         });
       }
       for (const invisible of ['REMOVE', 'SPACE'] as const) {
@@ -356,8 +366,9 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
         }
         if (!longest) { index++; continue; }
         const first = tokens[index]!, last = tokens[longest.last]!;
-        add({ ...compiled.entries[longest.entry]!, rule: 'dictionary.term', basis: 'DICTIONARY',
-          start: folded.origin[first.index]!, end: folded.originEnd[last.index + last[0].length - 1]! });
+        const start = folded.origin[first.index]!, end = folded.originEnd[last.index + last[0].length - 1]!;
+        add({ ...compiled.entries[longest.entry]!, rule: 'dictionary.term', basis: 'DICTIONARY', start, end,
+          matchStart: start, matchEnd: end });
         index = longest.last + 1;
       }
       }
@@ -366,9 +377,10 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
         let covered = -1;
         for (const match of text.matchAll(regex)) {
           if (match.index < covered) continue;
-          const end = expand(text, match.index + match[0].length, wordEnd);
+          const start = match.index, matchEnd = start + match[0].length;
+          const end = expand(text, matchEnd, wordEnd);
           covered = end;
-          add({ ...entry, rule: `pattern.${index}`, basis: 'PATTERN', start: match.index, end });
+          add({ ...entry, rule: `pattern.${index}`, basis: 'PATTERN', start, end, matchStart: start, matchEnd });
         }
       });
     }
@@ -384,7 +396,8 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
       // Resume after the value whether or not it qualifies, so each character is read once.
       KEY_VALUE.lastIndex = Math.max(KEY_VALUE.lastIndex, value.end);
       if (rule[2] && !/\d/u.test(text.slice(value.start, value.end))) continue;
-      add({ semanticType: 'ENGINEERING_IDENTIFIER', subtype: rule[1], rule: 'context.engineering-key', basis: 'CONTEXT', ...value });
+      add({ semanticType: 'ENGINEERING_IDENTIFIER', subtype: rule[1], rule: 'context.engineering-key', basis: 'CONTEXT',
+        ...value, matchStart: value.start, matchEnd: value.end });
     }
   } catch (error) { return failure(error instanceof RangeError ? 'TOO_MANY_CANDIDATES' : 'INTERNAL_ERROR'); }
 
@@ -393,6 +406,7 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
   const candidates = found.map((item, index) => Object.freeze({
     semanticType: item.semanticType, ...(item.subtype ? { subtype: item.subtype } : {}),
     ...(item.sensitivity ? { sensitivity: item.sensitivity } : {}), rule: item.rule, basis: item.basis, start: item.start, end: item.end,
+    matchStart: item.matchStart, matchEnd: item.matchEnd,
     evidence: Object.freeze({
       version: 1 as const, id: `${CONFIGURED_PRODUCER.id}.${item.basis.toLowerCase()}.${field}.${item.start}-${item.end}.${index}`,
       status: 'FOUND' as const,

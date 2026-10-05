@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { createNameDictionary } from '../dist/contact-candidates.js';
+import { createCandidateConfig } from '../dist/configured-candidates.js';
 import { detectNormalizedCandidates } from '../dist/normalized-detection.js';
 
 const scope = Object.freeze({ tenantRef: 'tenant-a', projectRef: 'project-a' });
@@ -9,6 +10,20 @@ const run = (input, rest = {}) => detectNormalizedCandidates({ input, inputRef: 
 const b64 = (value) => Buffer.from(value, 'utf8').toString('base64');
 const hex = (value) => Buffer.from(value, 'utf8').toString('hex');
 const pct = (value) => [...Buffer.from(value, 'utf8')].map((byte) => `%${byte.toString(16).padStart(2, '0')}`).join('');
+
+test('review: #6 carries #10 matched spans beside coverage spans without changing either span', () => {
+  // Synthetic only: a made-up namespace, a one-digit template and an unconfigured tail.
+  const configured = createCandidateConfig(scope, { patterns: [{ template: 'SYNTHETIC-ASSET-{9:1}',
+    semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ASSET_TAG', sensitivity: 'INTERNAL' }] });
+  const at = (text) => run(text, { configured }).candidates.find((item) => item.source === 'CONFIGURED');
+  const whole = at('SYNTHETIC-ASSET-1');
+  assert.deepEqual([whole.matchStart, whole.matchEnd, whole.view.span.start, whole.view.span.end], [0, 17, 0, 17]);
+  assert.equal(whole.original.kind, 'ORIGINAL_EXACT');
+  const covered = at('SYNTHETIC-ASSET-1UNCONFIGURED');
+  assert.deepEqual([covered.matchStart, covered.matchEnd], [0, 17]);
+  assert.deepEqual([covered.view.span.start, covered.view.span.end, covered.original.span.end], [0, 29, 29],
+    'coverage still reaches the end of the identifier');
+});
 
 test('raw text candidates have exact root offsets and source-specific evidence', () => {
   const names = createNameDictionary(scope, ['Synthetic Visitor']);

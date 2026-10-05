@@ -6,6 +6,7 @@
  * #8 evidence refuses this seam; it is not a key, is not routable and is never stored as a mapping.
  */
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { createCandidateConfig } from '../dist/configured-candidates.js';
 import {
@@ -27,10 +28,25 @@ const conflictingConfig = createCandidateConfig(A, { patterns: [ASSET_TAG,
   { template: 'SYNTHETIC-ASSET-{9:8}', semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'DOCUMENT_ID', sensitivity: 'CONFIDENTIAL' }] });
 
 const GOOD = 'SYNTHETIC-ASSET-PUMP0042';
+const EXACT_LENGTH = 17;
+// A one-digit template that matches exactly one value of the synthetic namespace and nothing after it.
+const exactConfig = createCandidateConfig(A, { patterns: [{ template: 'SYNTHETIC-ASSET-{9:1}',
+  semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ASSET_TAG', sensitivity: 'INTERNAL' }] });
+const rangeConfig = createCandidateConfig(A, { patterns: [{ template: 'SYNTHETIC-ASSET-{9:1-4}',
+  semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ASSET_TAG', sensitivity: 'INTERNAL' }] });
 const bytes = (value) => new TextEncoder().encode(value);
 const inspect = (original, more = {}, handle = config, scope = A) =>
   inspectSyntheticEngineeringReference({ version: 1, original, scope, configured: handle,
     inputRef: 'field-a.invalid', ...more });
+const RECORD = Object.freeze({ version: 1, original: bytes(GOOD), scope: A, configured: config,
+  inputRef: 'field-a.invalid' });
+const refuse = (value) => {
+  const result = inspectSyntheticEngineeringReference(value);
+  assert.equal(result.outcome, 'REFUSED', 'a planted shape must refuse');
+  assert.ok(ADMISSION_REFUSALS.includes(result.reason), `${result.reason} is a fixed refusal code`);
+  assert.equal(JSON.stringify(result).includes('planted'), false, 'no planted text is echoed');
+  return result;
+};
 
 test('a genuine configured synthetic identifier is classified with a reversible session recommendation', () => {
   const result = inspect(bytes(GOOD));
@@ -152,4 +168,93 @@ test('every refusal this seam emits is in the closed vocabulary', () => {
   const seen = new Set([...ADMISSION_REFUSALS]);
   assert.equal(seen.size, ADMISSION_REFUSALS.length);
   assert.deepEqual([...seen].sort(), [...ADMISSION_REFUSALS].sort());
+});
+
+test('review: only a genuine whole configured match corroborates; coverage alone does not', () => {
+  // Positive controls: the configured template itself matches the entire value.
+  assert.equal(inspect(bytes('SYNTHETIC-ASSET-1'), {}, exactConfig).outcome, 'CLASSIFIED');
+  assert.equal(inspect(bytes('SYNTHETIC-ASSET-0042'), {}, rangeConfig).outcome, 'CLASSIFIED');
+  // #10 extends a pattern match over the rest of the identifier. That is coverage, not corroboration:
+  // the unconfigured tail was never matched by the genuine source, so it cannot be admitted.
+  assert.equal(inspect(bytes('SYNTHETIC-ASSET-1UNCONFIGURED'), {}, exactConfig).reason, 'PARTIAL_CANDIDATE');
+  assert.equal(inspect(bytes('SYNTHETIC-ASSET-12'), {}, exactConfig).reason, 'PARTIAL_CANDIDATE');
+  assert.equal(inspect(bytes('SYNTHETIC-ASSET-1UNCONFIGURED'), {}, config).outcome, 'CLASSIFIED',
+    'a template that genuinely matches the whole value is still admitted');
+});
+
+test('review: every member, optional ones included, must be an own enumerable data property', () => {
+  const hidden = { ...RECORD };
+  Object.defineProperty(hidden, 'fieldKey', { value: 'DB_PASSWORD', enumerable: false });
+  assert.equal(inspectSyntheticEngineeringReference(hidden).reason, 'INVALID_REQUEST');
+  let reads = 0;
+  const accessor = Object.defineProperty({ ...RECORD }, 'fieldKey',
+    { enumerable: true, get: () => { reads += 1; return 'DB_PASSWORD'; } });
+  assert.equal(inspectSyntheticEngineeringReference(accessor).reason, 'INVALID_REQUEST');
+  assert.equal(reads, 0, 'an accessor descriptor is refused, never invoked');
+  assert.equal(inspectSyntheticEngineeringReference({ ...RECORD, fieldKey: 'DB_PASSWORD' }).reason,
+    'SECRET_EVIDENCE', 'the ordinary data-property control still refuses for its own reason');
+});
+
+test('review: the nested scope is closed, own, non-inherited and free of a session field', () => {
+  const scoped = (scope) => inspectSyntheticEngineeringReference({ ...RECORD, scope });
+  assert.equal(scoped({ ...A }).outcome, 'CLASSIFIED');
+  assert.equal(scoped({ ...A, sessionId: 'session-1' }).reason, 'INVALID_REQUEST');
+  assert.equal(scoped(Object.create(A)).reason, 'INVALID_REQUEST');
+  assert.equal(scoped({ tenantRef: A.tenantRef, projectRef: undefined }).reason, 'INVALID_REQUEST');
+  let reads = 0;
+  const trapped = new Proxy({ ...A }, { get: () => { reads += 1; throw new Error('planted'); } });
+  assert.deepEqual(scoped(trapped), scoped({ ...A }), 'descriptors answer a get-only Proxy without running it');
+  assert.equal(reads, 0);
+  const accessor = {};
+  Object.defineProperty(accessor, 'tenantRef', { enumerable: true, get: () => { reads += 1; return A.tenantRef; } });
+  Object.defineProperty(accessor, 'projectRef', { enumerable: true, value: A.projectRef });
+  assert.equal(inspectSyntheticEngineeringReference({ ...RECORD, scope: accessor }).reason, 'INVALID_REQUEST');
+  assert.equal(reads, 0, 'an accessor scope descriptor is refused, never invoked');
+});
+
+test('review: reflection, byte and serialization failures refuse with a fixed code, never a planted error', () => {
+  const genuine = bytes(GOOD);
+  const lengthTrap = new Proxy(genuine, { get: () => { throw new Error('planted-length'); } });
+  const indexTrap = new Proxy(genuine, { get: (target, key, receiver) => {
+    if (key === '0') throw new Error('planted-byte');
+    return Reflect.get(target, key, receiver);
+  } });
+  assert.equal(refuse({ ...RECORD, original: lengthTrap }).reason, 'INVALID_ORIGINAL');
+  assert.equal(refuse({ ...RECORD, original: indexTrap }).reason, 'INVALID_ORIGINAL');
+  assert.equal(refuse({ ...RECORD, inputRef: 'field-\ud800' }).reason, 'INVALID_REQUEST');
+  assert.equal(refuse({ ...RECORD, scope: { tenantRef: 'tenant-a\ud800', projectRef: A.projectRef } }).reason,
+    'INVALID_REQUEST');
+});
+
+test('review: a proxied element is never read, so nothing is coerced and nothing is read twice', () => {
+  const genuine = bytes(GOOD);
+  let elementReads = 0;
+  const coercing = new Proxy(genuine, { get: (target, key, receiver) => {
+    if (typeof key === 'string' && /^\d+$/u.test(key)) elementReads += 1;
+    if (key === '0') return { valueOf: () => 0x41, toString: () => 'A' };
+    return Reflect.get(target, key, receiver);
+  } });
+  assert.equal(refuse({ ...RECORD, original: coercing }).reason, 'INVALID_ORIGINAL');
+  assert.equal(elementReads, 0, 'a proxied element is never reached, so it can never be coerced');
+  const result = inspect(bytes(GOOD));
+  assert.equal(result.outcome, 'CLASSIFIED');
+  assert.equal(result.sourceDigest, createHash('sha256')
+    .update(`hylja.synthetic-engineering-admission.source.v1\0${GOOD}`).digest('hex'),
+  'the owned bytes, the owned text and the source digest are one congruent value');
+});
+
+test('review: the owned allocation is zero-filled on a copy failure, not only on the success path', () => {
+  const planted = new Uint8Array([...bytes(GOOD).slice(0, 4), 0xff]);
+  const cleaned = [];
+  const real = Uint8Array.prototype.fill;
+  Uint8Array.prototype.fill = function record(value) { cleaned.push(this); return real.apply(this, arguments); };
+  let result;
+  try {
+    result = inspectSyntheticEngineeringReference({ ...RECORD, original: planted });
+  } finally { Uint8Array.prototype.fill = real; }
+  assert.equal(result.reason, 'INVALID_ORIGINAL');
+  assert.ok(cleaned.some((buffer) => buffer.length === planted.length),
+    'the allocated copy is cleaned up before the refusal returns');
+  assert.ok(cleaned.every((buffer) => buffer.every((byte) => byte === 0)),
+    'every owned byte observed by the cleanup is zero');
 });

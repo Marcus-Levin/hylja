@@ -154,6 +154,27 @@ test('review: pattern spans expand over the whole identifier token, never coveri
   }
 });
 
+test('review: a pattern candidate reports the span the template matched beside its coverage span', () => {
+  // Synthetic only: a made-up namespace and a one-digit template that matches it exactly.
+  const exact = createCandidateConfig(A, { patterns: [{ template: 'SYNTHETIC-ASSET-{9:1}',
+    semanticType: 'ENGINEERING_IDENTIFIER', subtype: 'ASSET_TAG', sensitivity: 'INTERNAL' }] });
+  const spanOf = (text) => {
+    const [candidate] = detectConfigured({ text, inputRef: 'x', scope: A, config: exact }).candidates;
+    return { coverage: [candidate.start, candidate.end], matched: [candidate.matchStart, candidate.matchEnd] };
+  };
+  assert.deepEqual(spanOf('SYNTHETIC-ASSET-1'), { coverage: [0, 17], matched: [0, 17] },
+    'a whole match and its coverage are the same span');
+  assert.deepEqual(spanOf('SYNTHETIC-ASSET-1UNCONFIGURED'),
+    { coverage: [0, 29], matched: [0, 17] }, 'coverage extends; the match does not');
+  // A term, a field hint and the generic key rule never extend: their match span is their coverage span.
+  const [term] = run('Northwind Synthetic AB').candidates;
+  assert.deepEqual([term.matchStart, term.matchEnd], [term.start, term.end]);
+  const [hint] = run('anything-synthetic', { fieldPath: ['asset', 'tag'] }).candidates;
+  assert.deepEqual([hint.matchStart, hint.matchEnd], [hint.start, hint.end]);
+  const [key] = run('part_number: SYN-P-1', { config: undefined }).candidates;
+  assert.deepEqual([key.matchStart, key.matchEnd], [key.start, key.end]);
+});
+
 test('review: the generic engineering-key rule reads quoted, full-line, dotted and Swedish keys without prose hits', () => {
   for (const [text, value] of [['plc_tag: %I0.1', '%I0.1'], ['plc_address=%MW100', '%MW100'], ['opc_node: ns=2;s=Line1.Pump.Speed', 'ns=2;s=Line1.Pump.Speed'],
     ['scada_tag: "Line 1 Pump Speed"', 'Line 1 Pump Speed'], ['part_number: ABC+123', 'ABC+123'], ['drawing_no: DWG 1234 A', 'DWG 1234 A'],

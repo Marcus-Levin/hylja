@@ -130,6 +130,15 @@ export interface NormalizedCandidate {
   readonly evidence: CandidateEvidence;
   readonly view: ViewLocation;
   readonly original: OriginalLocation;
+  /**
+   * For a `CONFIGURED` candidate whose rule is a #10 template: the offsets that template actually matched,
+   * which `view`/`original` do not show on their own because #10 extends a template match forward over the
+   * rest of the identifier. `view.span` and `original` stay that wider coverage; these two stay the match,
+   * so a consumer can require whole-value corroboration instead of whole-value coverage. Every other
+   * source, and every other #10 basis, has no extension and is absent.
+   */
+  readonly matchStart?: number;
+  readonly matchEnd?: number;
   /** Present when the candidate came from a #7 parsed field rather than from scanning a whole view. */
   readonly field?: ParsedFieldLocation;
 }
@@ -190,6 +199,9 @@ export interface NormalizedDetectionRequest {
 interface Detected {
   start: number;
   end: number;
+  /** #10's matched template offsets, carried beside the coverage offsets above. */
+  matchStart?: number;
+  matchEnd?: number;
   subtype?: string;
   rule?: string;
   basis: string;
@@ -455,6 +467,7 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
       counts[source]++;
       candidates.push(Object.freeze({ source, ...(item.subtype ? { subtype: item.subtype } : {}),
         ...(item.rule ? { rule: item.rule } : {}), basis: item.basis,
+        ...(item.matchStart === undefined ? {} : { matchStart: item.matchStart, matchEnd: item.matchEnd }),
         ...(item.fidelity ? { fidelity: item.fidelity } : {}),
         ...(item.fingerprint ? { fingerprint: item.fingerprint } : {}), evidence: item.evidence,
         ...at }));
@@ -479,8 +492,10 @@ export function detectNormalizedCandidates(request: NormalizedDetectionRequest):
     }
     if (result.status === 'FAILURE') return;
     const items = (fieldHintsOnly ? result.candidates.filter((item) => item.basis === 'FIELD_HINT') : result.candidates)
-      .map((item) => ({ start: item.start, end: item.end, ...(item.subtype ? { subtype: item.subtype } : {}),
-        rule: item.rule, basis: item.basis, evidence: item.evidence }));
+      .map((item) => ({ start: item.start, end: item.end,
+        ...(item.matchStart === undefined || item.matchEnd === undefined ? {}
+          : { matchStart: item.matchStart, matchEnd: item.matchEnd }),
+        ...(item.subtype ? { subtype: item.subtype } : {}), rule: item.rule, basis: item.basis, evidence: item.evidence }));
     accept(view, 'CONFIGURED', items, place);
   };
 
