@@ -28,8 +28,9 @@ Wiring: the adapter takes the `tool_call` handler context and forwards `ctx.cwd`
 directory, because a foreground child runs inside the parent process where `process.cwd()` is the
 coordinator's directory, not the child's worktree.
 
-Wiring: project extension discovery loads it for the coordinator (`<cwd>/.pi/extensions/`), and both
-role profiles declare `extensions: ../extensions/hylja-workflow-guard.ts`, an allowlist that keeps
+Wiring: project extension discovery loads it for the coordinator (`<cwd>/.pi/extensions/`), and every
+role profile, the writer fallback included, declares
+`extensions: ../extensions/hylja-workflow-guard.ts`, an allowlist that keeps
 ambient extensions off in a foreground child while the host-required child extensions, the registered
 providers and the builtin tools still resolve. The relative entry resolves against the agent file's own
 directory, which is what pi-subagents does for a path-like `extensions` entry; the profiles' other
@@ -67,9 +68,10 @@ native smoke run, not by this document.
 ## Install and use
 
 Prerequisite: native Pi with `pi-subagents` loaded (`pi list`). Role configuration is the frontmatter of
-[`.pi/agents/hylja-implementer.md`](../../.pi/agents/hylja-implementer.md) and
-[`.pi/agents/hylja-reviewer.md`](../../.pi/agents/hylja-reviewer.md); `~/.agents/pstack-models.md` is
-untouched. Tested installation: pi-subagents 0.75.0 on Pi 1.0.0, whose release notes record the fix for
+[`.pi/agents/hylja-implementer.md`](../../.pi/agents/hylja-implementer.md),
+[`.pi/agents/hylja-reviewer.md`](../../.pi/agents/hylja-reviewer.md) and
+[`.pi/agents/hylja-implementer-sol61.md`](../../.pi/agents/hylja-implementer-sol61.md);
+`~/.agents/pstack-models.md` is untouched. Tested installation: pi-subagents 0.75.0 on Pi 1.0.0, whose release notes record the fix for
 background children failing on Pi 1.0.0 with a missing `@earendil-works/pi-agent-core/node` export;
 0.74.0 does not work on Pi 1.0.0. Foreground children do not depend on that fix. No extra script or
 package is added to this repository.
@@ -98,12 +100,33 @@ guard adapter is. Root runs one lane with `node scripts/development/run-native-l
 <absolute config.json>`. The CLI launches Pi once with the three extensions named in its config, the one
 fixed input the controller answers, and the one structured foreground delegation call into
 `pi-subagents`. No coordinator model takes part in that process; nothing here is a measured speedup,
-and a run under this CLI is still one lane: no model override, no background mode, no role fallback, no
-nesting, and no child that launches another lane.
+and a run under this CLI is still one lane: no model override, no background mode, no automatic role
+fallback, no nesting, and no child that launches another lane.
+
+**The dedicated writer fallback** is a third role profile,
+[`.pi/agents/hylja-implementer-sol61.md`](../../.pi/agents/hylja-implementer-sol61.md): the writer's own
+body, principles, tool allowlist, workflow-guard allowlist, fresh context, foreground, non-nesting
+settings and 20-minute ceiling, with `model: openai-codex/gpt-6.1-sol:medium` in place of the default
+writer's route. `agent` admits it, and both model checks — `checkInstall` and `verifyArtifacts` — accept
+exact-pin only this role: both model checks admit it at that exact Sol 6.1 medium string and refuse any
+other route or budget for it. The default writer and the reviewer keep their existing `:max` suffix
+admission rather than an exact pin, so a foreign `:max` route passes that check for them; they are bound
+only by the profile, preflight and metadata model equality the verification half already enforces. The
+fallback is therefore an auditable third role rather than a general failover.
+Nothing automatic reaches it: the CLI never retries, re-routes or carries a prior attempt forward, and
+a refused or timed-out lane leaves its artifacts and any uncommitted work exactly where they are. Root
+dispatches it explicitly, and only after the default writer route has actually failed and the previous
+child has settled; exit 2 and an INCOMPLETE verdict are evidence problems, not provider outages. The
+fallback is a writer lane, so `writerAcceptanceGate` reports it the same honest way the default writer
+is reported and `acceptanceProvesApproval` stays `false`; root admits a fallback writer lane by
+verifying its clean committed scoped paths and its evidence, exactly as for the default writer. A lane
+launched under this role needs fresh evidence paths like any other, because the earlier lane's evidence
+is preserved rather than reused.
 
 The config is root-owned, bounded and absolute. Every path field must start with `/`; `key` and `task`
-are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer` or `hylja-reviewer`;
-`timeoutMs` is a positive integer no greater than that role profile's own frontmatter deadline; an
+are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer`, `hylja-reviewer` or
+`hylja-implementer-sol61`; `timeoutMs` is a positive integer no greater than that role profile's own
+frontmatter deadline; an
 optional `softBudgetMs` is a positive integer strictly below `timeoutMs`; an optional
 `requiredReferences` list is described below; a `model` key is refused rather than ignored.
 
@@ -210,8 +233,9 @@ stays `INCOMPLETE`, and can never resolve to an approval. Progress records are p
 line that is not a plain object becomes a fixed `{"event": "malformed"}` snapshot rather than a thrown
 property read.
 
-Acceptance is reported, never assumed. A direct-API run of either role resolves `not-required`, because
-each role profile disables the native writer gate through the deprecated `false` shorthand, so the
+Acceptance is reported, never assumed. A direct-API run of either writer role or of the reviewer resolves
+`not-required`, because each role profile disables the native writer gate through the deprecated `false`
+shorthand, so the
 record carries no native writer acceptance evidence: `writerAcceptanceGate` says `not-required` and
 `acceptanceProvesApproval` is `false`. A run whose gate did resolve reports `checked`; an actual
 acceptance failure is refused. Root admits a writer lane separately, by verifying its clean committed
@@ -234,8 +258,9 @@ for `close` — never an indefinite wait.
 
 **When `softBudgetMs` is configured** (and only then): the child learns the two numbers once, in its
 initial task, as one role-aware paragraph — reviewer: report a literal verdict and stay read-only;
-writer: finish the checks, commit, then report — and that paragraph grants no authority the role body
-does not already carry. Root receives exactly one bounded numeric `soft_budget_reached` progress
+writer, fallback writer included: finish the checks, commit, then report — and that paragraph grants no
+authority the role body does not already carry. Root receives exactly one bounded numeric
+`soft_budget_reached` progress
 snapshot at the soft budget, which appears in the verification record's `progress` array. That snapshot
 is pinned inside both halves of that window: when a busy leaf's own later updates would push it out of
 the tail root reads after the child exits, it joins as the oldest survivor and the ordinary records it
@@ -252,8 +277,14 @@ provably the same code and not a re-implementation of it.
 
 Evidence: `node --test test/hylja-native-lane.test.mjs test/hylja-workflow-guard.test.mjs` drives the
 real controller and CLI exports against a fake event API, a fake preflight and a synthetic temporary
-platform (50 tests, 40 of them in the lane file). Two of them
-fake only the child transport, so the shipped default platform is what runs: the default filesystem
+platform (54 tests, 44 of them in the lane file). The dedicated writer fallback's own cases cover the
+four bounds it could have loosened: its exact role/model pair is admitted while a foreign route or a
+different budget is refused in both model checks, the default writer and the reviewer keep their own
+`:max` requirement, the fallback writer reports `writerAcceptanceGate` and
+`acceptanceProvesApproval` the way any writer does, a full fallback lane verifies end to end through
+the shipped CLI, and a configured soft budget gives that role the writer closing move instead of
+refusing the config. Two of them fake only the child transport, so the shipped default platform is what
+runs: the default filesystem
 must read the progress tail with bounded positional descriptor reads and close every descriptor it
 opens, and the default signal hooks must own SIGINT and SIGTERM, stop the owned child once and be
 removed on completion. Faking those two adapters had passed while the defaults read the whole progress

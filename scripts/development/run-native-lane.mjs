@@ -6,8 +6,11 @@
  * reads one bounded root-owned lane config, launches Pi once with exactly three extensions (the
  * installed `pi-subagents` entry, the project workflow guard and the opt-in controller) and the one
  * fixed input the controller answers, then verifies the public evidence that leaf left behind. There
- * is no coordinator model in this process, no model override, no role fallback, no background mode
- * and no nesting: one lane, one child, one receipt.
+ * is no coordinator model in this process, no model override, no automatic role fallback, no background
+ * mode and no nesting: one lane, one child, one receipt. Root may instead name the dedicated writer
+ * fallback role in a fresh config, after the default writer route has actually failed and the previous
+ * child has settled; this process never retries, re-routes or carries a prior attempt forward, and
+ * leaves every earlier artifact where it is.
  *
  * Every evidence path must be fresh, so a previous run's receipt, dispatch tuple, progress file or
  * verification record can never be reused as this run's evidence. The dispatch tuple the controller
@@ -31,6 +34,9 @@ import {
 	LANE_ROLES,
 	LANE_SUBAGENTS_ENV,
 	LANE_VERDICTS,
+	LANE_WRITER_FALLBACK_MODEL,
+	LANE_WRITER_FALLBACK_ROLE,
+	LANE_WRITER_ROLES,
 	MAX_PROGRESS_BYTES,
 	MAX_PROGRESS_RECORDS,
 	admitRequiredReferences,
@@ -85,6 +91,16 @@ export const SETUP_FAILURES = {
  * two observed forms, and it never implies the writer gate passed.
  */
 const ACCEPTED_RUNTIME_ACCEPTANCE = ['not-required', 'checked'];
+
+/**
+ * The one role-model rule both halves of this CLI share. A lane runs the model its own profile
+ * declares, and that declared budget is the admission: the default writer and the reviewer only at
+ * `:max`, and the dedicated writer fallback only at its own Sol 6.1 medium. A foreign route, a
+ * different budget, or any pair that is not a role's own declared model is refused here and again in
+ * `verifyArtifacts`, never inferred from the receipt or the metadata.
+ */
+const admitsRoleModel = (agent, model) => typeof model === 'string'
+	&& (agent === LANE_WRITER_FALLBACK_ROLE ? model === LANE_WRITER_FALLBACK_MODEL : model.endsWith(':max'));
 
 const TUPLE_FIELDS = ['requestId', 'ownerRunId', 'nodeId'];
 const USAGE_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'cost', 'turns', 'toolCalls', 'durationMs'];
@@ -236,7 +252,7 @@ export function checkInstall(config, profile, fs, resolveModules = resolveInstal
 	for (const path of [config.receipt, config.verification, config.progress, config.dispatch]) {
 		if (fs.exists(path)) return fail(SETUP_FAILURES.stale); // Fresh evidence paths only, never a reused run.
 	}
-	if (!profile.model.endsWith(':max')) return fail(SETUP_FAILURES.install);
+	if (!admitsRoleModel(config.agent, profile.model)) return fail(SETUP_FAILURES.install);
 	try {
 		resolveModules(config.subagents);
 	} catch {
@@ -340,8 +356,9 @@ export function verifyArtifacts(config, profile, dispatch, receipt, artifacts, f
 	const expected = dispatch.expected;
 	if (receipt.launchContractDigest !== expected.launchContractDigest) return fail(SETUP_FAILURES.contract);
 	if (receipt.agent !== config.agent || dispatch.agent !== config.agent) return fail(SETUP_FAILURES.role);
-	// The effective model is the role profile model at :max, and the resolved thinking must match.
-	if (receipt.model !== expected.model || receipt.model !== profile.model || !receipt.model.endsWith(':max')) {
+	// The effective model is the role profile's own model at that role's declared budget, and the
+	// resolved thinking must match.
+	if (receipt.model !== expected.model || receipt.model !== profile.model || !admitsRoleModel(config.agent, receipt.model)) {
 		return fail(SETUP_FAILURES.model);
 	}
 	if (expected.thinking !== null && receipt.thinking !== expected.thinking) return fail(SETUP_FAILURES.model);
@@ -417,7 +434,7 @@ export function verifyArtifacts(config, profile, dispatch, receipt, artifacts, f
 		// Reported honestly: the installed native writer gate did not run, so this lane carries no
 		// native writer acceptance evidence. Root admits a writer lane separately, by verifying clean
 		// committed scoped paths and its evidence, before any approval.
-		writerAcceptanceGate: meta.agent === 'hylja-implementer' ? acceptance.status : 'not-required',
+		writerAcceptanceGate: LANE_WRITER_ROLES.includes(meta.agent) ? acceptance.status : 'not-required',
 		acceptanceProvesApproval: false,
 	};
 }
