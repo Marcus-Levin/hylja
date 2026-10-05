@@ -26,7 +26,9 @@
  *   4. require an actual `SELECTED`/`KEEP` decision from `decidePolicy` for `USE` over the pinned
  *      bundle;
  *   5. read the real registry `current` and require `FOUND` and `ACTIVE`;
- *   6. require an actual `AUTHORIZED` decision from `authorizeMappingOperation` for `USE`;
+ *   6. require an actual `AUTHORIZED` decision from `authorizeMappingOperation` for `USE`. A refusal
+ *      at either of these two - and only one that names its own class - records one privacy-safe
+ *      `DENIED` decision before it is returned, which is the whole of the refusal evidence below;
  *   7. load the sealed material and the DEK into owned copies. Every authority answer and the
  *      material answer may be a promise and is awaited before it is read, and no plaintext exists at
  *      any of those awaits;
@@ -71,6 +73,22 @@
  * bought by a malformed answer. Neither `WITHHELD` nor `FAILED` ever performs, claims or reports a
  * `USE`.
  *
+ * Refusal evidence. Two refusal classes, and only those two, leave a record, and only where this call
+ * has already established the actor: the real registry reports the bound record as no longer live or
+ * no longer `ACTIVE` (`LIFECYCLE_DENIED`), and the real authorization seam reports no grant at all or
+ * a grant that has already expired (`RESOLUTION_DENIED`). Each is recorded by the same real
+ * `appendAuditEvent`, with the same owned identity, the same frozen context and the same pinned
+ * bundle identity the accepted path uses, as one `AUTHORIZATION_ATTEMPT` / `USE` / `DENIED` event, and
+ * each costs no material load and no backend call, because both guards run before any sealed byte
+ * exists. Everything else records nothing: an unreadable or foreign authority, a policy `BLOCK` or
+ * `HELD`, a grant that is misbound rather than absent or expired, an audit actor that is not the
+ * authenticated subject, a host fault, and every refusal raised after the material load. The decision
+ * is taken where the refusal is raised, from that refusal's own fixed class - there is no catch-all
+ * logger, no inferred identity and no reconstructed draft, so a malformed, foreign or trapped value
+ * can never be filed as evidence about somebody. A record never changes a code: the call is already
+ * `WITHHELD`, no effect follows a denial, and the appended result is deliberately not read, so a
+ * ledger that cannot commit leaves the same `WITHHELD`, no exception and no effect.
+ *
  * What this is not
  * - **Not a broker, vault, store or index.** It resolves no original, holds no mapping table, exposes
  *   no bulk lookup, makes no transaction and has no lock, retry, recovery or transport. The registry,
@@ -84,8 +102,10 @@
  *   construction, and an observation outside it never reaches the registry, the grant or the effect.
  * - **Not durable audit.** The ledger is a host-owned substrate. `gateHighRiskEffect` is a pure
  *   structural check, which is exactly why the value passed to it is the one `appendAuditEvent`
- *   returned, in this process, un-cached and un-reconstructed. This module records `ALLOWED`
- *   decisions only; privacy-safe evidence of a *refusal* stays the integrating host's obligation.
+ *   returned, in this process, un-cached and un-reconstructed. This module records the two `ALLOWED`
+ *   decisions of the accepted path and one `DENIED` decision for an attributable refusal, and
+ *   nothing else; privacy-safe evidence for every other refusal stays the integrating host's
+ *   obligation.
  * - **Not zeroization.** Overwriting owned buffers in JavaScript is best-effort hygiene: copies held
  *   inside native crypto, garbage-collected buffers and swapped pages are not covered.
  * - **Not a protected-egress safety claim.** A `USE` here spends plaintext on one local synchronous
@@ -95,7 +115,7 @@
 import { TRUST_LEVELS } from './classification.js';
 import type { Classification, Trust } from './classification.js';
 import { AUDIT_BUNDLE_COMPONENTS, appendAuditEvent, gateHighRiskEffect } from './audit-ledger.js';
-import type { AuditBundleComponent, AuditLedger, AuditTrustedContext } from './audit-ledger.js';
+import type { AuditBundleComponent, AuditLedger, AuditReasonCode, AuditTrustedContext } from './audit-ledger.js';
 import { decidePolicy } from './policy.js';
 import type { PolicyBundle, PolicyDecision } from './policy.js';
 import { authorizeMappingOperation } from './mapping-authorization.js';
@@ -204,10 +224,16 @@ type Denial =
   | 'NOT_ACTIVE' | 'UNAUTHORIZED' | 'POLICY_REFUSED' | 'MATERIAL_INVALID' | 'MATERIAL_STALE'
   | 'AUDIT_REFUSED' | 'AUDIT_ACTOR' | 'SUPERSEDED' | 'NOT_CONGRUENT' | 'CLOCK' | 'OPEN_REFUSED'
   | 'BACKEND_CONTRACT';
+/**
+ * The two denial classes that are recorded. Both are members of the ledger's own closed reason
+ * vocabulary, so a record needs no new schema, no new kind, no new operation and no new permission:
+ * `AUTHORIZATION_ATTEMPT` / `USE` / `DENIED` is already a legal event with this exact shape.
+ */
+type DenialEvidence = Extract<AuditReasonCode, 'RESOLUTION_DENIED' | 'LIFECYCLE_DENIED'>;
 const REFUSAL_BRAND: unique symbol = Symbol('hylja.mapping-use.refusal');
 
 class Refusal extends Error {
-  constructor(readonly code: Denial) { super(code); this.name = 'Refusal'; }
+  constructor(readonly code: Denial, readonly evidence?: DenialEvidence) { super(code); this.name = 'Refusal'; }
   readonly brand: typeof REFUSAL_BRAND = REFUSAL_BRAND;
 }
 
@@ -220,7 +246,22 @@ function isRefusal(error: unknown): boolean {
     return true;
   } catch { return false; }
 }
-function fail(code: Denial): never { throw new Refusal(code); }
+function fail(code: Denial, evidence?: DenialEvidence): never { throw new Refusal(code, evidence); }
+/**
+ * The refusal's own recorded class, read under a guard. A value that is not this module's branded
+ * refusal, whose class is not one of the two fixed codes, or whose read traps, yields no class - so
+ * the recording decision below can never be driven by a caller-supplied value.
+ */
+function denialClass(error: unknown): DenialEvidence | undefined {
+  try {
+    if (error === null || typeof error !== 'object') return undefined;
+    const candidate = error as { brand?: unknown; evidence?: unknown };
+    if (candidate.brand !== REFUSAL_BRAND) return undefined;
+    const evidence = candidate.evidence;
+    if (evidence !== 'RESOLUTION_DENIED' && evidence !== 'LIFECYCLE_DENIED') return undefined;
+    return evidence;
+  } catch { return undefined; }
+}
 /** Runs one synchronous call site. A throwing host callback is a refusal, never an escaped exception. */
 function attempt<T>(invoke: () => T): T {
   try { return invoke(); } catch (error) { if (isRefusal(error)) throw error; fail('HOST_FAULT'); }
@@ -517,7 +558,10 @@ interface Captured {
 }
 interface Observation {
   now: number; subject: WorkloadSubject; context: RequestContext; destination: Destination;
-  grant: TrustedMappingGrant; keyVersion: string;
+  /** An authority answer that carries no grant at all: absent is a fact, not a malformed value, and
+   *  it reaches the real authorization seam as its own `NO_GRANT` row rather than as a boundary
+   *  refusal that no seam ever saw. */
+  grant: TrustedMappingGrant | undefined; keyVersion: string;
 }
 interface Material {
   envelope: MappingSealedEnvelope;
@@ -559,7 +603,8 @@ function capture(fixed: FixedBindings): Captured {
 async function observe(captured: Captured): Promise<Observation> {
   const raw = await ask(() => invoke(captured.authority, captured.host, []));
   if (raw === null || typeof raw !== 'object') fail('INVALID_AUTHORITY');
-  const v = fields(raw, ['version', 'subject', 'context', 'destination', 'grant', 'keyVersion', 'now']);
+  const v = fields(raw, ['version', 'subject', 'context', 'destination', 'keyVersion', 'now'],
+    ['grant']);
   if (v.version !== 1) fail('INVALID_AUTHORITY');
   const observed = context(v.context);
   const scope = captured.fixed.scope;
@@ -567,8 +612,12 @@ async function observe(captured: Captured): Promise<Observation> {
     observed.sessionId !== scope.sessionId) fail('SCOPE_MISMATCH');
   const keyVersion = text(v.keyVersion, 48);
   if (!KEY_VERSION.test(keyVersion)) fail('INVALID_AUTHORITY');
+  // An omitted grant, and a grant carried as the absent value, are both handed on as absent: the
+  // authorization seam owns that row and denies it as `NO_GRANT`. A grant that is present but
+  // structurally wrong is still this boundary's refusal - `WITHHELD`, with no evidence and no actor.
+  const supplied = Object.hasOwn(v, 'grant') && v.grant !== undefined ? grant(v.grant) : undefined;
   return Object.freeze({ now: instant(v.now), subject: subject(v.subject), context: observed,
-    destination: destination(v.destination), grant: grant(v.grant), keyVersion });
+    destination: destination(v.destination), grant: supplied, keyVersion });
 }
 
 /**
@@ -592,9 +641,18 @@ function liveRecord(captured: Captured, now: number): RecordClaim {
     const found = invoke(readCurrent, registry, [{ version: 1, mappingRef,
       scope: { tenantId: scope.tenantId, projectId: scope.projectId, sessionId: scope.sessionId } },
     { now }]);
-    if (found === null || typeof found !== 'object' || found.state !== 'FOUND') fail('NOT_CURRENT');
+    if (found === null || typeof found !== 'object') fail('NOT_CURRENT');
+    if (found.state !== 'FOUND') {
+      // The registry's own reason is what makes this refusal attributable, so it is read here rather
+      // than inferred: only a record this registry holds and reports as no longer live is the
+      // lifecycle denial this call records. An unknown reference, a refused read and a trap all
+      // record nothing, because none of them is evidence about a record that existed.
+      fail('NOT_CURRENT', found.reason === 'NOT_LIVE' ? 'LIFECYCLE_DENIED' : undefined);
+    }
     const record: MappingMetadataRecord = found.metadata;
-    if (record === null || typeof record !== 'object' || record.state !== 'ACTIVE') fail('NOT_ACTIVE');
+    if (record === null || typeof record !== 'object' || record.state !== 'ACTIVE') {
+      fail('NOT_ACTIVE', 'LIFECYCLE_DENIED');
+    }
     const recordScope = fields(record.scope, ['tenantId', 'projectId', 'sessionId']);
     const claim: RecordClaim = Object.freeze({ mappingRef: text(record.mappingRef, 256),
       scope: Object.freeze({ tenantId: text(recordScope.tenantId, 256),
@@ -616,16 +674,91 @@ function liveRecord(captured: Captured, now: number): RecordClaim {
 function authorize(captured: Captured, observed: Observation, claim: RecordClaim): void {
   const { mappingRef } = captured.fixed;
   const { semanticType, sensitivity } = captured.classification;
-  const decision = attempt(() => authorizeMappingOperation(
-    { version: 1, mappingRef, subject: { ...observed.subject }, context: { ...observed.context },
-      destination: { ...observed.destination }, operation: 'USE' },
-    { authenticated: { subject: { ...observed.subject }, context: { ...observed.context } },
-      observed: { destination: { ...observed.destination } } },
-    { version: 1, mappingRef: claim.mappingRef, scope: { ...claim.scope },
-      lifecycle: claim.lifecycle, semanticType, sensitivity,
-      revision: claim.revision, expiresAt: claim.expiresAt },
-    observed.grant, { now: observed.now }));
-  if (decision.state !== 'AUTHORIZED') fail('UNAUTHORIZED');
+  // The decision and its reason are read inside one guard, so a trap on a hostile answer is a refusal
+  // like any other rather than an escape - and, inside the sealed segment, rather than an exception
+  // that would be mistaken for a reached effect.
+  const denial = attempt((): 'AUTHORIZED' | DenialEvidence | undefined => {
+    const decision = authorizeMappingOperation(
+      { version: 1, mappingRef, subject: { ...observed.subject }, context: { ...observed.context },
+        destination: { ...observed.destination }, operation: 'USE' },
+      { authenticated: { subject: { ...observed.subject }, context: { ...observed.context } },
+        observed: { destination: { ...observed.destination } } },
+      { version: 1, mappingRef: claim.mappingRef, scope: { ...claim.scope },
+        lifecycle: claim.lifecycle, semanticType, sensitivity,
+        revision: claim.revision, expiresAt: claim.expiresAt },
+      observed.grant, { now: observed.now });
+    if (decision.state === 'AUTHORIZED') return 'AUTHORIZED';
+    // Only an absent grant and an expired grant are recorded. Every other denial this seam can return
+    // - a grant for another operation, revision, principal, destination or purpose - is a refusal the
+    // host's own misbound authority produced, and it records nothing.
+    return decision.reason === 'NO_GRANT' || decision.reason === 'GRANT_EXPIRED'
+      ? 'RESOLUTION_DENIED' : undefined;
+  });
+  if (denial !== 'AUTHORIZED') fail('UNAUTHORIZED', denial);
+}
+
+/**
+ * The two guards that may leave evidence behind, in the same order they always run, and the only
+ * place a refusal here is recorded.
+ *
+ * The record is written between the guard that refused and the refusal that is rethrown, at the stage
+ * where this call has already established the scope, the authenticated subject and the audit identity
+ * congruent with it - so there is no identity to infer and nothing to reconstruct. Both guards run
+ * before any material is loaded, so a record here costs no sealed read, no recovered byte and no
+ * backend call. Everything refused elsewhere in this call records nothing.
+ */
+function attribute(captured: Captured, observed: Observation): RecordClaim {
+  let claim: RecordClaim;
+  try {
+    claim = liveRecord(captured, observed.now);
+  } catch (error) {
+    deny(captured, observed, error);
+    throw error;
+  }
+  try {
+    authorize(captured, observed, claim);
+  } catch (error) {
+    deny(captured, observed, error);
+    throw error;
+  }
+  return claim;
+}
+
+/**
+ * Records one privacy-safe denial for the refusal that is already being raised, and only when that
+ * refusal carries its own fixed class. The error is not caught and re-classified, and nothing is
+ * inferred from it: a value that is not this module's branded refusal, or one that names no class,
+ * writes nothing and is rethrown untouched.
+ *
+ * The draft carries the same pseudonymized reference the accepted path's first decision carries, the
+ * same pinned classification primitives, the same frozen context holding the owned actor, and the
+ * same pinned bundle identity. The ledger takes the actor from that context and pseudonymizes every
+ * reference, so no original, no raw reference, no reason value from any host and no exception text
+ * is reachable from the recorded event.
+ *
+ * The appended result is deliberately not read: this call is already refused, no effect depends on
+ * the record, and `WITHHELD` is the honest code for a substrate that could not commit it.
+ */
+function deny(captured: Captured, observed: Observation, error: unknown): void {
+  const denial = denialClass(error);
+  if (denial === undefined) return;
+  const { ledger, components } = captured.fixed.audit;
+  const pinned = captured.fixed.policy;
+  const draft = {
+    version: 1 as const,
+    kind: 'AUTHORIZATION_ATTEMPT' as const,
+    operation: 'USE' as const,
+    outcome: 'DENIED' as const,
+    reason: denial,
+    occurredAt: attempt(() => new Date(observed.now).toISOString()),
+    bundle: { policy: pinned.policy, components },
+    correlationRef: captured.fixed.mappingRef,
+    entityRef: captured.fixed.mappingRef,
+    interactionRef: pinned.interactionRef,
+    classification: { semanticType: captured.classification.semanticType,
+      sensitivity: captured.classification.sensitivity },
+  };
+  attempt(() => { appendAuditEvent(ledger, draft, captured.auditContext); });
 }
 
 /** The real Policy Engine, for `USE`, over the pinned bundle and the freshly observed authority. */
@@ -775,8 +908,7 @@ async function prepare(fixed: FixedBindings): Promise<MappingUseResult> {
     const observed = await observe(captured);
     bindAuditActor(captured, observed);
     const decision = selectPolicy(captured, observed);
-    const claim = liveRecord(captured, observed.now);
-    authorize(captured, observed, claim);
+    const claim = attribute(captured, observed);
 
     const material = await loadMaterial(captured, owned);
     let state: State = { observation: observed, revision: claim.revision, decision };

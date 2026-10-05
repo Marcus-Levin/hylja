@@ -382,28 +382,37 @@ test('a missing, misbound, stale or expired grant withholds before the material 
   const record = scenario.registry.current({ version: 1, mappingRef: scenario.mappingRef,
     scope: { ...scenario.scope } }, { now: USE_NOW });
   const cases = [
-    ['no grant at all', undefined],
-    ['a grant for another operation', makeGrant(scenario, record.metadata, 'DISPLAY')],
+    ['no grant at all', undefined, 1],
+    ['a grant for another operation', makeGrant(scenario, record.metadata, 'DISPLAY'), 0],
     ['a grant pinned to a superseded revision', makeGrant(scenario, record.metadata, 'USE',
-      { revision: 1 })],
+      { revision: 1 }), 0],
     ['a grant issued to another workload', makeGrant(scenario, record.metadata, 'USE',
-      { principal: { ...OTHER_WORKLOAD } })],
+      { principal: { ...OTHER_WORKLOAD } }), 0],
     ['a grant bound to another destination', makeGrant(scenario, record.metadata, 'USE',
-      { destination: { ...OTHER_DESTINATION } })],
+      { destination: { ...OTHER_DESTINATION } }), 0],
     ['a grant bound to another purpose', makeGrant(scenario, record.metadata, 'USE',
-      { context: { ...scenario.scope, purpose: 'other-bound-use.invalid' } })],
+      { context: { ...scenario.scope, purpose: 'other-bound-use.invalid' } }), 0],
     ['a grant that has already expired', makeGrant(scenario, record.metadata, 'USE',
-      { expiresAt: T0 + 30_000 })],
+      { expiresAt: T0 + 30_000 }), 1],
   ];
   assert.equal((await createBoundMappingUse(createHost({}).host).use()).code, 'USED');
-  for (const [name, grant] of cases) {
+  for (const [name, grant, recorded] of cases) {
     const backend = createBackend();
     const built = createHost({ scenario, grant, backend });
     const refused = await createBoundMappingUse(built.host).use();
     assert.equal(refused.code, 'WITHHELD', name);
     assert.equal(built.counters.material, 0, name);
     assert.equal(backend.state.calls, 0, name);
-    assert.equal(built.ledger.entries.length, 0, name);
+    // A missing grant and an expired grant are refusals attributable to the established, in-scope,
+    // authenticated actor, so each leaves one privacy-safe DENIED record. Every other refusal in
+    // this list is the actor's own misbound authority or a refusal of a reference this call never
+    // proved it held, so it leaves the ledger untouched and stays the host's obligation.
+    assert.equal(built.ledger.entries.length, recorded, name);
+    if (recorded === 1) {
+      assert.equal(built.ledger.entries[0].event.kind, 'AUTHORIZATION_ATTEMPT', name);
+      assert.equal(built.ledger.entries[0].event.outcome, 'DENIED', name);
+      assert.equal(built.ledger.entries[0].event.reason, 'RESOLUTION_DENIED', name);
+    }
   }
 });
 
@@ -1056,3 +1065,168 @@ test('an invocation that faults inside the reached effect segment is FAILED and 
     assert.equal(result.code, 'FAILED');
     assert.equal(trapped.state.calls, 0);
   });
+
+/* ---------- 17. An attributable refusal leaves evidence; every other one leaves none ---------- */
+
+/**
+ * The fixed evidence of a refusal this file asserts, read the way an auditor reads it: the two fixed
+ * codes, the established actor, the bound scope, the pinned bundle identity and the instant. Nothing
+ * else is in there - no reference, no identifier, no original and no exception text.
+ */
+function assertAttributableDenial(built, event, reason) {
+  assert.equal(event.kind, 'AUTHORIZATION_ATTEMPT');
+  assert.equal(event.operation, 'USE');
+  assert.equal(event.outcome, 'DENIED');
+  assert.equal(event.reason, reason);
+  assert.equal(event.occurredAt, OCCURRED_AT);
+  assert.deepEqual(event.actor, { integrationId: built.auditContext.integrationId,
+    actorBinding: 'AUTHENTICATED_UPSTREAM', principalId: WORKLOAD.principalId,
+    workloadId: WORKLOAD.workloadId });
+  assert.deepEqual(event.scope, { tenantId: SCOPE.tenantId, projectId: SCOPE.projectId });
+  assert.equal(event.classification.semanticType, CLASS);
+  assert.equal(event.classification.sensitivity, SENSITIVITY);
+  const image = JSON.stringify(built.ledger.entries);
+  assert.equal(image.includes(ORIGINAL), false);
+  assert.equal(image.includes(FOREIGN_HANDLE), false);
+  assert.equal(image.includes(built.scenario.mappingRef), false);
+  assert.equal(image.includes(OTHER_WORKLOAD.principalId), false);
+  assert.equal(verifyAuditStream(built.ledger, built.auditContext, []).status, 'UNANCHORED');
+}
+
+test('a missing or expired grant and a revoked mapping each record one attributable DENIED decision',
+  async () => {
+    // The accepted path is the control for every assertion below: the same host, the same actor and
+    // the same ledger still record exactly two ALLOWED decisions, spend the private resource once and
+    // never record a denial.
+    const control = createHost();
+    const accepted = await createBoundMappingUse(control.host).use();
+    assert.equal(accepted.code, 'USED');
+    assert.equal(control.ledger.entries.length, 2);
+    assert.equal(control.ledger.entries.every((entry) => entry.event.outcome === 'ALLOWED'), true);
+    assert.equal(control.ledger.entries.some((entry) => entry.event.outcome === 'DENIED'), false);
+
+    const scenario = buildScenario();
+    const record = scenario.registry.current({ version: 1, mappingRef: scenario.mappingRef,
+      scope: { ...scenario.scope } }, { now: USE_NOW }).metadata;
+    // Both refusals are answered by the real purpose-bound seam under an authenticated, in-scope
+    // actor, so both are attributable and both are recorded before anything is loaded or spent.
+    const grantCases = [
+      ['no grant at all', undefined],
+      ['a grant that has already expired', makeGrant(scenario, record, 'USE',
+        { expiresAt: T0 + 30_000 })],
+    ];
+    for (const [name, grant] of grantCases) {
+      const backend = createBackend();
+      const built = createHost({ scenario, grant, backend });
+      const refused = await createBoundMappingUse(built.host).use();
+      assertFixedShape(refused);
+      assert.equal(refused.code, 'WITHHELD', name);
+      // The evidence costs no sealed read and spends no identifier: this refusal is recorded with the
+      // material untouched and the private resource never called.
+      assert.equal(built.counters.material, 0, name);
+      assert.equal(backend.state.calls, 0, name);
+      assert.equal(cleared(backend.state.retained), false, name);
+      assert.equal(built.ledger.entries.length, 1, name);
+      assertAttributableDenial(built, built.ledger.entries[0].event, 'RESOLUTION_DENIED');
+      // Sequential reuse is not cached evidence: a second refused call records its own decision.
+      assert.equal((await createBoundMappingUse(built.host).use()).code, 'WITHHELD', name);
+      assert.equal(built.ledger.entries.length, 2, name);
+      assert.equal(built.ledger.entries[1].event.reason, 'RESOLUTION_DENIED', name);
+      assert.equal(built.backend.state.calls, 0, name);
+    }
+
+    // A revoked mapping is refused by the real registry, which stops reporting the record as current,
+    // and the refusal is recorded under the same established actor with the lifecycle class.
+    const revokedScenario = buildScenario();
+    const revokedBackend = createBackend();
+    const revoked = createHost({ scenario: revokedScenario, backend: revokedBackend });
+    const revokedRecord = revokedScenario.registry.current({ version: 1,
+      mappingRef: revokedScenario.mappingRef, scope: { ...revokedScenario.scope } },
+      { now: USE_NOW }).metadata;
+    const applied = revokedScenario.registry.transition({ version: 1,
+      mappingRef: revokedScenario.mappingRef, scope: { ...revokedScenario.scope },
+      expectedRevision: revokedRecord.revision, action: 'REVOKE' }, { now: USE_NOW });
+    assert.equal(applied.state, 'CHANGED');
+    const afterRevocation = await createBoundMappingUse(revoked.host).use();
+    assertFixedShape(afterRevocation);
+    assert.equal(afterRevocation.code, 'WITHHELD');
+    assert.equal(revoked.counters.material, 0);
+    assert.equal(revokedBackend.state.calls, 0);
+    assert.equal(cleared(revokedBackend.state.retained), false);
+    assert.equal(revoked.ledger.entries.length, 1);
+    assertAttributableDenial(revoked, revoked.ledger.entries[0].event, 'LIFECYCLE_DENIED');
+    // The recorded class is the lifecycle gate, and it names no lifecycle value the registry answer
+    // did not: the record is not live, which is exactly what the real registry reported.
+    assert.equal(applied.metadata.state, 'REVOKED');
+  });
+
+test('a foreign scope, a foreign audit actor and a ledger that cannot commit record nothing', async () => {
+  const scenario = buildScenario();
+  const record = scenario.registry.current({ version: 1, mappingRef: scenario.mappingRef,
+    scope: { ...scenario.scope } }, { now: USE_NOW }).metadata;
+  const expired = makeGrant(scenario, record, 'USE', { expiresAt: T0 + 30_000 });
+
+  // A foreign scope is refused before anything is known about the actor, so nothing is written for a
+  // tenant this call was never bound to: the record would be foreign-tenant evidence.
+  const foreignBackend = createBackend();
+  const foreign = createHost({ scenario, grant: expired, backend: foreignBackend,
+    authority: () => ({ version: 1, subject: { ...WORKLOAD },
+      context: { ...FOREIGN_SCOPE, purpose: PURPOSE }, destination: { ...DESTINATION },
+      keyVersion: KEY_VERSION, now: USE_NOW, grant: { ...expired } }) });
+  const refusedScope = await createBoundMappingUse(foreign.host).use();
+  assert.equal(refusedScope.code, 'WITHHELD');
+  assert.equal(foreign.counters.material, 0);
+  assert.equal(foreignBackend.state.calls, 0);
+  assert.equal(foreign.ledger.entries.length, 0);
+  assert.equal(JSON.stringify(foreign.ledger.entries).includes(FOREIGN_SCOPE.tenantId), false);
+
+  // A trusted context whose actor is somebody else is refused before the registry and the grant are
+  // read, so an attributable-looking refusal can never be filed under a substituted identity.
+  const foreignActor = createHost({ scenario, grant: expired, auditContext: { version: AUDIT_SCHEMA_VERSION,
+    scope: { tenantId: SCOPE.tenantId, projectId: SCOPE.projectId },
+    actor: { principalId: OTHER_WORKLOAD.principalId, workloadId: OTHER_WORKLOAD.workloadId },
+    integrationId: 'integration-bound-use-fixture.invalid', actorBinding: 'AUTHENTICATED_UPSTREAM',
+    pseudonymKey: keyBytes(0x33), chainKey: keyBytes(0x77) } });
+  const refusedActor = await createBoundMappingUse(foreignActor.host).use();
+  assert.equal(refusedActor.code, 'WITHHELD');
+  assert.equal(foreignActor.counters.material, 0);
+  assert.equal(foreignActor.backend.state.calls, 0);
+  assert.equal(foreignActor.ledger.entries.length, 0);
+
+  // A ledger that cannot commit is an audit outage, not an exception: the refusal is still
+  // `WITHHELD`, the code is unchanged, and no material or resource call follows the failed append.
+  const outage = createHost({ scenario, grant: expired });
+  outage.ledger.accepting = false;
+  const duringOutage = await createBoundMappingUse(outage.host).use();
+  assertFixedShape(duringOutage);
+  assert.equal(duringOutage.code, 'WITHHELD');
+  assert.equal(outage.ledger.entries.length, 0);
+  assert.equal(outage.counters.material, 0);
+  assert.equal(outage.backend.state.calls, 0);
+
+  // The same refusal against the same scenario with a committing substrate records its evidence, so
+  // the outage above is what withheld the record and not a scenario that never records one.
+  const control = createHost({ scenario, grant: expired });
+  assert.equal((await createBoundMappingUse(control.host).use()).code, 'WITHHELD');
+  assert.equal(control.ledger.entries.length, 1);
+  assert.equal(control.ledger.entries[0].event.reason, 'RESOLUTION_DENIED');
+});
+
+test('an accepted run records no denial, and a real BLOCK records none either', async () => {
+  // The success path is unchanged by refusal evidence: two ALLOWED records, one private effect, no
+  // DENIED entry anywhere in the stream.
+  const accepted = createHost();
+  assert.equal((await createBoundMappingUse(accepted.host).use()).code, 'USED');
+  assert.equal(accepted.ledger.entries.length, 2);
+  assert.equal(accepted.ledger.entries.every((entry) => entry.event.outcome === 'ALLOWED'), true);
+  assert.equal(accepted.backend.state.calls, 1);
+  assert.equal(cleared(accepted.backend.state.retained), true);
+
+  // A policy `BLOCK` is refused before the registry and the grant are read, so it records nothing: the
+  // evidence this executor owns describes the authorization and lifecycle gate, not the Policy Engine.
+  const blocked = createHost({ bundle: policyBundle('BLOCK') });
+  assert.equal((await createBoundMappingUse(blocked.host).use()).code, 'WITHHELD');
+  assert.equal(blocked.ledger.entries.length, 0);
+  assert.equal(blocked.counters.material, 0);
+  assert.equal(blocked.backend.state.calls, 0);
+});
