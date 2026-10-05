@@ -1,6 +1,6 @@
 # Bounded synthetic engineering-reference admission
 
-Status: contract for [`src/synthetic-engineering-admission.ts`](../../src/synthetic-engineering-admission.ts) ([#248](https://github.com/Marcus-Levin/hylja/issues/248)), a bounded pure prerequisite for capacity-one ephemeral custody and a child of [#15](https://github.com/Marcus-Livan/hylja/issues/15)/[#16](https://github.com/Marcus-Livan/hylja/issues/16). It resolves one missing reversibility **recommendation** and nothing else. What the software implements lives only in [capabilities.md](../capabilities.md).
+Status: contract for [`src/synthetic-engineering-admission.ts`](../../src/synthetic-engineering-admission.ts) ([#248](https://github.com/Marcus-Levin/hylja/issues/248)), a bounded pure prerequisite for capacity-one ephemeral custody and a child of [#15](https://github.com/Marcus-Levin/hylja/issues/15)/[#16](https://github.com/Marcus-Levin/hylja/issues/16). It resolves one missing reversibility **recommendation** and nothing else. What the software implements lives only in [capabilities.md](../capabilities.md).
 
 ## What it is, and what it is not
 
