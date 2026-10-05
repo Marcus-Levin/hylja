@@ -29,9 +29,19 @@
  * non-assertion API is outside it, and a reported finding is a shape to migrate rather than a
  * confirmed leak.
  *
+ * Residual surface, stated rather than implied: GUARDED_TEST_FILES is one file, and that file is
+ * clean. Across test/, src/, scripts/ and evaluations/ the guard reports 378 findings in 17 other
+ * files, most of which npm test and CI already run. Extending the list is therefore a migration, not
+ * a configuration edit: this guard keeps one flat binding map per file, so a single capture-derived
+ * binding taints every later assertion that mentions it - configured-units.test.mjs alone reports 101
+ * findings from one `const result = JSON.parse(child.stdout)`. Scoping the map per function is the
+ * change that would make list extension cheap, and it is not done here.
+ *
  * Bounds: the guarded file list is named and explicit rather than a repository sweep, 32 paths, 2 MiB
- * per file, six alias hops, and 50 printed findings with the true count in the summary line. Exceeding
- * a bound is a fixed refusal, never a silent pass. Findings print only a location, the assert method,
+ * per file, twelve alias hops, and 50 printed findings with the true count in the summary line. The
+ * first three exceeding a bound are a fixed refusal, never a silent pass; the printed-findings bound
+ * truncates the listing but still states the true count, so it cannot read as fewer findings either.
+ * Findings print only a location, the assert method,
  * the position class and the argument index: no source text, no value and no exception text.
  *
  * Exit codes: 0 no finding, 1 at least one finding, 2 a usage, bound or read refusal.
@@ -52,7 +62,7 @@ export const GUARDED_TEST_FILES = ['test/hylja-native-lane.test.mjs'];
 /** Bounds. A refusal is a fixed message; nothing read, planted or thrown is echoed. */
 export const MAX_FILES = 32;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
-export const MAX_ALIAS_HOPS = 6;
+export const MAX_ALIAS_HOPS = 12;
 export const MAX_PRINTED_FINDINGS = 50;
 
 /** The captured streams: a read of either is the value this guard exists to keep out of a diagnostic. */
@@ -171,7 +181,10 @@ function collectBindings(sourceFile) {
 
 /** Whether an identifier's binding carries captured output, followed through a bounded chain of hops. */
 function bindingCarries(name, bindings, visited, hops) {
-	if (hops >= MAX_ALIAS_HOPS) return false;
+	// Past the hop bound the guard can no longer prove a chain is clean, so it refuses the file instead
+	// of reporting nothing. Silently returning false here would make this bound the one that degrades to
+	// "checked 1 file, 0 findings" with exit 0 - the most misleading output this tool can produce.
+	if (hops >= MAX_ALIAS_HOPS) refuse(`a binding chain past ${MAX_ALIAS_HOPS} hops`);
 	const binding = bindings.get(name);
 	if (binding === undefined || visited.has(name)) return false;
 	if (binding.stream !== null) return true;
@@ -243,7 +256,11 @@ function carriesCapturedOutput(node, bindings, visited = new Set(), hops = 0) {
 		return node.elements.some((element) => carriesCapturedOutput(element, bindings, visited, hops));
 	}
 	if (ts.isObjectLiteralExpression(node)) {
-		return node.properties.some((property) => carriesCapturedOutput(property, bindings, visited, hops));
+		// A PropertyAssignment holds its value under `initializer`, so an object literal must traverse
+		// that member. Reading the node as a bare expression would fall through to the unmodelled rule
+		// below and let a capture through while an array literal of the same content is caught.
+		return node.properties.some((property) => carriesCapturedOutput(
+			ts.isPropertyAssignment(property) ? property.initializer : property, bindings, visited, hops));
 	}
 	if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)
 		|| ts.isNonNullExpression(node) || ts.isSatisfiesExpression(node) || ts.isAwaitExpression(node)

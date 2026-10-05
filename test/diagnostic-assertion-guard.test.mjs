@@ -18,6 +18,8 @@ import {
 	GUARDED_TEST_FILES,
 	MAX_FILES,
 	MAX_FILE_BYTES,
+	MAX_ALIAS_HOPS,
+	MAX_PRINTED_FINDINGS,
 	findRisksInSource,
 } from '../scripts/development/check-diagnostic-assertions.mjs';
 
@@ -110,6 +112,27 @@ test('the equivalent boolean comparisons keep their fixed message and are accept
 	assert.deepEqual(shape(findRisksInSource(source, 'fixture.test.mjs')), []);
 });
 
+test('a capture inside an object or array literal operand is refused like any other operand', () => {
+	// Both literals hold the same value in the same position. The array branch already traversed its
+	// elements; the object branch used to read a PropertyAssignment as a bare node, fall through to the
+	// unmodelled rule and report nothing, so the pair disagreed inside one modelled family.
+	const arrayLiteral = fixture(
+		"import assert from 'node:assert/strict';",
+		'assert.deepEqual([captured.stdout], expected, "fixed");',
+		'',
+	);
+	assert.ok(shape(findRisksInSource(arrayLiteral.source, 'fixture.test.mjs')).length > 0,
+		'an array literal holding a capture is a finding');
+	const objectLiteral = fixture(
+		"import assert from 'node:assert/strict';",
+		'assert.deepEqual({ got: captured.stdout }, expected, "fixed");',
+		'',
+	);
+	assert.deepEqual(shape(findRisksInSource(objectLiteral.source, 'fixture.test.mjs')),
+		shape(findRisksInSource(arrayLiteral.source, 'fixture.test.mjs')),
+		'the object literal reports exactly what the equivalent array literal reports');
+});
+
 test('a file without an assert import, and one without any assertion, report nothing', () => {
 	const withoutImport = fixture('const assert = helpers.assert;', "assert.equal(captured.stdout, expected, 'fixed');");
 	const withoutAssertion = fixture(
@@ -178,6 +201,38 @@ test('the guard refuses its own bounds instead of passing a file it did not read
 		assert.equal(oversized.status, 2, 'a file past the byte window is a refusal');
 		assert.equal(oversized.stderr, 'diagnostic assertion guard: refused (a file past the byte window)\n');
 		assert.equal(oversized.stdout, '', 'an unread file is never a clean pass');
+
+		// The hop bound used to return "no capture" at the cut-off, so six hops from a capture produced
+		// "checked 1 file, 0 findings" and exit 0 - the guard's most misleading possible output.
+		const deepPath = join(dir, 'deep.test.mjs');
+		writeFileSync(deepPath, [
+			"import assert from 'node:assert/strict';",
+			'function capture(run) { return run; }',
+			'const h0 = capture({ stdout: \'x\' }).stdout;',
+			...Array.from({ length: MAX_ALIAS_HOPS }, (_, index) => `const h${index + 1} = h${index};`),
+			`assert.equal(h${MAX_ALIAS_HOPS}, 'x', 'past the hop bound');`,
+			'',
+		].join('\n'));
+		const deep = spawnSync(process.execPath, [guardPath, deepPath],
+			{ cwd: root, encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
+		assert.equal(deep.status, 2, 'a chain past the hop bound is a refusal, never a clean pass');
+		assert.equal(deep.stdout, '', 'a truncated chain is not reported as clean');
+
+		// The printed-findings bound truncates output but must still state the true count.
+		const manyPath = join(dir, 'many.test.mjs');
+		writeFileSync(manyPath, [
+			"import assert from 'node:assert/strict';",
+			...Array.from({ length: MAX_PRINTED_FINDINGS + 5 }, (_, index) =>
+				`assert.equal(run${index}.stdout, '', 'finding ${index}');`),
+			'',
+		].join('\n'));
+		const many = spawnSync(process.execPath, [guardPath, manyPath],
+			{ cwd: root, encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
+		assert.equal(many.status, 1, 'findings past the print bound still fail the run');
+		const printed = many.stdout.split('\n').filter((line) => line.includes('equal operand')).length;
+		assert.equal(printed, MAX_PRINTED_FINDINGS, 'only the printed bound is printed');
+		assert.ok(many.stdout.includes(`${MAX_PRINTED_FINDINGS + 5} findings`),
+			'the summary line states the true count, not the printed count');
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
