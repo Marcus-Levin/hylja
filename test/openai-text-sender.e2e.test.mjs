@@ -1454,9 +1454,11 @@ let probeSerial = 0;
  *   buffer is retained by this test. `encodeInto` writes into a caller-owned array and allocates
  *   nothing, so it is deliberately left alone.
  *
- * `failEncodeAt(n)` makes the n-th TRACKED encode throw a synthetic allocation failure. That is how
- * the "failed after a body encode, before the image was completed" window is entered deterministically,
- * at the sender's own allocation point, without changing a line of production code.
+ * `failEncodeAt(n)` makes the n-th TRACKED - that is, sender-owned - encode throw a synthetic
+ * allocation failure. That is how the "failed after a body encode, before the image was completed"
+ * window is entered deterministically, at the sender's own allocation point, without changing a line
+ * of production code. The fault is gated on the same ownership set as the counter, so an armed fault
+ * can never land on an encoder this sender does not own while the probe is installed globally.
  */
 async function withEncoderProbe(run) {
   const native = globalThis.TextEncoder;
@@ -1471,11 +1473,15 @@ async function withEncoderProbe(run) {
       if (importing) { owned.add(this); constructed.push(this); }
     }
     encode(input = '') {
-      // The counter counts TRACKED allocations only, so an untracked encoder elsewhere in the
-      // process can neither trip the fault nor move it.
+      // The fault is injected into SENDER-OWNED encodes only, and only OWNED encodes are counted, so
+      // an encoder constructed after the import - untracked, belonging to no part of this sender - can
+      // neither trip the fault nor move it. Without the ownership gate on the fault condition itself
+      // the counter, which is shared by every encoder while the probe is installed globally, would make
+      // the fault land on an unrelated encoder's encode instead.
+      if (!owned.has(this)) return super.encode(input);
       if (faultAt > 0 && allocations.length + 1 === faultAt) throw new TypeError(ENCODER_FAULT);
       const bytes = super.encode(input);
-      if (owned.has(this)) allocations.push(bytes);
+      allocations.push(bytes);
       return bytes;
     }
   }
@@ -1606,4 +1612,53 @@ test('a sender-owned body encode is zeroed when a later encode fails before the 
         'the body encode buffer is zero after the head encode failed');
       assert.equal(point.sender.state, 'IDLE');
     });
+  });
+
+test('an armed encode fault reaches only the sender: an untracked encoder encodes natively',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // Astral, combining and CJK text, so the byte-identity claim below is over real UTF-8 encoding.
+    const sample = 'café \u{1F600} 诊断';
+    const nativeBytes = Buffer.from(new TextEncoder().encode(sample));
+
+    await withEncoderProbe(async (probe) => {
+      // The synthetic fault stays armed at the sender's SECOND own encode across everything below.
+      probe.failEncodeAt(2);
+
+      // Armed, with no tracked allocation yet: an encoder constructed AFTER the import is not the
+      // sender's module-scope encoder, so a sender-only fault has nothing to say about it.
+      const early = new probe.probed();
+      assert.equal(probe.constructed.length, 1, 'the post-import encoder was not attributed to the sender');
+      assert.equal(Buffer.from(early.encode(sample)).equals(nativeBytes), true,
+        'an untracked encoder encodes natively while the fault is armed');
+      assert.equal(probe.allocations.length, 0, 'an untracked encoder allocation is not counted');
+
+      // The real sender, under that same armed fault, still faults at its own second encode, and the
+      // buffer it had already allocated is wiped rather than left behind by the thrown allocation.
+      const point = await harness(t, {
+        create: probe.create,
+        policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']),
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+      });
+      assert.deepEqual(await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: LEAKY_REQUEST_BODY,
+      }), 'armed encode fault'), { status: 'REFUSED', code: 'SENDER_FAILED' });
+      assertNothingSent(point.sink, point.dispatch);
+      assert.equal(probe.allocations.length, 1, 'the armed fault landed after exactly one sender-owned encode');
+      assert.equal(unclearedBytes(probe.allocations), 0, 'the owned buffer is zero after the armed fault');
+      assert.equal(point.sender.state, 'IDLE');
+
+      // The counter now sits exactly where an ungated injection would trip: one owned allocation is
+      // recorded, so the next encode of ANY encoder built while the probe is installed would throw
+      // under a fault condition that never asked about ownership.
+      const late = new probe.probed();
+      assert.equal(probe.constructed.length, 1, 'the post-fault encoder was not attributed to the sender');
+      assert.equal(Buffer.from(late.encode(sample)).equals(nativeBytes), true,
+        'an untracked encoder encodes natively after the armed fault has landed');
+      assert.equal(probe.allocations.length, 1, 'an untracked encode after the fault is still uncounted');
+      assert.equal(unclearedBytes(probe.allocations), 0, 'the sender-owned buffer is still zero');
+    });
+
+    // Restored by the probe's `finally`, and checked from outside it rather than from inside.
+    assert.equal(globalThis.TextEncoder, NATIVE_TEXT_ENCODER, 'the native constructor is back in place');
+    assert.equal(Buffer.from(new TextEncoder().encode(sample)).equals(nativeBytes), true);
   });
