@@ -109,6 +109,19 @@ const EVIDENCE = composeClassification({ detectorEvidence: [{
   claim: { semanticType: CLASS, sensitivity: SENSITIVITY } },
 ] }, { interactionRef: INTERACTION_REF, sourceRef: SOURCE.ref, trust: TRUST });
 
+// The same detector finding with one declared subtype more, composed by the same v1 API. It is a
+// structurally valid record that is congruent with its own evidence and that the same bundle selects
+// KEEP for, so the only thing that separates it from `EVIDENCE` is the content digest an independent
+// pin commits to. A record whose top-level field disagrees with its own evidence would be a different
+// and easier thing to refuse.
+const EVIDENCE_WITH_SUBTYPE = composeClassification({ detectorEvidence: [{
+  version: 1, id: 'detector-bound-use-fixture.invalid', status: 'FOUND',
+  provenance: { inputRef: 'field-bound-use-fixture.invalid',
+    producerId: 'detector-bound-use-fixture.invalid', producerVersion: 'pack-1' },
+  claim: { semanticType: CLASS, subtype: 'NAME', sensitivity: SENSITIVITY } },
+] }, { interactionRef: INTERACTION_REF, sourceRef: SOURCE.ref, trust: TRUST });
+assert.notEqual(digestClassification(EVIDENCE_WITH_SUBTYPE), digestClassification(EVIDENCE));
+
 const RELEASE_TREATMENTS = ['KEEP', 'MASK', 'TOKENIZE', 'SYNTHETIC', 'GENERALIZE', 'REMOVE'];
 function policyBundle(decision = 'KEEP') {
   const rule = { id: `rule-bound-use-${decision.toLowerCase()}.invalid`,
@@ -233,7 +246,7 @@ function createHost(options = {}) {
         { id: 'AUTHORIZATION_POLICY', version: '1' }] },
     policy: { version: 1, interactionRef: INTERACTION_REF, candidateRef: CANDIDATE_REF,
       source: { ...SOURCE, trust: TRUST }, classification,
-      classificationDigest: digestClassification(classification),
+      classificationDigest: options.classificationDigest ?? digestClassification(classification),
       policy: { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(bundle) }, bundle },
     backend,
     authority: options.authority ?? (() => {
@@ -607,6 +620,37 @@ test('a method re-targeted after capture, and a host callback replaced after con
   assert.equal(replacement.state.calls, 1);
 });
 
+test('the backend method bound at construction is the one spent, not a replacement installed after it',
+  async () => {
+    // The promise is a construction-time binding, so the replacement is installed on the same backend
+    // object between construction and `use()`. A capture that re-read the property inside `use()`
+    // would spend the recovered bytes on the replacement.
+    const backend = createBackend();
+    const built = createHost({ backend });
+    const executor = createBoundMappingUse(built.host);
+    let replacementCalls = 0;
+    backend.lookup = (identifier) => { replacementCalls += 1; return true; };
+
+    const result = await executor.use();
+    assertFixedShape(result);
+    assert.equal(result.code, 'USED');
+    assert.equal(backend.state.calls, 1);
+    assert.equal(replacementCalls, 0);
+    assert.equal(cleared(backend.state.retained), true);
+    assert.equal(built.ledger.entries.length, 2);
+    assert.equal(built.counters.material, 1);
+
+    // Non-vacuous contrast: the identical replacement, installed before its own construction, is what
+    // a bound executor spends, so the assertions above are about the moment of binding and not about
+    // a replacement that could never have run.
+    const fresh = createBackend();
+    const freshHost = createHost({ backend: fresh });
+    fresh.lookup = (identifier) => { replacementCalls += 1; return true; };
+    assert.equal((await createBoundMappingUse(freshHost.host).use()).code, 'USED');
+    assert.equal(replacementCalls, 1);
+    assert.equal(fresh.state.calls, 0);
+  });
+
 /* ---------- 9. Reentry and overlap are refused ---------- */
 
 test('an overlapping use is refused before any host call, and one resource call is spent', async () => {
@@ -650,6 +694,7 @@ test('an unusable host throws one fixed TypeError at construction', async () => 
   const built = createHost();
   for (const broken of [null, 'bound-use.invalid', 42, {}, { ...built.host, registry: {} },
     { ...built.host, authority: 'nope' }, { ...built.host, material: 'nope' },
+    { ...built.host, backend: {} }, { ...built.host, backend: { lookup: 'nope' } },
     { ...built.host, entityId: 'not a token' }, { ...built.host, scope: { ...SCOPE, tenantId: '' } }]) {
     assert.throws(() => createBoundMappingUse(broken), (error) => {
       assert.equal(error instanceof TypeError, true);
@@ -657,10 +702,12 @@ test('an unusable host throws one fixed TypeError at construction', async () => 
       return true;
     });
   }
-  // A backend that loses its method is caught by the per-use capture, and fails closed there.
+  // A backend with no callable `lookup` is refused here, at construction, where its method is bound:
+  // an executor that captured a missing method per call would have deferred that refusal into a
+  // `use()` this file could no longer describe as a construction failure.
   const noMethod = createHost({ backend: {} });
-  const refused = await createBoundMappingUse(noMethod.host).use();
-  assert.equal(refused.code, 'WITHHELD');
+  assert.throws(() => createBoundMappingUse(noMethod.host), TypeError);
+  assert.equal(noMethod.counters.authority, 0);
   assert.equal(noMethod.counters.material, 0);
 });
 
@@ -793,18 +840,46 @@ test('the effect segment resolves no mutable function property and re-reads no c
     // A classification that drifts after the material load is refused before the resource, while the
     // registry record is still ACTIVE: nothing is withdrawn, the pinned digest simply no longer
     // describes what the policy engine was handed, so this is digest congruence and not lifecycle.
+    // The drifted record is a real composed v1 record carrying its own consistent detector evidence,
+    // so this case cannot be passing because the record became structurally invalid.
     const drifted = { ...EVIDENCE };
     const driftedHost = createHost({ classification: drifted,
-      hooks: { onMaterial() { drifted.sensitivity = 'PUBLIC'; } } });
+      hooks: { onMaterial() { Object.assign(drifted, EVIDENCE_WITH_SUBTYPE); } } });
     const afterDrift = await createBoundMappingUse(driftedHost.host).use();
     assert.equal(afterDrift.code, 'WITHHELD');
     assert.equal(driftedHost.backend.state.calls, 0);
     assert.equal(driftedHost.counters.material, 1);
     assert.equal(driftedHost.ledger.entries.length, 0);
+    // What the engine was finally handed is exactly the record the positive control accepts.
+    assert.equal(digestClassification(drifted), digestClassification(EVIDENCE_WITH_SUBTYPE));
     const stillActive = driftedHost.scenario.registry.current({ version: 1,
       mappingRef: driftedHost.scenario.mappingRef, scope: { ...driftedHost.scenario.scope } },
       { now: USE_NOW });
     assert.equal(stillActive.metadata.state, 'ACTIVE');
+
+    // The same changed record, pinned from the start against the original digest and nothing else
+    // different: also WITHHELD, and refused at the first policy selection, before any material is
+    // loaded. The only variable left is the pin.
+    const stalePin = createHost({ classification: EVIDENCE_WITH_SUBTYPE,
+      classificationDigest: digestClassification(EVIDENCE) });
+    const afterStalePin = await createBoundMappingUse(stalePin.host).use();
+    assert.equal(afterStalePin.code, 'WITHHELD');
+    assert.equal(stalePin.counters.material, 0);
+    assert.equal(stalePin.backend.state.calls, 0);
+    assert.equal(stalePin.ledger.entries.length, 0);
+
+    // Positive control on that exact record with its matching pin: a real SELECTED/KEEP decision and
+    // a real spend. The refusal above is therefore attributable to the pinned digest and to nothing
+    // else - not to the changed record, not to the bundle and not to the lifecycle.
+    const matchedPin = createHost({ classification: EVIDENCE_WITH_SUBTYPE,
+      classificationDigest: digestClassification(EVIDENCE_WITH_SUBTYPE) });
+    const afterMatchedPin = await createBoundMappingUse(matchedPin.host).use();
+    assertFixedShape(afterMatchedPin);
+    assert.equal(afterMatchedPin.code, 'USED');
+    assert.equal(matchedPin.backend.state.calls, 1);
+    assert.equal(matchedPin.ledger.entries.length, 2);
+    assert.equal(matchedPin.ledger.entries[1].event.decision.treatment, 'KEEP');
+    assert.equal(cleared(matchedPin.backend.state.retained), true);
   });
 
 test('an effect is spent only while the registry record is still ACTIVE at the backend', async () => {

@@ -15,15 +15,18 @@
  * spent. The host is trusted to answer honestly and coherently; this module authenticates nobody.
  *
  * The fixed order inside one `use()` is the contract:
- *   1. capture every callback function **and receiver** once, before any guard runs;
- *   2. read the current coherent authority; require the bound scope; read the real registry `current`
- *      and require `FOUND` and `ACTIVE`;
- *   3. require an actual `AUTHORIZED` decision from `authorizeMappingOperation` for `USE`;
- *   4. require an actual `SELECTED`/`KEEP` decision from `decidePolicy` for `USE`;
- *   5. require the audit substrate's recorded actor to be this authenticated subject;
- *   6. capture the owned immutable audit identity: the trusted context's actor is read once into a
- *      frozen snapshot that must be congruent with the authenticated subject, and the append below
- *      is handed that snapshot rather than the host's live actor;
+ *   1. bind every callback function and its receiver once, at construction. The backend object is
+ *      bound there with its `lookup` method, so a method re-pointed, swapped or re-targeted
+ *      afterwards is never invoked, and a host callback method runs with the host as its receiver;
+ *   2. read the current coherent authority; require the bound scope;
+ *   3. require the audit substrate's recorded actor to be this authenticated subject, and capture the
+ *      owned immutable audit identity: the trusted context's actor is read once into a frozen snapshot
+ *      congruent with the authenticated subject, and the appends below are handed that snapshot rather
+ *      than the host's live actor;
+ *   4. require an actual `SELECTED`/`KEEP` decision from `decidePolicy` for `USE` over the pinned
+ *      bundle;
+ *   5. read the real registry `current` and require `FOUND` and `ACTIVE`;
+ *   6. require an actual `AUTHORIZED` decision from `authorizeMappingOperation` for `USE`;
  *   7. load the sealed material and the DEK into owned copies. Every authority answer and the
  *      material answer may be a promise and is awaited before it is read, and no plaintext exists at
  *      any of those awaits;
@@ -43,11 +46,17 @@
  *      remaining host-owned read is ordered before the last one, which is the real registry read on
  *      the captured `current`, and captured classification primitives and one captured `Reflect.apply`
  *      feed the real `openMappingPayload` on an independently established expected AAD, with the
- *      **captured** synchronous backend invoked on its own receiver and the recovered bytes;
+ *      `lookup` binding captured at construction invoked on the backend object bound at construction;
  *  11. only a primitive boolean from that backend becomes `USED` or `NOT_FOUND`. Every owned byte
  *      buffer - each envelope copy, the DEK copy and the recovered plaintext - is enrolled the
  *      moment it comes into existence and overwritten in one `finally` on the success path and on
  *      every exceptional path, including a copy interrupted by a throwing byte read.
+ *
+ * The order inside steps 2-6 and inside every recheck is deliberate, and it is one rule: the
+ * authority answer, the live audit actor, the pinned policy bundle and the registry read are all
+ * host-owned reads, so they happen as early as each guard needs them and the fresh registry read is
+ * the **last** host-owned read of the call. Everything after it - the authorization, the material
+ * congruence, the effect scope - reads only values this module already owns.
  *
  * Refusal vocabulary. Every internal refusal - a refused registry read, a denied authorization, a
  * `BLOCK` or `HELD` policy decision, an absent audit record, a superseded revision, a rotated key, an
@@ -147,9 +156,10 @@ export interface MappingUseAudit {
 }
 
 /**
- * The private synchronous resource. One primitive boolean in, nothing out. It is bound at
- * construction, and it must not retain, copy, log or forward the bytes it is handed: this module
- * overwrites its own copy immediately after the call and cannot do anything about a retained one.
+ * The private synchronous resource. One primitive boolean in, nothing out. The object **and** its
+ * `lookup` method are bound at construction, and a `lookup` installed afterwards is never invoked:
+ * this module overwrites its own copy immediately after the call and cannot do anything about a
+ * retained one.
  */
 export interface MappingUseBackend { lookup(identifier: Uint8Array): boolean }
 
@@ -357,7 +367,9 @@ interface FixedBindings {
   /** The validated host object itself, kept only as the receiver for its own callback methods. */
   host: object;
   registry: MappingMetadataRegistry; readCurrent: MappingMetadataRegistry['current'];
-  audit: AuditBinding; policy: PolicyBinding; backend: MappingUseBackend;
+  audit: AuditBinding; policy: PolicyBinding;
+  /** The backend object, kept as the receiver, and the one `lookup` binding read here, once. */
+  backend: MappingUseBackend; lookup: (identifier: Uint8Array) => boolean;
   authority: () => unknown; material: () => unknown;
 }
 function bindings(hostValue: unknown): FixedBindings {
@@ -406,13 +418,20 @@ function bindings(hostValue: unknown): FixedBindings {
       typeof host.authority !== 'function' || typeof host.material !== 'function') {
       fail('INVALID_AUTHORITY');
     }
+    // The private resource's method is bound HERE, once, on the backend object bound above, and the
+    // effect segment invokes this binding for the life of the executor. A host that re-points
+    // `backend.lookup` after construction has replaced a property this module no longer reads, so
+    // the replacement is never invoked on the recovered bytes and the binding cannot be swapped at
+    // any later point in the call either.
+    const lookup = backend.lookup;
+    if (typeof lookup !== 'function') fail('INVALID_AUTHORITY');
     const authority = host.authority as () => unknown;
     const material = host.material as () => unknown;
     return Object.freeze({ mappingRef: text(host.mappingRef, 256), scope, entityId,
       host: hostValue as object,
       registry, readCurrent: registry.current,
       audit: Object.freeze({ ledger, context: contextValue, components }),
-      policy, backend, authority, material });
+      policy, backend, lookup, authority, material });
   } catch {
     // Host configuration is either usable or it is not: one fixed `TypeError`, never the supplied
     // value and never a partial binding.
@@ -433,10 +452,10 @@ function componentsOf(value: unknown): readonly { id: AuditBundleComponent; vers
  * Creates the one bound executor.
  *
  * Construction fixes the reference, the scope, the entity, the registry, the audit substrate, the
- * pinned policy handoff and the backend. It freezes **no** authority: the identity, context, route,
- * grant, key version and clock are re-read by every `use()`. A second `use()` that overlaps an
- * unfinished one is refused immediately, before any host call, because an overlapping effect on one
- * reference has no coherent snapshot to spend.
+ * pinned policy handoff, the backend object and its `lookup` method. It freezes **no** authority: the
+ * identity, context, route, grant, key version and clock are re-read by every `use()`. A second
+ * `use()` that overlaps an unfinished one is refused immediately, before any host call, because an
+ * overlapping effect on one reference has no coherent snapshot to spend.
  */
 export function createBoundMappingUse(hostValue: unknown): BoundMappingUse {
   const fixed = bindings(hostValue);
@@ -467,8 +486,7 @@ interface Captured {
   host: object;
   authority: () => unknown;
   material: () => unknown;
-  /** The backend method and its receiver, captured together before any guard runs. */
-  lookup: (identifier: Uint8Array) => boolean;
+  /** The backend object, kept as the receiver for the `lookup` binding fixed at construction. */
   receiver: MappingUseBackend;
   /** The classification primitives this call governs, read once. The host object is not re-read. */
   classification: { readonly semanticType: string; readonly sensitivity: string };
@@ -489,10 +507,11 @@ interface Material {
 interface State { observation: Observation; revision: number; decision: PolicyDecision }
 
 /**
- * Captures every callback function and every receiver this call will use, once, before the first
- * guard. A method swapped, re-pointed or re-targeted after this point cannot change what runs, a
- * host callback method runs with the host as its receiver, and no property of the host is read again
- * after the last guard below.
+ * Carries this call's own view of the fixed bindings: the host callbacks run with the host as their
+ * receiver, and the audit identity, the classification primitives and the frozen context the append
+ * is handed are read here. The backend's `lookup` is **not** read here: it was bound once at
+ * construction, so this module reads no property of the host or of its backend again at any later
+ * point, and in particular none between the last guard below and the effect.
  */
 function capture(fixed: FixedBindings): Captured {
   const classification = fixed.policy.classification;
@@ -502,12 +521,6 @@ function capture(fixed: FixedBindings): Captured {
     host: fixed.host,
     authority: attempt(() => fixed.authority),
     material: attempt(() => fixed.material),
-    lookup: attempt(() => {
-      const backend = fixed.backend;
-      const lookup = backend.lookup;
-      if (typeof lookup !== 'function') fail('HOST_FAULT');
-      return lookup;
-    }),
     receiver: fixed.backend,
     classification: Object.freeze({
       semanticType: attempt(() => text(classification.semanticType, 64)),
@@ -775,8 +788,8 @@ async function prepare(fixed: FixedBindings): Promise<MappingUseResult> {
  * awaited answer resumed into. `verified` is the same guard set every recheck runs, with its own
  * fresh registry read; `spend` follows it immediately. The scope, the classification primitive, the
  * invocation mechanics and both buffers were all established while guards could still run, and the
- * only host object touched from here on is the backend, through the captured function on its
- * captured receiver.
+ * only host object touched from here on is the backend, through the `lookup` binding captured at
+ * construction on its captured receiver.
  */
 function sealed(captured: Captured, material: Material, previous: State, observed: Observation,
   owned: Uint8Array[]): MappingUseResult {
@@ -790,7 +803,7 @@ function sealed(captured: Captured, material: Material, previous: State, observe
   if (opened.status !== 'OPENED') fail('OPEN_REFUSED');
   const plaintext = opened.plaintext;
   owned.push(plaintext);
-  const outcome = invoke(captured.lookup, captured.receiver, [plaintext]);
+  const outcome = invoke(captured.fixed.lookup, captured.receiver, [plaintext]);
   if (outcome === true) return USED;
   if (outcome === false) return NOT_FOUND;
   return fail('BACKEND_CONTRACT');
