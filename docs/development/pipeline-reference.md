@@ -108,9 +108,11 @@ fallback, no nesting, and no child that launches another lane.
 body, principles, tool allowlist, workflow-guard allowlist, fresh context, foreground, non-nesting
 settings and 20-minute ceiling, with `model: openai-codex/gpt-6.1-sol:medium` in place of the default
 writer's route. `agent` admits it, and both model checks — `checkInstall` and `verifyArtifacts` — accept
-exactly one role/model pair per role: this role only at that exact Sol 6.1 medium string, the default
-writer and the reviewer only at `:max`. A foreign route, a different budget, or a profile that drifted
-is refused in both halves, so the fallback is an auditable third role rather than a general failover.
+exact-pin only this role: both model checks admit it at that exact Sol 6.1 medium string and refuse any
+other route or budget for it. The default writer and the reviewer keep their existing `:max` suffix
+admission rather than an exact pin, so a foreign `:max` route passes that check for them; they are bound
+only by the profile, preflight and metadata model equality the verification half already enforces. The
+fallback is therefore an auditable third role rather than a general failover.
 Nothing automatic reaches it: the CLI never retries, re-routes or carries a prior attempt forward, and
 a refused or timed-out lane leaves its artifacts and any uncommitted work exactly where they are. Root
 dispatches it explicitly, and only after the default writer route has actually failed and the previous
