@@ -153,15 +153,12 @@ registration, a registration scope that is not the check scope, an unsupported v
 `SENTINEL_BLOCKED` here, before any child exists and before any host callback below has run: the same
 fixed refusal the runner's own check returns for the same input.
 
-**That branch has a fixed precedence, and the fallback only ever restricts.** When the snapshot is refused
-at all, the scope is re-read through **own data descriptors only**, so no accessor runs and a hostile or
-revoked Proxy trap is never invoked; a `tenantRef` or `projectRef` the descriptor read cannot supply, or
-supplies as anything other than the bound envelope's context, is `SCOPE_REFUSED`. The refusal stays
-`SENTINEL_BLOCKED` only when that descriptor-only read **does** establish the matching scope. So an
-otherwise valid host whose revoked `scope` Proxy fails the snapshot reports `SCOPE_REFUSED`, not
-`SENTINEL_BLOCKED`. Nothing here can authorize anything: the branch runs only where no child was spawned,
-it can never turn a refusal into a check, a dispatch or a send, and a scope it cannot prove is refused
-rather than assumed.
+When the snapshot is refused, the scope is re-read through own data descriptors and the fallback can only
+restrict: the read never invokes an accessor, but a Proxy `getOwnPropertyDescriptor` trap can still run, and
+a trap that throws is caught and yields no value. The refusal is `SCOPE_REFUSED` when that read cannot supply
+a `tenantRef` equal to the bound envelope's `tenantId`, or a `projectRef` equal to its `projectId` where the
+envelope defines one; otherwise it stays `SENTINEL_BLOCKED`. Neither outcome reaches a child, so the branch
+cannot turn a refusal into a check or a dispatch.
 
 The per-operation binding token is this send's **own generated interaction identity**, never a fixed global
 id, and the runner still mints the real per-child request id when it spawns. Nothing about the child's own
