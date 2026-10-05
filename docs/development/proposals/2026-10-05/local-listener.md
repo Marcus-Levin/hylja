@@ -33,7 +33,9 @@ Minimal integration edits: `src/node-net.d.ts`, `src/node-crypto.d.ts` only for 
 native declarations; `package.json` only if a focused script is necessary;
 `docs/capabilities.md`, `docs/development/synthetic-e2e.md`, `docs/README.md` for honest routing.
 These are proposed scope, not permission granted by this packet. No dependency/lockfile change.
-Inspect installed declarations and repository shims rather than guessing APIs.
+Prerequisites: net-server declarations are absent; crypto declares only hex hash output,
+not timingSafeEqual/randomBytes. Verify native API shapes and add narrow declarations for
+server lifecycle and constant-time fixed-length digest comparison; never guess APIs.
 Reuse conversation, sender, receiver, codecs, real policy and sentinel modules unchanged.
 Reuse synthetic fixture patterns without importing a test that schedules tests.
 
@@ -55,6 +57,24 @@ syntax (43 base64url characters); absent/forged/duplicate auth denies. Never for
 No tokens in git, logs, command-line examples or diagnostic assertions; only synthetic
 test tokens. No principal/tenant proof is derived from possession or loopback location.
 The gate does not authenticate human/workload identity, tenant membership or host evidence.
+
+## Bounded-lifetime evidence (option a)
+
+Usable life is the intersection of ALL pinned sender/receiver identityProof, requestProof,
+sourceProof and routeProof windows. These remain trusted synthetic fixture evidence, not
+proof of an arbitrary actual caller. A fresh #236 owner is not fresh evidence; reused
+requestProof is a synthetic harness premise, never per-request authentication.
+Per [envelope contract](../../../contracts/interaction-envelope.md) and source,
+MAX_AGE_MS = 5 min: at construction/exchange require issuedAt <= now, issuedAt >= now−5 min,
+expiresAt > now and expiresAt−issuedAt <= 5 min, across both boundaries. Stale construction
+latches a refusal-only listener (no exchanges); correct-token requests get fixed 403 RELEASE_REFUSED.
+Listener-owned observation wrappers must refuse outside the whole pinned intersection;
+existing owners still re-read their envelope snapshots immediately before dispatch/release:
+issuedAt <= now < expiresAt, window <= 5 min and occurredAt within the last 5 min.
+Pinning context keeps no proof valid. Never extend windows, override the clock or mint/
+reissue proofs from possession or loopback. This is not a long-lived operational gateway.
+Persistent operation requires a separately proposed/authorized per-request host evidence
+API and independent identity/request/source/route evidence; absence blocks that future child.
 
 ## Proposed strict inbound profile and resource bounds
 
@@ -88,7 +108,8 @@ Create a fresh #236 owner per accepted request, claiming the exchange slot synch
 The listener privately supplies `onReply(reply): Promise<void>` bound to that client's
 socket and cancellation state. No external sink callback or socket retargeting is allowed.
 Only receiver-guarded canonical body bytes become a 200 response with fixed JSON content
-label, computed UTF-8 Content-Length and Connection: close. Frame no unchecked payload.
+label, computed UTF-8 Content-Length and Connection: close. Start the private native write
+in the guarded release turn, without an intervening await. Frame no unchecked payload.
 A partially executed socket write cannot be rolled back; do not report it as undone.
 
 Source inspection: #236 captures `observe` and `onReply` and invokes each on the supplied
@@ -116,18 +137,21 @@ Each row has an independently declared fixed OpenAI-shaped error body, with fixe
 | Condition | HTTP | Public code |
 |---|---|---|
 | Invalid auth (including duplicate auth) | 401 | ACCESS_DENIED |
-| HTTP/codec unsupported or malformed input | 400 | REQUEST_REFUSED |
+| Inbound request HTTP/codec unsupported or malformed input | 400 | REQUEST_REFUSED |
 | Head/body byte or field bound | 413 | REQUEST_TOO_LARGE |
 | Read deadline | 408 | REQUEST_TIMEOUT |
-| Inspection, policy, sentinel, context/route or evidence refusal, either direction | 403 | RELEASE_REFUSED |
+| Inspection/policy/sentinel/context/evidence refusal; unsupported complete reply codec | 403 | RELEASE_REFUSED |
 | Busy/admission cap | 429 | BUSY |
 | Upstream/transport unavailable, truncated or invalid reply framing | 502 | UPSTREAM_UNAVAILABLE |
 | Upstream transport deadline | 504 | UPSTREAM_TIMEOUT |
 
 Closed/disconnected sockets receive no attempted error write. Startup invalidity fails
 without binding. Unexpected internal failures withhold and close, never expose details.
-502/504 are availability only, not policy or known-original distinctions. Never expose
-fine policy/sentinel reasons or planted strings. No automatic retries in the listener.
+Future contract must exhaustively map ALL #236, sender, receiver and both codec outcomes;
+unsupported complete inbound replies are coarse 403, never fine reasons. Only real transport
+availability uses 502/504; no policy/known-original oracle. No listener retries or idempotency:
+a client auto-retry is a fresh fully re-guarded exchange and may send another allowed
+upstream request. Never expose fine policy/sentinel reasons or planted strings.
 
 ## Proposed behavior-first acceptance evidence
 
@@ -154,6 +178,11 @@ counts and fixed codes, never token/body/buffer equality diagnostics that could 
 - Cancellation before dispatch and after request arrival; busy; close during inspection,
   child check, upstream read and response write: no later release, all sockets disposed,
   no stranded worker. Synthetic token comparisons/log capture reveal no token on failure.
+- Synthetic already-expired evidence (no five-minute sleep), correct token and valid body:
+  fixed 403 RELEASE_REFUSED, zero upstream connections/payload; valid control on a freshly
+  provisioned listener. Exercise expiry of each proof in either boundary independently.
+  Expiry between admission and dispatch/release is re-read: zero late payload/release bytes
+  respectively (readiness may connect); do not undo bytes already sent before expiry.
 - Unusable hosts and sink injection (`onReply`, releasePoint/sendPoint) never bind;
   one request cannot redirect another request's response socket.
 
@@ -169,8 +198,9 @@ After authorization, run from root: `npm ci --ignore-scripts --no-fund`,
 Require independent exact-head review and full exact-head CI per the canonical workflow.
 This prose packet itself needs only install, docs check and diff whitespace check.
 
-Proposed success: one synthetic non-streamed OpenAI-shaped HTTP exchange through the owned
-privacy mechanics. It does not prove production authentication, host authenticity,
+Proposed success: one synthetic non-streamed OpenAI-shaped HTTP exchange within ALL pinned
+evidence windows through the owned privacy mechanics, not persistent operational service.
+It does not prove production authentication, host authenticity,
 tenant membership, broker/restoration/persistence, multi-tenant isolation, bypass resistance,
 real SDK/provider integration, contextual privacy or reasoning utility. Local process
 compromise is out of scope. Fixture inspection labels are not generic classifiers;

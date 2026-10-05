@@ -33,6 +33,9 @@ The [conversation](../contracts/openai-local-conversation.md),
    tenant membership, validates no host boundary, and cannot satisfy #21 production
    authentication. Existing host proofs and inspection remain host obligations;
    capability possession must not be minted into an authenticated-principal proof.
+   This synthetic milestone is bounded-lifetime: all pinned sender/receiver evidence
+   windows cap usable life; a fresh owner renews no proof and context pinning preserves
+   no freshness. Reused requestProof is a harness premise, not per-request authentication.
 3. Different listeners require different capabilities. Reuse is misconfiguration,
    not automatic context or tenant isolation. Provision using cryptographic randomness
    of at least 256 bits; syntax validation cannot prove entropy.
@@ -76,7 +79,8 @@ an authorized live issue and cannot wire this record into runtime while it is pr
 Accept or decline only this narrowly described local-capability access model, explicitly
 excluding production identity and inspection authority. No adoption is recorded here.
 Success would be one non-streamed OpenAI-shaped HTTP client completing a guarded exchange
-against a synthetic loopback upstream. This child proves neither a real OpenAI SDK nor
+against a synthetic loopback upstream within the intersection of pinned evidence windows,
+not a long-lived operational gateway. This child proves neither a real OpenAI SDK nor
 coding-agent utility, production authentication, provider integration or bypass resistance.
 Generic inspection, tools/streaming, real provider integration and utility evidence remain
 later milestones under their own gates and the [evaluation policy](../evaluation.md).
