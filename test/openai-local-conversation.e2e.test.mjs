@@ -448,8 +448,8 @@ function completeRequest(buffer) {
  * survives into the final bytes, which is what the real fixed-worker child blocks on.
  */
 function createConversation(state, { runs = [], inbound = [], releases = [], suppress = false,
-  timeoutMs = DEADLINE_MS, port = state.port } = {}) {
-  const conversation = createOpenAiLocalConversation({
+  timeoutMs = DEADLINE_MS, port = state.port, create = createOpenAiLocalConversation } = {}) {
+  const conversation = create({
     port,
     timeoutMs,
     observe: () => OBSERVATION,
@@ -485,6 +485,16 @@ const assertNothingReachedPeer = (state) => {
 async function closed(state, label) {
   await waitFor(() => state.open.size === 0, `${label}: the owner closed its socket`);
   assert.equal(state.open.size, 0, `${label}: the owner closed every socket it opened`);
+}
+
+/**
+ * Spin the real clock forward on one thread. Nothing here is stubbed: the owner, the sender and the
+ * envelope all read the same real `Date.now()`, and time only moves forward, so a finite cost of this
+ * kind can expire a deadline but can never manufacture one.
+ */
+function spinTo(milliseconds) {
+  const deadline = Date.now() + milliseconds;
+  while (Date.now() < deadline) { /* the real elapsed time the observation under test costs */ }
 }
 
 /** Poll one bounded condition instead of sleeping a fixed guess. */
@@ -775,6 +785,40 @@ test('the head bound, the reply labeling and the surplus profile are decided on 
       await closed(state, entry.name);
     }
 
+    /* The same reply delivered as genuinely SEPARATE received chunks, paced by what the owner's own
+       client socket really observed rather than by two adjacent writes. The head minus its final LF is
+       sent first; nothing else crosses the wire until the owner's real `data` handler has been handed
+       that incomplete head. The terminator therefore spans two received chunks, which is the case the
+       adjacent-write version above never produced on a loopback socket. */
+    {
+      const state = await startRawPeer(t, (socket) => {
+        socket.write(bigHead.subarray(0, bigHead.byteLength - 1));
+        state.tail = () => { socket.end(Buffer.concat([bigHead.subarray(bigHead.byteLength - 1), bigBody])); };
+      });
+      const releases = [];
+      let observeFirst = () => {};
+      const firstChunk = new Promise((resolve) => { observeFirst = resolve; });
+      await withOwnerProbe(state.port, async (probe) => {
+        probe.afterData((index, chunk) => { if (index === 1) observeFirst(chunk); });
+        const { conversation } = createConversation(state, { releases, create: probe.create });
+        const pending = bounded(conversation.exchange(acceptedRequest()), 'segmented reply');
+        const head = await bounded(firstChunk, 'the owner received the incomplete head');
+        assert.equal(head.seen.byteLength, bigHead.byteLength - 1,
+          'the first chunk the owner received really was the head minus its final LF');
+        assert.equal(head.seen.toString('latin1').includes('\r\n\r\n'), false,
+          'the head terminator did NOT arrive whole: it spans the two chunks');
+        state.tail();
+        assert.deepEqual(await pending, { status: 'COMPLETED' }, 'segmented reply completed');
+        assert.equal(probe.chunks.length >= 2, true,
+          'the owner received the reply as more than one separate chunk');
+        assert.equal(probe.chunks[1].seen.toString('latin1').startsWith('\n'), true,
+          'the second received chunk starts with the LF the first one was missing');
+        assert.equal(releases.length, 1, 'exactly one guarded release from the segmented reply');
+        assert.equal(releases.length, 1, 'the segmented reply released exactly one guarded image');
+      });
+      await closed(state, 'segmented reply');
+    }
+
     /* Labeling outside the one supported profile is refused, and a balanced quoted charset is not. */
     const labelled = [
       { name: 'unmatched charset quote', header: 'Content-Type: application/json; charset="utf-8\r\n', code: 'RESPONSE_REFUSED' },
@@ -859,6 +903,175 @@ test('the accepted host methods run on the host receiver they were validated on'
     await closed(state, 'host receiver');
   });
 
+/* ---------- A test-only pass-through probe over the owner's REAL client socket ---------- */
+
+/**
+ * One probe, no production hook and no injection point, following #231's fresh-import codec pattern.
+ * It exists because two claims are only observable from outside the owner: that a segmented reply
+ * really arrives as more than one received chunk, and that every buffer the exchange allocates is
+ * zeroed when it ends.
+ *
+ * Attribution is the whole point, so it is deliberately narrow and every gate says why:
+ *
+ * - The owner is re-imported under a fresh URL, so the module-scope `TextDecoder` it builds is the
+ *   ONLY decoder tracked here. Its dependencies are not re-evaluated (a query string on the entry does
+ *   not propagate), so no other decoder can be counted and no other module is re-instrumented.
+ * - Only the OWNER's client socket is observed. A socket is the owner's when it is connected TO this
+ *   peer's port FROM another port, which is exactly the owner connecting and never the peer accepting;
+ *   the peer's own sockets are excluded by construction, not by provenance.
+ * - The client's real `data` listener is WRAPPED, not replaced: the owner's handler receives the same
+ *   chunk object through the same call, and this test only looks at it. Native `Uint8Array`
+ *   construction and `slice` are counted ONLY while that wrapped handler runs, which is precisely the
+ *   window in which the owner allocates its received chunks, its head/body joins and its body slice. A
+ *   `subarray` view allocates through that same species constructor, so one is counted too; it shares
+ *   the storage of a buffer the owner already wipes and can never outlive it.
+ * - Everything is restored in the probe's `finally`. Nothing here is a claim about the heap, about any
+ *   other process's copies, or about a buffer this module did not allocate.
+ */
+let ownerProbeSerial = 0;
+
+async function withOwnerProbe(peerPort, run) {
+  const nativeDecoder = globalThis.TextDecoder;
+  const nativeBytes = globalThis.Uint8Array;
+  const nativeOn = net.Socket.prototype.on;
+  const ownedDecoders = new WeakSet();
+  const chunks = [];
+  const allocations = [];
+  let decodes = 0;
+  let dispatching = false;
+  let importing = false;
+  let after = () => {};
+
+  class ProbedTextDecoder extends nativeDecoder {
+    constructor(...args) {
+      super(...args);
+      if (importing) ownedDecoders.add(this);
+    }
+    decode(input, options) {
+      if (ownedDecoders.has(this)) decodes += 1;
+      return super.decode(input, options);
+    }
+  }
+  class ProbedUint8Array extends nativeBytes {
+    constructor(...args) {
+      super(...args);
+      if (dispatching) allocations.push(this);
+    }
+  }
+  net.Socket.prototype.on = function probedOn(event, listener) {
+    if (event !== 'data' || typeof listener !== 'function' || this.remotePort !== peerPort
+      || this.localPort === peerPort) return nativeOn.call(this, event, listener);
+    const socket = this;
+    return nativeOn.call(this, event, (chunk) => {
+      // `seen` is a copy taken BEFORE the owner's handler can wipe the live buffer, and `live` is the
+      // object the owner itself enrolled and is expected to zero. Both are needed and neither is a
+      // claim about anything this owner did not allocate and receive.
+      chunks.push({ live: chunk, seen: Buffer.from(chunk) });
+      dispatching = true;
+      try { Reflect.apply(listener, socket, [chunk]); } finally { dispatching = false; }
+      after(chunks.length, chunks[chunks.length - 1]);
+    });
+  };
+  globalThis.TextDecoder = ProbedTextDecoder;
+  globalThis.Uint8Array = ProbedUint8Array;
+  try {
+    importing = true;
+    ownerProbeSerial += 1;
+    const fresh = await import(`../dist/openai-local-conversation.js?owner-probe=${ownerProbeSerial}`);
+    importing = false;
+    return await run({
+      create: fresh.createOpenAiLocalConversation, probed: ProbedTextDecoder,
+      chunks, allocations,
+      get decodes() { return decodes; },
+      afterData: (handler) => { after = handler; },
+    });
+  } finally {
+    importing = false;
+    globalThis.TextDecoder = nativeDecoder;
+    globalThis.Uint8Array = nativeBytes;
+    net.Socket.prototype.on = nativeOn;
+  }
+}
+
+/** Nonzero bytes still standing in the buffers this probe observed: zero is the whole claim. */
+const unclearedBytes = (buffers) => buffers.reduce(
+  (total, buffer) => total + buffer.reduce((count, byte) => count + (byte === 0 ? 0 : 1), 0), 0);
+
+/* ---------- Bounded cleanup, observed from outside the owner over its REAL allocations ---------- */
+
+/**
+ * Nonzero bytes standing, at one instant, in every buffer the probe attributes to this owner: the
+ * received chunks it enrolled and the buffers it allocated inside its own `data` handler. Zero-length
+ * buffers are excluded on purpose - they can never hold a byte, so counting one would make a residual
+ * total look measured where nothing was there. The probe's own `seen` copies are host copies and are
+ * deliberately NOT in this set: this is a claim about what the owner allocated, never about a copy
+ * this test made or about any buffer another process holds.
+ */
+const ownedResidual = (probe) => unclearedBytes([
+  ...probe.chunks.map((entry) => entry.live),
+  ...probe.allocations.filter((buffer) => buffer.byteLength > 0),
+]);
+
+/**
+ * One instant of that same observation, taken inside the wrapped handler's synchronous aftermath: after
+ * the owner's own handler returned and before any promise continuation of the exchange has run. It is
+ * the only window in which the reply body copy is still observable before its own decode, and it splits
+ * the owner's allocations into the ones its `done()` already wiped and the one it had not.
+ */
+const observationOf = (probe) => ({
+  chunk: unclearedBytes(probe.chunks.map((entry) => entry.live)),
+  wiped: unclearedBytes(probe.allocations.slice(0, -1)),
+  newest: unclearedBytes(probe.allocations.slice(-1)),
+  sizes: probe.allocations.map((buffer) => buffer.byteLength),
+  decodes: probe.decodes,
+});
+
+/** Collect one observation per received data event, on the probe's own restoration-safe hook. */
+const observeEveryChunk = (probe, onEvent) => {
+  const events = [];
+  probe.afterData(() => {
+    events.push(observationOf(probe));
+    if (onEvent !== undefined) onEvent(events.length);
+  });
+  return events;
+};
+
+/** The one supported reply head, written by hand, so the peer paces a head it can split itself. */
+const replyHead = (bodyBytes) => Buffer.from(
+  'HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n'
+  + `Content-Length: ${bodyBytes}\r\nConnection: close\r\n\r\n`, 'utf8');
+
+/**
+ * One raw peer that paces its own reply. The head minus its final LF is written first, and nothing else
+ * crosses the wire until the owner's real `data` handler has been handed that incomplete head: the
+ * terminator therefore spans two received chunks, and the first data event is observed while every
+ * buffer the owner allocated is still standing. `tail()` then delivers the final LF with whatever body
+ * bytes the case needs; a case that never calls it is a genuine incomplete reply.
+ */
+async function pacedPeer(t, body = Buffer.from(REPLY_BODY, 'utf8')) {
+  const head = replyHead(body.byteLength);
+  const state = await startRawPeer(t, (socket) => {
+    socket.write(head.subarray(0, head.byteLength - 1));
+    state.tail = (extra = body) => {
+      socket.end(Buffer.concat([head.subarray(head.byteLength - 1), extra]));
+    };
+  });
+  state.head = head;
+  state.tail = () => { throw new Error('this case never delivers the final LF'); };
+  state.bodyBytes = body.byteLength;
+  return state;
+}
+
+/**
+ * Non-vacuity, shared by all four cases below: at the FIRST received chunk the enrolled chunk and the
+ * head join the owner allocated over it really did hold bytes. Without this, every later "zero residual"
+ * assertion would also hold on an owner that had never allocated anything at all.
+ */
+const assertAllocatedNotVacuous = (label, first) => {
+  assert.equal(first.chunk > 0, true, `${label}: the received chunk really carried bytes`);
+  assert.equal(first.newest > 0, true, `${label}: the head join over it really carried bytes`);
+};
+
 /* ---------- A timeout and a cancellation leave the application empty and the peer closed ---------- */
 
 test('a silent peer times out and a cancelled exchange releases nothing; both controls release one',
@@ -904,6 +1117,52 @@ test('a silent peer times out and a cancelled exchange releases nothing; both co
     assertRefusal(await bounded(owner.conversation.exchange(acceptedRequest()), 'after cancel'),
       'CANCELLED');
     assert.equal(silent.requests, 1, 'a cancelled owner dispatches nothing further');
+  });
+
+/* ---------- One absolute deadline: readiness, final observation and the whole reply share it ------- */
+
+test('an exchange deadline that expires before the write delivers no request at all',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // The one absolute connection-and-reply deadline starts when readiness opens the connection and
+    // is never reset. The trusted final observation below costs real, finite time INSIDE that budget:
+    // a 150 ms observation against a 50 ms deadline. Readiness itself completes inside its own 50 ms,
+    // so the deadline is not spent there - it is spent by the observation that runs after it.
+    const BUDGET_MS = 50;
+    const OBSERVATION_MS = 150;
+    const state = await startRawPeer(t, (socket) => { socket.end(rawReply()); });
+    const releases = [];
+    const { conversation } = createConversation(state, { releases, timeoutMs: BUDGET_MS });
+    // Both observations are finite and both cost the same real time, so this is not a stub: the
+    // SECOND one is the dispatch-point observation the sender makes after readiness.
+    const owner = createOpenAiLocalConversation({
+      port: state.port, timeoutMs: BUDGET_MS,
+      observe: () => { spinTo(OBSERVATION_MS); return OBSERVATION; },
+      onReply: async (reply) => { releases.push(reply); },
+      sender: {
+        boundary: BOUNDARY, sourceTrust: SOURCE_TRUST, policyBundle: BUNDLE, scope: SCOPE,
+        known: registration(), sentinel: { deadlineMs: DEADLINE_MS },
+        inspectOriginal: requestInspect([]),
+      },
+      receiver: {
+        boundary: BOUNDARY, policyBundle: BUNDLE, scope: SCOPE, known: registration(),
+        sentinel: { deadlineMs: DEADLINE_MS }, inspect: replyInspect([]),
+      },
+    });
+    assertRefusal(await bounded(owner.exchange(acceptedRequest()), 'expired prepared deadline'),
+      'RESPONSE_TIMEOUT');
+    assert.equal(state.connections, 1, 'readiness opened exactly one connection');
+    assert.equal(state.requests, 0, 'an expired prepared deadline delivers no request');
+    assertNothingReleased(releases);
+    await closed(state, 'expired prepared deadline');
+
+    /* The live control on the same peer and the same shape with a budget the real observation fits
+       inside: the counters above are therefore real, not a peer that never accepted anything. */
+    assert.deepEqual(await bounded(conversation.exchange(acceptedRequest()), 'live control'),
+      { status: 'COMPLETED' });
+    assert.equal(state.requests, 1, 'the live control delivered exactly one exact request');
+    assert.equal(releases.length, 1, 'and exactly one guarded release');
+    assert.equal(releases[0] === EXPECTED_RELEASE, true);
+    await closed(state, 'live control');
   });
 
 /* ---------- An unusable host or endpoint can never dispatch ---------- */
@@ -963,4 +1222,160 @@ test('an unusable host or an unusable loopback endpoint can never dispatch',
     assert.deepEqual(await bounded(owner.conversation.exchange(acceptedRequest()), 'accepted shape'),
       { status: 'COMPLETED' });
     assert.equal(released.length, 1);
+  });
+/* ---------- What the exchange allocates is zeroed when it ends, on all four real endings --------- */
+
+/**
+ * The shared shape of the four cleanup cases below. Each one is a real exchange over a real loopback
+ * peer with a real reply, differs only in how it ENDS, and is observed through the same pass-through
+ * probe. Every claim is a count of bytes or a fixed code: a failing assertion prints no reply, no
+ * request, no chunk and no planted value.
+ */
+async function cleanupCase(t, label, act) {
+  const releases = [];
+  return withOwnerProbe(act.state.port, async (probe) => {
+    const events = observeEveryChunk(probe);
+    const { conversation } = createConversation(act.state, {
+      releases, timeoutMs: act.timeoutMs, create: probe.create,
+    });
+    const result = await bounded(act.run(conversation, events), label);
+    await closed(act.state, label);
+    return { result, releases, events, probe, conversation };
+  });
+}
+
+test('a completed exchange leaves no nonzero byte in anything it allocated', { timeout: TEST_TIMEOUT_MS },
+  async (t) => {
+    const state = await pacedPeer(t);
+    const { result, releases, events, probe } = await cleanupCase(t, 'success', {
+      state,
+      run: async (conversation, events) => {
+        const pending = conversation.exchange(acceptedRequest());
+        await bounded(waitFor(() => events.length >= 1, 'the owner received the incomplete head'),
+          'the owner received the incomplete head');
+        state.tail();
+        return pending;
+      },
+    });
+    assert.deepEqual(result, { status: 'COMPLETED' });
+    assert.equal(releases.length, 1, 'the exchange really did release a guarded reply');
+
+    /* Non-vacuous: the owner allocated, and what it allocated really held bytes. */
+    assert.equal(events.length >= 2, true, 'the paced reply arrived as separate received chunks');
+    assertAllocatedNotVacuous('success', events[0]);
+    const final = events[events.length - 1];
+    assert.equal(final.wiped, 0,
+      'every received chunk and every head join was already zeroed when the data handler returned');
+    assert.equal(final.newest, state.bodyBytes,
+      'the reply body copy really held exactly its declared bytes, still standing at that instant');
+    assert.equal(final.decodes, 0, 'the body had not been decoded at that instant either');
+
+    /* The claim: once the exchange has settled, nothing it allocated holds a byte. */
+    assert.equal(ownedResidual(probe), 0, 'no allocated buffer holds a nonzero byte after the exchange');
+    /* Exactly two decodes on this owner's own decoder: the received reply body, and the canonical
+       release image the receiver hands this owner's release point. Neither is a buffer allocated here. */
+    assert.equal(probe.decodes, 2, 'the reply body and the release image were each decoded exactly once');
+    assert.equal(probe.chunks.filter((entry) => entry.live.byteLength > 0).length >= 1, true,
+      'at least one real received chunk was observed');
+  });
+
+test('a complete reply whose body is not decodable leaves no nonzero byte in anything it allocated',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    /* A complete, correctly framed, correctly labelled reply whose one declared body byte is not
+       decodable UTF-8. The whole body therefore arrives, the owner's own strict decode fails, and the
+       owner refuses - the one ending where a body copy exists and no application byte is ever released. */
+    const UNDECODABLE = Buffer.from([0xff]);
+    const state = await pacedPeer(t, UNDECODABLE);
+    const { result, releases, events, probe } = await cleanupCase(t, 'undecodable body', {
+      state,
+      run: async (conversation, events) => {
+        const pending = conversation.exchange(acceptedRequest());
+        await bounded(waitFor(() => events.length >= 1, 'the owner received the incomplete head'),
+          'the owner received the incomplete head');
+        state.tail();
+        return pending;
+      },
+    });
+    assertRefusal(result, 'RESPONSE_REFUSED');
+    assert.equal(releases.length, 0, 'an undecodable body releases nothing to the application');
+    assertAllocatedNotVacuous('undecodable body', events[0]);
+    const final = events[events.length - 1];
+    assert.equal(final.wiped, 0, 'the received chunk and the head joins were zeroed in the same handler');
+    assert.equal(final.newest, 1, 'the one declared body byte really was standing at that instant');
+    assert.equal(ownedResidual(probe), 0,
+      'a refused decode still leaves no allocated buffer holding a nonzero byte');
+    assert.equal(probe.decodes, 1, 'the strict decode really was attempted exactly once');
+  });
+
+test('a reply that stops short of its declared body leaves no nonzero byte in anything it allocated',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    /* The declared body never arrives. The owner legitimately never allocates a completed body copy,
+       so this case proves the weaker, honest claim: what it DID allocate is wiped, and it never
+       decoded a body that does not exist. */
+    const PARTIAL = 16;
+    const head = replyHead(REPLY_BYTES);
+    const state = await startRawPeer(t, (socket) => {
+      socket.write(Buffer.concat([head, Buffer.alloc(PARTIAL, 0x41)]));
+    });
+    const { result, releases, events, probe } = await cleanupCase(t, 'partial reply', {
+      state, timeoutMs: SHORT_TIMEOUT_MS, run: (conversation) => conversation.exchange(acceptedRequest()),
+    });
+    assertRefusal(result, 'RESPONSE_TIMEOUT');
+    assert.equal(releases.length, 0, 'an incomplete reply releases nothing to the application');
+    assertAllocatedNotVacuous('partial reply', events[0]);
+    assert.equal(events[events.length - 1].newest > 0, true,
+      'the partial head join really was still standing when its data handler returned');
+    assert.equal(probe.decodes, 0, 'no body was decoded, because no complete body ever arrived');
+    assert.equal(probe.allocations.some((buffer) => buffer.byteLength === REPLY_BYTES), false,
+      'no body copy of the declared length was ever allocated');
+    const whole = head.byteLength + REPLY_BYTES;
+    assert.equal(Math.max(...probe.allocations.map((buffer) => buffer.byteLength)) < whole, true,
+      'every buffer allocated was strictly smaller than a complete framed reply');
+    assert.equal(ownedResidual(probe), 0, 'a timed-out exchange leaves no allocated buffer holding a byte');
+  });
+
+test('a cancel queued at body creation, before the decode, releases nothing and leaves no nonzero byte',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    /* Cancellation raised from inside the owner's own `data` handler aftermath: the reply body copy
+       exists and is still standing, the exchange's promise continuations have not run yet, and the
+       owner's next real step would be the decode. The cancellation therefore lands exactly there. */
+    const state = await pacedPeer(t);
+    const releases = [];
+    let cancelledAt = null;
+    let owner = null;
+    const { settled, events, probe } = await withOwnerProbe(state.port, async (probeHost) => {
+      const eventsHere = observeEveryChunk(probeHost, () => {
+        const newest = probeHost.allocations[probeHost.allocations.length - 1];
+        // The one event at which the owner created the declared-length body copy, and no other.
+        if (cancelledAt === null && newest !== undefined && newest.byteLength === state.bodyBytes) {
+          cancelledAt = eventsHere.length;
+          owner.cancel();
+        }
+      });
+      owner = createConversation(state, {
+        releases, timeoutMs: DEADLINE_MS, create: probeHost.create,
+      }).conversation;
+      const pending = bounded(owner.exchange(acceptedRequest()), 'cancel at body creation');
+      // The tail is delivered only after the owner has really received the incomplete head, so the body
+      // copy this cancellation targets is created by the LAST data event and by no other.
+      await bounded(waitFor(() => eventsHere.length >= 1, 'the owner received the incomplete head'),
+        'the owner received the incomplete head');
+      state.tail();
+      const settledResult = await pending;
+      assert.equal(cancelledAt !== null, true,
+        'the owner really did create the declared-length body copy before the exchange settled');
+      await closed(state, 'cancel at body creation');
+      return { settled: settledResult, events: eventsHere, probe: probeHost };
+    });
+
+    assertRefusal(settled, 'CANCELLED');
+    assert.equal(releases.length, 0, 'a cancelled exchange releases nothing to the application');
+    assertAllocatedNotVacuous('cancel at body creation', events[0]);
+    const atCancel = events[cancelledAt - 1];
+    assert.equal(atCancel.newest, state.bodyBytes,
+      'the body copy really existed and really was standing when the cancellation was queued');
+    assert.equal(atCancel.decodes, 0, 'and it had not been decoded at that instant');
+    assert.equal(ownedResidual(probe), 0,
+      'the abandoned body copy is wiped by the exchange cleanup on this outcome too');
+    assert.equal(probe.decodes, 0, 'the body was never decoded at all after the queued cancellation');
   });

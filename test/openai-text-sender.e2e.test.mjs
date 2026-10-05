@@ -164,11 +164,18 @@ function bounded(promise, label) {
   return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
 }
 
-async function startSink() {
+async function startSink(order = []) {
   const open = new Set();
   const captures = [];
   let connections = 0;
   let receivedBytes = 0;
+  let writes = 0;
+  let prepared = null;
+  const dispose = () => {
+    const owned = prepared;
+    prepared = null;
+    if (owned !== null) { try { owned.socket.destroy(); } catch { /* already closed */ } }
+  };
 
   const server = net.createServer((socket) => {
     connections += 1;
@@ -205,25 +212,50 @@ async function startSink() {
     get connections() { return connections; },
     get receivedBytes() { return receivedBytes; },
     get captures() { return captures; },
-    async write(bytes) {
+    /** Fixed labels of the real effects on this sink, in the order they actually happened. */
+    get order() { return order; },
+    get writes() { return writes; },
+    /**
+     * Readiness: open the one real connection, confirm it, install the reply, error and close
+     * listeners and capture the socket's own write and end. It sends no byte.
+     */
+    async waitUntilReady() {
+      dispose();
       const socket = net.connect(address.port, '127.0.0.1');
       open.add(socket);
       socket.on('error', () => {});
+      // Reading the response is also what puts the socket in flowing mode, so the listener belongs
+      // here, in readiness, before any byte exists on it.
+      const answered = [];
+      socket.on('data', (chunk) => answered.push(chunk));
       await bounded(new Promise((resolve, reject) => {
         socket.once('connect', resolve);
         socket.once('error', reject);
       }), 'loopback connect');
-      // Reading the response is also what puts the socket in flowing mode, so the exchange is
-      // observed here rather than inferred from the write.
-      const answered = [];
-      socket.on('data', (chunk) => answered.push(chunk));
-      socket.write(bytes);
-      await bounded(new Promise((resolve) => socket.once('close', resolve)), 'loopback response');
-      open.delete(socket);
-      assert.equal(Buffer.concat(answered).toString('latin1').startsWith('HTTP/1.1 204'), true,
+      const writeMethod = socket.write;
+      const endMethod = socket.end;
+      prepared = {
+        socket, answered,
+        write: (bytes) => { writes += 1; order.push('write'); writeMethod.call(socket, bytes); },
+        end: () => { endMethod.call(socket); },
+      };
+    },
+    async write(bytes) {
+      const owned = prepared;
+      prepared = null;
+      if (owned === null) throw new Error('the sink transport was never prepared');
+      // Synchronous, before this function's first `await`: the effect happens in the caller's own turn.
+      owned.write(bytes);
+      owned.end();
+      await bounded(new Promise((resolve) => owned.socket.once('close', resolve)), 'loopback response');
+      open.delete(owned.socket);
+      assert.equal(Buffer.concat(owned.answered).toString('latin1').startsWith('HTTP/1.1 204'), true,
         'the sink answered the request it received');
     },
+    /** A socket prepared and never dispatched is destroyed here, from the send `finally`. */
+    dispose,
     async close() {
+      dispose();
       for (const socket of open) socket.destroy();
       await bounded(new Promise((resolve) => server.close(() => resolve())), 'sink shutdown');
     },
@@ -262,9 +294,12 @@ function createHost(sink, options = {}) {
       // Queued observations: the first call is the one the check is made against, the second is what
       // the send point reports immediately before dispatch, and later calls clamp to the last entry.
       observe: () => observations[Math.min(calls++, observations.length - 1)],
-      // Readiness: the in-memory capture owns no connection, so there is nothing to wait for. It is
-      // here because the member is REQUIRED: there is no optional legacy dispatch path.
-      waitUntilReady: options.waitUntilReady ?? (async () => {}),
+      // Readiness owns the sink's real connection: it opens it, confirms it, installs the reply
+      // listener and sends nothing. Only a genuinely connectionless capture (no sink at all) has
+      // nothing to prepare, and only there is a no-op the whole shape of this seam.
+      waitUntilReady: options.waitUntilReady ?? (async () => {
+        if (sink !== null) await sink.waitUntilReady();
+      }),
       sendExact: async (image) => {
         dispatch.push(Buffer.from(image));
         if (sink !== null) await sink.write(image);
@@ -282,7 +317,17 @@ async function harness(t, options = {}) {
   // `options.create` selects the sender factory. It exists so the instrumentation section below can
   // drive a FRESH sender module instance; every other test keeps the one imported at the top.
   const create = options.create ?? createOpenAiTextSender;
-  return { sink, host, dispatch, sender: create(host) };
+  const owner = create(host);
+  return {
+    sink, host, dispatch,
+    sender: {
+      // The outer send `finally` this harness owns: whatever the sender decided, a socket prepared
+      // and never dispatched is destroyed here rather than left to `t.after`.
+      send: (input) => owner.send(input).finally(() => { if (sink !== null) sink.dispose(); }),
+      cancel: () => { owner.cancel(); },
+      get state() { return owner.state; },
+    },
+  };
 }
 
 /** The whole withholding invariant in one helper: no dispatch, no connection, no byte, no capture. */
@@ -292,6 +337,20 @@ const assertNothingSent = (sink, dispatch) => {
   assert.equal(sink.connections, 0, 'the sink accepted no connection');
   assert.equal(sink.receivedBytes, 0, 'the sink received zero bytes');
   assert.equal(sink.captures.length, 0);
+};
+
+/**
+ * The same invariant for a send whose READINESS already ran: readiness owns the connection and sends
+ * nothing, so what a withheld dispatch must leave behind is no byte, no capture and no native write -
+ * never "no connection", which is only true of a refusal taken before readiness.
+ */
+const assertNoByteSent = (sink, dispatch) => {
+  assert.equal(dispatch.length, 0, 'the transport was invoked zero times');
+  if (sink === null) return;
+  assert.equal(sink.receivedBytes, 0, 'the sink received zero bytes');
+  assert.equal(sink.captures.length, 0, 'no complete request reached the sink');
+  assert.equal(sink.writes, 0, 'the native write never happened');
+  assert.equal(sink.order.includes('write'), false, 'no write label was recorded at all');
 };
 
 /* ---------- The API surface ---------- */
@@ -656,7 +715,96 @@ test('a cancellation raised inside the last host observation withholds the dispa
     }), 'cancelled inside the final observation'), { status: 'REFUSED', code: 'CANCELLED' });
     assert.equal(calls, 2, 'the refusal came after the final observation, not before it');
     assert.equal(sender.state, 'CANCELLED');
-    assertNothingSent(sink, dispatch);
+    assertNoByteSent(sink, dispatch);
+    // Readiness ran and opened the connection, so the cancellation is not explained by never having
+    // prepared a transport: a connection existed and still no byte ever crossed it.
+    assert.equal(sink.connections, 1, 'readiness opened the one connection this transport owns');
+  });
+
+test('the migrated real transport writes in its first synchronous turn, never after a queued cancel',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const commit = { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(BUNDLE) };
+    const observation = Object.freeze({ destination: { id: SINK.ref, profileDigest: PROFILE_DIGEST }, commit });
+    const send = (sender) => sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
+    });
+
+    /* Case 1: a cancellation queued from the LAST observation. Readiness has already opened the one
+       real connection, so the counters below cannot be explained by never having prepared one - and
+       the fixed-label order shows the native write never followed the cancellation. */
+    {
+      const sink = await startSink();
+      t.after(() => sink.close());
+      const { host, dispatch } = createHost(sink, { observations: [observation, observation] });
+      const accepted = host.sendPoint;
+      const owner = { sender: null };
+      let calls = 0;
+      host.sendPoint = Object.freeze({
+        waitUntilReady: accepted.waitUntilReady,
+        observe: () => {
+          calls += 1;
+          if (calls === 2) { sink.order.push('cancel'); owner.sender.cancel(); }
+          return observation;
+        },
+        sendExact: accepted.sendExact,
+      });
+      const sender = createOpenAiTextSender(host);
+      owner.sender = sender;
+      assert.deepEqual(await bounded(send(sender), 'cancel queued from the last observation'),
+        { status: 'REFUSED', code: 'CANCELLED' });
+      assert.equal(calls, 2, 'the refusal came after the final observation');
+      assert.deepEqual(sink.order, ['cancel'], 'no native write was ever dispatched after the cancellation');
+      assert.equal(sink.connections, 1, 'readiness opened exactly one real connection');
+      assertNoByteSent(sink, dispatch);
+    }
+
+    /* Case 2: the same transport with nothing queued. One connected native write, one exact request
+       off that connection, and the write label is the first and only effect label. */
+    {
+      const point = await harness(t);
+      const sink = point.sink;
+      assert.deepEqual(await bounded(send(point.sender), 'live control'), { status: 'SENT' });
+      assert.deepEqual(sink.order, ['write'], 'the live control performed exactly one native write');
+      assert.equal(sink.connections, 1, 'exactly one real connection');
+      assert.equal(sink.captures.length, 1, 'and exactly one complete request off it');
+      assert.equal(sink.captures[0].equals(expectedImage()), true, 'the declared image, byte for byte');
+    }
+
+    /* Case 3: a cancellation queued DURING readiness, after the real child ALLOWed. Readiness
+       connects but sends nothing, so zero writes, zero requests and zero connections. */
+    {
+      const owner = { sender: null };
+      let order = null;
+      const point = await harness(t, {
+        waitUntilReady: async () => {
+          point.sink.order.push('cancel');
+          order = point.sink.order;
+          owner.sender.cancel();
+        },
+      });
+      owner.sender = point.sender;
+      const sink = point.sink;
+      assert.deepEqual(await bounded(send(point.sender), 'cancel during readiness'),
+        { status: 'REFUSED', code: 'CANCELLED' });
+      assert.deepEqual(order, ['cancel'], 'readiness dispatched no native write');
+      assert.equal(sink.connections, 0, 'and opened no connection at all');
+      assertNoByteSent(sink, point.dispatch);
+      assert.equal(point.sender.state, 'CANCELLED');
+    }
+
+    /* Case 4: the ordering claim itself, with no sender in the way. The write happens inside the
+       call, so a cancel queued in the SAME turn by the caller lands strictly after it. This is the
+       observation a "no deferred write" claim needs: a real effect, then the queued callback. */
+    {
+      const sink = await startSink();
+      t.after(() => sink.close());
+      await bounded(sink.waitUntilReady(), 'direct readiness');
+      const pending = sink.write(Buffer.from(expectedImage(), 'utf8'));
+      sink.order.push('cancel');
+      await bounded(pending, 'direct exchange');
+      assert.deepEqual(sink.order, ['write', 'cancel'], 'the native write precedes a cancel queued after it');
+      assert.equal(sink.captures.length, 1, 'the exact request really crossed the wire');
+    }
   });
 
 test('an accepted transport is captured, so a send-point Proxy get trap cannot run at dispatch',
@@ -781,7 +929,7 @@ test('readiness is awaited only after the real child ALLOWs, and every guard is 
     }
 
     /* The positive control on the same harness shape: readiness that resolves changes nothing else. */
-    const control = await harness(t, { observations: [observation, observation], waitUntilReady: async () => {} });
+    const control = await harness(t, { observations: [observation, observation] });
     assert.deepEqual(await bounded(control.sender.send({
       endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
     }), 'ready control'), { status: 'SENT' });
@@ -838,9 +986,10 @@ test('boundary evidence that expires during a finite inspection never authorizes
         assert.equal(point.sink.captures[0].equals(expectedImage()), true, name);
         assert.equal(point.sender.state, 'IDLE', name);
       } else {
-        // The real fixed-worker child ALLOWed these bytes; only the dispatch-time freshness re-read
-        // withheld them, so nothing was dispatched, connected or captured.
-        assertNothingSent(point.sink, point.dispatch);
+        // The real fixed-worker child ALLOWed these bytes and readiness opened the connection; only
+        // the dispatch-time freshness re-read withheld them, so nothing was dispatched, written or
+        // captured.
+        assertNoByteSent(point.sink, point.dispatch);
         assert.equal(point.sender.state, 'IDLE', name);
       }
     }

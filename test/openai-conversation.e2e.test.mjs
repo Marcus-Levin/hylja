@@ -409,22 +409,52 @@ async function startServer(t, answer = REPLY_BODY) {
   return state;
 }
 
-/** The trusted raw-socket transport owned by this file: it writes exact bytes and reads the reply. */
+/**
+ * One private transport lifecycle per exchange, split exactly as the sender's own accepted path is
+ * split: `waitUntilReady()` opens the one real loopback connection, confirms it, installs the reply,
+ * error and close listeners and captures the socket's own `write` and `end`. It sends no byte and
+ * grants no approval. `sendExact` invokes that captured write in its FIRST synchronous turn, before
+ * its own first `await`, so nothing separates the sender's last guard from the byte. `dispose()`
+ * destroys a prepared but undispatched socket from the send wrapper's own `finally`.
+ */
 function rawSocketTransport(state) {
-  return async (image) => {
-    const socket = net.connect(state.port, '127.0.0.1');
-    state.sockets.add(socket);
-    socket.on('error', () => {});
-    const received = [];
-    socket.on('data', (chunk) => received.push(chunk));
-    await bounded(new Promise((resolve, reject) => {
-      socket.once('connect', resolve);
-      socket.once('error', reject);
-    }), 'loopback connect');
-    socket.write(Buffer.from(image));
-    await bounded(new Promise((resolve) => socket.once('close', resolve)), 'exchange close');
-    state.sockets.delete(socket);
-    state.replies.push(Buffer.concat(received));
+  let prepared = null;
+  const dispose = () => {
+    const owned = prepared;
+    prepared = null;
+    if (owned !== null) { try { owned.socket.destroy(); } catch { /* already closed */ } }
+  };
+  return {
+    waitUntilReady: async () => {
+      dispose();
+      const socket = net.connect(state.port, '127.0.0.1');
+      state.sockets.add(socket);
+      socket.on('error', () => {});
+      const received = [];
+      socket.on('data', (chunk) => received.push(chunk));
+      await bounded(new Promise((resolve, reject) => {
+        socket.once('connect', resolve);
+        socket.once('error', reject);
+      }), 'loopback connect');
+      const writeMethod = socket.write;
+      const endMethod = socket.end;
+      prepared = {
+        socket, received,
+        write: (bytes) => { writeMethod.call(socket, Buffer.from(bytes)); },
+        end: () => { endMethod.call(socket); },
+      };
+    },
+    sendExact: async (image) => {
+      const owned = prepared;
+      prepared = null;
+      if (owned === null) throw new Error('the transport was never prepared');
+      owned.write(image);
+      owned.end();
+      await bounded(new Promise((resolve) => owned.socket.once('close', resolve)), 'exchange close');
+      state.sockets.delete(owned.socket);
+      state.replies.push(Buffer.concat(owned.received));
+    },
+    dispose,
   };
 }
 
@@ -447,6 +477,7 @@ function splitResponse(bytes) {
 
 function createSender(state, runs, mode = 'real') {
   const dispatch = [];
+  const transport = rawSocketTransport(state);
   const host = {
     boundary: BOUNDARY,
     sourceTrust: SOURCE_TRUST,
@@ -457,17 +488,27 @@ function createSender(state, runs, mode = 'real') {
     inspectOriginal: conversationInspect(runs, mode),
     sendPoint: {
       observe: () => OBSERVATION,
-      // Readiness is a required member: this in-memory capture owns no connection, so there is nothing
-      // to prepare and nothing that can withhold a byte after it. The real socket lifecycle below lives
-      // wholly inside `sendExact`, so this transport has no deferred write to guard against.
-      waitUntilReady: async () => {},
+      // Readiness is a required member and it owns a real connection here: it prepares the socket and
+      // sends nothing, so the guards the sender reads after it are read against a transport that will
+      // really dispatch now.
+      waitUntilReady: transport.waitUntilReady,
       sendExact: async (image) => {
         dispatch.push(Buffer.from(image));
-        await rawSocketTransport(state)(image);
+        await transport.sendExact(image);
       },
     },
   };
-  return { sender: createOpenAiTextSender(host), dispatch };
+  const owner = createOpenAiTextSender(host);
+  return {
+    sender: {
+      // The outer send `finally` this transport owns: a prepared but undispatched socket is destroyed
+      // here whatever the sender decided, and not left to the test teardown.
+      send: (input) => owner.send(input).finally(() => { transport.dispose(); }),
+      cancel: () => { owner.cancel(); },
+      get state() { return owner.state; },
+    },
+    dispatch,
+  };
 }
 
 /** The private model-context capture: an in-memory recorder of the receiver's own ALLOW copy. */

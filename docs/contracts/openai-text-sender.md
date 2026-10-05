@@ -296,6 +296,16 @@ withholding controls for a `MASK` decision on `METADATA` or `MODEL`, every other
 review; the inspection callback's receiver (the accepted data-property snapshot, with a normal masked
 release as its control); the owned-buffer zeroing of the inspection copy on both a masked send and an
 inspection refusal, asserted only as a count of zero bytes; and a masked rebuild that crosses the
-codec's own byte bound, which exercises the derivation-refusal branch for the first time. It calls no
+codec's own byte bound, which exercises the derivation-refusal branch for the first time. Every real test
+transport was migrated to the sender's own readiness/dispatch split, because the ordering claims above are
+only meaningful against a capture that behaves like this module does: readiness owns the real connection
+and confirms readiness without sending anything, `sendExact` invokes the captured native write
+synchronously before its own first `await`, and the send-finally disposes a socket that was prepared but
+never dispatched. That split is what the durable ordering guard measures, as fixed labels rather than
+timing: a cancellation queued from the final observation records `['cancel']` with the write never
+following it, a live control records `['write']`, a cancellation raised during readiness records zero
+writes and zero requests, and a caller-queued cancellation in the same turn records `['write', 'cancel']`.
+The same split was migrated in the other three conversation test files, so no test transport can supply a
+deferred write that a queued cancellation would overtake. It calls no
 provider, holds no credential, reaches the network only on `127.0.0.1` on an OS-assigned ephemeral port,
 and every fixture value is obviously synthetic and non-routable.

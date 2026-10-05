@@ -80,6 +80,22 @@ input separates them. That write is preceded by a re-read of cancellation and of
 `connecting`, `writable` and `bytesWritten === 0`. The kernel may still hold the write in its own buffer;
 that carries no authority, and the endpoint was confirmed before the write rather than after it.
 
+**There is exactly one absolute deadline, and it is read before the effect it bounds.** Readiness opens
+the connection and establishes `deadlineAt = now + timeoutMs`; that one absolute value is never reset,
+re-derived or extended afterwards. It covers connection preparation, the dispatch-point observation and
+the whole reply. Immediately before the captured write, the time it still has left is re-read, with no
+`await`, no host callback and no host input between that read and the write; a deadline already spent
+withholds the byte (`RESPONSE_TIMEOUT`) instead of expiring after it. The reply timer is then armed from
+the **same** absolute deadline, never from a new one.
+
+*Limit.* A timer cannot preempt a long synchronous host callback: `observe()` and the fixed-worker child
+run to completion on this thread, so a deadline spent inside one is discovered at the next read rather
+than during the callback. The pre-write re-read is what makes that safe - a **finite** host observation
+that costs more than the remaining budget therefore delivers **no request at all** (zero native writes,
+zero parsed requests, zero releases), which is a real observation and not a stubbed clock. It bounds the
+caller's own callback duration against the deadline; it does not interrupt or time-slice an unbounded one,
+and a host that never returns is host behaviour this module cannot bound.
+
 **Exactly one supported reply profile**, decided here and refused rather than tolerated:
 
 | Element | Accepted value |
@@ -112,6 +128,24 @@ path and on every refusal alike, as is any socket that was prepared but never di
 deadline timer is cleared. That claims the buffers
 **this module allocated** and nothing else: no erasure of immutable strings, caller input, runtime, peer
 or child copies, and no heap, RSS or swap erasure is claimed or proved.
+
+**Segmentation is observed, not assumed.** TCP can split one reply anywhere, so the suite paces its own
+peer: the head minus its final LF crosses first and nothing else follows until the owner's real client
+`data` handler has been handed that incomplete head, which makes the head terminator span two genuinely
+separate received chunks rather than two adjacent writes that the kernel may coalesce. The owner accepts
+that reply identically to the coalesced control.
+
+**Cleanup is observed, and non-vacuously.** A test-only pass-through probe re-imports this module under a
+fresh URL, so the module-scope `TextDecoder` it builds is the only decoder that can be counted, and it
+wraps - never replaces - the owner's real client `data` listener, gating `Uint8Array` construction to the
+window in which that handler runs. It therefore attributes exactly three kinds of buffer to this module:
+the received chunks the handler enrolled, the `join()` arrays it allocated over them, and the body copy
+its `slice()` cut. Each of the four endings is observed at two instants: inside the handler's own aftermath,
+before any promise continuation of the exchange has run - the only window in which the body copy is still
+observable before its decode - and again after the exchange has settled. The suite asserts the first
+instant really held bytes (a zero residual total would also hold on an owner that had allocated nothing)
+and that the second holds none. It claims those three kinds only: the probe's own copies, another
+process's copies, the composed owners' own buffers and any heap erasure are explicitly not claimed.
 
 ## The accepted path
 
@@ -168,7 +202,7 @@ part of the input, and no result carries bytes, a digest or a handle.
   result, a comparative win or promotion evidence ([evaluation.md](../evaluation.md)).
 
 [`test/openai-local-conversation.e2e.test.mjs`](../../test/openai-local-conversation.e2e.test.mjs) runs
-eight cases over a real `node:http` peer and raw `node:net` peers on `127.0.0.1`
+thirteen cases over a real `node:http` peer and raw `node:net` peers on `127.0.0.1`
 (`node --test test/openai-local-conversation.e2e.test.mjs`, route:
 [synthetic-e2e.md](../development/synthetic-e2e.md)): the accepted conversation, with a real detector run,
 a real policy `MASK`, both real fixed-worker children, one connection and one parsed request compared
@@ -179,10 +213,17 @@ the control on the
 same owner releases; chunked, non-200, oversize-length, duplicate-length, truncated and header-flood
 replies, each followed by a positive control on the same peer; a reply larger than the header bound
 accepted identically whether the peer coalesced it with the head or split the terminator across two reads,
-three mislabelled or malformed header cases refused, and a balanced quoted charset plus a surplus-tailed
+the same reply also delivered as genuinely separate received chunks paced by what the owner observed, three
+mislabelled or malformed header cases refused, and a balanced quoted charset plus a surplus-tailed
 first reply accepted with the surplus ignored; accepted `observe`/`onReply` methods proven to run on the
 host receiver they were validated on; a silent peer that times out and a cancelled
-in-flight exchange with a sticky `CANCELLED` owner; and unusable hosts, endpoints, deadlines and call
-shapes that never dispatch. Unexercised by that suite: `CONVERSATION_FAILED`, the endpoint-mismatch branch
-of `TRANSPORT_FAILED`, and an undecodable-UTF-8 body. Every fixture value is obviously synthetic and
+in-flight exchange with a sticky `CANCELLED` owner; an absolute deadline already spent by a finite host
+observation, which delivers no request at all while a live control on the same peer delivers exactly one;
+the four cleanup endings over the probe above - a completed exchange, a complete reply whose declared body
+is not decodable UTF-8, a reply that stops short of its declared body, and a cancellation queued at body
+creation before any decode - each asserted non-vacuously and each ending with no residual nonzero byte in
+anything this module allocated, with zero decodes after the queued cancellation and no completed body
+allocated at all on the timeout; and unusable hosts, endpoints, deadlines and call
+shapes that never dispatch. Unexercised by that suite: `CONVERSATION_FAILED` and the endpoint-mismatch
+branch of `TRANSPORT_FAILED`. Every fixture value is obviously synthetic and
 non-routable; no provider, credential or network is used.

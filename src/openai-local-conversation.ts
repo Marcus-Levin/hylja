@@ -451,10 +451,15 @@ export function createOpenAiLocalConversation(host: unknown): OpenAiLocalConvers
       done(null, cancelled ? 'CANCELLED' : 'TRANSPORT_FAILED');
       return;
     }
-    transport.write(image);
-    transport.end();
+    // The ONE absolute deadline that readiness established - connection and whole reply together - is
+    // re-read here, immediately before the effect it bounds. No `await`, no host callback and no reset
+    // of that deadline separates this read from the write below, so a deadline already spent by the
+    // dispatch-point observation withholds the byte instead of expiring after it.
     const remaining = transport.remaining();
     if (remaining <= 0) { done(null, 'RESPONSE_TIMEOUT'); return; }
+    transport.write(image);
+    transport.end();
+    // The reply timer is armed from the same absolute deadline, never from a new one.
     timer = setTimeout(() => { done(null, 'RESPONSE_TIMEOUT'); }, remaining);
     timer.unref();
   });
