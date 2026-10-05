@@ -98,7 +98,7 @@ function createCollector(limit, onOverflow) {
  * rather than implied: a descendant that leaves the group on purpose (its own session) is out of reach,
  * and a terminated descendant that nothing has reaped yet still counts as a group member until the bound.
  */
-function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null) {
+function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null, seams = {}) {
   return new Promise((resolve) => {
     let child = null;
     let settled = false;
@@ -133,6 +133,7 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null
 
     /** Whether any member of the owned child's process group still exists, from the OS. */
     const groupExists = () => {
+      if (typeof seams.groupProbe === 'function') return seams.groupProbe() === true;
       if (!groupLeader || child === null || !Number.isInteger(child.pid)) return false;
       try { process.kill(-child.pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
     };
@@ -151,7 +152,7 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs, inspect = null
     const armCleanupBound = (fn) => {
       if (bounded) return;
       bounded = true;
-      own(fn, CLEANUP_BOUND_MS);
+      own(fn, Number.isSafeInteger(seams.cleanupBoundMs) ? seams.cleanupBoundMs : CLEANUP_BOUND_MS);
     };
 
     /** Stop what this invocation owns, with the cleanup bound as the fallback if nothing confirms it. */
@@ -281,7 +282,14 @@ export function runNodeTest(entry) {
  * spawn unchanged and whatever the OS does is what is observed.
  * Reachable from test files under `test/` only; no product or operator command imports this module.
  */
-export function runNodeFixture({ entry = null, args = [], spawnOptions = {}, boundMs = BOUND_MS, inspect = null } = {}) {
+export function runNodeFixture({
+  entry = null, args = [], spawnOptions = {}, boundMs = BOUND_MS, inspect = null,
+  cleanupBoundMs = null, groupProbe = null,
+} = {}) {
   const execArgs = entry === null ? [...args] : [entry, ...args];
-  return runOwnedChild(process.execPath, execArgs, { ...ownChildOptions, ...spawnOptions }, boundMs, inspect);
+  const seams = {
+    ...(cleanupBoundMs === null ? {} : { cleanupBoundMs }),
+    ...(groupProbe === null ? {} : { groupProbe }),
+  };
+  return runOwnedChild(process.execPath, execArgs, { ...ownChildOptions, ...spawnOptions }, boundMs, inspect, seams);
 }

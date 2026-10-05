@@ -55,8 +55,13 @@ function publishPid(file, pid) {
   renameSync(temporary, file);
 }
 
-/** One real descendant that keeps running until it is stopped, and does nothing observable. */
-const IDLE_DESCENDANT = 'setInterval(() => {}, 1000)';
+/**
+ * One real descendant that does nothing observable until it is stopped, and bounds itself: the timer
+ * below is the only thing keeping it alive, so it exits on its own after ten seconds even if every stop
+ * and every teardown failed. A fixture that could outlive an interrupted suite would break the rule
+ * stated for the stall mode.
+ */
+const IDLE_DESCENDANT = 'setTimeout(() => {}, 10000)';
 /** One real descendant that writes to the stderr it inherited every 10 ms for 1.5 s, then exits. */
 const CHATTER_DESCENDANT = "const t = setInterval(() => process.stderr.write('x'.repeat(64) + '\\n'), 10);"
   + ' setTimeout(() => clearInterval(t), 1500)';

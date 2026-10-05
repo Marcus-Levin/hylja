@@ -28,6 +28,7 @@ import {
 } from './support/run-node-subprocess.mjs';
 
 const FIXTURE = fileURLToPath(new URL('./support/run-node-subprocess-fixture.mjs', import.meta.url));
+const INTERRUPT_HARNESS = fileURLToPath(new URL('./support/run-node-subprocess-interrupt-harness.mjs', import.meta.url));
 const FAILING_CONTROL = fileURLToPath(
   new URL('./support/run-node-subprocess-failing-control.test.mjs', import.meta.url),
 );
@@ -206,6 +207,53 @@ test('a run that exits normally leaves no running descendant behind either', { t
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('a group member that survives the cleanup bound after a normal exit is a fixed failure, never the exit code',
+  { timeout: TEST_TIMEOUT_MS }, async () => {
+    // The probe says the group never empties, standing in for a member the OS would not release inside
+    // the bound. The child itself really runs and really exits zero, so the old path would report that
+    // zero as a success.
+    const run = await runNodeFixture({
+      entry: FIXTURE, args: [], cleanupBoundMs: 300, groupProbe: () => true,
+    });
+    assert.equal(run.transportFailure, true, 'an unconfirmed cleanup is the fixed failure');
+    assert.equal(run.code === null, true, 'the real exit code is not reported as if cleanup had succeeded');
+    assert.equal(run.signal === null, true, 'no signal is reported either');
+    assert.equal(run.stalled, false, 'it was not a stall');
+    assert.equal(run.stdout === '' && run.stderr === '', true, 'no captured text accompanies an unconfirmed cleanup');
+  });
+
+for (const how of ['sigint', 'sigterm', 'exit']) {
+  test(`an interrupted runner (${how}) takes down the process group the helper owns`,
+    { timeout: TEST_TIMEOUT_MS }, async () => {
+      const directory = mkdtempSync(join(tmpdir(), 'hylja-run-node-'));
+      const file = join(directory, 'descendant.pid');
+      let pid = null;
+      try {
+        const harness = spawn(process.execPath, [INTERRUPT_HARNESS, how === 'exit' ? 'exit' : 'wait', file],
+          { cwd: REPO_ROOT, stdio: 'ignore' });
+        const closed = new Promise((resolve) => { harness.on('close', (code, signal) => { resolve({ code, signal }); }); });
+        for (let attempt = 0; attempt < 600 && publishedPid(file) === null; attempt += 1) await sleep(10);
+        pid = publishedPid(file);
+        const aliveBefore = pid !== null && isRunning(pid);
+        if (how !== 'exit') harness.kill(how === 'sigint' ? 'SIGINT' : 'SIGTERM');
+        const ended = await closed;
+        let aliveAfter = pid !== null && isRunning(pid);
+        for (let attempt = 0; attempt < 200 && aliveAfter; attempt += 1) {
+          await sleep(10);
+          aliveAfter = isRunning(pid);
+        }
+        assert.equal(aliveBefore, true, 'the descendant was really running before the interruption');
+        assert.equal(aliveAfter, false, 'the interrupted runner left no running descendant of its owned group');
+        if (how === 'exit') assert.equal(ended.code, 0, 'a normal exit keeps its own code');
+        else assert.equal(ended.signal, how === 'sigint' ? 'SIGINT' : 'SIGTERM',
+          'the default behaviour of the signal is re-raised, so the runner still dies of it');
+      } finally {
+        reap(pid);
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+}
 
 test('a failed run stops retaining output at once, even while a process out of its reach keeps writing',
   { timeout: TEST_TIMEOUT_MS }, async () => {
