@@ -72,7 +72,7 @@ function keyBytes(fill) { return new Uint8Array(MAPPING_AEAD_LIMITS.keyBytes).fi
  * only to be sealed; nothing here retains it, and the scenario holds ciphertext plus non-secret
  * metadata.
  */
-function buildScenario({ scope = SCOPE, keyFill = 0x11 } = {}) {
+function buildScenario({ scope = SCOPE, keyFill = 0x11, activate = true } = {}) {
   const hmacKey = keyBytes(0x44);
   const derived = deriveScopedEntityReference({ scope: 'SESSION', tenantId: scope.tenantId,
     projectId: scope.projectId, sessionId: scope.sessionId, entityId: ENTITY_ID,
@@ -84,13 +84,20 @@ function buildScenario({ scope = SCOPE, keyFill = 0x11 } = {}) {
   const inserted = registry.insert({ version: 1, mappingRef, scope: { ...scope }, expiresAt },
     { now: T0 });
   assert.equal(inserted.state, 'INSERTED');
-  const activated = registry.transition({ version: 1, mappingRef, scope: { ...scope },
-    expectedRevision: 1, action: 'ACTIVATE' }, { now: T0 + 1_500 });
-  assert.equal(activated.state, 'CHANGED');
-  assert.equal(activated.metadata.revision, 2);
-  const seal = (revision) => sealMappingPayload({ scope: aadScope(scope, revision),
+  // `activate: false` leaves the real record at `CREATED`: the shipped registry still calls that
+  // live and reports it as the current record, so it is the one genuine in-bound `FOUND` answer
+  // whose metadata is not `ACTIVE`.
+  let revision = 1;
+  if (activate) {
+    const activated = registry.transition({ version: 1, mappingRef, scope: { ...scope },
+      expectedRevision: 1, action: 'ACTIVATE' }, { now: T0 + 1_500 });
+    assert.equal(activated.state, 'CHANGED');
+    assert.equal(activated.metadata.revision, 2);
+    revision = 2;
+  }
+  const seal = (at) => sealMappingPayload({ scope: aadScope(scope, at),
     plaintext: ORIGINAL_BYTES, key: keyBytes(keyFill) });
-  const sealed = seal(2);
+  const sealed = seal(revision);
   assert.equal(sealed.status, 'SEALED');
   return { registry, mappingRef, scope: Object.freeze({ ...scope }), expiresAt,
     envelope: sealed.envelope, seal };
@@ -240,7 +247,7 @@ function createHost(options = {}) {
     mappingRef: scenario.mappingRef,
     scope: { ...scenario.scope },
     entityId: ENTITY_ID,
-    registry: scenario.registry,
+    registry: options.registry ?? scenario.registry,
     audit: { ledger, context: auditContext,
       components: [{ id: 'CLASSIFICATION_POLICY', version: '1' },
         { id: 'AUTHORIZATION_POLICY', version: '1' }] },
@@ -1230,3 +1237,153 @@ test('an accepted run records no denial, and a real BLOCK records none either', 
   assert.equal(blocked.counters.material, 0);
   assert.equal(blocked.backend.state.calls, 0);
 });
+
+/* ---------- 18. Every append is bound to this call's own stream ---------- */
+
+/**
+ * A genuine tenant-B substrate: the shipped ledger over the foreign tenant/project, and a trusted
+ * context over that same foreign scope with this call's actor and its own keys. Nothing here mocks
+ * the append - `appendAuditEvent` really records into this stream, which is precisely why the
+ * executor has to refuse to hand it a decision it did not establish inside tenant B.
+ */
+function foreignSubstrate() {
+  return { ledger: createInMemoryAuditLedger({ tenantId: FOREIGN_SCOPE.tenantId,
+    projectId: FOREIGN_SCOPE.projectId }),
+    auditContext: { version: AUDIT_SCHEMA_VERSION,
+      scope: { tenantId: FOREIGN_SCOPE.tenantId, projectId: FOREIGN_SCOPE.projectId },
+      actor: { principalId: WORKLOAD.principalId, workloadId: WORKLOAD.workloadId },
+      integrationId: 'integration-bound-use-fixture.invalid',
+      actorBinding: 'AUTHENTICATED_UPSTREAM', pseudonymKey: keyBytes(0x33), chainKey: keyBytes(0x77) } };
+}
+
+test('an audit substrate outside the bound scope records neither decision on either path', async () => {
+  // The accepted path is the control: the same host with its own stream records exactly two ALLOWED
+  // decisions, loads the material once and spends the private resource once.
+  const control = createHost();
+  assert.equal((await createBoundMappingUse(control.host).use()).code, 'USED');
+  assert.equal(control.ledger.entries.length, 2);
+  assert.equal(control.counters.material, 1);
+  assert.equal(control.backend.state.calls, 1);
+
+  // The genuine tenant-A host - tenant-A registry, authority, scope and actor - with tenant B's
+  // genuine ledger and a matching tenant-B context. Every earlier guard passes, so both appends
+  // would really commit and the pseudonyms in them would be tenant B's.
+  const cases = [
+    ['the ALLOWED path', {}],
+    ['the DENIED path', { grant: undefined }]];
+  for (const [name, grantOptions] of cases) {
+    const backend = createBackend();
+    const substrate = foreignSubstrate();
+    const built = createHost({ backend, ...grantOptions, ...substrate });
+    const refused = await createBoundMappingUse(built.host).use();
+    assertFixedShape(refused);
+    assert.equal(refused.code, 'WITHHELD', name);
+    // Zero entries, zero material and zero backend calls: the mismatch is caught before the guarded
+    // effect exists, and not one decision of this call lands in another tenant's stream.
+    assert.equal(built.ledger.entries.length, 0, name);
+    assert.equal(built.counters.material, 0, name);
+    assert.equal(backend.state.calls, 0, name);
+    assert.equal(cleared(backend.state.retained), false, name);
+    assert.equal(JSON.stringify(built.ledger.entries).includes(FOREIGN_SCOPE.tenantId), false, name);
+  }
+
+  // The foreign stream is genuinely usable, so the zero entries above are this executor's congruence
+  // refusal and not a ledger that could not have committed one.
+  const probe = foreignSubstrate();
+  const recorded = appendAuditEvent(probe.ledger, { version: AUDIT_SCHEMA_VERSION,
+    kind: 'AUTHORIZATION_ATTEMPT', operation: 'USE', outcome: 'DENIED',
+    reason: 'RESOLUTION_DENIED', occurredAt: OCCURRED_AT,
+    bundle: { policy: { ...KNOWN_POLICY_BUNDLE, digest: digestPolicyBundle(control.bundle) },
+      components: [{ id: 'AUTHORIZATION_POLICY', version: '1' }] },
+    correlationRef: control.scenario.mappingRef, entityRef: control.scenario.mappingRef },
+    probe.auditContext);
+  assert.equal(recorded.status, 'RECORDED');
+  assert.deepEqual(probe.ledger.entries[0].event.scope,
+    { tenantId: FOREIGN_SCOPE.tenantId, projectId: FOREIGN_SCOPE.projectId });
+});
+
+/* ---------- 19. Lifecycle evidence needs a validated record in the bound scope ---------- */
+
+/**
+ * The shipped registry, its real scope query and its real lifecycle reducer, answering with a
+ * different record than the one it holds. The read is not mocked - only the metadata the host hands
+ * back is replaced, which is what an unauthenticated host is free to do.
+ */
+function rewrittenRegistry(scenario, rewrite) {
+  const real = scenario.registry;
+  const seen = { last: undefined };
+  return { registry: { version: 1, current(request, clock) {
+    const answer = real.current(request, clock);
+    seen.last = answer.state === 'FOUND' ? rewrite(answer.metadata) : undefined;
+    if (answer.state !== 'FOUND') return answer;
+    return Object.freeze({ version: 1, state: 'FOUND', metadata: seen.last });
+  } }, seen };
+}
+
+test('a record that is not a validated record of this bound reference records no lifecycle denial',
+  async () => {
+    const scenario = buildScenario();
+    const record = scenario.registry.current({ version: 1, mappingRef: scenario.mappingRef,
+      scope: { ...scenario.scope } }, { now: USE_NOW }).metadata;
+
+    // The control on the identical host: the real record, the real substrate, two ALLOWED decisions.
+    const control = createHost({ scenario });
+    assert.equal((await createBoundMappingUse(control.host).use()).code, 'USED');
+    assert.equal(control.ledger.entries.length, 2);
+
+    const cases = [
+      ['no metadata at all', () => null],
+      ['an empty metadata record', () => ({})],
+      ['a record whose own state names no lifecycle', () => ({ ...record, state: 'unknown' })],
+      ['a record in another scope that is still ACTIVE',
+        () => ({ ...record, scope: { ...FOREIGN_SCOPE } })],
+      ['a record in another scope that is not ACTIVE', () => ({ ...record, state: 'REVOKED',
+        scope: { ...FOREIGN_SCOPE } })]];
+    for (const [name, rewrite] of cases) {
+      const backend = createBackend();
+      const tampered = rewrittenRegistry(scenario, rewrite);
+      const built = createHost({ scenario, backend, registry: tampered.registry });
+      const refused = await createBoundMappingUse(built.host).use();
+      assertFixedShape(refused);
+      assert.equal(refused.code, 'WITHHELD', name);
+      // Non-vacuity: the shipped registry really reported `FOUND` and really handed over a record
+      // that is not the bound `ACTIVE` one it holds, so every case is a real answer this call
+      // declined to attribute rather than a read that never got that far.
+      assert.equal(tampered.seen.last !== undefined, true, name);
+      assert.notDeepEqual(tampered.seen.last, record, name);
+      // An unreadable, foreign or malformed record is not evidence about a lifecycle: nothing is
+      // recorded, no sealed read happens and the resource is never reached.
+      assert.equal(built.ledger.entries.length, 0, name);
+      assert.equal(JSON.stringify(built.ledger.entries).includes('LIFECYCLE_DENIED'), false, name);
+      assert.equal(built.counters.material, 0, name);
+      assert.equal(backend.state.calls, 0, name);
+    }
+
+    // A real record in the bound scope that the real registry still calls current, and that is
+    // simply not `ACTIVE`: the lifecycle class is real here and is still recorded.
+    const unactivated = buildScenario({ activate: false });
+    const unactivatedBackend = createBackend();
+    const notActive = createHost({ scenario: unactivated, backend: unactivatedBackend });
+    const found = unactivated.registry.current({ version: 1, mappingRef: unactivated.mappingRef,
+      scope: { ...unactivated.scope } }, { now: USE_NOW });
+    assert.equal(found.state, 'FOUND');
+    assert.equal(found.metadata.state, 'CREATED');
+    assert.equal((await createBoundMappingUse(notActive.host).use()).code, 'WITHHELD');
+    assert.equal(notActive.ledger.entries.length, 1);
+    assertAttributableDenial(notActive, notActive.ledger.entries[0].event, 'LIFECYCLE_DENIED');
+    assert.equal(notActive.counters.material, 0);
+    assert.equal(unactivatedBackend.state.calls, 0);
+
+    // The revoked bound record is the other real lifecycle denial, and it is unaffected.
+    const revoked = buildScenario();
+    const revokedBackend = createBackend();
+    const revokedHost = createHost({ scenario: revoked, backend: revokedBackend });
+    const applied = revoked.registry.transition({ version: 1, mappingRef: revoked.mappingRef,
+      scope: { ...revoked.scope }, expectedRevision: 2, action: 'REVOKE' }, { now: USE_NOW });
+    assert.equal(applied.state, 'CHANGED');
+    assert.equal((await createBoundMappingUse(revokedHost.host).use()).code, 'WITHHELD');
+    assert.equal(revokedHost.ledger.entries.length, 1);
+    assertAttributableDenial(revokedHost, revokedHost.ledger.entries[0].event, 'LIFECYCLE_DENIED');
+    assert.equal(revokedHost.counters.material, 0);
+    assert.equal(revokedBackend.state.calls, 0);
+  });
