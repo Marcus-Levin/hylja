@@ -14,7 +14,7 @@ only shipped inbound end-to-end evidence before this was **test-local**
 ([openai-response-inspection-e2e.md](openai-response-inspection-e2e.md)), which runs a real chain and records
 a capture, but whose trusted boundary, benign fixture claim and sentinel key are wired inside a test file and
 which owns no runtime effect at all. The sibling outbound unit
-([openai-keep-sender.md](openai-keep-sender.md)) is the smallest actual runtime effect owner for a request;
+([openai-text-sender.md](openai-text-sender.md)) is the smallest actual runtime effect owner for a request;
 this is the same discipline on the inbound path.
 
 This module is the smallest inbound runtime effect owner: one call translates, builds the exact private
