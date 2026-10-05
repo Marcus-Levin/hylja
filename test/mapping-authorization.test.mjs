@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   MAPPING_AUTHORIZATION_OPERATIONS, MAPPING_AUTHORIZATION_REASONS,
-  authorizeMappingOperation,
+  authorizeMappingOperation, normalizeMappingGrant,
 } from '../dist/mapping-authorization.js';
 
 const NOW = 1_800_000_000_000;
@@ -489,6 +489,99 @@ test('a null-prototype record is judged on its own data, never on its prototype'
     neutral(ALL.mapping), neutral(ALL.grant), neutral(ALL.clock)), authorized);
   assert.deepEqual(decide((p) => { p.grant = Object.create({ operation: 'EXPORT' }); }),
     denied('INVALID_CONTEXT'));
+});
+
+test('the shared grant normalizer returns an owned copy that later caller mutation cannot reach', () => {
+  const p = parts();
+  const normalized = normalizeMappingGrant(p.grant);
+  // A complete, valid grant round-trips into a structurally identical record that is not the source:
+  // every nested record is a new object of this module's own making, not an alias into the caller's.
+  assert.deepEqual(normalized, ALL.grant);
+  assert.notEqual(normalized, p.grant);
+  assert.notEqual(normalized.principal, p.grant.principal);
+  assert.notEqual(normalized.context, p.grant.context);
+  assert.notEqual(normalized.destination, p.grant.destination);
+  // The copy is settled: a caller that edits every one of its own records afterwards leaves the
+  // snapshot exactly as it was normalized, so a later check reads the value it validated.
+  p.grant.principal.principalId = PRINCIPAL_B;
+  p.grant.principal.workloadId = WORKLOAD_B;
+  p.grant.context.purpose = OTHER_PURPOSE;
+  p.grant.destination.ref = FORGED;
+  p.grant.destination.profileId = OTHER_PROFILE.profileId;
+  p.grant.operation = 'EXPORT';
+  p.grant.expiresAt = NOW;
+  assert.deepEqual(normalized, ALL.grant);
+  // It is the record the seam itself would have built, so it authorizes exactly as the source does.
+  assert.deepEqual(authorizeMappingOperation(p.request, p.host, p.mapping, normalized, p.clock),
+    authorized);
+  // Normalizing the normalized copy again is stable, and the copy's own shape is not an alias.
+  const again = normalizeMappingGrant(normalized);
+  assert.deepEqual(again, normalized);
+  assert.notEqual(again, normalized);
+});
+
+test('the shared grant normalizer refuses every shape outside the one grant schema', () => {
+  const boom = new Error('planted-normalizer-detail.invalid');
+  const grant = ALL.grant;
+  const without = (key) => { const copy = { ...grant }; delete copy[key]; return copy; };
+  const nested = (key, value) => ({ ...grant, [key]: value });
+  const refused = [
+    ['absent', undefined],
+    ['null', null],
+    ['text', 'approved'],
+    ['a number', 7],
+    ['an array', []],
+    ['an empty record', {}],
+    ['a wrong version', { ...grant, version: 2 }],
+    ['no mappingRef', without('mappingRef')],
+    ['no revision', without('revision')],
+    ['a revision below one', { ...grant, revision: 0 }],
+    ['a fractional revision', { ...grant, revision: 4.5 }],
+    ['no principal', without('principal')],
+    ['a principal with no workloadId', nested('principal', { principalId: PRINCIPAL_A })],
+    ['an extra principal key', nested('principal', { ...grant.principal, note: 'x' })],
+    ['no context', without('context')],
+    ['a context with no purpose', nested('context',
+      { tenantId: TENANT_A, projectId: PROJECT_A, sessionId: SESSION_A })],
+    ['an oversized tenantId', nested('context', { ...grant.context, tenantId: 't'.repeat(257) })],
+    ['no destination', without('destination')],
+    ['a destination with no profileId', nested('destination',
+      { kind: LOCAL_SINK.kind, ref: LOCAL_SINK.ref, trustZone: LOCAL_SINK.trustZone })],
+    ['an oversized destination ref', nested('destination',
+      { ...grant.destination, ref: 'r'.repeat(2049) })],
+    ['no operation', without('operation')],
+    ['an operation outside the vocabulary', { ...grant, operation: 'PUBLISH' }],
+    ['no expiry', without('expiresAt')],
+    ['an expiry at zero', { ...grant, expiresAt: 0 }],
+    ['an unsafe expiry', { ...grant, expiresAt: Number.MAX_SAFE_INTEGER + 1 }],
+    ['an unknown key', { ...grant, approved: true }],
+    ['an oversized mappingRef', { ...grant, mappingRef: 'm'.repeat(257) }],
+    ['a padded mappingRef', { ...grant, mappingRef: ` ${grant.mappingRef}` }],
+    ['a symbol key', { ...grant, [Symbol('note')]: 'x' }],
+    ['a hidden field', Object.defineProperty({ ...grant }, 'revision',
+      { enumerable: false, value: 4, configurable: true })],
+    ['an accessor', Object.defineProperty({ ...grant }, 'expiresAt',
+      { enumerable: true, get() { throw boom; } })],
+    ['an ownKeys trap', new Proxy({ ...grant }, { ownKeys() { throw boom; } })],
+    ['a descriptor trap', new Proxy({ ...grant }, {
+      getOwnPropertyDescriptor() { throw boom; } })],
+    ['a getPrototypeOf trap', new Proxy({ ...grant }, { getPrototypeOf() { throw boom; } })],
+    ['an inherited prototype', Object.assign(Object.create({ operation: 'USE' }), grant)],
+    ['too many keys', { ...grant, a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10,
+      k: 11, l: 12, m: 13, n: 14, o: 15, p: 16, q: 17, r: 18, s: 19, t: 20, u: 21, v: 22,
+      w: 23, x: 24, y: 25, z: 26 }],
+  ];
+  for (const [label, value] of refused) {
+    // Every one of these, including the four that raise while the value is being reflected on,
+    // answers with the absent marker and never lets an exception - or its text - reach the caller.
+    let answer;
+    assert.doesNotThrow(() => { answer = normalizeMappingGrant(value); }, label);
+    assert.equal(answer, null, label);
+  }
+  // A refused shape is refused as itself, not as an absent grant: the seam still names it malformed.
+  const p = parts();
+  assert.deepEqual(authorizeMappingOperation(p.request, p.host, p.mapping,
+    { ...grant, note: 'x' }, p.clock), denied('INVALID_CONTEXT'));
 });
 
 test('the seam is pure: inputs are not mutated and the same inputs give the same decision', () => {

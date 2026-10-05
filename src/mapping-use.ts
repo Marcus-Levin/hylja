@@ -132,7 +132,7 @@ import { AUDIT_BUNDLE_COMPONENTS, appendAuditEvent, gateHighRiskEffect } from '.
 import type { AuditBundleComponent, AuditLedger, AuditReasonCode, AuditTrustedContext } from './audit-ledger.js';
 import { decidePolicy } from './policy.js';
 import type { PolicyBundle, PolicyDecision } from './policy.js';
-import { authorizeMappingOperation, MAPPING_AUTHORIZATION_OPERATIONS } from './mapping-authorization.js';
+import { authorizeMappingOperation, normalizeMappingGrant } from './mapping-authorization.js';
 import type { TrustedMappingGrant, WorkloadSubject } from './mapping-authorization.js';
 import { MAPPING_METADATA_REASONS } from './mapping-metadata-registry.js';
 import type { MappingMetadataCurrentResult, MappingMetadataRecord,
@@ -346,12 +346,6 @@ function text(value: unknown, limit = REF_LIMIT): string {
     /[\u0000-\u001f\u007f]/u.test(value)) fail('INVALID_AUTHORITY');
   return value;
 }
-/** An authorization revision: a positive safe integer, the floor the authorization seam itself sets. */
-function revision(value: unknown): number {
-  const parsed = instant(value);
-  if (parsed < 1) fail('INVALID_AUTHORITY');
-  return parsed;
-}
 function member<T extends string>(value: unknown, choices: readonly T[],
   code: Denial = 'INVALID_AUTHORITY'): T {
   if (typeof value !== 'string' || !choices.includes(value as T)) fail(code);
@@ -378,35 +372,6 @@ function destination(value: unknown): Destination {
   return { kind: text(v.kind, AUTH_STRING_LIMIT), ref: text(v.ref),
     trustZone: text(v.trustZone, AUTH_STRING_LIMIT),
     profileId: text(v.profileId, AUTH_STRING_LIMIT) };
-}
-/**
- * A defensive, owned copy of the host's grant, read as **the authorization seam's own private
- * `parseGrant` reads it** and not as a subset of it: exactly its eight fields, none optional, its
- * own `version` 1, a positive safe-integer revision and expiry, its own operation vocabulary, and its
- * three nested records each read by the same bounded own-key snapshot the observation itself uses.
- *
- * This runs on **every** observation, before anything else is asked of the answer, because this is
- * the only place a malformed grant can be told apart from a genuine one. A cast would let a grant
- * that names no valid version, revision, operation or instant reach the lifecycle guard, which then
- * recorded a `LIFECYCLE_DENIED` about a record on the strength of authority this call never proved it
- * held. The semantic check itself stays with `authorizeMappingOperation`: this reader decides shape
- * only, refuses without evidence, and never moves the seam earlier in the call.
- *
- * An omitted grant, and a grant carried as the absent value, are both handed on as absent so the
- * seam owns that `NO_GRANT` row; a grant that is present and structurally wrong is this boundary's
- * `WITHHELD`, with no evidence, no actor and no lifecycle named.
- */
-function grant(value: unknown): TrustedMappingGrant {
-  const v = fields(value, ['version', 'mappingRef', 'revision', 'principal', 'context',
-    'destination', 'operation', 'expiresAt']);
-  if (v.version !== 1) fail('INVALID_AUTHORITY');
-  // The nested identities are normalized here too, not carried by reference: the authorization seam
-  // reads them later, and a grant whose inner objects stayed host-owned would be a host property read
-  // inside the sealed effect segment.
-  return Object.freeze({ version: 1, mappingRef: text(v.mappingRef, AUTH_STRING_LIMIT),
-    revision: revision(v.revision), principal: subject(v.principal), context: context(v.context),
-    destination: destination(v.destination),
-    operation: member(v.operation, MAPPING_AUTHORIZATION_OPERATIONS), expiresAt: instant(v.expiresAt) });
 }
 function equal(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
@@ -664,8 +629,18 @@ async function observe(captured: Captured): Promise<Observation> {
   if (!KEY_VERSION.test(keyVersion)) fail('INVALID_AUTHORITY');
   // An omitted grant, and a grant carried as the absent value, are both handed on as absent: the
   // authorization seam owns that row and denies it as `NO_GRANT`. A grant that is present but
-  // structurally wrong is still this boundary's refusal - `WITHHELD`, with no evidence and no actor.
-  const supplied = Object.hasOwn(v, 'grant') && v.grant !== undefined ? grant(v.grant) : undefined;
+  // structurally wrong is still this boundary's refusal - `WITHHELD`, with no evidence, no actor and
+  // no lifecycle named - and it is the seam's own exported normalizer, `normalizeMappingGrant`, that
+  // decides "structurally wrong". This module therefore keeps no second copy of the grant schema to
+  // drift out of step with the seam's: one reader, eight mandatory fields, one set of bounds, and
+  // every nested principal, context and destination owned by the record it hands back, so nothing
+  // host-owned is read again inside the sealed effect segment.
+  let supplied: TrustedMappingGrant | undefined;
+  if (Object.hasOwn(v, 'grant') && v.grant !== undefined) {
+    const normalized = normalizeMappingGrant(v.grant);
+    if (normalized === null) fail('INVALID_AUTHORITY');
+    supplied = normalized;
+  }
   return Object.freeze({ now: instant(v.now), subject: subject(v.subject), context: observed,
     destination: destination(v.destination), grant: supplied, keyVersion });
 }
