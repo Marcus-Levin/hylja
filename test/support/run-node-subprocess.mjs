@@ -3,7 +3,20 @@
  *
  * It runs one Node entry point in a real child process with the same executable, working directory and
  * stdio discipline the operator uses, and it returns what actually happened: the exit code, the signal,
- * whether the invocation finished inside its bound, and the two captured streams.
+ * whether the invocation finished inside its bound, whether the RUN ITSELF failed, and the two captured
+ * streams. There is ONE private lifecycle helper behind all of it, so every entry point is spawned,
+ * bounded, stopped and settled the same way.
+ *
+ * A failure to RUN is never an exception and never a diagnostic. A synchronous spawn exception, an
+ * asynchronous `error` from the spawn itself, a child whose required pipes are missing and an error on
+ * one of those pipes all settle exactly once with the same fixed restrictive outcome: no exit code, no
+ * signal, no captured text, and `transportFailure` set. Nothing from the failure - no native message, no
+ * code, no stack, no checkout path - reaches the caller, and only the one child this helper spawned is
+ * ever signalled, with a bounded stop whose unconfirmed outcome is still the fixed failure.
+ *
+ * An ordinary NON-ZERO exit is not a transport failure. The exit code, the signal and both captured
+ * streams survive it, which is what lets the confidentiality evidence read a real failing TAP report
+ * from a real `node --test` run instead of inferring one.
  *
  * The captured streams are returned as opaque strings and are only ever to be compared through BOOLEANS.
  * Nothing here puts them into an assertion message, an error, a diagnostic or a log, because a captured
@@ -19,33 +32,121 @@ export const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 export const BOUND_MS = 60_000;
 /** The bound is a deadline, not a kill policy for valid work: only a stalled owned child is stopped. */
 export const TEST_TIMEOUT_MS = 180_000;
+/**
+ * How long an owned child may take to actually go away after it has been stopped. A stop this helper
+ * cannot confirm within it settles as the fixed failure anyway: an unconfirmed stop is never success.
+ */
+const CLEANUP_BOUND_MS = 5_000;
+
+/** The one fixed restrictive outcome. Fixed, non-echoing, and carrying nothing from the failure. */
+const FIXED_FAILURE = Object.freeze({
+  code: null, signal: null, stalled: false, transportFailure: true, stdout: '', stderr: '',
+});
+
+/**
+ * The one lifecycle helper: spawn one owned child, collect its two streams inside a bound, stop only
+ * that child, and settle exactly once. `spawnOptions` is passed to the native spawn unchanged, so a
+ * fixture can hand the native call a genuinely bad option and observe the real failure it raises.
+ */
+function runOwnedChild(execPath, execArgs, spawnOptions, boundMs) {
+  return new Promise((resolve) => {
+    const stdout = [];
+    const stderr = [];
+    /** Every timer this invocation owns. None of them outlives the outcome they exist for. */
+    const owned = new Set();
+    let child = null;
+    let settled = false;
+    let failing = false;
+    let stalled = false;
+
+    const clearOwnedTimers = () => { for (const timer of owned) clearTimeout(timer); owned.clear(); };
+
+    const own = (fn, ms) => { const timer = setTimeout(fn, ms); owned.add(timer); return timer; };
+
+    const settle = (outcome) => {
+      if (settled) return;
+      settled = true;
+      clearOwnedTimers();
+      resolve(outcome);
+    };
+
+    /** Bounded stop of the ONE child this invocation spawned. No other process is ever signalled. */
+    const stopOwnedChild = () => {
+      if (child === null || typeof child.kill !== 'function') return;
+      try { child.kill('SIGKILL'); } catch { /* already gone: its own `close` still decides */ }
+    };
+
+    /**
+     * The run itself failed. Stop the owned child, keep nothing the failure produced, and settle with the
+     * one fixed outcome - immediately if the child really closes, and at the cleanup bound if it does
+     * not, so an unconfirmed stop can never leave this promise pending or read as success.
+     */
+    const failTheRun = () => {
+      if (settled || failing) return;
+      failing = true;
+      clearOwnedTimers();
+      stdout.length = 0;
+      stderr.length = 0;
+      stopOwnedChild();
+      own(() => settle(FIXED_FAILURE), CLEANUP_BOUND_MS);
+    };
+
+    let spawned;
+    try {
+      spawned = spawn(execPath, execArgs, spawnOptions);
+    } catch {
+      // A synchronous spawn exception: the native call refused the arguments and no child exists, so
+      // there is nothing to stop and nothing to capture. The fixed outcome is the whole report.
+      settle(FIXED_FAILURE);
+      return;
+    }
+    child = spawned;
+
+    // The two streams are how the outcome is observed, so a child without them cannot be observed.
+    if (child.stdout === null || child.stdout === undefined || child.stderr === null || child.stderr === undefined) {
+      failTheRun();
+      return;
+    }
+    child.stdout.on('data', (chunk) => { stdout.push(chunk); });
+    child.stderr.on('data', (chunk) => { stderr.push(chunk); });
+    child.on('error', failTheRun);
+    child.stdout.on('error', failTheRun);
+    child.stderr.on('error', failTheRun);
+    child.on('close', (code, signal) => {
+      if (failing) { settle(FIXED_FAILURE); return; }
+      if (settled) return;
+      settle({
+        code,
+        signal,
+        stalled,
+        transportFailure: false,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      });
+    });
+    // The bound is a deadline on this invocation. It stops only the owned child, and whether the child
+    // really goes away is decided by its own `close`, with this bound as the fallback.
+    own(() => {
+      stalled = true;
+      stopOwnedChild();
+      own(() => settle({
+        code: null, signal: null, stalled: true, transportFailure: false,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      }), CLEANUP_BOUND_MS);
+    }, boundMs);
+  });
+}
+
+/** The stdio discipline every invocation of this helper uses, so both streams are observable. */
+const ownChildOptions = Object.freeze({ cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
 
 /**
  * Run one entry point in a real child process and resolve once it is gone. The child's own stdout and
  * stderr are collected in memory and handed back untouched; they are never decoded into a report.
  */
 export function runNode(entry, args) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [entry, ...args], {
-      cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const stdout = [];
-    const stderr = [];
-    let stalled = false;
-    child.stdout.on('data', (chunk) => { stdout.push(chunk); });
-    child.stderr.on('data', (chunk) => { stderr.push(chunk); });
-    const timer = setTimeout(() => { stalled = true; child.kill('SIGKILL'); }, BOUND_MS);
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      resolve({
-        code,
-        signal,
-        stalled,
-        stdout: Buffer.concat(stdout).toString('utf8'),
-        stderr: Buffer.concat(stderr).toString('utf8'),
-      });
-    });
-  });
+  return runOwnedChild(process.execPath, [entry, ...args], { ...ownChildOptions }, BOUND_MS);
 }
 
 /**
@@ -61,25 +162,19 @@ export function runNode(entry, args) {
 export function runNodeTest(entry) {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', entry], {
-      cwd: REPO_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const stdout = [];
-    const stderr = [];
-    let stalled = false;
-    child.stdout.on('data', (chunk) => { stdout.push(chunk); });
-    child.stderr.on('data', (chunk) => { stderr.push(chunk); });
-    const timer = setTimeout(() => { stalled = true; child.kill('SIGKILL'); }, BOUND_MS);
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      resolve({
-        code,
-        signal,
-        stalled,
-        stdout: Buffer.concat(stdout).toString('utf8'),
-        stderr: Buffer.concat(stderr).toString('utf8'),
-      });
-    });
-  });
+  return runOwnedChild(process.execPath, ['--test', '--test-reporter=tap', entry],
+    { ...ownChildOptions, env }, BOUND_MS);
+}
+
+/**
+ * TEST-ONLY: the same one private lifecycle helper, with the native spawn options and the bound a fixture
+ * needs in order to reach a real failure - a spawn the native call refuses synchronously, a spawn that
+ * reports an error asynchronously, or a child whose required pipes are missing. There is no simulation
+ * here: the option is handed to the native spawn unchanged and whatever the OS does is what is observed.
+ * Reachable from test files under `test/` only; no product or operator command imports this module.
+ */
+export function runNodeFixture({ entry = null, args = [], spawnOptions = {}, boundMs = BOUND_MS } = {}) {
+  const execPath = entry === null ? process.execPath : entry;
+  const execArgs = entry === null ? [...args] : [entry, ...args];
+  return runOwnedChild(execPath, execArgs, { ...ownChildOptions, ...spawnOptions }, boundMs);
 }

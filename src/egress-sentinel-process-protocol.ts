@@ -176,17 +176,41 @@ export interface SentinelProcessKnownRegistration {
   readonly key: Uint8Array;
   readonly entries: readonly SentinelProcessKnownEntry[];
 }
-export interface SentinelProcessSnapshot {
+/**
+ * Everything a reply is validated against, and nothing else: the ids, labels and digest this parent
+ * computed for the request it actually sent. It holds no payload byte, no key and no registration
+ * value, so anything that only has to check a reply can be handed this instead of the whole snapshot.
+ */
+export interface SentinelReplyBinding {
   readonly requestId: string;
   readonly scope: SentinelProcessScope;
   readonly observed: SentinelProcessDestination;
   readonly authorized: SentinelProcessDestination;
+  readonly payloadDigest: string;
+  readonly registeredRefs: readonly string[];
+}
+
+export interface SentinelProcessSnapshot extends SentinelReplyBinding {
   /** A private copy of the caller's bytes. The caller holds no reference to it. */
   readonly payload: Uint8Array;
-  readonly payloadDigest: string;
   /** `null` only when the caller passed an explicit `null`. */
   readonly known: SentinelProcessKnownRegistration | null;
-  readonly registeredRefs: readonly string[];
+}
+
+/**
+ * Project the binding out of a snapshot. Pure: the projected object shares the snapshot's immutable
+ * labels and digest and carries no byte array at all, so the caller's remaining payload and key copies
+ * can be dropped (and overwritten by their owners) without affecting anything a reply needs.
+ */
+export function projectSentinelReplyBinding(snapshot: SentinelProcessSnapshot): SentinelReplyBinding {
+  return Object.freeze({
+    requestId: snapshot.requestId,
+    scope: snapshot.scope,
+    observed: snapshot.observed,
+    authorized: snapshot.authorized,
+    payloadDigest: snapshot.payloadDigest,
+    registeredRefs: snapshot.registeredRefs,
+  });
 }
 
 function isLabel(value: unknown, maxChars: number): value is string {
@@ -751,7 +775,7 @@ export function encodeResponseFrame(reply: SentinelProcessReply): Uint8Array | n
  */
 export function decodeResponseFrame(
   bytes: Uint8Array,
-  snapshot: SentinelProcessSnapshot,
+  binding: SentinelReplyBinding,
 ): SentinelProtocolResult<SentinelProcessResponse, SentinelReplyFailure> {
   const limits = EGRESS_SENTINEL_PROCESS_LIMITS;
   if (!(bytes instanceof Uint8Array) || bytes.byteLength > limits.maxResponseBytes) return failed('REPLY_TOO_LARGE');
@@ -774,10 +798,10 @@ export function decodeResponseFrame(
     observedProfile === null || authorizedId === null || authorizedProfile === null || payloadDigest === null ||
     (decision !== DECISION_ALLOW && decision !== DECISION_BLOCK) ||
     count > limits.maxReasons ||
-    requestId !== snapshot.requestId || tenantRef !== snapshot.scope.tenantRef ||
-    projectRef !== snapshot.scope.projectRef || observedId !== snapshot.observed.id ||
-    observedProfile !== snapshot.observed.profileDigest || authorizedId !== snapshot.authorized.id ||
-    authorizedProfile !== snapshot.authorized.profileDigest || payloadDigest !== snapshot.payloadDigest) {
+    requestId !== binding.requestId || tenantRef !== binding.scope.tenantRef ||
+    projectRef !== binding.scope.projectRef || observedId !== binding.observed.id ||
+    observedProfile !== binding.observed.profileDigest || authorizedId !== binding.authorized.id ||
+    authorizedProfile !== binding.authorized.profileDigest || payloadDigest !== binding.payloadDigest) {
     return failed('REPLY_BINDING_MISMATCH');
   }
   const reasonCodes: string[] = [];
@@ -787,7 +811,7 @@ export function decodeResponseFrame(
     reasonCodes.push(reason);
   }
   const rules: string[] = [];
-  const allowed = new Set(snapshot.registeredRefs);
+  const allowed = new Set(binding.registeredRefs);
   for (;;) {
     const step = reader.step();
     if (step.kind === 'done') break;

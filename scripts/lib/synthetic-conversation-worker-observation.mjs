@@ -11,27 +11,47 @@
  *
  * What it does. It captures the native `spawn` BEFORE the module graph that binds it is linked, forwards
  * every call to it with its own arguments, and returns the ACTUAL `ChildProcess` the native call
- * produced: untouched, unwrapped, unproxied, with the same streams and the same stdio. The observation is
- * purely additive - the only thing added to the real process is this module's own read-only listeners
- * on that child's own `stdout` and `close` events, and the real runner keeps receiving all of them.
+ * produced: untouched, unwrapped, unproxied, with the same streams and the same stdio. On top of that it
+ * installs TWO read-only taps, each a pass-through that keeps its own receiver, its own arguments, its
+ * own callbacks and its own return value:
  *
- * What it records. Per worker child, in spawn order: that it reported `close`, whether it exited with
- * code zero, whether a signal closed it, whether its whole stdout was exactly one complete RESPONSE
- * decision frame of the fixed protocol, the fixed decision enum inside that frame, and whether the
- * frame carried the known-original reason code and named the ref THIS fixture registered. Nothing else
- * is read: no payload byte, no original, no key, no reason text and no rule text is retained, decoded
- * into a string, logged or printed. Reason and rule fields are compared against this parent's own fixed
- * literals and then dropped, and the accumulated reply bytes are dropped at `close`. A child that prints
- * anything this reader cannot parse is recorded as "not one complete decision frame", never as a
- * decision, and an exit code of zero alone admits nothing.
+ * 1. the outgoing request frame, on the actual `write` and `end` methods of the child's own `stdin`, so
+ *    the binding a reply will be checked against comes from the frame the REAL runner really wrote;
+ * 2. the incoming reply bytes, on the child's own `stdout` event delivery, so the reply can be validated
+ *    instead of partially interpreted.
+ *
+ * What it validates, and with what. Both directions are decided by the SAME authoritative protocol the
+ * accepted runner uses ([egress-sentinel-process-protocol.ts](../../src/egress-sentinel-process-protocol.ts)):
+ * `decodeRequestFrame` on the outgoing frame, `projectSentinelReplyBinding` on the decoded request, then
+ * `classifyReplyFraming` and `decodeResponseFrame` on the child's whole stdout. This module keeps NO
+ * decoder of its own. A child is counted as a complete frame ONLY when the request frame decoded, the
+ * binding exists, the framing is exactly one complete response frame and the authoritative decoder
+ * accepted it - which is also what decides the known-original reason and whether every reported ref is
+ * one this parent's own request frame registered. An unknown reason code, a foreign binding, a ref this
+ * parent never registered, more rules than the protocol bounds allow, a truncated, duplicated or trailing
+ * reply, a missing binding, a child that did not exit zero, a child that never reported `close` and a
+ * child that reported a diagnostic overflow are therefore all "no decision", never a block.
+ *
+ * Privacy. No payload byte, no key, no original and no child reply text is retained, logged or printed.
+ * Reason codes are compared against this parent's own fixed literals and dropped; refs are compared
+ * against the label this fixture registered and dropped. The temporary copies the decoder allocates for
+ * the payload and the registration key are overwritten with zeroes here and the reference is dropped, and
+ * the accumulated reply bytes are dropped at `close`. That is a bounded reference drop and a typed-array
+ * overwrite: this module creates no string of a protected value itself, and it claims no string erasure
+ * and no heap or RSS erasure - the authoritative decoder materialises registration values as strings
+ * inside its own temporary snapshot, which this module then drops.
  *
  * What it is NOT. It is not an enforcement boundary, a second worker, a control or a policy authority.
  * It sends no byte, decides nothing, changes no result and can release nothing: it observes the real
- * children the real runner spawns, over obviously synthetic, non-routable fixtures. The fault hook at
- * the bottom is TEST/DEMO-ONLY and is reachable from fixture code only; the operator command has no
- * argument, environment variable or file that can arm it.
+ * children the real runner spawns, over obviously synthetic, non-routable fixtures. The fault hooks at the
+ * bottom are TEST/DEMO-ONLY and are reachable from fixture code only; the operator command has no
+ * argument, environment variable or file that can arm them.
  */
 import { createRequire } from 'node:module';
+import {
+  EGRESS_SENTINEL_PROCESS_LIMITS, classifyReplyFraming, decodeRequestFrame, decodeResponseFrame,
+  encodeResponseFrame, projectSentinelReplyBinding,
+} from '../../dist/egress-sentinel-process-protocol.js';
 
 /**
  * The native module object, obtained WITHOUT importing `node:child_process` as an ES module. ESM links a
@@ -46,107 +66,166 @@ const NATIVE_SPAWN = nativeModule.spawn;
 if (typeof NATIVE_SPAWN !== 'function') throw new Error('the native child-process spawn is unavailable');
 let installed = false;
 
-/* ---------- The fixed RESPONSE frame, read only as far as the decision ---------- */
-
-const encoder = new TextEncoder();
 /** The fixed worker this repository ships next to the runner. No other child is observed. */
 const WORKER_SUFFIX = 'egress-sentinel-process-worker.js';
-const MAGIC = Uint8Array.from([0x48, 0x53, 0x50, 0x50]); // "HSPP"
-const KIND_RESPONSE = 0x02;
-const NEWLINE = 0x0a;
-const HEADER_BYTES = 9;
-const FIELD_HEADER_BYTES = 5;
-const DECISION_ALLOW = 0x01;
-const DECISION_BLOCK = 0x02;
-/** The protocol's own reply bounds, restated so an oversize reply is never accumulated. */
-const MAX_REPLY_BYTES = 1 << 20;
-const MAX_REASONS = 32;
-const MAX_LABEL_BYTES = 256;
-/** The fixed sentinel reason code for a match against a registered original, compared as bytes. */
-const KNOWN_ORIGINAL_REASON = encoder.encode('KNOWN_ORIGINAL_DETECTED');
-/** Response tags in their fixed wire order: eight echoed bindings, then decision, then count. */
-const BINDING_TAGS = Object.freeze([30, 31, 32, 33, 34, 35, 36, 37]);
-const TAG_DECISION = 38;
-const TAG_REASON_COUNT = 39;
-const TAG_REASON = 40;
-const TAG_RULE = 50;
+/** The protocol's own reply bound: an oversize reply is never accumulated in the first place. */
+const MAX_REPLY_BYTES = EGRESS_SENTINEL_PROCESS_LIMITS.maxStdoutBytes;
+/** The fixed sentinel reason code for a match against a registered original, compared as a string. */
+const KNOWN_ORIGINAL_REASON = 'KNOWN_ORIGINAL_DETECTED';
 
-const DONE = Object.freeze({ kind: 'done' });
-const BAD = Object.freeze({ kind: 'bad' });
+/* ---------- The request binding, taken from the frame the runner really wrote ---------- */
 
-function sameBytes(bytes, expected) {
-  if (bytes.byteLength !== expected.byteLength) return false;
-  for (let index = 0; index < expected.byteLength; index += 1) {
-    if (bytes[index] !== expected[index]) return false;
-  }
-  return true;
+/**
+ * Decode one outgoing request frame into the binding a reply is checked against, and drop everything
+ * else about it immediately.
+ *
+ * The frame is the runner's own buffer: it is read here and never written to. `decodeRequestFrame`
+ * recomputes the payload digest from the frame bytes rather than trusting any parent-side value, and
+ * rejects a frame it cannot rebuild. The projection it returns holds only labels and that digest, so the
+ * payload copy and the registration key copy the decoder just allocated are zeroed and dropped with the
+ * temporary snapshot. That is a bounded overwrite of this module's own copies; it is not heap erasure.
+ */
+function bindingFromFrame(record, chunk) {
+  if (record.binding !== null || record.frameRefused) return;
+  if (!(chunk instanceof Uint8Array)) { record.frameRefused = true; return; }
+  const decoded = decodeRequestFrame(chunk);
+  if (!decoded.ok) { record.frameRefused = true; return; }
+  record.binding = projectSentinelReplyBinding(decoded.value);
+  decoded.value.payload.fill(0);
+  decoded.value.known?.key.fill(0);
 }
 
 /**
- * Read one whole RESPONSE frame. Magic, kind, the declared body length, the trailing newline and the
- * exact field order must all hold, so truncation, a second reply, an unknown field and a reordered
- * field are all "not one complete decision frame" rather than a decision. Label fields are SKIPPED, the
- * decision is read as a single fixed byte, and each reason and rule is compared against this parent's
- * own literal and then forgotten: no field text becomes a string or leaves this function.
+ * Pass-through taps on the child's OWN `stdin.write` and `stdin.end`, which are the two methods the
+ * accepted runner actually calls with its request frame. Each tap forwards the call unchanged - same
+ * receiver, same argument list including any callback, same return value - and reads the byte argument
+ * only when there is one, because `end()` is called here with no data at all.
  */
-function readResponse(bytes) {
-  const seen = { complete: false, decision: 'NONE', knownOriginalReason: false, registeredRefNamed: false };
-  if (bytes.byteLength <= HEADER_BYTES || bytes.byteLength > MAX_REPLY_BYTES) return seen;
-  for (let index = 0; index < MAGIC.byteLength; index += 1) if (bytes[index] !== MAGIC[index]) return seen;
-  if (bytes[4] !== KIND_RESPONSE) return seen;
-  const whole = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (whole.getUint32(5, false) + HEADER_BYTES + 1 !== bytes.byteLength) return seen;
-  if (bytes[bytes.byteLength - 1] !== NEWLINE) return seen;
-  const body = bytes.subarray(HEADER_BYTES, bytes.byteLength - 1);
-  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
-  let at = 0;
-  const step = () => {
-    if (at === body.byteLength) return DONE;
-    if (body.byteLength - at < FIELD_HEADER_BYTES) return BAD;
-    const tag = body[at];
-    const length = view.getUint32(at + 1, false);
-    if (body.byteLength - at - FIELD_HEADER_BYTES < length) return BAD;
-    const start = at + FIELD_HEADER_BYTES;
-    at = start + length;
-    return { tag, bytes: body.subarray(start, at) };
+function tapOutgoingRequest(child, record) {
+  const stdin = child.stdin;
+  if (stdin === null || stdin === undefined) return;
+  const nativeWrite = stdin.write;
+  const nativeEnd = stdin.end;
+  if (typeof nativeWrite !== 'function' || typeof nativeEnd !== 'function') return;
+  stdin.write = function observedWrite(...args) {
+    if (args.length > 0) bindingFromFrame(record, args[0]);
+    return Reflect.apply(nativeWrite, this, args);
   };
-  const field = (tag) => {
-    const stepped = step();
-    if (stepped === DONE || stepped === BAD || stepped.tag !== tag) return null;
-    return stepped.bytes;
+  stdin.end = function observedEnd(...args) {
+    if (args.length > 0) bindingFromFrame(record, args[0]);
+    return Reflect.apply(nativeEnd, this, args);
   };
-  for (const tag of BINDING_TAGS) if (field(tag) === null) return seen;
-  const decision = field(TAG_DECISION);
-  if (decision === null || decision.byteLength !== 1) return seen;
-  const code = decision[0];
-  if (code !== DECISION_ALLOW && code !== DECISION_BLOCK) return seen;
-  const count = field(TAG_REASON_COUNT);
-  if (count === null || count.byteLength !== 4) return seen;
-  const reasons = new DataView(count.buffer, count.byteOffset, count.byteLength).getUint32(0, false);
-  if (reasons > MAX_REASONS) return seen;
-  for (let index = 0; index < reasons; index += 1) {
-    const reason = field(TAG_REASON);
-    if (reason === null || reason.byteLength === 0 || reason.byteLength > MAX_LABEL_BYTES) return seen;
-    if (sameBytes(reason, KNOWN_ORIGINAL_REASON)) seen.knownOriginalReason = true;
+}
+
+/* ---------- The reply, decided by the authoritative protocol decoder ---------- */
+
+/**
+ * Record one child's whole stdout, or nothing. The binding must exist, the bytes must be exactly one
+ * complete RESPONSE frame, and the authoritative decoder must accept it against that binding; anything
+ * else leaves `complete` false, so a malformed, foreign, oversized or duplicated reply is never counted
+ * as a decision. The decoded reason codes and refs are compared to this parent's own literals here and
+ * are not stored.
+ */
+function recordReply(record, bytes) {
+  if (record.binding === null) return;
+  const framing = classifyReplyFraming(bytes);
+  if (framing !== 'OK') return;
+  const decoded = decodeResponseFrame(bytes, record.binding);
+  if (!decoded.ok) return;
+  record.complete = true;
+  record.decision = decoded.value.decision;
+  record.knownOriginalReason = decoded.value.reasonCodes.includes(KNOWN_ORIGINAL_REASON);
+  // The decoder already restricted every reported ref to the refs this parent's own request frame
+  // registered, so this only decides whether they are the fixture's declared known-original label.
+  record.registeredRefNamed = decoded.value.rules.length > 0
+    && declaredRef !== null
+    && decoded.value.rules.every((rule) => rule === declaredRef);
+}
+
+/* ---------- TEST/DEMO-ONLY faults, reachable from fixture code only ---------- */
+
+/** The fixed reply faults a fixture may inject, each a real refusal the real runner must reach. */
+export const REPLY_FAULTS = Object.freeze({
+  UNKNOWN_REASON: 'unknown-reason',
+  FOREIGN_BINDING: 'foreign-binding',
+  TOO_MANY_RULES: 'too-many-rules',
+});
+const KNOWN_FAULTS = new Set(Object.values(REPLY_FAULTS));
+
+/**
+ * Build the frame this fixture substitutes for one child's real reply. It is built from the request
+ * binding that child really received, through the protocol's own encoder, so it is a well-formed frame
+ * that differs from the truth in exactly one documented way. This is deliberately NOT a decode of the
+ * child's own reply: the fault is "this child answered differently", and the whole point is that the
+ * runner has to reject it.
+ */
+function corruptedReply(record) {
+  const binding = record.binding;
+  if (binding === null || declaredRef === null) return null;
+  const echoed = {
+    requestId: binding.requestId,
+    tenantRef: binding.scope.tenantRef,
+    projectRef: binding.scope.projectRef,
+    observedId: binding.observed.id,
+    observedProfileDigest: binding.observed.profileDigest,
+    authorizedId: binding.authorized.id,
+    authorizedProfileDigest: binding.authorized.profileDigest,
+    payloadDigest: binding.payloadDigest,
+  };
+  if (record.fault === REPLY_FAULTS.FOREIGN_BINDING) {
+    // A digest this parent never computed for this payload: a binding mismatch, not a decision.
+    return encodeResponseFrame({
+      ...echoed,
+      payloadDigest: 'f'.repeat(64),
+      response: { decision: 'BLOCK', reasonCodes: [KNOWN_ORIGINAL_REASON], rules: [declaredRef] },
+    });
   }
-  let rules = 0;
-  let everyRuleNamed = registeredRef !== null;
-  for (;;) {
-    const stepped = step();
-    if (stepped === DONE) break;
-    if (stepped === BAD || stepped.tag !== TAG_RULE) return seen;
-    const rule = stepped.bytes;
-    if (rule.byteLength === 0 || rule.byteLength > MAX_LABEL_BYTES) return seen;
-    rules += 1;
-    if (registeredRef === null || !sameBytes(rule, registeredRef)) everyRuleNamed = false;
+  if (record.fault === REPLY_FAULTS.UNKNOWN_REASON) {
+    // The genuine known-original block plus one reason code this sentinel version cannot produce.
+    return encodeResponseFrame({
+      ...echoed,
+      response: {
+        decision: 'BLOCK',
+        reasonCodes: [KNOWN_ORIGINAL_REASON, 'FIXTURE_REASON_THIS_SENTINEL_CANNOT_PRODUCE'],
+        rules: [declaredRef],
+      },
+    });
   }
-  // The protocol's own consistency rule, re-checked here: an ALLOW carries no reason and no ref, and a
-  // BLOCK carries at least one of them. Anything else is not a coherent decision frame.
-  if ((code === DECISION_ALLOW) !== (reasons === 0 && rules === 0)) return seen;
-  seen.complete = true;
-  seen.decision = code === DECISION_ALLOW ? 'ALLOW' : 'BLOCK';
-  seen.registeredRefNamed = everyRuleNamed && rules > 0;
-  return seen;
+  // One ref over the protocol's own rule bound, every one of them a ref this parent registered.
+  return encodeResponseFrame({
+    ...echoed,
+    response: {
+      decision: 'BLOCK',
+      reasonCodes: [KNOWN_ORIGINAL_REASON],
+      rules: Array.from(
+        { length: EGRESS_SENTINEL_PROCESS_LIMITS.maxRules + 1 },
+        () => declaredRef,
+      ),
+    },
+  });
+}
+
+/**
+ * Substitute the faulted frame for the FIRST reply this child writes, through the child's own `stdout`
+ * delivery, so the real runner receives a real `data` event carrying it. Every other event and every
+ * later chunk of this child is forwarded untouched.
+ */
+function tapOutgoingReplyFault(record) {
+  const stdout = record.stdout;
+  if (record.fault === null || stdout === null || stdout === undefined) return;
+  const nativeEmit = stdout.emit;
+  if (typeof nativeEmit !== 'function') return;
+  let substituted = false;
+  stdout.emit = function observedEmit(event, ...args) {
+    if (!substituted && event === 'data' && args.length === 1 && args[0] instanceof Uint8Array) {
+      const corrupted = corruptedReply(record);
+      if (corrupted !== null) {
+        substituted = true;
+        return Reflect.apply(nativeEmit, this, ['data', corrupted]);
+      }
+    }
+    return Reflect.apply(nativeEmit, this, [event, ...args]);
+  };
 }
 
 /* ---------- The private observation state ---------- */
@@ -154,8 +233,8 @@ function readResponse(bytes) {
 /** One record per observed fixed worker child, in spawn order. Nothing here is caller reachable. */
 const records = [];
 /** The privacy-safe ref this fixture registered, so a child naming a rule can be compared to it. */
-let registeredRef = null;
-/** An armed TEST-ONLY termination, or `null`. Never set by the operator command. */
+let declaredRef = null;
+/** An armed TEST-ONLY termination or reply fault, or `null`. Never set by the operator command. */
 let injected = null;
 
 export const MAX_FAULT_ORDINAL = 8;
@@ -167,7 +246,7 @@ export const MAX_FAULT_ORDINAL = 8;
  */
 export function noteRegisteredOriginal(ref) {
   if (typeof ref !== 'string' || ref.length === 0 || ref.length > 128) throw new TypeError('registered original ref');
-  registeredRef = encoder.encode(ref);
+  declaredRef = ref;
 }
 
 /**
@@ -182,7 +261,22 @@ export function injectWorkerTermination(ordinal) {
     throw new TypeError('worker termination ordinal');
   }
   if (injected !== null && injected.ordinal === ordinal) return;
-  injected = { ordinal };
+  injected = { ordinal, fault: null };
+}
+
+/**
+ * TEST/DEMO-ONLY fault: the `ordinal`-th fixed worker child answers with a frame that differs from the
+ * truth in one documented way, so the real runner's real refusal and the receiver's real collapse into
+ * `SENTINEL_BLOCKED` are what the demonstration has to survive. The child's own reply is replaced; the
+ * child itself, the runner and the receiver are untouched. Reachable from fixture code only.
+ */
+export function injectReplyFrameFault(ordinal, fault) {
+  if (!Number.isSafeInteger(ordinal) || ordinal < 1 || ordinal > MAX_FAULT_ORDINAL) {
+    throw new TypeError('reply fault ordinal');
+  }
+  if (!KNOWN_FAULTS.has(fault)) throw new TypeError('reply fault kind');
+  if (injected !== null && injected.ordinal === ordinal && injected.fault === fault) return;
+  injected = { ordinal, fault };
 }
 
 /** One worker's private record. */
@@ -190,14 +284,19 @@ function observe(args, child) {
   const record = {
     closed: false, exitedZero: false, closedBySignal: false,
     complete: false, decision: 'NONE', knownOriginalReason: false, registeredRefNamed: false,
+    binding: null, frameRefused: false,
+    // A fault belongs to ONE ordinal: the request-side child is never faulted, so it still really runs
+    // and really answers, which is what makes a faulted run comparable to a working one.
+    fault: injected !== null && records.length + 1 === injected.ordinal ? injected.fault : null,
+    stdout: child === null ? null : child.stdout,
   };
   records.push(record);
+  tapOutgoingRequest(child, record);
   const chunks = [];
   let captured = 0;
   let textual = false;
-  const stdout = child === null ? null : child.stdout;
-  if (stdout !== null && stdout !== undefined) {
-    stdout.on('data', (chunk) => {
+  if (record.stdout !== null && record.stdout !== undefined) {
+    record.stdout.on('data', (chunk) => {
       if (!(chunk instanceof Uint8Array)) { textual = true; chunks.length = 0; return; }
       captured += chunk.byteLength;
       if (captured > MAX_REPLY_BYTES) { chunks.length = 0; captured = MAX_REPLY_BYTES + 1; return; }
@@ -212,16 +311,15 @@ function observe(args, child) {
       const joined = new Uint8Array(captured);
       let at = 0;
       for (const chunk of chunks) { joined.set(chunk, at); at += chunk.byteLength; }
-      const seen = readResponse(joined);
-      record.complete = seen.complete;
-      record.decision = seen.decision;
-      record.knownOriginalReason = seen.knownOriginalReason;
-      record.registeredRefNamed = seen.registeredRefNamed;
+      recordReply(record, joined);
     }
-    // The reply bytes existed only to read the fixed decision out of them. Nothing is retained.
+    // The reply bytes and the binding existed only to decide one boolean. Nothing is retained.
     chunks.length = 0;
+    record.binding = null;
+    record.stdout = null;
   });
-  if (injected !== null && records.length === injected.ordinal) {
+  tapOutgoingReplyFault(record);
+  if (injected !== null && record.fault === null && records.length === injected.ordinal) {
     // The actual child is still forwarded untouched; the fixture only asks the OS to stop it.
     try { child.kill('SIGKILL'); } catch { /* already gone: the runner observes the real close */ }
   }

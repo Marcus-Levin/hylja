@@ -79,6 +79,17 @@ const ROWS = Object.freeze({
     runs: 2, findings: 1,
     workers: { spawned: 2, exitedZero: 1, closedBySignal: 1, frames: 1, allow: 1, block: 0, named: 0 },
   },
+  /**
+   * The blocked-reply case with its SECOND real child's reply replaced by a frame the protocol must
+   * refuse: an unknown reason code, a foreign binding, or one ref over the rule bound. The child really
+   * runs and really exits cleanly - it only answered differently - so the request-side `ALLOW` is
+   * unaffected and the demonstration still has to decline itself.
+   */
+  unfavourableReply: {
+    result: 'REFUSED', code: 'SENTINEL_BLOCKED', connections: 1, requests: 1, releases: 0, mask: 'yes',
+    runs: 2, findings: 1,
+    workers: { spawned: 2, exitedZero: 2, closedBySignal: 0, frames: 1, allow: 1, block: 0, named: 0 },
+  },
 });
 
 /** The fixed labels the demo prints about what it is and is not. */
@@ -233,7 +244,38 @@ test('a terminated fixed worker fails the blocked case even though the owner rep
     assertNoPlantedMaterial(faulted, 'the faulted run');
   });
 
-test('a real TAP run over output carrying the planted values reports none of them',
+test('a reply the protocol must refuse never passes as the genuine known-original block', { timeout: TEST_TIMEOUT_MS },
+  async () => {
+    // The genuine control, in the same test and at its observed counts: the second real child really
+    // runs, really exits cleanly and really blocks that reply over the registered known original.
+    const control = await runDemo(['--case', 'blocked-reply']);
+    assert.equal(control.code, 0, 'the genuine blocked reply is the control and exits zero');
+    assert.equal(control.stdout === `${summaryOf('blocked-reply', ROWS['blocked-reply'])}\n`, true,
+      'the control really observed one BLOCK naming the registered known original');
+    // Each fault keeps both real children and both clean exits, and changes only what the second one
+    // answered. None of them may be counted as the declared block.
+    const faults = [
+      'corrupt-reply-unknown-reason',
+      'corrupt-reply-foreign-binding',
+      'corrupt-reply-too-many-rules',
+    ];
+    for (const fault of faults) {
+      const run = await runNode(FAULT_DRIVER, [fault]);
+      assert.equal(run.stalled, false, 'the faulted invocation finished inside its bound');
+      assert.equal(run.signal, null, 'the faulted run exited on its own, with no signal');
+      assert.equal(run.code, 1, 'a reply the protocol must refuse makes the demonstration decline itself');
+      assert.equal(run.stderr === DECLINED_STDERR, true, 'the faulted run reports one fixed line and nothing else');
+      assert.equal(run.stdout === `${summaryOf('blocked-reply', ROWS.unfavourableReply)}\n`, true,
+        'both real children ran and exited cleanly, and the unfavourable reply is counted as no decision');
+      assert.equal(run.stdout.includes('real fixed-worker BLOCK decisions: 0'), true,
+        'an unfavourable reply is never counted as a block');
+      assert.equal(run.stdout.includes('real fixed-worker blocks naming the registered known original: 0'), true,
+        'an unfavourable reply is never counted as the declared known-original block');
+      assertNoPlantedMaterial(run, 'the faulted run');
+    }
+  });
+
+test('a real TAP run over output carrying the planted values reports none of it',
   { timeout: TEST_TIMEOUT_MS }, async () => {
     // Observed, not asserted about: a real `node --test` run of a probe whose subprocess really printed
     // the planted original and the planted secret, with the runner's own TAP output captured here.
