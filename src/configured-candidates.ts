@@ -44,13 +44,17 @@ export interface ConfiguredCandidate extends Classified {
   start: number;
   end: number;
   /**
-   * Offsets the rule itself matched, before coverage was extended. Equal to `start`/`end` for every basis
-   * except `PATTERN`, where #10 extends a template match forward over the rest of the identifier so a value
-   * is never covered in part. `start`/`end` stay that coverage; `matchStart`/`matchEnd` stay what the
-   * genuine source actually matched, so a consumer can tell corroboration from coverage.
+   * Did #10's own matcher match the **whole scanned unit** it ran over? `start`/`end` are that unit's
+   * coverage: for every basis except `PATTERN`, #10 extends a template match forward over the rest of the
+   * identifier so a value is never covered in part, and this flag then stays `false` because the match
+   * stopped short of the unit the coverage reached.
+   *
+   * It is a fact about the scanned unit and nothing else. It is not an offset in any other domain: a
+   * later seam may fold, parse or decode this text and relocate coverage, while this one boolean keeps
+   * answering the same question about the unit #10 actually saw. A `DICTIONARY`, `FIELD_HINT` or `CONTEXT`
+   * match is always its own whole unit, so the flag is `true` there.
    */
-  matchStart: number;
-  matchEnd: number;
+  wholeUnitMatch: boolean;
   evidence: DetectorEvidenceInput;
 }
 export interface ConfiguredResult {
@@ -285,7 +289,7 @@ function engineeringValue(text: string, at: number, keyStart: number, lines: Lin
 /* ---------- Detection ---------- */
 
 interface Found extends Classified { rule: string; basis: ConfiguredCandidate['basis'];
-  start: number; end: number; matchStart: number; matchEnd: number }
+  start: number; end: number; wholeUnitMatch: boolean }
 function failure(reason: string): ConfiguredResult {
   return Object.freeze({ status: 'FAILURE', reasons: Object.freeze([reason]), candidates: Object.freeze([]) });
 }
@@ -348,8 +352,9 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
       if (fieldPath) {
         compiled.hints.forEach(({ path, entry }, index) => {
           const start = text.length - text.trimStart().length, end = text.trimEnd().length;
+          // A field hint is given the whole trimmed value, so the unit it scans is the match in full.
           if (end > start && hintMatches(path, fieldPath!)) add({ ...entry, rule: `field-hint.${index}`, basis: 'FIELD_HINT',
-            start, end, matchStart: start, matchEnd: end });
+            start, end, wholeUnitMatch: true });
         });
       }
       for (const invisible of ['REMOVE', 'SPACE'] as const) {
@@ -368,7 +373,8 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
         const first = tokens[index]!, last = tokens[longest.last]!;
         const start = folded.origin[first.index]!, end = folded.originEnd[last.index + last[0].length - 1]!;
         add({ ...compiled.entries[longest.entry]!, rule: 'dictionary.term', basis: 'DICTIONARY', start, end,
-          matchStart: start, matchEnd: end });
+          // The trie walked exactly the token run it reports: the match is the whole scanned unit.
+          wholeUnitMatch: true });
         index = longest.last + 1;
       }
       }
@@ -377,10 +383,12 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
         let covered = -1;
         for (const match of text.matchAll(regex)) {
           if (match.index < covered) continue;
-          const start = match.index, matchEnd = start + match[0].length;
-          const end = expand(text, matchEnd, wordEnd);
+          // The scanned unit of a template is the identifier it covers, so the one honest question is whether
+          // the regex match reached that unit's end. It always starts at the unit's start, so only the end is open.
+          const start = match.index, matched = start + match[0].length;
+          const end = expand(text, matched, wordEnd);
           covered = end;
-          add({ ...entry, rule: `pattern.${index}`, basis: 'PATTERN', start, end, matchStart: start, matchEnd });
+          add({ ...entry, rule: `pattern.${index}`, basis: 'PATTERN', start, end, wholeUnitMatch: matched === end });
         }
       });
     }
@@ -397,7 +405,8 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
       KEY_VALUE.lastIndex = Math.max(KEY_VALUE.lastIndex, value.end);
       if (rule[2] && !/\d/u.test(text.slice(value.start, value.end))) continue;
       add({ semanticType: 'ENGINEERING_IDENTIFIER', subtype: rule[1], rule: 'context.engineering-key', basis: 'CONTEXT',
-        ...value, matchStart: value.start, matchEnd: value.end });
+        // The key rule scanned exactly the value span it reports, so the match is the whole scanned unit.
+        ...value, wholeUnitMatch: true });
     }
   } catch (error) { return failure(error instanceof RangeError ? 'TOO_MANY_CANDIDATES' : 'INTERNAL_ERROR'); }
 
@@ -406,7 +415,7 @@ export function detectConfigured(request: ConfiguredRequest): ConfiguredResult {
   const candidates = found.map((item, index) => Object.freeze({
     semanticType: item.semanticType, ...(item.subtype ? { subtype: item.subtype } : {}),
     ...(item.sensitivity ? { sensitivity: item.sensitivity } : {}), rule: item.rule, basis: item.basis, start: item.start, end: item.end,
-    matchStart: item.matchStart, matchEnd: item.matchEnd,
+    wholeUnitMatch: item.wholeUnitMatch,
     evidence: Object.freeze({
       version: 1 as const, id: `${CONFIGURED_PRODUCER.id}.${item.basis.toLowerCase()}.${field}.${item.start}-${item.end}.${index}`,
       status: 'FOUND' as const,

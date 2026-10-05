@@ -307,20 +307,19 @@ function evidenceOf(value: unknown): { evidence: ContributingEvidence; semanticT
 }
 function candidateOf(value: unknown): Read1 | null {
   const record = data(value, ['source', 'basis', 'evidence', 'view', 'original'],
-    ['subtype', 'rule', 'fidelity', 'fingerprint', 'field', 'matchStart', 'matchEnd']);
+    ['subtype', 'rule', 'fidelity', 'fingerprint', 'field', 'wholeUnitMatch']);
   if (!record || !inSet(record.source, SOURCES) || !label(record.basis, 64)) return null;
   if (Object.hasOwn(record, 'subtype') && !label(record.subtype, 64)) return null;
   if (Object.hasOwn(record, 'rule') && !label(record.rule, 128)) return null;
-  // #6 carries #10's matched offsets beside the coverage span. They are read, checked as one bounded pair and
-  // then deliberately **not** kept on the unit: composition places by the occurrence span, so a host that
-  // invented a match pair changes nothing here. A half-present or out-of-range pair is still a malformed
-  // record and refuses, exactly like any other unknown member.
-  if (Object.hasOwn(record, 'matchStart') || Object.hasOwn(record, 'matchEnd')) {
-    const matchStart = record.matchStart;
-    const matchEnd = record.matchEnd;
-    if (typeof matchStart !== 'number' || typeof matchEnd !== 'number' || !Number.isSafeInteger(matchStart) ||
-        !Number.isSafeInteger(matchEnd) || matchStart < 0 || matchEnd <= matchStart) return null;
-  }
+  // #6 carries one boolean beside the coverage span: whether #10's own matcher matched the whole text unit
+  // it scanned. It is read through this same closed boundary, must be a boolean, and may appear only on a
+  // `CONFIGURED` candidate, because no other source has a configured matcher behind it. The numeric offset
+  // members an earlier draft accepted are not in the accepted key list at all, so a record carrying one is
+  // malformed exactly like any other unknown member. Whatever this reader concludes, the member is
+  // deliberately **not** kept on the unit: composition places by the occurrence span, so a host that
+  // invented the fact changes nothing here.
+  if (Object.hasOwn(record, 'wholeUnitMatch') &&
+      (typeof record.wholeUnitMatch !== 'boolean' || record.source !== 'CONFIGURED')) return null;
   const evidence = evidenceOf(record.evidence);
   const view = viewOf(record.view);
   const original = originalOf(record.original);
