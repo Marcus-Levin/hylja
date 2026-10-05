@@ -11,7 +11,8 @@
  *
  * It refuses an operand or a message that can hold captured output:
  * - a captured stream read, `run.stdout` or `run.stderr`, directly or through optional chaining or an
- *   element access with that literal property name;
+ *   element access with that literal property name, and one element of a capture-derived container,
+ *   such as `lines[0]` where `lines` is `run.stdout.split('\n')`;
  * - a simple local alias of one: a `const`/`let`/`var` binding whose initializer is such a read, and a
  *   destructured `{ stdout }`/`{ stderr: text }` binding, followed through chains of those bindings;
  * - a string built from one by a template literal, a `+` concatenation or a call that is not a
@@ -191,9 +192,9 @@ function selectedProperty(node) {
 }
 
 /**
- * Whether the value of an expression can hold captured stdout/stderr. Conservative outside the shapes
- * listed in the header: an unrecognised expression that mentions a capture counts as carrying it, so
- * the guard over-reports rather than under-reports.
+ * Whether the value of an expression can hold captured stdout/stderr. It reports the shapes listed in the
+ * header and reports nothing for a shape it does not model, so it under-reports outside those shapes: an
+ * unrecognised expression is unproven rather than safe, and the header states that as a limit.
  */
 function carriesCapturedOutput(node, bindings, visited = new Set(), hops = 0) {
 	if (node === undefined || node === null) return false;
@@ -204,6 +205,11 @@ function carriesCapturedOutput(node, bindings, visited = new Set(), hops = 0) {
 		if (STREAM_PROPERTIES.has(property)) return true;
 		if (NON_ECHOING_PROPERTIES.has(property)) return false;
 		return carriesCapturedOutput(node.expression, bindings, visited, hops);
+	}
+	// One element of a capture-derived container carries as much as the container: `lines[0]` is bytes.
+	if (ts.isElementAccessExpression(node)) {
+		return carriesCapturedOutput(node.expression, bindings, visited, hops)
+			|| carriesCapturedOutput(node.argumentExpression, bindings, visited, hops);
 	}
 	if (ts.isBinaryExpression(node)) {
 		if (COMPARISON_OPERATORS.has(node.operatorToken.kind)) return false;

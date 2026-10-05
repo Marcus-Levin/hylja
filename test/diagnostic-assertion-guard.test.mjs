@@ -26,11 +26,12 @@ const guardPath = join(root, 'scripts', 'development', 'check-diagnostic-asserti
 
 /** Obviously synthetic and non-routable: the captured original a failing assertion must not print. */
 const PLANTED = 'synthetic-planted-subprocess-output.invalid';
-const SAFE_MESSAGE = 'control: the synthetic child wrote the planted original';
-const SAFE_ASSERTION = `assert.equal(captured.stdout === planted, true, '${SAFE_MESSAGE}');`;
-const UNSAFE_ASSERTION = `assert.equal(captured.stdout, 'synthetic-expected-original.invalid', '${SAFE_MESSAGE}');`;
-/** The expected value the unsafe shape compares against; it never appears in a diagnostic. */
+/** The expected value both shapes compare against; it never appears in a diagnostic. */
 const EXPECTED = 'synthetic-expected-original.invalid';
+const SAFE_MESSAGE = 'control: the synthetic child wrote the planted original';
+/** The same fact as the unsafe shape, compared so Node prints the comparison and not the value. */
+const SAFE_ASSERTION = `assert.equal(captured.stdout === '${EXPECTED}', true, '${SAFE_MESSAGE}');`;
+const UNSAFE_ASSERTION = `assert.equal(captured.stdout, '${EXPECTED}', '${SAFE_MESSAGE}');`;
 /** One bound on a synthetic child, never a wait without one. */
 const CHILD_TIMEOUT_MS = 30_000;
 
@@ -56,14 +57,19 @@ test('captured stdout and stderr are refused as assertion operands and messages,
 		"assert.match(captured.stderr, /synthetic/, 'a fixed message');",
 		"assert.equal(captured.status, 0, captured.stderr);",
 		"assert.equal(JSON.parse(captured.stdout).status, 0, 'a fixed message');",
+		"const lines = captured.stdout.split('\\n');",
+		"assert.equal(lines[1], '', 'a fixed message');",
 	);
+	// A finding locates the start of the offending argument, so the column walks a reader straight to the
+	// shape that has to change while the printed line still carries no source text.
 	assert.deepEqual(shape(findRisksInSource(source, 'fixture.test.mjs')), [
 		{ line: 2, column: columnOf(lines[1], 'captured.stdout'), method: 'equal', position: 'operand', argument: 0 },
 		{ line: 3, column: columnOf(lines[2], 'captured.stderr'), method: 'notEqual', position: 'operand', argument: 0 },
 		{ line: 4, column: columnOf(lines[3], 'captured.stdout'), method: 'deepStrictEqual', position: 'operand', argument: 0 },
 		{ line: 5, column: columnOf(lines[4], 'captured.stderr'), method: 'match', position: 'operand', argument: 0 },
 		{ line: 6, column: columnOf(lines[5], 'captured.stderr'), method: 'equal', position: 'message', argument: 2 },
-		{ line: 7, column: columnOf(lines[6], 'captured.stdout'), method: 'equal', position: 'operand', argument: 0 },
+		{ line: 7, column: columnOf(lines[6], 'JSON.parse'), method: 'equal', position: 'operand', argument: 0 },
+		{ line: 9, column: columnOf(lines[8], 'lines[1]'), method: 'equal', position: 'operand', argument: 0 },
 	]);
 });
 
@@ -109,7 +115,8 @@ test('a file without an assert import, and one without any assertion, report not
 	const withoutAssertion = fixture(
 		"import assert from 'node:assert/strict';",
 		'const report = JSON.parse(captured.stdout);',
-		"assert.equal(report.status, 0, 'the fixed refusal');",
+		'const observed = report.status;',
+		'',
 	);
 	assert.deepEqual(shape(findRisksInSource(withoutImport.source, 'fixture.test.mjs')), [],
 		'a local object that is not the assert module is outside this guard');
@@ -132,7 +139,8 @@ test('the shipped guard refuses an unsafe file with a fixed location line and pr
 			{ cwd: root, encoding: 'utf8', timeout: CHILD_TIMEOUT_MS, env: { ...process.env, HYLJA_SYNTHETIC_PLANTED: PLANTED } });
 		assert.equal(unsafe.error, undefined, 'the guard finished inside its bound');
 		assert.equal(unsafe.status, 1, 'a raw diagnostic assertion is refused');
-		assert.equal(unsafe.stdout, `${unsafePath}:2:14 equal operand 0\n`, 'one fixed location line, no source text');
+		assert.equal(unsafe.stdout, `${unsafePath}:2:14 equal operand 0\nchecked 1 file, 1 finding\n`,
+			'one fixed location line and one fixed summary line, no source text');
 		assert.equal(`${unsafe.stdout}${unsafe.stderr}`.includes(PLANTED), false, 'the planted original never reaches the log');
 		assert.equal(unsafe.stderr, '', 'the refusal is one stdout line, never a traceback');
 
@@ -178,15 +186,18 @@ test('the guard refuses its own bounds instead of passing a file it did not read
 test('a real failing subprocess assertion keeps its fixed diagnostic, and the unsafe shape is the control', () => {
 	const dir = mkdtempSync(join(tmpdir(), 'hylja-diagnostic-child-'));
 	try {
-		// One synthetic child, one real subprocess, two assertion shapes that differ in one place: the
-		// compared operand. Both fail, both carry the same fixed message, and the only difference in
-		// what reaches the log is the shape.
+		// One synthetic child, one real subprocess, two assertion shapes that assert the same fact about
+		// the same capture and differ in one place: the compared operand. Both fail on a child that
+		// writes the planted original, both carry the same fixed message, and the only difference in
+		// what reaches the log is the shape. The capture is decoded to text on purpose: an undecoded
+		// Buffer is printed as hex bytes, which would leave the negative control unproven.
 		const childSource = (assertion) => [
 			"import assert from 'node:assert/strict';",
 			"import { spawnSync } from 'node:child_process';",
 			'',
 			`const planted = '${PLANTED}';`,
-			"const captured = spawnSync(process.execPath, ['-e', 'process.stdout.write(process.argv[1])', planted]);",
+			"const captured = spawnSync(process.execPath, ['-e', 'process.stdout.write(process.argv[1])', planted],"
+				+ " { encoding: 'utf8' });",
 			assertion,
 			'',
 		].join('\n');
