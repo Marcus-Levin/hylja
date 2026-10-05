@@ -1,10 +1,12 @@
-// #201: the KEEP-only complete-text OpenAI request sender under test.
+// #201 and #218: the complete-text OpenAI request sender under test.
 //
-// What this proves, precisely: `createOpenAiKeepSender` owns translation, the exact private serialized
-// request image (allowlisted fixed metadata and the model included), snapshot-bound whole-image
-// classification evidence, the real deterministic SEND policy decision, the real FIXED-WORKER child
-// process sentinel, and exactly one trusted transport dispatch. Nothing is ever handed back to a
-// caller that could be replayed: there is no READY/prepared handle and no `sendPrepared`.
+// What this proves, precisely: `createOpenAiTextSender` owns translation, the exact private serialized
+// ORIGINAL request image (allowlisted fixed metadata and the model included), snapshot-bound whole-image
+// classification evidence over that original, the real deterministic SEND policy decision per unit, the
+// private per-unit plan, the rebuilt final image when real policy selected MASK for a message unit, the
+// real FIXED-WORKER child process sentinel over exactly those final bytes, and exactly one trusted
+// transport dispatch. Nothing is ever handed back to a caller that could be replayed: there is no
+// READY/prepared handle and no `sendPrepared`.
 //
 // What it is NOT: an authentication proof (the host boundary, the policy pin, the sentinel key and
 // the known-original registration are obvious synthetic fixtures), an OS sandbox or an RSS cap, a
@@ -23,7 +25,7 @@ import { composeClassification, TRUST_LEVELS } from '../dist/classification.js';
 import {
   digestClassification, digestPolicyBundle, KNOWN_POLICY_BUNDLE,
 } from '../dist/policy.js';
-import { createOpenAiKeepSender, OPENAI_KEEP_SENDER_REFUSALS } from '../dist/openai-keep-sender.js';
+import { createOpenAiTextSender, OPENAI_TEXT_SENDER_REFUSALS } from '../dist/openai-text-sender.js';
 import { OPENAI_TEXT_REQUEST_ENDPOINT } from '../dist/openai-text-request.js';
 
 /** Host-owned sentinel deadline. A check either answers inside it or is stopped at it. */
@@ -255,7 +257,7 @@ function createHost(sink, options = {}) {
     scope: options.scope ?? SCOPE,
     known: options.known === undefined ? registration(BENIGN_ENTRIES) : options.known,
     sentinel: options.sentinel ?? { deadlineMs: DEADLINE_MS },
-    inspect: options.inspect ?? inspectWholeImage,
+    inspectOriginal: options.inspect ?? inspectWholeImage,
     sendPoint: {
       // Queued observations: the first call is the one the check is made against, the second is what
       // the send point reports immediately before dispatch, and later calls clamp to the last entry.
@@ -274,7 +276,7 @@ async function harness(t, options = {}) {
   const sink = options.sink === null ? null : await startSink();
   if (sink !== null) t.after(() => sink.close());
   const { host, dispatch } = createHost(sink, options);
-  return { sink, host, dispatch, sender: createOpenAiKeepSender(host) };
+  return { sink, host, dispatch, sender: createOpenAiTextSender(host) };
 }
 
 /** The whole withholding invariant in one helper: no dispatch, no connection, no byte, no capture. */
@@ -299,8 +301,8 @@ test('the sender exposes send, cancel and state, and no prepared or replayable s
     assert.equal(typeof sender.send, 'function');
     assert.equal(typeof sender.cancel, 'function');
     // The published refusal vocabulary is a closed, fixed list of codes.
-    assert.equal(OPENAI_KEEP_SENDER_REFUSALS.includes('SENTINEL_BLOCKED'), true);
-    assert.equal(OPENAI_KEEP_SENDER_REFUSALS.includes('SENDER_BUSY'), true);
+    assert.equal(OPENAI_TEXT_SENDER_REFUSALS.includes('SENTINEL_BLOCKED'), true);
+    assert.equal(OPENAI_TEXT_SENDER_REFUSALS.includes('SENDER_BUSY'), true);
   });
 
 /* ---------- The accepted path ---------- */
@@ -417,7 +419,8 @@ test('a non-KEEP treatment, a held review and a foreign or stale boundary all re
     t.after(() => sink.close());
 
     for (const [name, options, code] of [
-      ['MASK treatment', { policyBundle: MASK_BUNDLE }, 'POLICY_NOT_KEEP'],
+      // METADATA and MODEL units are never masked, so a MASK decision over the first unit still refuses.
+      ['METADATA unit selected MASK', { policyBundle: MASK_BUNDLE }, 'POLICY_NOT_KEEP'],
       ['REQUIRE_REVIEW', { policyBundle: REVIEW_BUNDLE }, 'POLICY_HELD'],
       ['stale policy pin', { commit: { ...KNOWN_POLICY_BUNDLE, digest: OTHER_PROFILE_DIGEST } }, 'POLICY_DENIED'],
       ['foreign boundary destination', {
@@ -639,7 +642,7 @@ test('a cancellation raised inside the last host observation withholds the dispa
       },
       sendExact: transport.sendExact,
     });
-    const sender = createOpenAiKeepSender(host);
+    const sender = createOpenAiTextSender(host);
     owner.sender = sender;
     assert.deepEqual(await bounded(sender.send({
       endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
@@ -669,7 +672,7 @@ test('an accepted transport is captured, so a send-point Proxy get trap cannot r
         return Reflect.get(object, key, receiver);
       },
     });
-    const sender = createOpenAiKeepSender(host);
+    const sender = createOpenAiTextSender(host);
     owner.sender = sender;
     assert.deepEqual(await bounded(sender.send({
       endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
@@ -1010,12 +1013,12 @@ test('an unusable trusted host yields a permanently restrictive sender, never a 
       ['unknown own key', { ...host, trustedTransport: null }],
       ['send point is not callable', { ...host, sendPoint: { ...host.sendPoint, sendExact: 'nope' } }],
       ['source trust is not a trust level', { ...host, sourceTrust: 'CONTROLLED' }],
-      ['inspect is not a function', { ...host, inspect: {} }],
+      ['inspection is not a function', { ...host, inspectOriginal: {} }],
       ['accessor instead of a data property', Object.defineProperty({ ...host }, 'scope', {
         enumerable: true, get: () => SCOPE,
       })],
     ]) {
-      const sender = createOpenAiKeepSender(unusable);
+      const sender = createOpenAiTextSender(unusable);
       assert.equal(sender.state, 'FAILED', name);
       assert.deepEqual(await bounded(sender.send({
         endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: SAFE_REQUEST_BODY,
@@ -1042,7 +1045,7 @@ test('a revoked Proxy anywhere in the trusted host is contained as an unusable s
     ]) {
       let sender = null;
       let threw = false;
-      try { sender = createOpenAiKeepSender(unusable); } catch { threw = true; }
+      try { sender = createOpenAiTextSender(unusable); } catch { threw = true; }
       assert.equal(threw, false, `${name}: construction never throws`);
       assert.equal(sender.state, 'FAILED', name);
       assert.deepEqual(await bounded(sender.send({
@@ -1051,5 +1054,258 @@ test('a revoked Proxy anywhere in the trusted host is contained as an unusable s
       sender.cancel();
       assert.equal(sender.state, 'FAILED', name);
       assert.equal(dispatch.length, 0, `${name}: the transport was never invoked`);
+    }
+  });
+/* ---------- Policy-selected whole-message irreversible MASK (#218) ---------- */
+
+/**
+ * The generic irreversible literal. It is written here as an independently declared literal a
+ * reviewer can read without running anything, and it is compared byte-for-byte: this file never
+ * imports the sender's own constant.
+ */
+const MASKED = '[hylja:masked]';
+/** Not a registered original, so two identical units can be shown to be treated independently. */
+const DUPLICATE_LINE = 'shared synthetic line token-2f81.invalid';
+
+const ruleFor = (semanticType, decision) => ({
+  id: `text-rule-${semanticType.toLowerCase()}.invalid`, profileId: PROFILE.id, semanticType,
+  sensitivities: ['PUBLIC'], sourceTrust: [...TRUST_LEVELS], operations: ['SEND'], decision,
+});
+/** One real policy rule per semantic type, so real policy selects a different treatment per unit. */
+function bundleFor(byType, permittedTreatments) {
+  return Object.freeze({
+    ...KNOWN_POLICY_BUNDLE,
+    profiles: [Object.freeze({ ...PROFILE, permittedTreatments })],
+    rules: Object.freeze(Object.entries(byType).map(([type, decision]) => ruleFor(type, decision))),
+  });
+}
+/** The two semantic types this section classifies by: kept units and selected-MASK units. */
+const KEEP_TYPE = 'APPLICATION_OR_ENVIRONMENT';
+const MASK_TYPE = 'PERSON';
+
+function classificationOfType(binding, semanticType) {
+  return composeClassification({
+    detectorEvidence: [{
+      version: 1, id: 'detector-text.invalid', status: 'FOUND',
+      provenance: {
+        inputRef: 'field-text.invalid', producerId: 'detector-text.invalid', producerVersion: 'pack-text-1',
+      },
+      claim: { semanticType, sensitivity: 'PUBLIC' },
+    }],
+  }, { interactionRef: binding.interactionRef, sourceRef: SOURCE.ref, trust: SOURCE_TRUST });
+}
+
+/**
+ * Classify by unit kind (and by message index), so the real Policy Engine selects a real treatment
+ * for each unit independently. Nothing here supplies a treatment, a literal or a replacement: the
+ * classification is fixture evidence and the treatment is whatever real policy decides over it.
+ */
+function inspectByKind(kindTypes) {
+  return (image, binding) => {
+    let message = 0;
+    const units = binding.units.map((unit) => {
+      const semanticType = unit.kind === 'MESSAGE'
+        ? (kindTypes.message?.[message++] ?? KEEP_TYPE)
+        : kindTypes[unit.kind.toLowerCase()];
+      const classification = classificationOfType(binding, semanticType);
+      return { unitRef: unit.unitRef, classificationDigest: digestClassification(classification), classification };
+    });
+    return {
+      version: 1, interactionRef: binding.interactionRef, imageDigest: binding.imageDigest,
+      coverage: 'COMPLETE', remainder: 'NONE', units,
+    };
+  };
+}
+
+/** The final image a reviewer can read: the same framing, only Content-Length recomputed. */
+function maskedImage(body) {
+  const bytes = Buffer.byteLength(body, 'utf8');
+  const head = [
+    `POST ${OPENAI_TEXT_REQUEST_ENDPOINT} HTTP/1.1`,
+    `Host: ${SINK.ref}`,
+    'Content-Type: application/json; charset=utf-8',
+    `Content-Length: ${bytes}`,
+    '', '',
+  ].join('\r\n');
+  return Buffer.from(`${head}${body}`, 'utf8');
+}
+
+test('a policy-selected MASK sends the declared mixed image with only the selected message replaced',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const { sink, sender, dispatch } = await harness(t, {
+      policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']),
+      inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [KEEP_TYPE, MASK_TYPE] }),
+    });
+    const leaky = `Escalate to ${PLANTED_ORIGINAL} before the window opens.`;
+    assert.deepEqual(await bounded(sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT,
+      body: requestBody([
+        { role: 'system', content: SAFE_SYSTEM_TEXT },
+        { role: 'user', content: leaky },
+      ]),
+    }), 'mixed keep and mask'), { status: 'SENT' });
+
+    assert.equal(dispatch.length, 1, 'exactly one trusted transport dispatch');
+    assert.equal(sink.captures.length, 1);
+    // Declared here as a literal, so a wrong literal, a wrong role, a wrong order or a wrong
+    // Content-Length all fail the comparison instead of agreeing with a buggy serializer.
+    const expectedBody = '{"model":"fixture-model-keep-sender","messages":['
+      + '{"role":"system","content":"You are a synthetic fixture assistant."},'
+      + `{"role":"user","content":${JSON.stringify(MASKED)}}]}`;
+    const received = sink.captures[0];
+    assert.equal(received.equals(maskedImage(expectedBody)), true, 'the sink received the declared masked image');
+    assert.equal(received.includes(PLANTED_ORIGINAL), false, 'the masked original never reached the sink');
+    assert.equal(received.includes(MASKED), true, 'the generic literal is present exactly as declared');
+    const body = received.subarray(received.indexOf('\r\n\r\n') + 4).toString('utf8');
+    assert.equal(body, expectedBody, 'the body is the declared final body');
+    const head = received.subarray(0, received.indexOf('\r\n\r\n') + 2).toString('latin1');
+    // Only Content-Length is recomputed; every other header field is byte-identical.
+    assert.equal(head.includes(`Content-Length: ${Buffer.byteLength(expectedBody, 'utf8')}\r\n`), true,
+      'Content-Length is the UTF-8 byte length of the final body');
+    assert.equal(head.includes(`Host: ${SINK.ref}\r\n`), true);
+    assert.equal(head.includes('Content-Type: application/json; charset=utf-8\r\n'), true);
+    assert.equal(body.indexOf('role":"system') < body.indexOf('role":"user'), true, 'message order survives');
+    assert.equal(sender.state, 'IDLE');
+  });
+
+test('every selected message is masked, KEEP units keep their bytes, and Unicode length is exact',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const { sink, sender, dispatch } = await harness(t, {
+      policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']),
+      inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE, KEEP_TYPE, MASK_TYPE] }),
+    });
+    // Astral, combining and CJK text in a KEEP unit, and a planted original in each masked unit.
+    const kept = 'Diagnose café \u{1F600} 诊断 https port 443 now.';
+    assert.deepEqual(await bounded(sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT,
+      body: requestBody([
+        { role: 'user', content: `first ${PLANTED_ORIGINAL}` },
+        { role: 'assistant', content: kept },
+        { role: 'user', content: `third ${PLANTED_CANARY}` },
+      ]),
+    }), 'mask, keep, mask'), { status: 'SENT' });
+    assert.equal(dispatch.length, 1);
+    const expectedBody = '{"model":"fixture-model-keep-sender","messages":['
+      + `{"role":"user","content":${JSON.stringify(MASKED)}},`
+      + `{"role":"assistant","content":${JSON.stringify(kept)}},`
+      + `{"role":"user","content":${JSON.stringify(MASKED)}}]}`;
+    const received = sink.captures[0];
+    assert.equal(received.equals(maskedImage(expectedBody)), true, 'the sink received the declared image');
+    // The declared expectation is checked against real UTF-8 byte length, not a JS string length.
+    assert.equal(received.subarray(received.indexOf('\r\n\r\n') + 4).byteLength,
+      Buffer.byteLength(expectedBody, 'utf8'));
+    assert.equal(received.includes(Buffer.from(kept, 'utf8')), true, 'the KEEP unit kept its exact bytes');
+    assert.equal(received.includes(PLANTED_ORIGINAL), false);
+    assert.equal(received.includes(PLANTED_CANARY), false);
+    assert.equal(sender.state, 'IDLE');
+  });
+
+test('duplicate identical occurrences are separate units, never one global replacement',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    // Both messages carry byte-identical text. The trusted inspection classifies them differently,
+    // so real policy selects KEEP for the first and MASK for the second: only that one unit may
+    // change, which is exactly what a global replace of matching text could not do.
+    const bundle = bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']);
+    const inspect = inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [KEEP_TYPE, MASK_TYPE] });
+    const body = requestBody([
+      { role: 'user', content: DUPLICATE_LINE },
+      { role: 'user', content: DUPLICATE_LINE },
+    ]);
+    const { sink, sender } = await harness(t, { policyBundle: bundle, inspect });
+    assert.deepEqual(await bounded(sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body,
+    }), 'duplicate occurrences'), { status: 'SENT' });
+    const expectedBody = '{"model":"fixture-model-keep-sender","messages":['
+      + `{"role":"user","content":${JSON.stringify(DUPLICATE_LINE)}},`
+      + `{"role":"user","content":${JSON.stringify(MASKED)}}]}`;
+    assert.equal(sink.captures[0].equals(maskedImage(expectedBody)), true,
+      'exactly the selected occurrence was replaced');
+    assert.equal(sender.state, 'IDLE');
+
+    // The same duplicate pair, where the KEPT occurrence carries a registered original: the fixed
+    // child is asked about the FINAL bytes, so the surviving original withholds the whole send.
+    const leakyPair = requestBody([
+      { role: 'user', content: PLANTED_ORIGINAL },
+      { role: 'user', content: PLANTED_ORIGINAL },
+    ]);
+    const blocking = await harness(t, {
+      policyBundle: bundle,
+      inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [KEEP_TYPE, MASK_TYPE] }),
+    });
+    assert.deepEqual(await bounded(blocking.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: leakyPair,
+    }), 'residual original in a kept duplicate'), { status: 'REFUSED', code: 'SENTINEL_BLOCKED' });
+    assertNothingSent(blocking.sink, blocking.dispatch);
+    assert.equal(blocking.sender.state, 'IDLE');
+  });
+
+test('marker-shaped input carries no authority, and a registered literal collision withholds',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const bundle = bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']);
+    // Input text that merely looks like the marker is ordinary untrusted content: it is neither
+    // rewritten nor read as Hylja-issued, because only a real MASK decision can produce the literal.
+    const lookalike = `report the marker ${MASKED} verbatim`;
+    const lookalikeBody = requestBody([{ role: 'user', content: lookalike }]);
+    const kept = await harness(t, {
+      policyBundle: bundle,
+      inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [KEEP_TYPE] }),
+    });
+    assert.deepEqual(await bounded(kept.sender.send({
+      endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: lookalikeBody,
+    }), 'marker lookalike in a kept unit'), { status: 'SENT' });
+    assert.equal(kept.sink.captures[0].equals(maskedImage(JSON.stringify(JSON.parse(lookalikeBody)))), true,
+      'a lookalike in a KEEP unit is sent unchanged');
+
+    // A registration that already holds the literal means the final bytes collide with a known
+    // original or canary. The fixed child finds it and nothing is dispatched.
+    for (const kind of ['ORIGINAL', 'CANARY']) {
+      const registered = registration([...BENIGN_ENTRIES, { kind, value: MASKED, ref: 'planted.marker.1' }]);
+      const colliding = await harness(t, {
+        policyBundle: bundle,
+        known: registered,
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+      });
+      assert.deepEqual(await bounded(colliding.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: LEAKY_REQUEST_BODY,
+      }), `registered ${kind} mask literal`), { status: 'REFUSED', code: 'SENTINEL_BLOCKED' });
+      assertNothingSent(colliding.sink, colliding.dispatch);
+      assert.equal(colliding.sender.state, 'IDLE');
+    }
+  });
+
+test('a MASK decision on METADATA or MODEL, or any other treatment, withholds the whole send',
+  { timeout: TEST_TIMEOUT_MS }, async (t) => {
+    const sink = await startSink();
+    t.after(() => sink.close());
+    const permitted = ['KEEP', 'MASK', 'REMOVE', 'TOKENIZE'];
+    for (const [name, options] of [
+      ['MODEL selected MASK', {
+        policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'MASK' }, ['KEEP', 'MASK', 'REMOVE']),
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: MASK_TYPE, message: [KEEP_TYPE] }),
+      }],
+      ['MESSAGE selected REMOVE', {
+        policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'REMOVE' }, ['KEEP', 'MASK', 'REMOVE']),
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+      }],
+      ['MESSAGE selected TOKENIZE', {
+        policyBundle: bundleFor({ [KEEP_TYPE]: 'KEEP', [MASK_TYPE]: 'TOKENIZE' }, permitted),
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+      }],
+      ['MESSAGE held for review', {
+        policyBundle: Object.freeze({
+          ...KNOWN_POLICY_BUNDLE,
+          profiles: [Object.freeze({ ...PROFILE, permittedTreatments: ['KEEP', 'MASK', 'REMOVE'] })],
+          rules: [ruleFor(KEEP_TYPE, 'KEEP'),
+            Object.freeze({ ...ruleFor(MASK_TYPE, 'REQUIRE_REVIEW'), reviewTreatments: ['MASK'] })],
+        }),
+        inspect: inspectByKind({ metadata: KEEP_TYPE, model: KEEP_TYPE, message: [MASK_TYPE] }),
+      }],
+    ]) {
+      const point = await harness(t, { ...options, sink });
+      assert.deepEqual(await bounded(point.sender.send({
+        endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: LEAKY_REQUEST_BODY,
+      }), name), { status: 'REFUSED', code: name.includes('held') ? 'POLICY_HELD' : 'POLICY_NOT_KEEP' }, name);
+      assertNothingSent(sink, point.dispatch);
+      assert.equal(point.sender.state, 'IDLE', name);
     }
   });

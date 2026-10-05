@@ -1,7 +1,7 @@
-// #209: an actual HTTP framing round trip over the shipped KEEP sender and the shipped response codec.
+// #209: an actual HTTP framing round trip over the shipped text sender and the shipped response codec.
 //
-// What this proves, precisely: one complete, text-only, KEEP-authorized request produced by the real
-// `createOpenAiKeepSender` (which itself runs the real fixed-worker sentinel child over the exact bytes)
+// What this proves, precisely: one complete, text-only, KEEP-only request produced by the real
+// `createOpenAiTextSender` (which itself runs the real fixed-worker sentinel child over the exact bytes)
 // is written by the trusted test transport as raw socket bytes to a real `node:http` server on an
 // OS-assigned ephemeral 127.0.0.1 port. The server parses one POST with exact framing - the method, the
 // path, the exact three-header set, the declared Host label, the UTF-8 Content-Type and the UTF-8
@@ -34,7 +34,7 @@ import { composeClassification, TRUST_LEVELS } from '../dist/classification.js';
 import {
   digestClassification, digestPolicyBundle, KNOWN_POLICY_BUNDLE,
 } from '../dist/policy.js';
-import { createOpenAiKeepSender } from '../dist/openai-keep-sender.js';
+import { createOpenAiTextSender } from '../dist/openai-text-sender.js';
 import { OPENAI_TEXT_REQUEST_ENDPOINT } from '../dist/openai-text-request.js';
 import { OPENAI_TEXT_RESPONSE_ENDPOINT, translateOpenAiTextResponse } from '../dist/openai-text-response.js';
 
@@ -356,13 +356,13 @@ function createSender(state) {
     scope: SCOPE,
     known: { scope: SCOPE, key: KEY, entries: BENIGN_ENTRIES },
     sentinel: { deadlineMs: DEADLINE_MS },
-    inspect: inspectWholeImage,
+    inspectOriginal: inspectWholeImage,
     sendPoint: {
       observe: () => OBSERVATION,
       sendExact: rawSocketTransport(state),
     },
   };
-  return createOpenAiKeepSender(host);
+  return createOpenAiTextSender(host);
 }
 
 /** The whole withholding invariant: no connection, no parsed request and no byte reached the server. */

@@ -1,11 +1,14 @@
 /**
- * KEEP-only complete-text OpenAI-compatible request sender (#201). One call owns the whole runtime
- * effect: translation, the exact private serialized request image, snapshot-bound whole-image
- * classification evidence, the real deterministic SEND policy decision, the real fixed-worker egress
- * sentinel child process, and exactly one trusted transport dispatch.
+ * Complete-text OpenAI-compatible request sender (#201, whole-message MASK #218). One call owns the
+ * whole runtime effect: translation, the exact private serialized ORIGINAL request image,
+ * snapshot-bound whole-image classification evidence over that original, the real deterministic SEND
+ * policy decision per unit, a private per-unit plan, the rebuilt final image when real policy selected
+ * `MASK` for a message, the real fixed-worker egress sentinel child process over those exact final
+ * bytes, and exactly one trusted transport dispatch.
  *
  * What this is NOT. It is not a gateway, a listener, a provider client, an authentication
- * implementation, a credential or vault path, a transformation engine or a response release. The
+ * implementation, a credential or vault path, a general transformation engine or a response release.
+ * The one transformation it owns is the narrow, irreversible, generic whole-message mask below. The
  * trusted host supplies an already authenticated boundary, the pinned policy commit, the
  * snapshot-bound inspection handoff and the exact-byte transport; **nothing here authenticates any of
  * them**, and this unit cannot prove that an arbitrary injected transport honors its contract.
@@ -20,12 +23,19 @@
  * - There is no public "prepared" or "ready" handle and no replayable `sendPrepared`. A `SENT` result
  *   carries no bytes and no digest, so nothing a caller holds can be sent twice, mutated after a
  *   check, or re-sent after routing changed. Cancellation is sender-owned, never a caller signal.
- * - Only `KEEP` releases. `MASK`, `REMOVE`, every other treatment and `REQUIRE_REVIEW` all withhold,
- *   because this unit implements no transformation semantics and no review authority.
+ * - `KEEP` releases as before. A `MESSAGE` unit whose real policy decision is `SELECTED` with
+ *   treatment `MASK` releases as the fixed generic literal `[hylja:masked]`
+ *   (decision 011), irreversibly and with
+ *   nothing original in the released representation. That literal is original-independent and carries
+ *   no kind, format, fidelity or other derived fact; it is not a typed placeholder, not a field-level
+ *   or span-level rewrite, not a mapping and not reversible. `METADATA` and `MODEL` units still
+ *   require `KEEP`; `REMOVE` and every other treatment, and `REQUIRE_REVIEW`, all withhold, because
+ *   this unit implements no other treatment and no review authority.
  * - `coverage: 'COMPLETE'` alone never authorizes. Authorization is the conjunction of exact whole-image
  *   unit coverage, a classification digest that matches the record actually used, a real `RESOLVED`
- *   classification carrying detector evidence, a real `SELECTED`/`KEEP` policy decision, and a real
- *   `ALLOW` from the sentinel child over these exact bytes.
+ *   classification carrying detector evidence, a real `SELECTED` policy decision that is `KEEP` for
+ *   every unit or `MASK` for a `MESSAGE` unit, a derivation that reproduces the plan over the final
+ *   bytes, and a real `ALLOW` from the sentinel child over exactly those final bytes.
  * - Authorization does not outlive its evidence. Sticky cancellation is re-read after the last host
  *   observation, and the snapshotted boundary proof intervals are re-read for freshness at the dispatch
  *   point, immediately before the transport call. That is freshness, never authenticity: authenticating
@@ -40,7 +50,7 @@
  *   It is not a rule that revokes on host-side mutation: a host that rewrites its own members to the same
  *   values is checked under exactly the captured ones.
  * - Every accepted method is captured once, on the receiver it was validated on, and is never looked up
- *   on the host object again. `inspect`, `observe` and `sendExact` run as the function references the
+ *   on the host object again. `inspectOriginal`, `observe` and `sendExact` run as the function references the
  *   validated data properties held, so reading a method back off the host at the dispatch point - a
  *   Proxy `get` trap away from running after the last guard - never happens, and a host that replaces
  *   its own method later does not retarget a sender that already exists. Invoking the captured transport
@@ -48,9 +58,10 @@
  * - Detector absence is never clearance: an empty or partial finding set, an unclassified remainder, a
  *   caller-supplied digest or an `UNRESOLVED` record all refuse.
  *
- * The checked image is private. The trusted inspection callback receives its own copy, which it may
- * scribble on; the released bytes are the sentinel's own private ALLOW copy. The only representation
- * that may reach the transport is that copy, handed over once.
+ * Both images are private. The trusted inspection callback is bound to the ORIGINAL image and receives
+ * its own copy, which it may scribble on; the rebuilt final image exists only inside this unit. The
+ * released bytes are the sentinel's own private ALLOW copy over the FINAL image. The only
+ * representation that may reach the transport is that copy, handed over once.
  */
 import { createHash } from 'node:crypto';
 import { createInteractionEnvelope } from './interaction-envelope.js';
@@ -75,7 +86,7 @@ import type { OpenAiTextRequestRefusal } from './openai-text-request.js';
  * field name, byte offset, parser excerpt, exception message, transport error or any part of the
  * input, so a refusal is safe to log and a planted value never reappears in a result.
  */
-export const OPENAI_KEEP_SENDER_REFUSALS = Object.freeze([
+export const OPENAI_TEXT_SENDER_REFUSALS = Object.freeze([
   /** The trusted host object is not the exact declared shape; this sender can never dispatch. */
   'HOST_INVALID',
   /** One send is already in flight. There is no queue, no pool and no replay. */
@@ -108,32 +119,32 @@ export const OPENAI_KEEP_SENDER_REFUSALS = Object.freeze([
   'SENDER_FAILED',
 ] as const);
 
-export type KeepSendRefusal = (typeof OPENAI_KEEP_SENDER_REFUSALS)[number] | OpenAiTextRequestRefusal;
-export type KeepSendResult =
+export type TextSendRefusal = (typeof OPENAI_TEXT_SENDER_REFUSALS)[number] | OpenAiTextRequestRefusal;
+export type TextSendResult =
   | Readonly<{ status: 'SENT' }>
-  | Readonly<{ status: 'REFUSED'; code: KeepSendRefusal }>;
-export type KeepSenderState = 'IDLE' | 'BUSY' | 'CANCELLED' | 'FAILED';
+  | Readonly<{ status: 'REFUSED'; code: TextSendRefusal }>;
+export type TextSenderState = 'IDLE' | 'BUSY' | 'CANCELLED' | 'FAILED';
 
 /** One inspected unit of the exact private image, in wire order: the header block, then the model, then each message. */
-export type KeepInspectionUnitKind = 'METADATA' | 'MODEL' | 'MESSAGE';
-export interface KeepInspectionUnit {
+export type TextInspectionUnitKind = 'METADATA' | 'MODEL' | 'MESSAGE';
+export interface TextInspectionUnit {
   /** Opaque reference chosen by the sender. It names a position, never a value or a raw span. */
   readonly unitRef: string;
-  readonly kind: KeepInspectionUnitKind;
+  readonly kind: TextInspectionUnitKind;
   /** SHA-256 of this unit's exact bytes inside the image. A binding token, never a permission. */
   readonly digest: string;
 }
 
 /** What the sender hands the trusted inspector: which image, which interaction, which units. */
-export interface KeepInspectionBinding {
+export interface TextInspectionBinding {
   readonly version: 1;
   readonly interactionRef: string;
   /** SHA-256 of the sender's own private snapshot of the exact wire image. */
   readonly imageDigest: string;
-  readonly units: readonly KeepInspectionUnit[];
+  readonly units: readonly TextInspectionUnit[];
 }
 
-export interface KeepInspectionFinding {
+export interface TextInspectionFinding {
   readonly unitRef: string;
   /** Digest the trusted producer pinned for this exact record. Congruence is checked, not trusted. */
   readonly classificationDigest: string;
@@ -141,7 +152,7 @@ export interface KeepInspectionFinding {
 }
 
 /** The shape a trusted inspector returns. It is validated here; the declared type grants no authority. */
-export interface KeepInspectionResult {
+export interface TextInspectionResult {
   readonly version: 1;
   readonly interactionRef: string;
   readonly imageDigest: string;
@@ -149,23 +160,23 @@ export interface KeepInspectionResult {
   readonly coverage: 'COMPLETE';
   /** Explicit: no part of the image is left unclassified. Anything else refuses. */
   readonly remainder: 'NONE';
-  readonly units: readonly KeepInspectionFinding[];
+  readonly units: readonly TextInspectionFinding[];
 }
 
-export interface KeepSenderObservation {
+export interface TextSenderObservation {
   /** Destination id and profile digest observed at the send point, right now. */
   readonly destination: SentinelProcessDestination;
   /** The currently committed policy identity and content digest. */
   readonly commit: Readonly<{ id: string; version: string; digest: string }>;
 }
 
-export interface KeepSenderSendPoint {
+export interface TextSenderSendPoint {
   /**
    * Re-observes the actual route and the committed policy. Called once for the check and again in the
    * same synchronous turn as the dispatch, so no await separates the last check from the effect.
    * Redirects are prohibited: a different route is a refusal, never a followed location.
    */
-  observe(): KeepSenderObservation;
+  observe(): TextSenderObservation;
   /** Sends exactly these bytes, once. A resolved promise is the only confirmation of the effect. */
   sendExact(image: Uint8Array): Promise<void>;
 }
@@ -175,7 +186,7 @@ export interface KeepSenderSendPoint {
  * none of them arrives from a request header, body, model text or launcher flag, and none of them
  * authenticates itself here.
  */
-export interface KeepSenderHost {
+export interface TextSenderHost {
   /** Independently authenticated subject/context plus the observed source and destination with proofs. */
   readonly boundary: BoundaryContext;
   /** Source trust observed for this interaction. Never a payload or model claim. */
@@ -189,22 +200,22 @@ export interface KeepSenderHost {
   /** Host-owned sentinel runner configuration. The child is the module's fixed compiled worker. */
   readonly sentinel: SentinelProcessRunnerConfig;
   /** Whole-image, snapshot-bound classification handoff. The only classification source. */
-  inspect(image: Uint8Array, binding: KeepInspectionBinding): unknown;
+  inspectOriginal(image: Uint8Array, binding: TextInspectionBinding): unknown;
   /** Independently observed route/profile and the exact-byte transport. */
-  readonly sendPoint: KeepSenderSendPoint;
+  readonly sendPoint: TextSenderSendPoint;
 }
 
-export interface OpenAiKeepSender {
+export interface OpenAiTextSender {
   /** One send per call. A second concurrent call is refused rather than queued or duplicated. */
-  send(input: unknown): Promise<KeepSendResult>;
+  send(input: unknown): Promise<TextSendResult>;
   /** Sender-owned, sticky cancellation. After it, this sender can never dispatch again. */
   cancel(): void;
-  readonly state: KeepSenderState;
+  readonly state: TextSenderState;
 }
 
 /* ---------- Fixed, closed vocabularies and strict structural readers ---------- */
 
-const HOST_KEYS: readonly string[] = ['boundary', 'sourceTrust', 'policyBundle', 'scope', 'known', 'sentinel', 'inspect', 'sendPoint'];
+const HOST_KEYS: readonly string[] = ['boundary', 'sourceTrust', 'policyBundle', 'scope', 'known', 'sentinel', 'inspectOriginal', 'sendPoint'];
 const SEND_POINT_KEYS: readonly string[] = ['observe', 'sendExact'];
 const OBSERVATION_KEYS: readonly string[] = ['destination', 'commit'];
 const DESTINATION_KEYS: readonly string[] = ['id', 'profileDigest'];
@@ -224,9 +235,9 @@ const CONTENT_TYPE = 'application/json; charset=utf-8';
 const encoder = new TextEncoder();
 
 type Fields = Record<string, unknown>;
-type ObserveMethod = () => KeepSenderObservation;
+type ObserveMethod = () => TextSenderObservation;
 type SendExactMethod = (image: Uint8Array) => Promise<void>;
-type InspectMethod = (image: Uint8Array, binding: KeepInspectionBinding) => unknown;
+type InspectOriginalMethod = (image: Uint8Array, binding: TextInspectionBinding) => unknown;
 
 /**
  * Bind one already-accepted method to the receiver it was validated on, once. The wrapper calls that
@@ -290,7 +301,7 @@ function usableDestination(destination: unknown): SentinelProcessDestination | n
   return { id, profileDigest };
 }
 
-function observationOf(value: unknown): KeepSenderObservation | null {
+function observationOf(value: unknown): TextSenderObservation | null {
   const fields = exact(value, OBSERVATION_KEYS);
   if (fields === null) return null;
   const destination = usableDestination(fields['destination']);
@@ -307,7 +318,7 @@ function same(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function refused(code: KeepSendRefusal): KeepSendResult {
+function refused(code: TextSendRefusal): TextSendResult {
   return Object.freeze({ status: 'REFUSED' as const, code });
 }
 
@@ -316,12 +327,12 @@ function refused(code: KeepSendRefusal): KeepSendResult {
  * envelope, the policy seam and the sentinel runner remain the authority for everything they own, and
  * this never duplicates them.
  */
-function trustedHost(value: unknown): KeepSenderHost | null {
+function trustedHost(value: unknown): TextSenderHost | null {
   const fields = exact(value, HOST_KEYS);
   if (fields === null) return null;
   const sendPoint = exact(fields['sendPoint'], SEND_POINT_KEYS);
   if (sendPoint === null) return null;
-  const inspect = fields['inspect'];
+  const inspect = fields['inspectOriginal'];
   const observe = sendPoint['observe'];
   const sendExact = sendPoint['sendExact'];
   if (typeof inspect !== 'function' || typeof observe !== 'function' || typeof sendExact !== 'function') return null;
@@ -341,12 +352,12 @@ function trustedHost(value: unknown): KeepSenderHost | null {
   const snapshot = Object.freeze({ ...fields });
   return Object.freeze({
     ...snapshot,
-    inspect: captured(inspect as InspectMethod, snapshot),
+    inspect: captured(inspect as InspectOriginalMethod, snapshot),
     sendPoint: Object.freeze({
       observe: captured(observe as ObserveMethod, fields['sendPoint']),
       sendExact: captured(sendExact as SendExactMethod, fields['sendPoint']),
     }),
-  }) as unknown as KeepSenderHost;
+  }) as unknown as TextSenderHost;
 }
 
 /* ---------- The exact private image and its unit decomposition ---------- */
@@ -355,13 +366,64 @@ interface SendImage {
   readonly bytes: Uint8Array;
   /** Byte length of the header section, including the blank line that ends it. */
   readonly metadataLength: number;
+  /** The observed destination label this image was framed with. */
+  readonly hostLabel: string;
+  /** The exact JSON body the image carries, as text. Never a parsed value. */
+  readonly body: string;
   /** The exact JSON literal bytes the model occupies in the image. */
   readonly modelLiteral: string;
+  /** The model text itself, as the codec decoded it. A masked rebuild never changes it. */
+  readonly model: string;
+  /** The roles, in wire order. A masked rebuild never changes one. */
+  readonly messages: readonly DraftMessage[];
   /** The exact JSON literal bytes each message content occupies, in wire order. */
   readonly messageLiterals: readonly string[];
 }
 
 interface DraftMessage { readonly role: string; readonly literal: string }
+
+/**
+ * The one generic irreversible literal this unit can emit. It is original-independent: it carries no
+ * kind, format, fidelity or other derived fact, it is not a typed placeholder, and nothing resolves it
+ * back. Its only visibility is the minimal irreversible presence and structure a masked unit has.
+ */
+const MASK_LITERAL = '[hylja:masked]';
+/** The exact JSON literal those bytes occupy as a message `content` value in the rebuilt body. */
+const MASK_JSON_LITERAL = JSON.stringify(MASK_LITERAL);
+/** Recorded in every plan entry, so a final image is bound to the rule version that produced it. */
+const TRANSFORMATION_VERSION = 1;
+
+/**
+ * One private derivation commitment, shared by both arms of the plan. It binds the ORIGINAL
+ * interaction's unit reference and digest to the classification, the observed policy commit, the
+ * decision fingerprint and the transformation version that were actually used. It is congruence
+ * evidence about one change and nothing else: not clearance, not authorization, not an identity and
+ * not a bearer capability.
+ */
+interface PlanBinding {
+  readonly unitRef: string;
+  readonly originalDigest: string;
+  readonly classificationDigest: string;
+  readonly policy: Readonly<{ id: string; version: string; digest: string }>;
+  readonly decisionRef: string | null;
+  readonly version: number;
+}
+
+/**
+ * The private, discriminated per-unit plan. Only the real Policy Engine writes an entry, only for a
+ * real `SELECTED` decision: `KEEP` for every unit kind, and `MASK` for a `MESSAGE` unit only. There is
+ * no caller-selected treatment, no substitute text and no per-span or per-field rewrite anywhere here.
+ */
+type UnitPlan =
+  | Readonly<PlanBinding & { treatment: 'KEEP'; unitKind: TextInspectionUnitKind }>
+  | Readonly<PlanBinding & { treatment: 'MASK'; unitKind: 'MESSAGE' }>;
+
+/** A rebuilt image plus the unit digests the plan has to reproduce exactly. */
+interface DerivedImage {
+  readonly bytes: Uint8Array;
+  readonly imageDigest: string;
+  readonly units: readonly TextInspectionUnit[];
+}
 
 function draftMessages(draft: InteractionDraft): readonly DraftMessage[] {
   const payload = draft.payload;
@@ -377,14 +439,12 @@ function draftMessages(draft: InteractionDraft): readonly DraftMessage[] {
 }
 
 /**
- * Serialize the translated draft into the exact wire image. The header set is fixed and allowlisted:
- * the caller contributes the endpoint (matched literally by the codec), the model and the message
- * texts, and nothing else. There is no treatment here, so the checked image is the sent image.
+ * Frame the given message literals into the exact wire image. The header set is fixed and
+ * allowlisted: the caller contributes the endpoint (matched literally by the codec), the model and the
+ * message texts, and nothing else. `Content-Length` is the only field derived from the body, so a
+ * rebuilt body is the only thing that can change a header, and the trusted codec owns that bound.
  */
-function buildImage(draft: InteractionDraft, hostLabel: string): SendImage {
-  const model = draft.metadata?.model;
-  if (typeof model !== 'string') throw new TypeError('model');
-  const messages = draftMessages(draft);
+function frameImage(messages: readonly DraftMessage[], model: string, hostLabel: string): SendImage {
   const modelLiteral = JSON.stringify(model);
   const body = `{"model":${modelLiteral},"messages":[${messages
     .map((message) => `{"role":${JSON.stringify(message.role)},"content":${message.literal}}`).join(',')}]}`;
@@ -401,14 +461,90 @@ function buildImage(draft: InteractionDraft, hostLabel: string): SendImage {
   bytes.set(headBytes, 0);
   bytes.set(bodyBytes, headBytes.byteLength);
   return Object.freeze({
-    bytes, metadataLength: headBytes.byteLength, modelLiteral,
+    bytes, metadataLength: headBytes.byteLength, hostLabel, body, model, modelLiteral, messages,
     messageLiterals: Object.freeze(messages.map((message) => message.literal)),
   });
 }
 
+/** The ORIGINAL image: what the caller's body says, with no treatment applied anywhere. */
+function buildImage(draft: InteractionDraft, hostLabel: string): SendImage {
+  const model = draft.metadata?.model;
+  if (typeof model !== 'string') throw new TypeError('model');
+  return frameImage(draftMessages(draft), model, hostLabel);
+}
+
+/**
+ * Rebuild the final image from the private plan and prove the rebuild is congruent with the original.
+ *
+ * A `KEEP` message keeps its exact original literal bytes, a `KEEP` model keeps its exact original
+ * literal bytes, and roles, order and count never change: the same text in two messages is two
+ * separate units, so one selected unit can never rewrite a byte in another. A `MASK` message unit is
+ * replaced whole by the fixed literal. Only `Content-Length` is recomputed, as the UTF-8 byte length
+ * of the rebuilt body.
+ *
+ * Every step is deterministic and fail-closed: the rebuilt body is re-parsed by the same strict codec
+ * the caller's original had to pass and is compared against the plan, so a representation the codec
+ * refuses, a digest that does not reproduce or a message that does not decode back to the plan throws
+ * and the send withholds. Masked text is never relabelled, never reclassified and never re-bound to a
+ * clearance: no `PUBLIC` relabelling happens here, and a final unit digest is recomputed rather than
+ * reused from the original.
+ */
+function deriveFinal(image: SendImage, units: readonly TextInspectionUnit[],
+  plan: readonly UnitPlan[], interactionRef: string): DerivedImage {
+  if (plan.length !== units.length || plan.length !== image.messageLiterals.length + 2) {
+    throw new TypeError('plan');
+  }
+  // METADATA and MODEL occupy the first two plan slots, so message i is plan[i + 2].
+  const messages = image.messages.map((message, index) => {
+    const entry = plan[index + 2];
+    return { role: message.role, literal: entry === undefined || entry.treatment === 'KEEP'
+      ? message.literal : MASK_JSON_LITERAL };
+  });
+  const final = frameImage(messages, image.model, image.hostLabel);
+  const finalUnits = unitsOf(final, interactionRef);
+  const maskedDigest = digestOf(encoder.encode(MASK_JSON_LITERAL));
+  for (let index = 0; index < plan.length; index += 1) {
+    const entry = plan[index] as UnitPlan;
+    const original = units[index] as TextInspectionUnit;
+    const derived = finalUnits[index] as TextInspectionUnit;
+    if (entry.unitRef !== original.unitRef || entry.unitRef !== derived.unitRef ||
+      entry.unitKind !== original.kind || entry.unitKind !== derived.kind ||
+      entry.originalDigest !== original.digest) throw new TypeError('binding');
+    if (entry.treatment === 'MASK') {
+      if (entry.unitKind !== 'MESSAGE' || derived.digest !== maskedDigest) throw new TypeError('mask');
+    } else if (entry.unitKind !== 'METADATA' && derived.digest !== original.digest) {
+      // A KEEP model or message unit must still carry its own original bytes. The METADATA unit is the
+      // one exception decision 011 authorizes: its header block covers the recomputed Content-Length.
+      throw new TypeError('keep');
+    }
+  }
+  const reparsed = translateOpenAiTextRequest({ endpoint: OPENAI_TEXT_REQUEST_ENDPOINT, body: final.body });
+  if (reparsed.status !== 'TRANSLATED') throw new TypeError('codec');
+  const decoded = draftMessages(reparsed.draft);
+  if (reparsed.draft.metadata?.model !== image.model || decoded.length !== messages.length) {
+    throw new TypeError('codec');
+  }
+  for (let index = 0; index < messages.length; index += 1) {
+    if (decoded[index]?.role !== messages[index]?.role || decoded[index]?.literal !== messages[index]?.literal) {
+      throw new TypeError('codec');
+    }
+  }
+  return Object.freeze({ bytes: final.bytes, imageDigest: digestOf(final.bytes), units: finalUnits });
+}
+
+/**
+ * The fail-closed entry to the derivation. A deterministic failure - a codec refusal, a digest that
+ * does not reproduce, a message that does not decode back - withholds the whole send and carries no
+ * detail; no partial image, no substitute literal and no original ever comes back out of here.
+ */
+function derivationOf(image: SendImage, units: readonly TextInspectionUnit[],
+  plan: readonly UnitPlan[], interactionRef: string): DerivedImage | null {
+  try { return deriveFinal(image, units, plan, interactionRef); } catch { return null; }
+}
+
 /** One unit per inspectable position of the whole image, each bound to its exact bytes inside it. */
-function unitsOf(image: SendImage, interactionRef: string): readonly KeepInspectionUnit[] {
-  const units: KeepInspectionUnit[] = [
+function unitsOf(image: SendImage, interactionRef: string): readonly TextInspectionUnit[] {
+  const units: TextInspectionUnit[] = [
     { unitRef: `${interactionRef}-u0`, kind: 'METADATA', digest: digestOf(image.bytes.subarray(0, image.metadataLength)) },
     { unitRef: `${interactionRef}-u1`, kind: 'MODEL', digest: digestOf(encoder.encode(image.modelLiteral)) },
   ];
@@ -425,7 +561,7 @@ function unitsOf(image: SendImage, interactionRef: string): readonly KeepInspect
  * when every declared unit is present exactly once; the caller then binds each record by digest and
  * decides policy over it.
  */
-function findingsOf(value: unknown, binding: KeepInspectionBinding): readonly KeepInspectionFinding[] | null {
+function findingsOf(value: unknown, binding: TextInspectionBinding): readonly TextInspectionFinding[] | null {
   const fields = exact(value, RESULT_KEYS);
   if (fields === null) return null;
   if (fields['version'] !== 1 || fields['interactionRef'] !== binding.interactionRef ||
@@ -434,7 +570,7 @@ function findingsOf(value: unknown, binding: KeepInspectionBinding): readonly Ke
   const units = fields['units'];
   if (!Array.isArray(units) || units.length !== binding.units.length) return null;
   const seen = new Set<string>();
-  const findings: KeepInspectionFinding[] = [];
+  const findings: TextInspectionFinding[] = [];
   for (const entry of units) {
     const finding = exact(entry, FINDING_KEYS);
     if (finding === null) return null;
@@ -456,7 +592,7 @@ function findingsOf(value: unknown, binding: KeepInspectionBinding): readonly Ke
  * unresolved remainder, or a semantic-only PUBLIC judgment that no detector corroborated all refuse:
  * detector absence is never clearance.
  */
-function usableClassification(finding: KeepInspectionFinding): Classification | null {
+function usableClassification(finding: TextInspectionFinding): Classification | null {
   if (ownData(finding.classification, 'status') !== 'RESOLVED') return null;
   const evidence = ownData(finding.classification, 'evidence');
   if (!Array.isArray(evidence)) return null;
@@ -496,13 +632,13 @@ function currentEvidence(envelope: InteractionEnvelope, now: number): boolean {
  * Create a KEEP-only sender bound to one trusted host. Construction never throws and never sends: an
  * unusable host yields a permanently restrictive sender instead of an echo of a caller value.
  */
-export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
+export function createOpenAiTextSender(host: unknown): OpenAiTextSender {
   const trusted = trustedHost(host);
   if (trusted === null) {
     return Object.freeze({
-      send: (): Promise<KeepSendResult> => Promise.resolve(refused('HOST_INVALID')),
+      send: (): Promise<TextSendResult> => Promise.resolve(refused('HOST_INVALID')),
       cancel: (): void => { /* an unusable sender owns nothing to cancel */ },
-      get state(): KeepSenderState { return 'FAILED'; },
+      get state(): TextSenderState { return 'FAILED'; },
     });
   }
   const runner = createSentinelProcessRunner(trusted.sentinel);
@@ -510,7 +646,7 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
   let cancelled = false;
 
   /** One send, start to finish. Every stage that is not an authorization withholds. */
-  const run = async (input: unknown): Promise<KeepSendResult> => {
+  const run = async (input: unknown): Promise<TextSendResult> => {
     const translated = translateOpenAiTextRequest(input);
     if (translated.status === 'REFUSED') return refused(translated.reason);
 
@@ -532,12 +668,15 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
     try { image = buildImage(translated.draft, observed.destination.id); } catch { return refused('SENDER_FAILED'); }
     const imageDigest = digestOf(image.bytes);
     const units = unitsOf(image, interactionRef);
-    const binding: KeepInspectionBinding = Object.freeze({
+    const binding: TextInspectionBinding = Object.freeze({
       version: 1, interactionRef, imageDigest, units,
     });
 
-    // The exact request the child is asked to check is captured into private, capped copies BEFORE the
-    // host inspector runs, and those copies are what the child is later handed. The existing sentinel
+    // The scope, registration and destinations the child is asked to check under are captured into
+    // private, capped copies BEFORE the host inspector runs, and those copies - not the host's own
+    // aliases - are what the child is later handed. The request this send owns and checks is the
+    // FINAL image; it does not exist yet, so this pre-capture binds only what cannot wait for the
+    // policy decisions. The existing sentinel
     // snapshot seam owns that validation and copying, so this reuses it instead of adding a second
     // context validator: an unknown own key, an oversized registration, a registration scope that is not
     // the check scope, an unsupported value or a hostile trap refuses here exactly as the runner's own
@@ -566,6 +705,9 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
       return refused('SENTINEL_BLOCKED');
     }
     const capturedRequest = taken.value;
+    // This sender's own private copy of the FINAL image, made once the plan is known and zeroed with
+    // the rest of this send's copies below.
+    let checked: Uint8Array | null = null;
     try {
       // The captured scope is compared against the BOUND ENVELOPE, not against an earlier mutable alias
       // of the host object: this is the scope the child is about to run under, so it is the one that
@@ -578,10 +720,11 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
 
       // The inspector gets its own copy. It can answer, mutate or throw; none of it reaches the bytes,
       // and a thrown value is never inspected: its text, class and stack are all caller-controlled.
-      let findings: readonly KeepInspectionFinding[] | null;
-      try { findings = findingsOf(trusted.inspect(image.bytes.slice(), binding), binding); } catch { findings = null; }
+      let findings: readonly TextInspectionFinding[] | null;
+      try { findings = findingsOf(trusted.inspectOriginal(image.bytes.slice(), binding), binding); } catch { findings = null; }
       if (findings === null) return refused('INSPECTION_REFUSED');
       const byUnit = new Map(findings.map((finding) => [finding.unitRef, finding] as const));
+      const plan: UnitPlan[] = [];
 
       for (const unit of units) {
         const finding = byUnit.get(unit.unitRef);
@@ -604,13 +747,35 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
         const decision = decidePolicy(request, boundary, trusted.policyBundle);
         if (decision.state === 'DENIED') return refused('POLICY_DENIED');
         if (decision.state === 'HELD') return refused('POLICY_HELD');
+        const commitment: PlanBinding = {
+          unitRef: unit.unitRef, originalDigest: unit.digest,
+          classificationDigest: finding.classificationDigest, policy: { ...observed.commit },
+          decisionRef: decision.decisionRef ?? null, version: TRANSFORMATION_VERSION,
+        };
+        // The one treatment this unit implements, for the one unit kind that may carry it. The
+        // decision is real policy's alone: nothing here can select it, and the METADATA and MODEL
+        // units are never masked, so a MASK decision over either still refuses below.
+        if (unit.kind === 'MESSAGE' && decision.treatment === 'MASK') {
+          plan.push(Object.freeze({ ...commitment, treatment: 'MASK', unitKind: 'MESSAGE' }));
+          continue;
+        }
         if (decision.treatment !== 'KEEP') return refused('POLICY_NOT_KEEP');
+        plan.push(Object.freeze({ ...commitment, treatment: 'KEEP', unitKind: unit.kind }));
       }
 
+      // The rebuild is deterministic and fail-closed. Anything the trusted codec refuses, any digest
+      // the plan does not reproduce and any message that does not decode back withholds the send, and
+      // a derived image never becomes a handle: it exists only here, is checked below and is dropped
+      // with this frame.
+      const derived = derivationOf(image, units, plan, interactionRef);
+      if (derived === null) return refused('SENDER_FAILED');
+      checked = derived.bytes.slice();
+
       const outcome = await runner.check({
-        // The private captured bytes, scope and registration. A host alias mutated during the inspection
-        // cannot retarget the check: the child is asked about exactly what this send captured.
-        bytes: capturedRequest.payload,
+        // The private FINAL bytes, under the scope and registration captured before the inspection. A
+        // host alias mutated during the inspection cannot retarget the check, and the child is asked
+        // about exactly the bytes that will be dispatched - never the original ones.
+        bytes: checked,
         scope: capturedRequest.scope,
         destination: capturedRequest.observed,
         authorized: capturedRequest.authorized,
@@ -650,6 +815,7 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
       // These provisional copies are this sender's own and exist only for this send. They are zeroed when
       // it ends - including on an inspection, policy or sentinel refusal - and they are never reachable
       // from a result, a binding, a finding or the sent bytes.
+      checked?.fill(0);
       capturedRequest.payload.fill(0);
       capturedRequest.known?.key.fill(0);
     }
@@ -661,7 +827,7 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
      * synchronously, before any stage runs, so a concurrent call is refused rather than queued and can
      * never produce a second dispatch.
      */
-    send: (input: unknown): Promise<KeepSendResult> => {
+    send: (input: unknown): Promise<TextSendResult> => {
       if (busy) return Promise.resolve(refused('SENDER_BUSY'));
       if (cancelled) return Promise.resolve(refused('CANCELLED'));
       busy = true;
@@ -672,7 +838,7 @@ export function createOpenAiKeepSender(host: unknown): OpenAiKeepSender {
       cancelled = true;
       runner.cancel();
     },
-    get state(): KeepSenderState {
+    get state(): TextSenderState {
       if (cancelled) return 'CANCELLED';
       if (runner.state === 'QUARANTINED') return 'FAILED';
       return busy ? 'BUSY' : 'IDLE';
