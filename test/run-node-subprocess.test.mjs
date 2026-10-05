@@ -83,7 +83,7 @@ test('a child that really runs reports its own exit code and both captured strea
     assert.equal(run.code, 0, 'the working run exited zero');
     assert.equal(run.signal, null, 'the working run exited on its own');
     assert.equal(run.stdout.includes('a working run'), true, 'its stdout was captured');
-    assert.equal(run.stderr, '', 'it printed nothing on stderr');
+    assert.equal(run.stderr === '', true, 'it printed nothing on stderr');
   });
 
 test('an ordinary non-zero exit keeps its code and its output, and is not a transport failure', { timeout: TEST_TIMEOUT_MS },
@@ -94,7 +94,7 @@ test('an ordinary non-zero exit keeps its code and its output, and is not a tran
     assert.equal(run.code, 1, 'the failing run reported its own exit code');
     assert.equal(run.signal, null, 'the failing run exited on its own, not on a signal');
     assert.equal(run.stderr.includes('an ordinary failing run'), true, 'its stderr was captured');
-    assert.equal(run.stdout, '', 'it printed nothing on stdout');
+    assert.equal(run.stdout === '', true, 'it printed nothing on stdout');
   });
 
 test('a failing `node --test` run keeps its TAP and its non-zero exit', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -122,8 +122,8 @@ test('a synchronous spawn exception settles once with the fixed restrictive outc
     assert.equal(run.code, null, 'no exit code is invented for a child that never ran');
     assert.equal(run.signal, null, 'no signal is invented for a child that never ran');
     assert.equal(run.stalled, false, 'a spawn that threw is not a stall');
-    assert.equal(run.stdout, '', 'nothing is captured when the child never ran');
-    assert.equal(run.stderr, '', 'no native error text and no checkout path is reported');
+    assert.equal(run.stdout === '', true, 'nothing is captured when the child never ran');
+    assert.equal(run.stderr === '', true, 'no native error text and no checkout path is reported');
   });
 
 test('an asynchronous spawn error settles once with the fixed restrictive outcome', { timeout: TEST_TIMEOUT_MS },
@@ -132,8 +132,8 @@ test('an asynchronous spawn error settles once with the fixed restrictive outcom
     assert.equal(run.transportFailure, true, 'a spawn that reports an error is a transport failure');
     assert.equal(run.code, null, 'no exit code is invented');
     assert.equal(run.signal, null, 'no signal is invented');
-    assert.equal(run.stdout, '', 'nothing is captured');
-    assert.equal(run.stderr, '', 'no native error text and no checkout path is reported');
+    assert.equal(run.stdout === '', true, 'nothing is captured');
+    assert.equal(run.stderr === '', true, 'no native error text and no checkout path is reported');
   });
 
 test('a child whose required pipes are missing settles once with the fixed restrictive outcome', { timeout: TEST_TIMEOUT_MS },
@@ -142,8 +142,8 @@ test('a child whose required pipes are missing settles once with the fixed restr
     assert.equal(run.transportFailure, true, 'a run whose output cannot be captured is a transport failure');
     assert.equal(run.code, null, 'no exit code is reported for a run that was not observed');
     assert.equal(run.signal, null, 'no signal is reported');
-    assert.equal(run.stdout, '', 'nothing is captured');
-    assert.equal(run.stderr, '', 'nothing is reported');
+    assert.equal(run.stdout === '', true, 'nothing is captured');
+    assert.equal(run.stderr === '', true, 'nothing is reported');
   });
 
 test('a stall inside the bound is reported as a stall, and only the owned child is stopped', { timeout: TEST_TIMEOUT_MS },
@@ -152,8 +152,8 @@ test('a stall inside the bound is reported as a stall, and only the owned child 
     assert.equal(run.stalled, true, 'the stalled run is reported as a stall');
     assert.equal(run.code, null, 'a stopped child reported no exit code of its own');
     assert.equal(typeof run.signal, 'string', 'the stop really was a signal');
-    assert.equal(run.stdout, '', 'a stopped run captured nothing');
-    assert.equal(run.stderr, '', 'a stopped run reported nothing');
+    assert.equal(run.stdout === '', true, 'a stopped run captured nothing');
+    assert.equal(run.stderr === '', true, 'a stopped run reported nothing');
   });
 
 test('a stalled run takes down its whole process tree before it returns', { timeout: TEST_TIMEOUT_MS }, async () => {
