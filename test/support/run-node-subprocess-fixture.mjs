@@ -10,9 +10,11 @@
  * planted or protected value exists here at all.
  *
  *   (no argument)  a working run: one fixed stdout line, exit 0
- *   --fail         an ordinary failing run: one fixed stderr line, exit 1, no signal
- *   --sleep        a stall: sleeps well past any bound the suite uses, until it is stopped
- *   --descriptors  reports whether this process really hit EMFILE, then really runs one child
+ *   failing        an ordinary failing run: one fixed stderr line, exit 1, no signal
+ *   stall          a stall: holds itself well past any bound the suite uses, until it is stopped
+ *   descriptors    reports whether this process really hit EMFILE, then really runs one child
+ *
+ * Exactly one of those words, or none at all. Anything else is refused below.
  *
  * Any other argument is refused with one fixed line and exits 2, like every other fixture here.
  */
@@ -28,9 +30,12 @@ const MODES = Object.freeze({
 const KNOWN = new Set(Object.values(MODES));
 const REFUSED = 'run-node-subprocess fixture: argument refused\n';
 
-const mode = process.argv.length === 2 && KNOWN.has(process.argv[2]) ? process.argv[2] : MODES.WORKING;
+/** The arguments after the entry point: exactly one fixed mode word, or none. */
+const requested = process.argv.slice(2);
+const refused = requested.length > 1 || (requested.length === 1 && !KNOWN.has(requested[0]));
+const mode = refused ? null : requested[0] ?? MODES.WORKING;
 
-if (process.argv.length > 2 && !KNOWN.has(mode)) {
+if (refused) {
   process.stderr.write(REFUSED);
   process.exitCode = 2;
 } else if (mode === MODES.FAILING) {
@@ -38,18 +43,26 @@ if (process.argv.length > 2 && !KNOWN.has(mode)) {
   process.exitCode = 1;
 } else if (mode === MODES.STALL) {
   // Ten seconds: far longer than the bound the suite gives this run, short enough that a leaked handle
-  // cannot outlive the suite by much even if the bound were removed.
+  // cannot outlive the suite by much even if the bound were removed. It prints nothing, so a stopped
+  // run has captured nothing to report.
   setTimeout(() => { process.exitCode = 0; }, 10_000);
 } else if (mode === MODES.DESCRIPTORS) {
-  // Open descriptors until the OS refuses, so the next real spawn really fails the way a busy process
-  // fails. Only the fixed label below leaves this process.
+  // Open descriptors until the OS refuses, and KEEP THEM OPEN across the run below: a descriptor this
+  // process gives back is one the next spawn can use again, so closing them first would make the spawn
+  // succeed and prove nothing. They are this process's own, and are closed once the run has settled.
   let exhausted = false;
   const opened = [];
   try {
     for (;;) opened.push(openSync('/dev/null', 'r'));
   } catch (error) { exhausted = error.code === 'EMFILE'; }
-  for (const fd of opened) { try { closeSync(fd); } catch { /* the OS already refused more */ } }
-  const run = await runNode(process.execPath, ['-e', '']);
+  let run;
+  try {
+    run = await runNode(process.execPath, ['-e', '']);
+  } finally {
+    for (const fd of opened) { try { closeSync(fd); } catch { /* the OS already refused more */ } }
+    opened.length = 0;
+  }
+  // Only the fixed labels below leave this process, each of them a boolean about what really happened.
   process.stdout.write(`descriptor limit reached: ${exhausted ? 'yes' : 'no'}\n`);
   process.stdout.write(`helper reported a transport failure: ${run.transportFailure ? 'yes' : 'no'}\n`);
   process.stdout.write(`helper reported an exit code: ${run.code === null ? 'no' : 'yes'}\n`);

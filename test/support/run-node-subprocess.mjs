@@ -12,7 +12,9 @@
  * one of those pipes all settle exactly once with the same fixed restrictive outcome: no exit code, no
  * signal, no captured text, and `transportFailure` set. Nothing from the failure - no native message, no
  * code, no stack, no checkout path - reaches the caller, and only the one child this helper spawned is
- * ever signalled, with a bounded stop whose unconfirmed outcome is still the fixed failure.
+ * ever signalled, with a bounded stop whose unconfirmed outcome is still the fixed failure. The child
+ * itself is contained before its streams are inspected, because a spawn that fails after the child
+ * object exists reports an asynchronous `error` on it and never reports `close`.
  *
  * An ordinary NON-ZERO exit is not a transport failure. The exit code, the signal and both captured
  * streams survive it, which is what lets the confidentiality evidence read a real failing TAP report
@@ -91,6 +93,23 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs) {
       own(() => settle(FIXED_FAILURE), CLEANUP_BOUND_MS);
     };
 
+    /**
+     * The child is really gone. A run that already failed reports the fixed outcome whatever this close
+     * says; an observed close is the only thing that may report an exit code or captured text at all.
+     */
+    const onClose = (code, signal) => {
+      if (failing) { settle(FIXED_FAILURE); return; }
+      if (settled) return;
+      settle({
+        code,
+        signal,
+        stalled,
+        transportFailure: false,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      });
+    };
+
     let spawned;
     try {
       spawned = spawn(execPath, execArgs, spawnOptions);
@@ -102,6 +121,13 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs) {
     }
     child = spawned;
 
+    // The child itself is contained BEFORE anything else is looked at. A spawn that fails after the
+    // child object exists - a descriptor-exhaustion `EMFILE`, for one - reports it as an asynchronous
+    // `error` on that object and never emits `close`, so a listener attached after a missing-pipe
+    // refusal would leave that event unobserved and crash the caller with a native message and a path.
+    child.on('error', failTheRun);
+    child.on('close', onClose);
+
     // The two streams are how the outcome is observed, so a child without them cannot be observed.
     if (child.stdout === null || child.stdout === undefined || child.stderr === null || child.stderr === undefined) {
       failTheRun();
@@ -109,21 +135,8 @@ function runOwnedChild(execPath, execArgs, spawnOptions, boundMs) {
     }
     child.stdout.on('data', (chunk) => { stdout.push(chunk); });
     child.stderr.on('data', (chunk) => { stderr.push(chunk); });
-    child.on('error', failTheRun);
     child.stdout.on('error', failTheRun);
     child.stderr.on('error', failTheRun);
-    child.on('close', (code, signal) => {
-      if (failing) { settle(FIXED_FAILURE); return; }
-      if (settled) return;
-      settle({
-        code,
-        signal,
-        stalled,
-        transportFailure: false,
-        stdout: Buffer.concat(stdout).toString('utf8'),
-        stderr: Buffer.concat(stderr).toString('utf8'),
-      });
-    });
     // The bound is a deadline on this invocation. It stops only the owned child, and whether the child
     // really goes away is decided by its own `close`, with this bound as the fallback.
     own(() => {
@@ -169,12 +182,14 @@ export function runNodeTest(entry) {
 /**
  * TEST-ONLY: the same one private lifecycle helper, with the native spawn options and the bound a fixture
  * needs in order to reach a real failure - a spawn the native call refuses synchronously, a spawn that
- * reports an error asynchronously, or a child whose required pipes are missing. There is no simulation
- * here: the option is handed to the native spawn unchanged and whatever the OS does is what is observed.
+ * reports an error asynchronously, or a child whose required pipes are missing. `entry` means exactly
+ * what it means in `runNode`: the script this repository's own node runs, with `args` after it. Passing
+ * `null` runs the executable with no script at all, which only ever reaches a spawn failure that
+ * happens before a child could run. There is no simulation here: the options are handed to the native
+ * spawn unchanged and whatever the OS does is what is observed.
  * Reachable from test files under `test/` only; no product or operator command imports this module.
  */
 export function runNodeFixture({ entry = null, args = [], spawnOptions = {}, boundMs = BOUND_MS } = {}) {
-  const execPath = entry === null ? process.execPath : entry;
   const execArgs = entry === null ? [...args] : [entry, ...args];
-  return runOwnedChild(execPath, execArgs, { ...ownChildOptions, ...spawnOptions }, boundMs);
+  return runOwnedChild(process.execPath, execArgs, { ...ownChildOptions, ...spawnOptions }, boundMs);
 }

@@ -28,6 +28,8 @@ const FIXTURE = fileURLToPath(new URL('./support/run-node-subprocess-fixture.mjs
 const FAILING_CONTROL = fileURLToPath(
   new URL('./support/run-node-subprocess-failing-control.test.mjs', import.meta.url),
 );
+/** A fixed message declared here, not captured: the control's own deliberately failing assertion text. */
+const CONTROL_MESSAGE = 'this control fails on purpose';
 /** Short enough to keep the suite quick, long enough that a healthy child never reaches it. */
 const SHORT_BOUND_MS = 1_500;
 
@@ -62,12 +64,18 @@ test('a failing `node --test` run keeps its TAP and its non-zero exit', { timeou
   const tap = `${run.stdout}${run.stderr}`;
   assert.equal(tap.includes('not ok 1'), true, 'the real TAP report of the failing test was captured');
   assert.equal(tap.includes('# fail 1'), true, 'the real failure count was captured');
-  assert.equal(tap.includes(REPO_ROOT), false, 'no checkout path leaked into the report the suite reads');
+  assert.equal(tap.includes(CONTROL_MESSAGE), true,
+    'the report is the runner own serialization of the control real failure, not a substitute');
+  // Deliberately NOT asserted: that the report contains no checkout path. The real test runner prints
+  // its own file URLs in every failing assertion's stack, so path absence would be a false invariant
+  // that hides the property that matters: the fixed transport outcome above carries no captured text at
+  // all, and the demo E2E shows that a run whose captured stream really carries planted material still
+  // reports none of it.
 });
 
 test('a synchronous spawn exception settles once with the fixed restrictive outcome', { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const run = await runNodeFixture({ args: [], spawnOptions: { stdio: ['ignore', 'pipe', 'not-a-stream'] } });
+    const run = await runNodeFixture({ entry: FIXTURE, args: [], spawnOptions: { stdio: ['ignore', 'pipe', 'not-a-stream'] } });
     assert.equal(run.transportFailure, true, 'a spawn that throws is a transport failure');
     assert.equal(run.code, null, 'no exit code is invented for a child that never ran');
     assert.equal(run.signal, null, 'no signal is invented for a child that never ran');
@@ -78,7 +86,7 @@ test('a synchronous spawn exception settles once with the fixed restrictive outc
 
 test('an asynchronous spawn error settles once with the fixed restrictive outcome', { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const run = await runNodeFixture({ args: [], spawnOptions: { cwd: '/nonexistent-run-node-subprocess-probe' } });
+    const run = await runNodeFixture({ entry: FIXTURE, args: [], spawnOptions: { cwd: '/nonexistent-run-node-subprocess-probe' } });
     assert.equal(run.transportFailure, true, 'a spawn that reports an error is a transport failure');
     assert.equal(run.code, null, 'no exit code is invented');
     assert.equal(run.signal, null, 'no signal is invented');
@@ -88,7 +96,7 @@ test('an asynchronous spawn error settles once with the fixed restrictive outcom
 
 test('a child whose required pipes are missing settles once with the fixed restrictive outcome', { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const run = await runNodeFixture({ args: [], spawnOptions: { stdio: 'ignore' } });
+    const run = await runNodeFixture({ entry: FIXTURE, args: [], spawnOptions: { stdio: 'ignore' } });
     assert.equal(run.transportFailure, true, 'a run whose output cannot be captured is a transport failure');
     assert.equal(run.code, null, 'no exit code is reported for a run that was not observed');
     assert.equal(run.signal, null, 'no signal is reported');
@@ -98,7 +106,7 @@ test('a child whose required pipes are missing settles once with the fixed restr
 
 test('a stall inside the bound is reported as a stall, and only the owned child is stopped', { timeout: TEST_TIMEOUT_MS },
   async () => {
-    const run = await runNodeFixture({ args: ['stall'], boundMs: SHORT_BOUND_MS });
+    const run = await runNodeFixture({ entry: FIXTURE, args: ['stall'], boundMs: SHORT_BOUND_MS });
     assert.equal(run.stalled, true, 'the stalled run is reported as a stall');
     assert.equal(run.code, null, 'a stopped child reported no exit code of its own');
     assert.equal(typeof run.signal, 'string', 'the stop really was a signal');
