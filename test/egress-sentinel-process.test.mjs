@@ -169,7 +169,13 @@ function request(overrides = {}) {
   };
 }
 
+/**
+ * Liveness of one real child, observed directly with signal 0. A value that is not a real pid is refused
+ * rather than passed on: pid 0 addresses this test process's own group and would report alive for
+ * anything, which would make a stop observation vacuous.
+ */
 function alive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
@@ -663,17 +669,36 @@ async function publicationAppeared(directory, name, polls) {
   return false;
 }
 
+/** What one staged-name observation reports: appearance, exact-basename shape, and that child's pid. */
+const STAGED_ABSENT = Object.freeze({ appeared: false, wellFormed: false, pid: 0 });
+const STAGED_UNUSABLE = Object.freeze({ appeared: true, wellFormed: false, pid: 0 });
+
 /**
- * The child's staged name is the ready name plus a private suffix, so this reports whether a staged
- * write really happened in the owned installation directory. It never reads the payload.
+ * The child names its private staged file `<ready name>.staged-<its own process.pid>`, so the NAME
+ * carries that child's identity while the payload may still be mid-write. This reads directory entries
+ * only - it never opens or parses the staged file - and it never treats staging as readiness. A name that
+ * is not exactly the expected basename, or more than one such name, yields no pid at all, so a malformed
+ * or foreign entry can never be read as a live child.
  */
-async function stagedWriteAppeared(directory, name, polls = READINESS_POLLS) {
+function stagedObservation(directory, name) {
   const prefix = name + '.staged-';
-  for (let attempt = 0; attempt < polls; attempt++) {
-    if (readdirSync(directory).some((entry) => entry.startsWith(prefix))) return true;
+  const staged = readdirSync(directory).filter((entry) => entry.startsWith(prefix));
+  if (staged.length === 0) return STAGED_ABSENT;
+  if (staged.length !== 1) return STAGED_UNUSABLE;
+  const suffix = /^\d+$/.exec(staged[0].slice(prefix.length));
+  if (suffix === null) return STAGED_UNUSABLE;
+  const pid = Number(suffix[0]);
+  return { appeared: true, wellFormed: pid > 0, pid };
+}
+
+/** Wait for the child's private staged name within the fixed poll budget, or report that it never came. */
+async function awaitStagedName(directory, name, polls = READINESS_POLLS) {
+  let observation = stagedObservation(directory, name);
+  for (let attempt = 0; attempt < polls && !observation.appeared; attempt++) {
     await delay(READINESS_POLL_MS);
+    observation = stagedObservation(directory, name);
   }
-  return false;
+  return observation;
 }
 
 test('the readiness boundary itself: a partially written ready name is not a publication, a renamed one is', () => {
@@ -693,9 +718,19 @@ test('the readiness boundary itself: a partially written ready name is not a pub
   const staged = join(directory, 'fake-pid.json.staged-synthetic');
   writeFileSync(staged, JSON.stringify({ pid: process.pid }));
   assert.equal(existsSync(ready), false, 'a staged write published the ready name');
+  // The exact basename shape is what would carry a child pid. A suffix that is not digits is a malformed
+  // staged name: it is observed, and it yields no pid, so nothing can be read as a live child from it.
+  const malformed = stagedObservation(directory, 'fake-pid.json');
+  assert.equal(malformed.appeared, true, 'the private staged write was not observed at all');
+  assert.equal(malformed.wellFormed, false, 'a non-numeric staged suffix was read as a child pid');
+  assert.equal(malformed.pid, 0, 'a malformed staged name still yielded a pid');
+
   renameSync(staged, ready);
   assert.equal(existsSync(ready), true);
   assert.equal(typeof JSON.parse(readFileSync(ready, 'utf8')).pid, 'number');
+  // The rename consumed exactly the staged name, so nothing staged is left behind to be re-observed.
+  assert.equal(stagedObservation(directory, 'fake-pid.json').appeared, false,
+    'the staged name outlived the rename onto the ready name');
 });
 
 test('a stalled child is terminated at the absolute deadline, with no in-thread fallback and no release', async () => {
@@ -758,22 +793,38 @@ test('a staged readiness write is never observed as ready, and the check stays p
   const { runner, installation } = await fakeRunner({ mode: 'stall-unpublished', pidFile: 'fake-pid.json' }, {
     deadlineMs: 30_000, cleanupGraceMs: 2_000,
   });
+  // The installation is fresh and owned by this test, so any staged name seen below belongs to the child
+  // this check spawns and cannot be a leftover from an earlier run.
+  assert.equal(stagedObservation(installation, 'fake-pid.json').appeared, false,
+    'the owned installation already held a staged readiness name before this check started');
   const pending = runner.check(request());
   let settled = false;
   pending.then(() => { settled = true; }, () => { settled = true; });
 
-  assert.equal(await stagedWriteAppeared(installation, 'fake-pid.json'), true,
+  const staged = await awaitStagedName(installation, 'fake-pid.json');
+  assert.equal(staged.appeared, true,
     'the control never wrote its private staged file, so it proved nothing');
+  // Only the exact basename shape carries this child's identity. Reading the pid out of the staged
+  // payload instead would parse a file that may still be being written.
+  assert.equal(staged.wellFormed, true,
+    'the staged name did not have the exact basename shape that carries the child pid');
+  assert.equal(staged.pid === process.pid, false,
+    'the staged name identified this test process instead of the spawned child');
+
   assert.equal(await publicationAppeared(installation, 'fake-pid.json', 30), false,
     'a staged temporary write was observed as a completed publication');
   assert.equal(settled, false, 'the check settled while its readiness was never published');
 
   // The child is still a real running process: cancelling it is what ends the check, not its exit.
+  assert.equal(alive(staged.pid), true, 'the staged name did not identify a live child process');
   runner.cancel();
   const outcome = await bounded(pending, 5_000, 'staged readiness cancel');
   assert.equal(outcome.status, 'BLOCK');
   assert.equal(outcome.code, 'CANCELLED');
   assert.equal('release' in outcome, false);
+  // The stop is observed on that same child rather than inferred from the outcome code: a pid that was
+  // never a real child, or that belonged to this test process, would still read as alive here.
+  assert.equal(alive(staged.pid), false, 'the cancelled child was still alive after close');
   assert.equal(runner.state, 'IDLE');
 });
 
