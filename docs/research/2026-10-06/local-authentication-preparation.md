@@ -80,3 +80,62 @@ Future A must own native server/socket enrollment and opaque connection handles,
 The smallest follow-up is a separately admitted source-complete issuer/TLS preparation recovery with independently bounded process/socket settlement; hosted-CI reproducibility needs its own admitted support/verification seam afterward, without silent binary/dependency assumptions or skips. There is no production issuer, SDK conformity, wrong-tuple OS/native fault, registry/authenticator, managed-egress, tenant isolation, restoration, utility, scoring, held-out or release-safety proof in this checkpoint.
 
 Prose gates and the committed head belong to the external writer report. They validate repository hygiene only, not the missing experiments. Root alone publishes; independent exact-head review and human implementation/merge gates remain outstanding.
+
+## Separately admitted non-private cleanup qualification — 2026-10-06, 23:37 UTC
+
+This is a **new prerequisite unit**, not a reset or retry of the ended issuer/TLS attempt above. The original incomplete checkpoint at `9ba28cde658769535d958ccd9df4025555efdcf9`, old measurements, unsafe drafts and reports remain preserved. Root supplied a cleanup-only brief with fixed checkpoint 23:50 UTC/end 23:55 UTC. The later first-wave workflow failure at `state.set('firstWave')` concerned an undefined output-path mapping; it was not a private experiment or a cleanup result. No schema workaround, provider/harness switch or overlapping writer was used here.
+
+All 37 inputs mandatory for **this smaller unit** were freshly read to EOF before execution. Exact returned ranges, continuation trailers and per-file EOF completion are durably recorded in `cleanup-qualification-scratch/read-ledger.md`, beneath the run directory named above. Long files used contiguous chunks of at most 300 lines; no byte-truncated response was accepted. This ledger does not retroactively certify the old attempt's uncertain reads or inspect/admit any OpenSSL/TLS/crypto operation. Decisions 007/008 remain accepted foundation direction, decision 014 accepted bounded technical design, and the gateway slice draft.
+
+### New method and actual observations
+
+New outside-repository artifacts:
+
+```text
+cleanup-qualification-scratch/bounded-cleanup.mjs
+cleanup-qualification-scratch/run-controls.mjs
+cleanup-qualification-scratch/method-manifest.json
+cleanup-qualification-scratch/pre-execution.sha256
+cleanup-qualification-scratch/input-identities.sha256
+cleanup-qualification-scratch/read-ledger.md
+cleanup-qualification-scratch/result.json
+cleanup-qualification-scratch/native-terminal.txt
+```
+
+Only the unchanged three-line public `pipe-control-wrapper.sh` was spawned, using the fixed `/bin/bash --noprofile --norc` argv, detached dedicated groups, and explicit `PATH=/usr/bin:/bin`, `LC_ALL=C`. No shell flags, third fixture, child service, process queue, private material or socket was added. Root agreed before execution that source-evidenced exceptional handling plus pure transition controls suffices for this unit; it does not establish native exceptional-fault behavior.
+
+Each case captures an absolute deadline of at most 3000 ms, intersected with the suite's one 10000 ms deadline. Spawn/stdio/terminal callbacks share that deadline and one settlement path. Retained stdout is capped at 1024 bytes; stderr is never retained and its count is capped, with 1025 meaning cap exceeded rather than an exact oversized total. Signal exceptions normalize to fixed allowlisted outcomes; no captured subprocess text or native exception is printed. UNKNOWN is sticky and stops subsequent controls.
+
+Termination ownership requires the fresh validated PID, successful spawn, no exit/close/settlement, a live group check, and time remaining. Cancellation makes exactly one SIGKILL attempt at 100 ms while the leader remains live. Exit revokes termination authority and cancels the cancellation timer; no delayed escalation or termination signal follows reaping/settlement. After observed close, one immediate **non-signalling** group-existence check is permitted for that just-owned group. Only actual exit/reaping, close and `ESRCH` can count as successful OS cleanup.
+
+On expiry, spawn/stdio/signal failure or unconfirmed absence, the method resolves finite sanitized UNKNOWN, revokes signaling, destroys its streams and unreferences the child handle. That is local reporting/resource release, **not evidence the OS child/group terminated**. It retains unknown status without a delayed or recycled-PID kill. Timers cannot preempt synchronous callbacks/native calls or a stalled event loop; no kernel-stall bound is claimed.
+
+The new driver ran exactly once under Node `v24.15.0`, pinned npm `10.9.9` tooling, with outer timeout 15 seconds. Native exit was **0**, status `NON_PRIVATE_CONTROLS_PASS`; the complete result was read back from disk:
+
+| New native control | Fresh owned leader | Actual terminal/absence facts | Duration |
+| --- | --- | --- | --- |
+| Exact harmless OS pipe | 162521 | exit and close code 0; 31 exact synthetic stdout bytes; stderr 0; immediate `ESRCH`; no termination signal | 7 ms |
+| Deliberate owned-group cancellation | 162524 | live group confirmed; one SIGKILL; exit and close signal SIGKILL; stdout/stderr 0; immediate `ESRCH` | 103 ms |
+
+Suite duration was **111 ms**: **26 pure controls passed**, **2 native controls passed**, **0 UNKNOWN results**, **2 groups sequentially**, **0 sockets/private-material/TLS/OpenSSL/upstream operations**, and no retry. Stream release and signaling revocation were observed true for both cases. The cancellation case intentionally has no exact-output match; its success criterion is the deliberate terminal signal plus close/absence, not pipe-output acceptance.
+
+The pure controls exercise sticky UNKNOWN on spawn/child/stdio/signal errors, expiry/missing close, `EPERM`/other/present absence, missing exit/close, PID exclusions, single-attempt ownership and post-exit refusal. They also execute the caught-signal helper against synthetic throws and a throwing error-code getter. Pure state transitions and synthetic exceptions are **not mocked native cleanup evidence**, permission failures or OS fault observations. No product contract, repository test or fabricated RED was added.
+
+Observed SHA-256 identities for the frozen new evidence:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `bounded-cleanup.mjs` | `80b6d65e651dc99ea70bc336f28c20e9cf36a7a716ed32939949803c1ae89045` |
+| `run-controls.mjs` | `bfa1d4eea058dee6561b82da27844e113e01fcde2686649233e9d94247aea041` |
+| `method-manifest.json` | `6fd437f0a7e5c95c414696fb08ef0851380ddd266e7237961c9e99e7dbf893a6` |
+| `read-ledger.md` | `6afd513c4770f0e9649a14f7ce6a7b86d3df3407c3552578e6ef7c417496b36c` |
+| `result.json` | `c0cefd7d47bfc5f53b9fb71ff467b8067304ffad05d3e589a6228f06b9dbb19c` |
+| `native-terminal.txt` | `7650855c978427c33d7e8215d8878f73bcf7452db7978cbd0c6c53ba88d15af2` |
+
+The same source-chain identities listed above were rechecked and retained in `input-identities.sha256`; the additionally fully read Node child-process document hashes to `a7faa746c3681fd0cdf708237bc840006ceceace519dcdf89360b4ea9e508538`. The API/source basis is the pinned Node 24.15.0 process-kill section and JS/native/libuv chain plus captured Linux manual, **not whole process.md reading, a kernel version pin or hosted-CI evidence**.
+
+### What this narrower result does not establish
+
+The artifact provides measured cleanup for these two fresh harmless groups and finite exceptional reporting semantics supported by source/pure controls. Real missing-close, native `EPERM`, spawn failure, kernel stall and termination on UNKNOWN remain **NOT PROVEN**. Escaped groups, hostile-host protection, heap/swap erasure and platform/CI portability remain excluded. Native guard/profile resolution and callbacks require root's actual metadata consumption; no new timeout-zero control or self-certified extension count was substituted.
+
+This success neither fixes nor admits the preserved unsafe issuer/TLS draft. All private issuance, TLS/X509/API/declaration, resumption/early-data, native parser, A/P/B/C, production, protected-egress and hosted-CI prerequisites above remain unproven. Root alone arbitrates any next admission, review or publication. Green prose gates for this exact addition and the resulting commit are recorded in the separate cleanup-qualification report.
