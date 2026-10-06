@@ -16,6 +16,7 @@ import {
 	BLOCK_REASON_MACHINE_WIDE_SEARCH,
 	DEFAULT_COMMAND_TIMEOUT_SECONDS,
 	MAX_COMMAND_TIMEOUT_SECONDS,
+	INVALID_VALIDATION_APPROVAL,
 	evaluateBashToolInput,
 } from '../.pi/lib/hylja-command-guard.mjs';
 
@@ -26,12 +27,112 @@ const guardPath = resolve(root, '.pi', 'extensions', 'hylja-workflow-guard.ts');
 // the handler context. These roots are synthetic and are never touched on disk.
 const CHILD_CWD = '/srv/synthetic-lancer/worktree';
 const CHILD_CONTEXT = { cwd: CHILD_CWD };
+const VALIDATION_COMMANDS = [
+	'PATH=/tmp/synthetic-toolchain/bin:$PATH npm test > /tmp/synthetic-test.log 2>&1',
+	'PATH=/tmp/synthetic-toolchain/bin:$PATH npm run test:coverage > /tmp/synthetic-coverage.log 2>&1',
+];
+const approval = () => ({ cwd: CHILD_CWD, commands: [...VALIDATION_COMMANDS] });
+
+async function installedHandler(record, ordinary = false) {
+	const module = await import(guardPath);
+	const handlers = [];
+	const install = ordinary ? module.default : module.installHyljaWorkflowGuard;
+	install({ on(name, handler) {
+		assert.equal(name, 'tool_call'); handlers.push(handler);
+	} }, record);
+	assert.equal(handlers.length, 1);
+	return handlers[0];
+}
+
+function bash(handler, command, timeout, context = CHILD_CONTEXT) {
+	const input = { command, ...(timeout !== undefined ? { timeout } : {}) };
+	const result = handler({ toolName: 'bash', input }, context);
+	return { input, result };
+}
+
+test('coordinator-approved exact test and coverage calls retain requested 600 through the real adapter', async () => {
+	const handler = await installedHandler(approval());
+	for (const command of VALIDATION_COMMANDS) {
+		assert.equal(bash(handler, command, 600).input.timeout, 600);
+	}
+});
 
 // Fixed roots so a case never depends on the machine it runs on.
 const OPTIONS = { home: '/home/synthetic-lancer', cwd: '/home/synthetic-lancer/worktree' };
 
 /** The exact command shape that burned eight minutes before the exact paths were used. */
 const KNOWN_FAILURE = 'find / -name hylja-implementer.md | head -20';
+
+test('approved and ordinary adapters retain timeout defaults, bounds, malformed refusals and other tools', async () => {
+	for (const ordinary of [false, true]) {
+		const handler = await installedHandler(approval(), ordinary);
+		for (const command of VALIDATION_COMMANDS) {
+			for (const [requested, expected] of [[undefined, 120], [0.5, 0.5], [300, 300], [600, ordinary ? 300 : 600], [9000, ordinary ? 300 : 600]]) {
+				assert.equal(bash(handler, command, requested).input.timeout, expected);
+			}
+			for (const timeout of [null, 0, -1, '600', NaN, Infinity, {}]) {
+				assert.deepEqual(bash(handler, command, timeout).result, { block: true, reason: BLOCK_REASON_INVALID_TIMEOUT });
+			}
+		}
+		const input = { command: VALIDATION_COMMANDS[0], timeout: 9000 };
+		assert.equal(handler({ toolName: 'read', input }, CHILD_CONTEXT), undefined);
+		assert.equal(input.timeout, 9000);
+	}
+	const missing = await installedHandler(undefined);
+	assert.equal(bash(missing, VALIDATION_COMMANDS[0], 600).input.timeout, 300);
+});
+
+test('approval requires exact whole command and exact session cwd with no inference', async () => {
+	const handler = await installedHandler(approval());
+	const command = VALIDATION_COMMANDS[0];
+	for (const altered of [command + '; npm run build', command + '\necho synthetic', 'echo synthetic; ' + command,
+		command + ' ', ' ' + command, command.replace('synthetic-test.log', 'synthetic-other.log'),
+		'npm test', 'npm run test:coverage', 'npm run build']) {
+		assert.equal(bash(handler, altered, 600).input.timeout, 300);
+	}
+	for (const cwd of [CHILD_CWD + '/', CHILD_CWD + '/child', '/srv/synthetic-other/worktree', undefined]) {
+		assert.equal(bash(handler, command, 600, { cwd }).input.timeout, 300);
+	}
+});
+
+test('installation snapshots approval and command array without later widening', async () => {
+	const record = approval();
+	const handler = await installedHandler(record);
+	record.cwd = '/srv/synthetic-other/worktree';
+	record.commands[0] = 'npm run build';
+	record.commands.push('npm test');
+	assert.equal(bash(handler, VALIDATION_COMMANDS[0], 600).input.timeout, 600);
+	assert.equal(bash(handler, 'npm run build', 600).input.timeout, 300);
+	assert.equal(bash(handler, 'npm test', 600).input.timeout, 300);
+	assert.equal(bash(handler, VALIDATION_COMMANDS[0], 600, { cwd: record.cwd }).input.timeout, 300);
+});
+
+test('malformed approval fails installation whole with fixed non-echoing setup error', async () => {
+	const module = await import(guardPath);
+	let registrations = 0;
+	let reads = 0;
+	const accessor = { cwd: CHILD_CWD, get commands() { reads++; throw Error('synthetic-planted.invalid'); } };
+	const arrayAccessor = [...VALIDATION_COMMANDS];
+	Object.defineProperty(arrayAccessor, '0', { get() { reads++; throw Error('synthetic-planted.invalid'); } });
+	const bad = [null, false, {}, { ...approval(), extra: true }, { ...approval(), cwd: 'relative' },
+		{ ...approval(), cwd: '/' + 'x'.repeat(4096) }, { ...approval(), cwd: '/tmp/\0bad' }, accessor,
+		Object.assign(Object.create({}), approval()),
+		...[[], [''], [' '], [1], [VALIDATION_COMMANDS[0], VALIDATION_COMMANDS[0]],
+			['x'.repeat(16385)], ['a', 'b', 'c'], new Array(1), arrayAccessor].map((commands) => ({ cwd: CHILD_CWD, commands }))];
+	for (const record of bad) {
+		assert.throws(() => module.installHyljaWorkflowGuard({ on() { registrations++; } }, record),
+			(error) => error instanceof Error && error.message === INVALID_VALIDATION_APPROVAL);
+	}
+	assert.equal(registrations, 0);
+	assert.equal(reads, 0);
+});
+
+test('validation approval never overrides the independent forbidden-find decision', async () => {
+	const handler = await installedHandler({ cwd: CHILD_CWD, commands: [KNOWN_FAILURE, 'npm test'] });
+	const { input, result } = bash(handler, KNOWN_FAILURE, 600);
+	assert.deepEqual(result, { block: true, reason: BLOCK_REASON_MACHINE_WIDE_SEARCH });
+	assert.equal(input.timeout, 600);
+});
 
 test('the known machine-wide search is refused before execution', () => {
 	const decision = evaluateBashToolInput({ command: KNOWN_FAILURE }, OPTIONS);

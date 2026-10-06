@@ -32,6 +32,40 @@ export const DEFAULT_COMMAND_TIMEOUT_SECONDS = 120;
 /** Ceiling for an explicit request; a larger value is clamped, never granted. */
 export const MAX_COMMAND_TIMEOUT_SECONDS = 300;
 
+/** Fixed, non-echoing setup refusal; approval is trusted coordinator configuration, not authentication. */
+export const INVALID_VALIDATION_APPROVAL = 'Invalid Hylja validation approval';
+
+/** Snapshot the compact approval once; malformed records never grant a partial approval. */
+export function snapshotValidationApproval(record) {
+	if (record === undefined) return undefined;
+	try {
+		if (record === null || typeof record !== 'object' || Object.getPrototypeOf(record) !== Object.prototype) throw new Error();
+		const fields = Object.getOwnPropertyDescriptors(record);
+		if (Reflect.ownKeys(fields).length !== 2 || !fields.cwd || !fields.commands ||
+			!Object.hasOwn(fields.cwd, 'value') || !Object.hasOwn(fields.commands, 'value')) throw new Error();
+		const cwd = fields.cwd.value;
+		const commands = fields.commands.value;
+		if (typeof cwd !== 'string' || !cwd.startsWith('/') || cwd.length > 4096 || /[\x00-\x1f\x7f]/.test(cwd) ||
+			!Array.isArray(commands) || Object.getPrototypeOf(commands) !== Array.prototype) throw new Error();
+		const length = Object.getOwnPropertyDescriptor(commands, 'length')?.value;
+		if (!Number.isInteger(length) || length < 1 || length > 2) throw new Error();
+		const entries = Object.getOwnPropertyDescriptors(commands);
+		if (Reflect.ownKeys(entries).length !== length + 1) throw new Error();
+		const copy = [];
+		for (let index = 0; index < length; index += 1) {
+			const entry = entries[index];
+			if (!entry || !Object.hasOwn(entry, 'value')) throw new Error();
+			const command = entry.value;
+			if (typeof command !== 'string' || command.trim().length === 0 || command.length > 16384 || command.includes('\0') ||
+				copy.includes(command)) throw new Error();
+			copy.push(command);
+		}
+		return Object.freeze({ cwd, commands: Object.freeze(copy) });
+	} catch {
+		throw new Error(INVALID_VALIDATION_APPROVAL);
+	}
+}
+
 /**
  * Top-level absolute roots that mean "the whole machine", matched on the first path segment. `/tmp`,
  * `/var/tmp` and unlisted absolute roots are deliberately absent: this project keeps scratch work in
@@ -146,17 +180,18 @@ export function isMachineWideFindRoot(rawRoot, options = {}) {
  * Decides the timeout for one bash call: default when absent, explicit tighter value preserved,
  * excessive value clamped, malformed value refused.
  */
-export function resolveCommandTimeout(value) {
+export function resolveCommandTimeout(value, validationApproved = false) {
 	if (value === undefined) return { allowed: true, seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS };
 	if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return { allowed: false, seconds: undefined };
-	return { allowed: true, seconds: Math.min(value, MAX_COMMAND_TIMEOUT_SECONDS) };
+	return { allowed: true, seconds: Math.min(value, validationApproved === true ? 600 : MAX_COMMAND_TIMEOUT_SECONDS) };
 }
 
 /**
  * The one entry point the Pi adapter calls.
  *
  * @param input - the bash tool input, mutated by the caller with the returned timeout.
- * @param options - named roots for the decision; defaults to the real home and working directory.
+ * @param options - named roots plus an installation-snapshotted validation approval; defaults to
+ * the real home and working directory. Approval selects only the fixed 600s explicit ceiling.
  * @returns `{ allowed: false, reason }` to block, or `{ allowed: true, timeout }` to apply.
  */
 export function evaluateBashToolInput(input, options = {}) {
@@ -167,7 +202,10 @@ export function evaluateBashToolInput(input, options = {}) {
 			return { allowed: false, reason: BLOCK_REASON_MACHINE_WIDE_SEARCH };
 		}
 	}
-	const timeout = resolveCommandTimeout(input !== null && typeof input === 'object' ? input.timeout : undefined);
+	// Exact whole-string comparison only; this does not verify shell safety or coordinator authority.
+	const approved = options.validationApproval !== undefined && options.cwd === options.validationApproval.cwd &&
+		options.validationApproval.commands.includes(command);
+	const timeout = resolveCommandTimeout(input !== null && typeof input === 'object' ? input.timeout : undefined, approved);
 	if (!timeout.allowed) return { allowed: false, reason: BLOCK_REASON_INVALID_TIMEOUT };
 	return { allowed: true, timeout: timeout.seconds };
 }
