@@ -1,6 +1,6 @@
 # Decision 014: Authenticated local connections and independently bound request evidence
 
-Status: **proposed** — human technical design acceptance is required before runtime wiring. No runtime authority, deployment approval or change to decision 013 is granted here.
+Status: **accepted bounded technical design** by explicit project-owner acceptance, 2026-10-06, of choices 1 and 2 below only. Implementation requires separately admitted units and unresolved prerequisites; this records no implemented authenticator, deployed gateway, renewed proof, merge/release authorization, production adoption or change to decision 013.
 
 Design admission: [#263](https://github.com/Marcus-Levin/hylja/issues/263), child of [#21](https://github.com/Marcus-Levin/hylja/issues/21). The [next-unit proposal](../development/proposals/2026-10-06/authenticated-local-request.md) partitions implementation and its executable gates. Live follow-up issues, not this record, own implementation status; [capabilities](../capabilities.md) alone owns implemented behavior and limits.
 
@@ -72,11 +72,15 @@ Cancellation, incomplete HTTP, client close, shutdown and outages latch refusal,
 
 Authentication proves neither classification nor policy clearance. Fixture-backed labels stay explicitly fixture-backed; generic inspection needs its separate unadopted human gate. No mapping lookup, resolution/restoration, streaming/tools/images, real provider/SDK conformity, utility, held-out scoring, managed-egress/bypass resistance or production-risk adoption is authorized. Broader tenant/reversible claims still require [#14](https://github.com/Marcus-Levin/hylja/issues/14), [#15](https://github.com/Marcus-Levin/hylja/issues/15), [#16](https://github.com/Marcus-Levin/hylja/issues/16) and [#17](https://github.com/Marcus-Levin/hylja/issues/17); this does not complete parent #21.
 
-## Exact decisions for human acceptance
+## Recorded human acceptance and scope
 
-1. Accept **only** the synthetic native mTLS connection proof with independently enrolled exact certificate mapping and live revocation/expiry checks as the next runtime authenticator unit. Recommended: yes; production issuer and SPIFFE deployment remain deferred.
-2. Accept the evidence-origin model and separately admitted shared-owner prerequisite before any provider/gateway wiring. Recommended: require direction-specific observations, response-time construction and final owned write guards; do not authorize a monolithic auth rewrite.
+On 2026-10-06 the project owner replied "I accept" to the recommendation for these two bounded design choices:
+
+1. **Synthetic native mTLS:** a real client certificate, independently enrolled exact certificate-to-workload mapping and live expiry/revocation checks. Production issuer, SPIFFE deployment and production identity adoption remain deferred.
+2. **Staged evidence integration:** direction-specific observations, response-time receiver construction and final owned-write guards through separately admitted A/P/B/C units, not a monolithic rewrite.
+
+This accepts those design choices only, not runtime implementation before its prerequisites or merging PR #264. Certificate issuance/provisioning and custody remain unresolved; an offline OpenSSL-based issuer was suggested, but no fixture mechanism, binary or dependency has been admitted or executed.
 
 Rejected simpler alternatives: bearer -> principal, localhost -> tenant, CN/header/body -> scope, clock -> all proofs, new owner -> renewal, caller profile -> actual sink, unchanged shared `observe()` -> both routes, and detector absence -> clearance. Each omits an independent fact required at the effect.
 
-Unresolved before runtime dispatch: reviewed synthetic certificate creation/custody without new unapproved dependencies or binaries; exact Node TLS/X509 typing, resumption/early-data handling and certificate-size bounds; the shared-owner API and coherent registry snapshot ownership; exact lease durations and shutdown failure handling. Resolve these in narrow admitted unit briefs, not by silently loosening this proposal. Technical human acceptance is distinct from independent exact-head review, explicit merge/release authorization, deployment/production privacy-risk acceptance, and the independent-human taxonomy/information-model and frozen evaluation/custody/rubric gates. None is satisfied by this document or its prose checks.
+Unresolved before runtime dispatch: reviewed synthetic certificate creation/custody without new unapproved dependencies or binaries; exact Node TLS/X509 typing, resumption/early-data handling and certificate-size bounds; the shared-owner API and coherent registry snapshot ownership; exact lease durations and shutdown failure handling. Resolve these in narrow admitted unit briefs, not by silently loosening this design. The recorded acceptance of choices 1 and 2 is distinct from the still-required independent exact-head review, explicit merge/release authorization, deployment/production privacy-risk acceptance, generic inspection approval, decision 010/taxonomy/information-model/transformation acceptance and frozen evaluation/custody/rubric gates. None of those remaining gates is satisfied by this acceptance record or its prose checks; broader #21 completion is not authorized.
