@@ -21,7 +21,7 @@ export interface DevelopmentCase {
   /** Synthetic-only fixture context; it is NOT authenticated runtime identity. */
   context?: { tenantId: string; projectId: string; sessionId: string; principalId: string;
     purpose: string; provenanceRef: string };
-  task?: { id: string; prompt: string };
+  task?: { id: string; prompt: string; requiredSinkId?: string };
 }
 /** Independently planted source truth; never derived from candidate events or sentinel catches. */
 export interface PlantedOccurrence {
@@ -82,7 +82,7 @@ export interface UntestedEvidence {
   sinkId?: string;
   provenance: 'untested';
   reason: 'no-capture' | 'no-secret-control' | 'no-candidate-events' | 'no-task-control' |
-    'no-task-result' | 'no-grader' | 'grader-error' | 'no-operational-observation';
+    'no-task-result' | 'no-task-sink-binding' | 'no-grader' | 'grader-error' | 'no-operational-observation';
   /** An untested claim has no observed outcome. */
   outcome?: never;
 }
@@ -228,8 +228,14 @@ function caseRecord(input: unknown): DevelopmentCase {
   }
   let task: DevelopmentCase['task'];
   if (Object.hasOwn(record, 'task')) {
-    const inputTask = object(record.task, ['id', 'prompt']);
-    task = { id: id(inputTask.id), prompt: plain(inputTask.prompt) };
+    const inputTask = object(record.task, ['id', 'prompt'], ['requiredSinkId']);
+    let requiredSinkId: string | undefined;
+    if (Object.hasOwn(inputTask, 'requiredSinkId')) {
+      requiredSinkId = id(inputTask.requiredSinkId);
+      if (!sinks.some((sink) => sink.id === requiredSinkId)) invalid();
+    }
+    task = { id: id(inputTask.id), prompt: plain(inputTask.prompt),
+      ...(requiredSinkId !== undefined ? { requiredSinkId } : {}) };
   }
   return { version: 1, id: id(record.id), familyId, partition: 'development', fields, sinks,
     ...(context ? { context } : {}), ...(task ? { task } : {}) };
@@ -401,7 +407,7 @@ export function createDevelopmentEvaluation(): DevelopmentEvaluation {
         fields: Object.freeze(record.fields.map((field) => Object.freeze({ ...field }))),
         sinks: Object.freeze(record.sinks.map((target) => Object.freeze({ ...target }))),
         ...(record.context ? { context: Object.freeze({ ...record.context }) } : {}),
-        ...(record.task ? { task: Object.freeze({ ...record.task }) } : {}),
+        ...(record.task ? { task: Object.freeze({ id: record.task.id, prompt: record.task.prompt }) } : {}),
       });
       let active = true;
       const send: ControlledSyntheticSend = (sinkId, serialized) => safe(() => {
@@ -495,9 +501,10 @@ export function createDevelopmentEvaluation(): DevelopmentEvaluation {
         let taskCorrect: boolean | null = null;
         if (!record.task || oracle.taskExpected === undefined) missing.push(untested('task-correctness', 'no-task-control'));
         else if (!taskResults.has(key)) missing.push(untested('task-correctness', 'no-task-result'));
-        // A response with no observed send may be a blocked or unobserved attempt. The
-        // development seam cannot distinguish those states, so it cannot grade utility.
-        else if (!captures.length) missing.push(untested('task-correctness', 'no-capture'));
+        // Binding is evaluator-authored, never inferred from captures or sink order.
+        else if (!Object.hasOwn(record.task, 'requiredSinkId')) missing.push(untested('task-correctness', 'no-task-sink-binding'));
+        // This synthetic observation proves neither route identity nor response correlation.
+        else if (!captures.some((capture) => capture.sinkId === record.task?.requiredSinkId)) missing.push(untested('task-correctness', 'no-capture'));
         else if (typeof gradeTask !== 'function') missing.push(untested('task-correctness', 'no-grader'));
         else {
           // A grader's exception/non-boolean result is an unknown measurement, never a pass.

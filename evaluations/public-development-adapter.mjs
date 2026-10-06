@@ -145,7 +145,8 @@ export function projectPublicDevelopmentFixture(input, sinkInput) {
       partition: 'development', fields,
       sinks: Object.freeze([Object.freeze({ id: localSink.id, surface: 'model.input',
         profileId: localSink.profileId })]),
-      ...(taskPrompt !== undefined ? { task: Object.freeze({ id: 'task-1', prompt: taskPrompt }) } : {}) });
+      ...(taskPrompt !== undefined ? { task: Object.freeze({ id: 'task-1', prompt: taskPrompt,
+        requiredSinkId: localSink.id }) } : {}) });
     const fieldByPointer = new Map(pointers.map((path, index) => [path, `field-${index}`]));
     const projection = Object.freeze({ developmentCase,
       fieldRefForSourcePointer(pointer) {
