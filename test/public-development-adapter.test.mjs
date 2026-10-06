@@ -79,6 +79,8 @@ test('D01/D02/D05 project text, each log line, canonical JSON with evaluator-onl
   for (const projected of [chat, log, config]) {
     assert.equal(projected.developmentCase.sinks[0].profileId, localSink.profileId);
     assert.equal(projected.developmentCase.sinks[0].surface, 'model.input');
+    assert.equal(projected.developmentCase.task.requiredSinkId === localSink.id, true);
+    assert.equal(Object.isFrozen(projected.developmentCase.task), true);
     assert.equal(Object.isFrozen(projected.developmentCase.fields), true);
   }
 });

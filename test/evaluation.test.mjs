@@ -16,7 +16,7 @@ function developmentCase(overrides = {}) {
     context: { tenantId: 'tenant-a.invalid', projectId: 'project-a.invalid',
       sessionId: 'session-a.invalid', principalId: 'principal-a.invalid',
       purpose: 'synthetic-diagnostic', provenanceRef: 'issuer-a.invalid' },
-    task: { id: 'diagnose-config', prompt: 'Which port must the client use?' }, ...overrides,
+    task: { id: 'diagnose-config', prompt: 'Which port must the client use?', requiredSinkId: sink.id }, ...overrides,
   };
 }
 function oracle(overrides = {}) {
@@ -245,13 +245,16 @@ test('ordinary report mints opaque case/sink refs instead of echoing a protected
   const source = `diagnose ${value}`;
   const evals = createDevelopmentEvaluation();
   evals.registerCase(developmentCase({ id: caseId, fields: [{ ref: 'body', content: source }],
-    sinks: [{ ...sink, id: sinkId }, secondSink] }));
+    sinks: [{ ...sink, id: sinkId }, secondSink],
+    task: { id: 'task-control', prompt: value, requiredSinkId: sinkId } }));
   evals.registerOracle(oracle({ caseId, occurrences: [{ ...oracle().occurrences[0], value,
     start: bytes('diagnose ').length, end: bytes(source).length,
     expectedBySink: [{ sinkId, treatment: 'BLOCK' }, { sinkId: 'sink-judge', treatment: 'BLOCK' }] }] }));
   const capture = createInMemorySinkCapture();
   capture.capture({ caseId, sinkId, body: bytes('masked synthetic data'), metadata: bytes('local-only') });
-  const report = evals.report(caseId, capture);
+  evals.recordTaskResult(caseId, value);
+  const report = evals.report(caseId, capture, () => { throw Error(value); });
+  assert.equal(findUntested(report, 'task-correctness').reason, 'grader-error');
   assert.equal(JSON.stringify(report).includes(protectedPrefix), false);
   assert.equal(report.privacy.secretPlanted, 1);
   assert.equal(report.caseId, 'case-1');
@@ -337,8 +340,170 @@ test('candidate callback cannot smuggle oracle labels or self-grade via extra fi
   assert.equal(findUntested(result, 'task-correctness').reason, 'no-task-result');
 });
 
+test('required task sink: another declared capture never invokes the grader', () => {
+  const { evals, capture } = initialized();
+  evals.recordTaskResult('synthetic-config-01', 'port 443');
+  capture.capture({ caseId: 'synthetic-config-01', sinkId: 'sink-judge',
+    body: bytes('synthetic masked'), metadata: bytes('') });
+  let calls = 0;
+  const report = evals.report('synthetic-config-01', capture, () => { calls++; return true; });
+  assert.equal(calls, 0);
+  assert.equal(report.utility.taskCorrect, null);
+  assert.equal(report.observed.some((row) => row.claim === 'task-correctness'), false);
+  assert.equal(findUntested(report, 'task-correctness').reason, 'no-capture');
+  capture.capture({ caseId: 'synthetic-config-01', sinkId: sink.id,
+    body: bytes('synthetic masked'), metadata: bytes('') });
+  const bound = evals.report('synthetic-config-01', capture, () => { calls++; return true; });
+  assert.equal(calls, 1);
+  assert.equal(bound.utility.taskCorrect, true);
+});
+
 test('capture for an undeclared sink is rejected instead of silently making a known sink pass', () => {
   const { evals, capture } = initialized();
   capture.capture({ caseId: 'synthetic-config-01', sinkId: 'other-sink', body: bytes(planted), metadata: bytes('') });
   assert.throws(() => evals.report('synthetic-config-01', capture), TypeError);
+});
+
+function taskFixture(task, sinks = [sink, secondSink]) {
+  const evals = createDevelopmentEvaluation();
+  const record = developmentCase({ task, sinks });
+  evals.registerCase(record);
+  evals.registerOracle(oracle({ occurrences: [] }));
+  return { evals, record, capture: createInMemorySinkCapture() };
+}
+function localCapture(capture, sinkId, caseId = 'synthetic-config-01') {
+  capture.capture({ caseId, sinkId, body: bytes('synthetic masked'), metadata: bytes('') });
+}
+const fixedEvaluationError = (error) => error instanceof TypeError &&
+  error.message === 'Invalid synthetic evaluation input';
+
+test('unbound single-sink legacy task stays untested with task prerequisite precedence', () => {
+  const task = { id: 'task-control', prompt: planted };
+  const { evals, capture } = taskFixture(task, [sink]);
+  localCapture(capture, sink.id);
+  assert.equal(findUntested(evals.report('synthetic-config-01', capture), 'task-correctness').reason, 'no-task-result');
+  evals.recordTaskResult('synthetic-config-01', planted);
+  let calls = 0;
+  const report = evals.report('synthetic-config-01', capture, () => { calls++; return true; });
+  assert.equal(calls, 0);
+  assert.equal(report.utility.taskCorrect, null);
+  assert.equal(findUntested(report, 'task-correctness').reason, 'no-task-sink-binding');
+  assert.equal(findRow(report, 'task-correctness') === undefined, true);
+  assert.equal(JSON.stringify(report).includes(planted), false);
+  const noControl = createDevelopmentEvaluation();
+  noControl.registerCase(developmentCase({ task }));
+  noControl.registerOracle({ version: 1, caseId: 'synthetic-config-01', occurrences: [] });
+  noControl.recordTaskResult('synthetic-config-01', planted);
+  assert.equal(findUntested(noControl.report('synthetic-config-01', capture), 'task-correctness').reason, 'no-task-control');
+});
+
+test('present binding validates closed own descriptors without reading hostile accessors', () => {
+  let calls = 0;
+  const base = { id: 'task-control', prompt: planted };
+  const getter = { ...base, get requiredSinkId() { calls++; throw Error(planted); } };
+  const bad = [undefined, null, '', 1, {}, 'foreign-sink', 'x'.repeat(65), planted];
+  for (const task of [getter, Object.assign(Object.create({ requiredSinkId: sink.id }), base),
+    { ...base, requiredSinkId: sink.id, extra: planted },
+    ...bad.map((requiredSinkId) => ({ ...base, requiredSinkId }))]) {
+    assert.throws(() => createDevelopmentEvaluation().registerCase(developmentCase({ task })), fixedEvaluationError);
+  }
+  assert.equal(calls, 0);
+  Object.defineProperty(Object.prototype, 'requiredSinkId', { configurable: true,
+    get() { calls++; throw Error(planted); } });
+  try {
+    const { evals, capture } = taskFixture(base);
+    evals.recordTaskResult('synthetic-config-01', planted);
+    localCapture(capture, sink.id);
+    const report = evals.report('synthetic-config-01', capture, () => { calls++; return true; });
+    assert.equal(findUntested(report, 'task-correctness').reason, 'no-task-sink-binding');
+    assert.equal(report.utility.taskCorrect, null);
+  } finally { delete Object.prototype.requiredSinkId; }
+  assert.equal(calls, 0);
+});
+
+test('binding snapshot and frozen private handoff gate callback grading at B only', async () => {
+  for (const includeRequired of [false, true]) {
+    const task = { id: 'task-control', prompt: planted, requiredSinkId: secondSink.id };
+    const { evals, capture } = taskFixture(task);
+    task.requiredSinkId = sink.id;
+    await evals.runCandidate('synthetic-config-01', (view, send) => {
+      assert.equal(Object.keys(view.task).sort().join(',') === 'id,prompt', true);
+      assert.equal(Object.isFrozen(view.task), true);
+      assert.equal(Object.hasOwn(view.task, 'requiredSinkId'), false);
+      send(sink.id, { body: bytes('synthetic masked'), metadata: bytes('') });
+      if (includeRequired) send(secondSink.id, { body: bytes('synthetic masked'), metadata: bytes('') });
+      return { events: [], taskResult: planted };
+    }, capture);
+    let calls = 0;
+    const report = evals.report('synthetic-config-01', capture, () => { calls++; return true; });
+    assert.equal(calls, includeRequired ? 1 : 0);
+    assert.equal(report.utility.taskCorrect, includeRequired ? true : null);
+    assert.equal(JSON.stringify(report).includes(planted), false);
+  }
+});
+
+test('candidate binding overrides reject without choosing evaluator task destination', async () => {
+  for (const extra of [{ requiredSinkId: sink.id }, { task: { requiredSinkId: sink.id } }]) {
+    const { evals, capture } = taskFixture({ id: 'task-control', prompt: planted,
+      requiredSinkId: secondSink.id });
+    await assert.rejects(evals.runCandidate('synthetic-config-01', (_view, send) => {
+      send(sink.id, { body: bytes('synthetic masked'), metadata: bytes('') });
+      return { events: [], taskResult: planted, ...extra };
+    }, capture), fixedEvaluationError);
+    let calls = 0;
+    const report = evals.report('synthetic-config-01', capture, () => { calls++; return true; });
+    assert.equal(calls, 0);
+    assert.equal(report.utility.taskCorrect, null);
+    assert.equal(findUntested(report, 'task-correctness').reason, 'no-task-result');
+  }
+});
+
+test('bound grader false, throwing and non-boolean preserve distinct utility outcomes', () => {
+  for (const outcome of [false, true, 'nonboolean', 'throw']) {
+    const { evals, capture } = taskFixture({ id: 'task-control', prompt: planted, requiredSinkId: secondSink.id });
+    evals.recordTaskResult('synthetic-config-01', planted);
+    localCapture(capture, secondSink.id);
+    let calls = 0;
+    const report = evals.report('synthetic-config-01', capture, () => {
+      calls++;
+      if (outcome === 'throw') throw Error(planted);
+      return outcome === 'nonboolean' ? planted : outcome;
+    });
+    assert.equal(calls, 1);
+    assert.equal(report.utility.taskCorrect, typeof outcome === 'boolean' ? outcome : null);
+    assert.equal(findRow(report, 'task-correctness')?.outcome,
+      typeof outcome === 'boolean' ? (outcome ? 'pass' : 'fail') : undefined);
+    if (typeof outcome !== 'boolean') assert.equal(findUntested(report, 'task-correctness').reason, 'grader-error');
+    assert.equal(JSON.stringify(report).includes(planted), false);
+  }
+});
+
+test('generated required-sink subsets and order through eight sinks never borrow another case capture', () => {
+  let vectors = 0;
+  for (let size = 1; size <= 8; size++) {
+    const sinks = Array.from({ length: size }, (_, index) => ({ ...sink, id: `synthetic-sink-${index}` }));
+    for (const required of sinks) for (const reverse of [false, true]) {
+      for (let subset = 0; subset < 2 ** size; subset++) {
+        const { evals, capture } = taskFixture({ id: 'task-control', prompt: planted,
+          requiredSinkId: required.id }, reverse ? [...sinks].reverse() : sinks);
+        evals.recordTaskResult('synthetic-config-01', planted);
+        localCapture(capture, required.id, 'synthetic-other-case');
+        for (let index = 0; index < size; index++) if (subset & (1 << index)) localCapture(capture, sinks[index].id);
+        let calls = 0;
+        const report = evals.report('synthetic-config-01', capture, () => { calls++; return true; });
+        const expected = Boolean(subset & (1 << sinks.indexOf(required)));
+        assert.equal(calls, expected ? 1 : 0);
+        assert.equal(report.utility.taskCorrect, expected ? true : null);
+        assert.equal(report.observed.some((row) => row.claim === 'task-correctness'), expected);
+        if (!expected) {
+          const row = findUntested(report, 'task-correctness');
+          assert.equal(row.reason, 'no-capture');
+          assert.equal(Object.hasOwn(row, 'outcome'), false);
+        }
+        vectors++;
+        evals.clear(); capture.clear();
+      }
+    }
+  }
+  assert.equal(vectors, 7172);
 });
