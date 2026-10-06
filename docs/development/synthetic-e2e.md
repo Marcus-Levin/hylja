@@ -21,6 +21,7 @@ command. Tests import `../dist/*.js`, so build once before any of them.
 | HTTP framing round trip ([#209](https://github.com/Marcus-Levin/hylja/issues/209)) | [`test/openai-http-roundtrip.e2e.test.mjs`](../../test/openai-http-roundtrip.e2e.test.mjs) | [openai-text-sender.md](../contracts/openai-text-sender.md), [openai-text-response.md](../contracts/openai-text-response.md) | `node --test test/openai-http-roundtrip.e2e.test.mjs` |
 | Complete-text request sender, KEEP and policy-selected whole-message MASK ([#218](https://github.com/Marcus-Levin/hylja/issues/218)) | [`test/openai-text-sender.e2e.test.mjs`](../../test/openai-text-sender.e2e.test.mjs) | [openai-text-sender.md](../contracts/openai-text-sender.md) | `node --test test/openai-text-sender.e2e.test.mjs` |
 | Bounded local conversation owner: real sender, real receiver and the module's own loopback transport, one request, one guarded release ([#236](https://github.com/Marcus-Levin/hylja/issues/236)) | [`test/openai-local-conversation.e2e.test.mjs`](../../test/openai-local-conversation.e2e.test.mjs) | [openai-local-conversation.md](../contracts/openai-local-conversation.md) | `node --test test/openai-local-conversation.e2e.test.mjs` |
+| Bounded local-capability HTTP listener ([#261](https://github.com/Marcus-Levin/hylja/issues/261)) | [`test/openai-local-listener.e2e.test.mjs`](../../test/openai-local-listener.e2e.test.mjs) | [openai-local-listener.md](../contracts/openai-local-listener.md) | `node --test test/openai-local-listener.e2e.test.mjs` |
 | Egress send point, earlier fixture evidence | [`test/egress-sendpoint.e2e.test.mjs`](../../test/egress-sendpoint.e2e.test.mjs) | [egress-sendpoint-e2e.md](egress-sendpoint-e2e.md) | `node --test test/egress-sendpoint.e2e.test.mjs` |
 | Whole synthetic conversation: real detection, policy-selected whole-message MASK, both real fixed-worker children, one real loopback transfer and one KEEP-only release ([#228](https://github.com/Marcus-Levin/hylja/issues/228)) | [`test/openai-conversation.e2e.test.mjs`](../../test/openai-conversation.e2e.test.mjs) | [openai-text-sender.md](../contracts/openai-text-sender.md), [openai-keep-receiver.md](../contracts/openai-keep-receiver.md) | `node --test test/openai-conversation.e2e.test.mjs` |
 
@@ -77,9 +78,9 @@ planted values report none of them.
 
 ## What these runs are
 
-Each one joins **already-shipped, accepted-v1 seams** inside one test file over explicitly synthetic,
-invented, non-routable fixtures (`*.invalid`, loopback, made-up names). Nothing in `src/` changes
-because of them, and no proposed module is wired into accepted classification, policy or an adapter.
+Each run joins **accepted-v1 seams** over explicitly synthetic,
+invented, non-routable fixtures (`*.invalid`, loopback, made-up names). Test-only joins change no runtime seam. The listener run instead exercises the separately contracted
+runtime surface above; no proposed classification, policy or information-model module is adopted.
 Concretely:
 
 - **Synthetic-only trusted context.** The `PolicyBoundary`, the pinned bundle and classification
@@ -101,8 +102,8 @@ Concretely:
   and an OS-assigned ephemeral port; where a capture exists it is an in-memory model-context capture of
   the sentinel's own private ALLOW copy. No provider traffic, no credential, no network, no real sink.
 
-**These runs are not** a gateway, a vault, a broker, an authenticated caller, an adapter at a real send
-point, KMS/HSM integration or production plaintext protection. They are not a held-out or scored
+**These runs are not** a production authenticated gateway, a vault, a broker, an authenticated caller,
+a deployed provider send point, KMS/HSM integration or production plaintext protection. They are not a held-out or scored
 result, they authorize no freeze, custody, scoring, promotion or release, and they establish nothing
 about any production path. Each is evidence for a seam, not an enforcement boundary; per
 [capabilities.md](../capabilities.md#assurance-governance-and-release-seams), no adapter sits at a real

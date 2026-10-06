@@ -7,6 +7,8 @@ declare module 'node:crypto' {
   export function createHash(algorithm: 'sha256'): {
     update(data: string | Uint8Array): { digest(encoding: 'hex'): string };
   };
+  /** Native fixed-length constant-time comparison for listener capability digests. */
+  export function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean;
   export function createHmac(algorithm: 'sha256', key: Uint8Array): {
     update(data: string | Uint8Array): { digest(encoding: 'hex'): string };
   };
