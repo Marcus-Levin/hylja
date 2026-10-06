@@ -20,9 +20,33 @@ Two guarantees, both decided before the tool executes, both logged nowhere:
 | `find` with a machine-wide absolute root | blocked with a fixed reason naming the allowed roots |
 | `timeout` omitted on a builtin bash call | set to 120 s, Pi's builtin bash having no default |
 | `timeout` present, 0 < t <= 300 | preserved unchanged |
-| `timeout` > 300 s | clamped to 300 s |
+| `timeout` > 300 s, ordinary installation or unmatched approval | clamped to 300 s |
+| exact approved session cwd and whole command, explicit `timeout` > 300 s | clamped to 600 s |
 | `timeout` malformed, non-finite or <= 0 | blocked with a fixed reason |
 | any other tool | untouched, and no timeout applied |
+
+The default export/load path always installs the ordinary guard above; profiles are unchanged.
+A coordinator-owned run wrapper may explicitly import `installHyljaWorkflowGuard` from the same
+adapter and call `installHyljaWorkflowGuard(pi, { cwd, commands })` instead of installing the default.
+The approval is one exact absolute session cwd (at most 4096 characters, no control characters) and
+one or two distinct nonempty whole command strings (at most 16384 characters each, no NUL).
+The intended two commands are standalone canonical `npm test` and `npm run test:coverage` invocations,
+possibly with coordinator-owned fixed PATH, log, exit and elapsed recording; do not chain other
+validation commands into them. This intended command safety is a coordinator obligation, not parsed
+or verified by the guard. There is no general ceiling option, config discovery, environment inference,
+repository marker or model-supplied authorization.
+
+Installation validates and privately snapshots the record and array once. Missing approval keeps
+ordinary behaviour; malformed approval throws the fixed `Invalid Hylja validation approval` before
+registering any handler, with no partial grant or input echoed. Mutation after installation cannot
+widen the snapshot. Only exact equality of `ctx.cwd` and the entire command string selects the fixed
+600 s explicit ceiling: no normalization, shell parsing, substring or wrapper inference. Whitespace,
+extra commands, changed logging and a different cwd all retain 300 s. Omitted timeout remains 120 s,
+positive values through 300 s remain unchanged, and malformed timeout and forbidden machine-wide
+find remain refused even for an approved string. The same helper owns all refusal decisions.
+The guard authenticates nobody and cannot verify shell safety or coordinator authority; trusted
+run-owned configuration is not a new authorization boundary. Root owns native-load smoke and any
+subsequent expensive validation; these tests execute no approved shell commands.
 
 Wiring: the adapter takes the `tool_call` handler context and forwards `ctx.cwd` as the session
 directory, because a foreground child runs inside the parent process where `process.cwd()` is the
@@ -61,7 +85,8 @@ allowed on purpose, so the guard cannot block scoped repository discovery or the
 
 Evidence: `node --test test/hylja-workflow-guard.test.mjs` exercises the helper and the adapter
 directly, including the exact command shape that failed, quoted and absolute-executable variants, scoped
-discovery, the timeout default, preservation, clamp and refusal, that no other tool is mutated, and that
+discovery, the timeout default, preservation, ordinary and approved clamps, exact-command/cwd mismatches,
+malformed setup refusal, snapshot mutation and independent forbidden-find refusal, that no other tool is mutated, and that
 each role profile's declared path resolves to an existing file. The load path itself is proven by a
 native smoke run, not by this document.
 
