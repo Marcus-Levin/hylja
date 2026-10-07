@@ -124,21 +124,74 @@ DISPLAY or custody authority. Integration must not change reviewed S1 schemas si
 
 ### S2: one-reference scoped fixture owner
 
-Proposed construction inputs: one public synthetic original, its S1 context-label tuple,
-a single purpose `SYNTHETIC-LOG-SUMMARY`, fixture operation `DISPLAY`, finite expiry and
-initial current revision. An owner privately retains only that one original/reference pair.
-No bulk mapping enumeration or originals API is permitted. The fixed later demonstration uses
-one asset repeated throughout the message/log; S1's wider multi-asset case confers no owner capacity.
+The isolated proposed [`owner.mjs`](../../evaluations/mvp-roundtrip-draft/owner.mjs) exports
+only `createDraftOwner(configJson, contextJson, original)`. All arguments are primitives;
+config/context are nonempty printable ASCII compact JSON capped at 512 bytes each. Original
+matches S1's whole synthetic asset grammar (17..80 ASCII bytes). Exact closed key sets and
+`JSON.stringify(parsed) === input` refuse duplicates, escapes, alternate numbers, whitespace,
+unknown/missing/nested fields and trailing material; input key order may vary. Extra positional
+JavaScript arguments are ignored, not authority. No caller objects, callbacks or coercion occur.
 
-Proposed operation: `displayOne(reference, fixtureRequest, now)` returns one synthetic original
-or one fixed non-echoing refusal, not a collection. The closed fixture request must independently
-match the owner's label tuple, exact purpose and operation; provider text can supply only the
-reference. Current ACTIVE state, current revision and `now < expiresAt` are mandatory.
-Unknown/foreign reference, purpose mismatch, USE/EXPORT substitution, expiry, revoked/deleted
-state, stale revision or invalid request denies without revealing an original. Lifecycle changes
-are monotonic; revocation cannot be undone by replay. These are fixture checks, not principal
-or workload authentication, broker policy, registry/audit durability or private custody.
-Exact construction/request/lifecycle representations require Root's S2 assignment and review.
+Configuration has exactly these members:
+
+```json
+{"version":1,"purpose":"SYNTHETIC-LOG-SUMMARY","operation":"DISPLAY","destination":"SYNTHETIC-DISPLAY-A","adminDestination":"SYNTHETIC-ADMIN-A","createdAt":10,"expiresAt":100,"revision":1}
+```
+
+Purpose/operation are fixed literals. Destination grammars are
+`^SYNTHETIC-DISPLAY-[A-Z0-9]{1,32}$` and `^SYNTHETIC-ADMIN-[A-Z0-9]{1,32}$`.
+Times are integers in 0..1000000; `createdAt < expiresAt`; initial revision is exactly 1.
+Context is unchanged S1 version/scope/session/context JSON. Construction calls unchanged
+`transformDraft` with that context, original, fixed task `SUMMARIZE_FAILURES`, and exactly
+one log event `{asset: original, tick: 0, level: 'INFO', code: 'START'}`. It requires the complete
+TRANSFORMED result and exactly one reference, retaining only that public original/reference
+pair plus bounded metadata. No reference derivation/lookup export is added to S1.
+
+Construction returns frozen `{status: 'OWNED', owner}`; owner is frozen with only two bound
+methods, `displayOne(reference, requestJson, now)` and `revoke(adminRequestJson, now)`.
+It exposes no original, reference, enumeration, collection lookup or metadata read API.
+Successful display returns frozen `{status: 'DISPLAYED', value: original}`. Any constructor
+or operation refusal returns only frozen `{status: 'REFUSED', reason: 'OWNER_REFUSED'}`;
+no handle, partial value or diagnostic echo accompanies refusal.
+
+DISPLAY request is a separately supplied primitive compact ASCII JSON string (512-byte cap)
+with exactly `version`, `scope`, `session`, `context`, `purpose`, `operation`, `destination`,
+`revision`. Version is 1, label tuple matches S1 context, purpose is `SYNTHETIC-LOG-SUMMARY`,
+operation is `DISPLAY`, destination matches configuration and revision equals current revision.
+Only one primitive candidate reference matching the complete S1 grammar and bound reference
+is accepted, never a prefix, array or foreign token. USE/EXPORT and response-shaped attempts
+to manufacture authority refuse. Provider/responder text supplies only the candidate reference;
+S3 must independently supply fixture configuration/request, never derive them from response.
+
+Administrative request is separately supplied primitive JSON with the same bounds/canonical
+checks, exactly `version`, `scope`, `session`, `context`, `administrativePurpose`, `operation`,
+`destination`, `revision`. Tuple/version must match, administrativePurpose is exactly
+`SYNTHETIC-OWNER-LIFECYCLE`, operation exactly `REVOKE`, destination matches adminDestination,
+and revision is current. DISPLAY/USE requests cannot revoke. ACTIVE revision 1 revokes to
+REVOKED revision 2, drops the retained original and returns frozen
+`{status: 'REVOKED', revision: 2}`. Correct repeat at revision 2 is idempotent; revision 1
+replay conflicts and refuses. No renewal, activation, deletion command or revival exists.
+No accepted MAPPING_ADMIN/CREATE grant is borrowed or inferred.
+
+Every operation observes independently supplied primitive `now` first, even if its request
+or candidate later refuses. This public fixture clock is not real-time/kernel authority.
+Valid observations are integers in 0..1000000, at least the last observation (initially
+createdAt); they advance the high-water mark even on a denied request. ACTIVE with
+`now >= expiresAt` becomes permanently EXPIRED revision 2 and drops original. Invalid or
+rollback observation while ACTIVE becomes permanently DELETED revision 2 and drops original.
+Both refuse all later operations, including rollback/revocation. REVOKED remains terminal;
+only valid monotonic observations and a matching revision-2 admin request may acknowledge
+idempotent revocation, even after expiry. Invalid/rollback observations refuse without
+changing that terminal state. Display requires ACTIVE/current revision and
+`createdAt <= now < expiresAt` at the synchronous operation itself. No async gap, timer,
+callback, renewal or implicit fresh deadline exists. Terminal states never reveal originals.
+
+These are restrictive hypothetical fixture predicates, not authentication, accepted policy,
+a broker, custody, audit/registry durability, trusted clocks or secure erasure. Dropping one
+runtime string reference does not erase caller, returned, GC/heap/swap copies. Public labels
+and digest predictability confer no authority. S1's multi-asset support confers no owner capacity.
+[`owner.test.mjs`](../../evaluations/mvp-roundtrip-draft/owner.test.mjs) is public, unscored,
+pure component evidence; S3 integration and any real effects still require separate gates.
 
 ### S3: fixed attachment and deterministic responder integration
 

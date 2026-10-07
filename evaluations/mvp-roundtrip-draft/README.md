@@ -25,10 +25,11 @@ attachment/responder methods need their own gates and exact reviewed component c
 
 ## Verification
 
-The explicit focused command (not part of default `npm test` or CI suite enumeration) is:
+The explicit focused commands (not part of default `npm test` or CI suite enumeration) are:
 
 ```sh
 node --test evaluations/mvp-roundtrip-draft/transform.test.mjs
+node --test evaluations/mvp-roundtrip-draft/owner.test.mjs
 ```
 
 [`transform.test.mjs`](transform.test.mjs) is deterministic public development evidence for
@@ -45,3 +46,31 @@ all-refusing new-draft baseline; it is not an existing product defect. The repos
 fixture guard checks indexed paths, and the docs guard checks indexed Markdown links.
 The default diagnostic-assertion guard does **not** enumerate these new draft tests.
 No test logs compare raw captured output or original-bearing objects.
+
+## S2 one-reference fixture owner
+
+[`owner.mjs`](owner.mjs) is a synchronous, isolated proposed owner for exactly one public
+synthetic original and its unchanged S1 reference. `createDraftOwner(configJson, contextJson,
+original)` accepts only bounded primitives; its frozen handle exposes only `displayOne` and
+`revoke`. The [S2 specification](../../docs/specs/mvp-synthetic-roundtrip-draft.md#s2-one-reference-scoped-fixture-owner)
+freezes the exact closed JSON configuration, independent DISPLAY request, separate hypothetical
+administrative request, fixed refusals, revision conflicts and restrictive lifecycle semantics.
+No lookup/enumeration surface, reference-as-authority, caller callbacks or experimental IO exists.
+
+DISPLAY requires the complete bound reference, fixture scope/session/context, fixed summary
+purpose/operation, separately bound destination, current revision and active clock interval.
+Observed expiry and invalid/rollback clocks latch terminal refusal; revision-2 revocation cannot
+be replayed at revision 1 or revived. Dropping the public original reference is not secure erasure.
+Request labels and numeric fixture clocks are unauthenticated; response text must not supply them.
+These predicates grant no accepted DISPLAY/CREATE, broker, custody, trusted time, audit or policy.
+Only the owner component is exercised; the fixed file/responder integration remains separately gated.
+
+[`owner.test.mjs`](owner.test.mjs) covers exact restoration, frozen bound/no-bulk handle behavior,
+foreign/forged/prefix reference refusals, independently varied request components, malformed,
+unknown, duplicate, escaped, nested and oversize inputs, no caller-object inspection, expiry
+boundary/stickiness, invalid-clock/rollback deletion, separate administrative revocation,
+stale/current revision conflicts, idempotency and 1000 bounded generated identity/lifecycle cases.
+The valid behavior RED uses an explicit all-refusing new-draft baseline, not an existing-product
+defect. Public synthetic pure tests establish neither authenticated tenant isolation nor a full
+round-trip, private restoration, final-byte egress, responder/model utility or scored evaluation.
+No passing test, commit or AI review adopts proposed015 or opens any human/product gate.
