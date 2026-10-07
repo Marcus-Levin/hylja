@@ -91,7 +91,7 @@ Internal per-call equality mapping is ephemeral and never exposed.
 | Context |512|Less than256: three labels of at most48/50/50 bytes plus fixed framing|Maximal valid labels admitted; raw512/513-byte malformed inputs refused|
 | Message |1024|Less than800: eight80-byte assets plus fixed framing and either task|Maximal valid declaration admitted; raw1024/1025-byte malformed inputs refused|
 | Log |16384|Reachable with128 events, matching at most8 assets and variable integer ticks|Schema-valid canonical16384-byte input admitted;16385-byte input differing only in valid tick length refused|
-| Cloak |32768|Less than22000: each event at most141 bytes, each reference79 bytes, at most128 events and8 message refs, fixed framing less than512 bytes|Maximum-shaped reachable input admitted below cap; over-cap valid output is unreachable|
+| Cloak |32768|Less than22000: each event at most141 bytes, each reference80 bytes, at most128 events and8 message refs, fixed framing less than512 bytes|Maximum-shaped reachable input admitted below cap; over-cap valid output is unreachable|
 
 Raw exact/over refusals at unreachable caps are not valid-at-cap acceptance or branch/order
 proof: identical fixed refusals cannot distinguish cap from schema rejection. Source inspection
