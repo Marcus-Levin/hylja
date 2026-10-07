@@ -44,3 +44,37 @@ The contract documents which byte caps are reachable. Unreachable exact raw caps
 malformed refusal, not valid acceptance or proof of cutoff order. Source inspection establishes
 pre-parse bounds. No fabricated output-over-cap branch, protected egress, authenticated tenant
 isolation, private restoration/erasure, real model utility, held-out scoring or adoption is claimed.
+
+## P2 pure one-reference fixture owner
+
+[`owner.mjs`](owner.mjs) exports only `createPilotOwner(configJson,contextJson,original)`;
+its [separate frozen owner contract](../../docs/specs/synthetic-pilot-owner-draft.md) is
+PROPOSED / NON-ENFORCING / PUBLIC_DRAFT_ONLY under016, not adopted authority.
+It binds exactly one public marker using unchanged P1 derivation, exposing only a frozen
+status/mode/`displayOne`/`revoke` handle and fixed non-echoing failures, no originals list,
+map, reference property or bulk lookup. Independent fixture configuration and ordered closed
+DISPLAY/admin requests bind purpose, operation, destination, tuple, revision and supplied clock.
+Provider text supplies none of these. USE is not DISPLAY; DISPLAY is not EXPORT.
+
+Every invocation observes time first, including denied calls. Invalid/rollback/expiry clocks
+close permanently; valid denied observations advance the high-water mark. Only a proper
+current administrative request advances revision to2, and valid current2 acknowledgment is
+idempotent even after closure. No reactivation/rebinding/renewal exists. Public labels/time
+are not authenticated identity, trusted clocks, accepted CREATE/DISPLAY or private custody.
+A fresh owner is separate fixture state, not persistent/global revocation/currentness.
+
+Explicit finite pure component verification:
+
+```sh
+node --test evaluations/synthetic-pilot-draft/owner.test.mjs
+```
+
+[`owner.test.mjs`](owner.test.mjs) uses a NEW all-refusing factory RED baseline and unchanged
+GREEN behavior tests, including1000 bounded generated identity/lifecycle cases, independent
+owners and adversarial closed/canonical/primitive/reference/purpose/clock/revision checks.
+Run-specific raw receipts remain external. Default product tests/CI/diagnostic guarding do not
+enumerate this suite; dedicated pilot CI is a separate integration assignment. Passing P2
+establishes no multi-reference whole-answer atomicity, CLI/stdin/stdout, actual model utility,
+authenticated tenants, OS protection, private erasure, held-out scoring or human adoption.
+P3 must validate a complete reply before restoring, stage individual eligible values internally,
+and refuse the whole displayed answer/trace on any later owner denial, with no partial output.
