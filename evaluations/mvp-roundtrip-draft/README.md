@@ -74,3 +74,40 @@ The valid behavior RED uses an explicit all-refusing new-draft baseline, not an 
 defect. Public synthetic pure tests establish neither authenticated tenant isolation nor a full
 round-trip, private restoration, final-byte egress, responder/model utility or scored evaluation.
 No passing test, commit or AI review adopts proposed015 or opens any human/product gate.
+
+## S3 fixed public file and deterministic responder
+
+[`integration.mjs`](integration.mjs) composes the unchanged pure seams with one fixed
+[`public synthetic attachment`](fixed-synthetic-log.json), a bounded read-only regular-file
+adapter, an actual ASCII byte boundary to an in-process deterministic responder, strict reply
+validation and one independently configured fixture-purpose DISPLAY. There is no model inference,
+provider, network, socket, child, private input, caller path/callback or accepted runtime wiring.
+The [S3 specification](../../docs/specs/mvp-synthetic-roundtrip-draft.md#s3-fixed-attachment-and-deterministic-responder-integration)
+owns the exact interfaces, byte/refusal semantics, finite scenarios and integration limits.
+
+After a separate full-code/source/method and finite-command experimental gate:
+
+```sh
+node --test evaluations/mvp-roundtrip-draft/integration.test.mjs
+node evaluations/mvp-roundtrip-draft/demo.mjs
+```
+
+The demo prints one public synthetic result with the actual responder-consumed/returned byte
+captures, independent DISPLAY request, and displayed answer, or one fixed refusal. It accepts no
+path/options. A fresh fixture owner per run does not prove shared durable revocation/currentness
+or accepted CREATE authority. These explicit focused tests/demo are not default npm test or CI.
+Independent reproduction needs its own method gate, not the writer's permission.
+
+[`integration.test.mjs`](integration.test.mjs) distinguishes physical fixed-file reproduction
+from injected primitive-text/scenario cases. It checks exact original absence over actual outbound
+captures, failure counting including zero and maximum count, order/enum/tick/equality fidelity,
+one exact restored answer, atomic fixed refusals, request/lifecycle isolation and strict response
+schema/count/reference checks. Injected invalid attachment cases do not exercise OS fault paths;
+tests never mutate the fixture. The component RED uses an explicit pure all-refusing baseline,
+not an existing product defect. Output/counts belong to the external run-specific evidence packet.
+
+Only public synthetic values may be captured or displayed here. Read flags require supported
+numeric constants, but do not prove ancestor/hard-link/mount confinement, concurrent-file
+atomicity, finite native blocking or kernel containment. Native failure reproduction, private
+custody/erasure, real authorization/tenants, actual model/provider utility, protected egress,
+held-out scoring and human adoption remain unproven. Passing this draft grants none of them.

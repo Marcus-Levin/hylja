@@ -195,20 +195,65 @@ pure component evidence; S3 integration and any real effects still require separ
 
 ### S3: fixed attachment and deterministic responder integration
 
-Proposed handoff: a separately gated integration owner reads only one fixed public synthetic
-attachment, calls S1, and supplies **exactly** `cloakedJson` to an in-process deterministic local
-responder. It must capture exact input/output byte images without substituting reconstructed
-objects as evidence. No real provider, model, socket, child or attachment IO is exercised in S1.
-Root must approve the complete method/source and finite commands before any experimental IO.
+The isolated proposed [`integration.mjs`](../../evaluations/mvp-roundtrip-draft/integration.mjs)
+composes S1/S2 unchanged. `runFixedDraft(scenario = 'VALID')` reads only
+[`fixed-synthetic-log.json`](../../evaluations/mvp-roundtrip-draft/fixed-synthetic-log.json)
+through a module-relative fixed file URL. No caller path, callback, upload, configuration,
+request, clock or responder injection API exists. `runInjectedDraft(logJson, scenario = 'VALID')`
+accepts primitive synthetic log text only; its cases are not physical filesystem fault evidence.
+Both admit only the finite scenario literals in the module; nonprimitive/unknown scenarios refuse
+before file effects. Root's full-method/finite-command gate precedes experimental execution;
+independent reproduction requires its own gate. S1 itself still has no attachment/responder IO.
 
-Proposed responder output is one bounded compact ASCII JSON string (1024-byte ceiling):
+The fixed file contains only `SYNTHETIC-ASSET-A1`, also the separately fixed message's asset.
+The reader requires present numeric `O_RDONLY`, `O_NOFOLLOW`, `O_NONBLOCK`, opens read-only,
+checks descriptor regular-file status and size 1..16384, and reads into one owned 16385-byte
+Uint8Array using positive-progress bounded `readSync` calls until zero-byte EOF. Overflow,
+size mismatch, nonprintable/non-ASCII bytes or native exceptions refuse. The descriptor is
+closed in `finally` before downstream work; a close exception withholds success. There is no
+unbounded `readFileSync` allocation. The complete text then passes unchanged S1 canonical/schema
+checks and the stricter one-fixed-original constraint. No prefix or partial answer is returned.
+
+Exactly S1's `cloakedJson` is encoded to ASCII bytes. The in-process deterministic responder
+captures the numeric byte snapshot it actually consumes and parses that snapshot; its returned
+Uint8Array is captured at the controller, not reconstructed from parsed response fields. There
+is no model inference, provider, network, socket, child or retry. The response is compact ASCII
+JSON capped at 1024 bytes, with exactly `version`, `summary`, `reference`, `errorCount`:
 `{version: 1, summary: 'FAILURES_FOUND' | 'NO_FAILURES', reference: token, errorCount: integer}`.
-It contains exactly one reference: the message asset, and errorCount is the number of log
-ERROR events with that token (0..128). Summary must agree with count. Response text cannot
-assert a purpose, owner identity or grant. The integration independently validates this schema
-and reference, asks S2 for that single fixture-purpose DISPLAY operation, then builds a fixed
-synthetic displayed answer. Malformed/unknown/foreign/stale response refuses with no partial
-answer or raw diagnostic echo. Response parsing/restoration is not an S1 export or test claim.
+Count is ERROR events for the bound message reference, 0..128, irrespective of code. The
+controller independently validates closed schema, canonical bytes, version, reference and exact
+count/summary agreement against its admitted image before S2. Response text supplies no purpose,
+owner identity, destination, revision, clock or grant.
+
+Independent literal fixture config/context/request select S2's summary-purpose DISPLAY at
+`now = 20`, createdAt 10, expiresAt 100, revision 1, destination `SYNTHETIC-DISPLAY-A`.
+Only that one response reference is submitted. Each run constructs a fresh public fixture owner;
+this is not shared lifecycle/currentness, authentication or accepted CREATE authority. On success,
+one frozen result contains `status: 'DISPLAYED'`, `mode: 'PUBLIC_DRAFT_ONLY'`, integer `errorCount`,
+`answer` (at most 256 bytes), and a frozen `trace`. Answer is exactly
+`Synthetic log summary for SYNTHETIC-ASSET-A1: <count> ERROR events.`
+Trace holds `attachmentKind` (`FIXED_FILE` or `INJECTED_TEXT`), immutable numeric `attachmentBytes`,
+actual immutable `consumedBytes`/`returnedBytes`, independent `displayRequestJson` and `displayNow`.
+These public original-bearing attachment/display artifacts are not outbound responder context.
+Any refusal is exactly frozen `{status: 'REFUSED', reason: 'INTEGRATION_REFUSED'}` with no trace,
+answer, exception, path or partial output. Extra positional arguments confer no authority.
+
+The finite injected scenarios cover wrong purpose/destination/USE/EXPORT, foreign scope/session/
+context, stale revision, expired/revoked/rollback fixture owners, unknown/foreign/malformed
+references, malformed/oversize/non-ASCII/duplicate/escaped/trailing responses, wrong count type,
+negative/over/disagreeing count, disagreeing summary and authority smuggling. Invalid synthetic
+attachment text and no-failure utility are in-memory cases, never claims of physical OS failure.
+The fixed fixture is never mutated by tests. Exact original absence is checked over complete
+actual responder byte captures; event order/count/tick/enum fidelity and restored answer are
+checked separately. Tests are public unscored development evidence, outside default CI enumeration.
+
+The reader requires a trusted stable local directory/file and POSIX-style constants; unsupported
+platforms refuse. Flag presence does not prove hostile ancestor, hard-link or mount confinement,
+concurrent-file atomicity, finite native blocking, CPU preemption or kernel containment. Owned
+buffer wiping does not prove string/heap/caller/swap erasure. No private restoration, real-tenant
+isolation, protected-egress safety, accepted policy, model utility, held-out score or human adoption
+is established. [`demo.mjs`](../../evaluations/mvp-roundtrip-draft/demo.mjs) prints only this public
+synthetic result or a fixed refusal; it accepts no CLI path/options.
 
 ## Threat coverage and evidence limits
 
