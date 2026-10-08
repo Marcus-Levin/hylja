@@ -21,7 +21,9 @@
  * command is safe, bounded or correct. The timeout decision bounds only calls that reach this guard's
  * builtin `bash` handling; other tools and other APIs receive no bound from here.
  *
- * No input text reaches the caller: a refusal is one of two fixed reasons below.
+ * Optional command-window helpers snapshot a declared stop and reserve, then check supplied UTC;
+ * they do not observe a native deadline or prove final backend execution timing.
+ * No input text reaches the caller: refusals use fixed reasons.
  */
 
 import { homedir } from 'node:os';
@@ -34,6 +36,32 @@ export const MAX_COMMAND_TIMEOUT_SECONDS = 300;
 
 /** Fixed, non-echoing setup refusal; approval is trusted coordinator configuration, not authentication. */
 export const INVALID_VALIDATION_APPROVAL = 'Invalid Hylja validation approval';
+export const INVALID_COMMAND_WINDOW = 'Invalid Hylja command window';
+
+/** Trusted run configuration, snapshotted once without invoking accessors. No deadline renewal. */
+export function snapshotCommandWindow(record) {
+	if (record === undefined) return undefined;
+	try {
+		if (record === null || typeof record !== 'object' || Object.getPrototypeOf(record) !== Object.prototype) throw new Error();
+		const fields = Object.getOwnPropertyDescriptors(record);
+		if (Reflect.ownKeys(fields).length !== 2 || !fields.hardStopMs || !fields.reserveSeconds ||
+			!Object.hasOwn(fields.hardStopMs, 'value') || !Object.hasOwn(fields.reserveSeconds, 'value')) throw new Error();
+		const hardStopMs = fields.hardStopMs.value;
+		const reserveSeconds = fields.reserveSeconds.value;
+		if (!Number.isSafeInteger(hardStopMs) || hardStopMs <= 0 ||
+			!Number.isSafeInteger(reserveSeconds) || reserveSeconds < 0 || reserveSeconds > 86400) throw new Error();
+		return Object.freeze({ hardStopMs, reserveSeconds });
+	} catch {
+		throw new Error(INVALID_COMMAND_WINDOW);
+	}
+}
+
+/** Pure admission at supplied UTC: cap plus fixed finish reserve must fit, rounded up to milliseconds. */
+export function commandFitsWindow(window, now, seconds) {
+	if (!Number.isSafeInteger(now) || now < 0 || typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return false;
+	const requiredMs = Math.ceil(seconds * 1000) + window.reserveSeconds * 1000;
+	return Number.isSafeInteger(requiredMs) && requiredMs <= window.hardStopMs - now;
+}
 
 /** Snapshot the compact approval once; malformed records never grant a partial approval. */
 export function snapshotValidationApproval(record) {

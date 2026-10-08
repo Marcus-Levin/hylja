@@ -1,0 +1,1 @@
+{"version":1,"events":[{"asset":"SYNTHETIC-ASSET-A1","tick":4,"level":"INFO","code":"START"},{"asset":"SYNTHETIC-ASSET-A1","tick":2,"level":"ERROR","code":"FAILURE"},{"asset":"SYNTHETIC-ASSET-A1","tick":2,"level":"ERROR","code":"STOP"},{"asset":"SYNTHETIC-ASSET-A1","tick":8,"level":"INFO","code":"STOP"}]}

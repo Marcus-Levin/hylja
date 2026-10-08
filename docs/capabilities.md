@@ -105,6 +105,11 @@ There is no transport interceptor, no vault, no authorization broker, no KMS/HSM
 
 ### Public evidence is unscored; scoring needs human gates
 
+The isolated [public-synthetic round-trip draft](../evaluations/mvp-roundtrip-draft/README.md)
+implements a fixed-file/ASCII-byte/deterministic in-process responder/one-reference fixture DISPLAY
+demonstration, not accepted runtime classification, policy, authenticated protection, private custody,
+model/provider traffic or scored evaluation. Proposed015 remains unadopted; its focused tests are outside default CI.
+
 Everything in `evaluations/`, `scripts/research/` and `docs/research/` is **public, synthetic-only, unscored development evidence**. It proves a contract branch or a bounded measurement; it is not a held-out result, a comparative win or adoption approval.
 
 - [`node evaluations/preparation-integrity.mjs`](../evaluations/preparation-integrity.mjs) reports `PREPARATION_VALID_BUT_NOT_ELIGIBLE / PUBLIC_DRAFT_ONLY`. That status never authorizes scoring, custody, a freeze or a release, and `requireScoredV0()` denies unconditionally.
