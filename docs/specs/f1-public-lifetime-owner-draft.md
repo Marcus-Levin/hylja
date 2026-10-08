@@ -139,6 +139,32 @@ If `now >= deadline`, latch UNKNOWN/EXPIRED before applying its action. Never re
 deadline or high-water; construction of another owner is not renewal of this attempt.
 An invalid/foreign frame latches its fixed refusal without using its supplied clock.
 
+**First-expiry reduction order.** Each boundary performs one reduction in this order:
+validate the capped snapshot of own property descriptors and the matched identities once,
+then apply the clock, then the row's change. A decrease latches UNKNOWN/CLOCK_ROLLBACK and
+records nothing; equality is permitted; otherwise high-water becomes `now`. If `now >= deadline`,
+this same call latches UNKNOWN/EXPIRED when no earlier stop exists, and that first reason is
+sticky. Whether the expired call then records anything depends only on its kind, never on how
+the caller labels it.
+
+For an otherwise-ordered passive observation — `END_RETURN`, `END_THROW`, `END_OK`, `END_FAILED`,
+`EXIT_OK`, `CHILD_CLOSE`, `REAP`, `ENVELOPE_ABSENT` or `NO_INPUT` — the order is: match and
+validate, apply the clock, latch the first EXPIRED, then record its fact and recompute
+retirement where the table says so, and return `APPLIED`/`NONE`. `APPLIED`/`NONE` for an expired
+passive observation records a fact only; it never grants authority, increments a counter,
+renews the clock or permits completion.
+
+Any other expired call — a control effect (`ACQUIRE`, `GO`, `INPUT_BEGIN`), a stop command, a
+report loss or `FINALIZE` — still refuses under its fixed existing rule, records no fact and
+increments no counter, even though the same reduction already latched EXPIRED.
+
+An already stopped owner runs the identical order from its current first reason: an expired
+otherwise-ordered passive observation returns `APPLIED`/`NONE`, records its fact and recomputes
+retirement, and never clears, replaces or overwrites the first reason, revives authority, or
+turns UNKNOWN into MODEL_COMPLETE. A passive call that is also invalid — foreign identity,
+malformed or over-cap shape, clock decrease, or rejected duplicate/ordering — records no fact,
+returns its own fixed refusal, and leaves both the first reason and retirement unchanged.
+
 Current effect authority means MODEL_PENDING, acquired, no stop, `now < deadline`, and no
 observed exit or child close. Each GO/INPUT_BEGIN increments its corresponding counter once
 in the same reduction as its last guard. There is no callback, await, host read or emitted native
@@ -161,7 +187,7 @@ latches MODEL_UNKNOWN/ORDER_REFUSED and emits no effect. No omitted transition i
 | control / `GO` | current authority, not go | go=true, goEffects=1 |
 | control / `INPUT_BEGIN` | current authority, go, not attempted, not noInput | attempted=true, retired=false, inputEffects=1; input call is now on stack |
 | control / `END_RETURN` | attempted, not endReturned | endReturned=true; recompute retirement |
-| control / `END_THROW` | attempted, not endReturned | endReturned=true; UNKNOWN/INPUT_FAILED; no invented callback |
+| control / `END_THROW` | attempted, not endReturned | endReturned=true; clear on-stack input barrier; recompute retirement; latch UNKNOWN/INPUT_FAILED only if no earlier stop; no invented callback/close, no flushed success, existing UNKNOWN kept |
 | observer / `END_OK` | attempted, not endCallback | endCallback=true, flushed=true; recompute retirement |
 | observer / `END_FAILED` | attempted, not endCallback | endCallback=true, flushed=false; UNKNOWN/INPUT_FAILED; recompute retirement |
 | observer / `EXIT_OK` | acquired, not exited | exited=true; revoke effect authority, not a settlement fact |
@@ -172,6 +198,12 @@ latches MODEL_UNKNOWN/ORDER_REFUSED and emits no effect. No omitted transition i
 | observer / `FINALIZE` | complete predicate below | MODEL_COMPLETE/NONE; no effect |
 | observer / `REVOKE`, `OWNER_LOST`, `OBSERVER_LOST`, `FAULT`, `UNSUPPORTED` | pending | UNKNOWN with respective fixed reason (`REVOKE` maps to REVOKED) |
 | report / lost | pending | UNKNOWN/CONTROLLER_LOST |
+
+A monotonic clock at or past the deadline is well-shaped but not authoritative. Every row's
+`no earlier stop` precondition is therefore evaluated after the same-call expiry latch, not
+against MODEL_PENDING: an expired control, stop, report-loss or FINALIZE call refuses as its row
+and the sticky-stop paragraph below require, while an expired but otherwise-ordered passive
+observation named there records its fact, recomputes retirement and returns APPLIED/NONE.
 
 END_OK may arrive before END_RETURN or after CHILD_CLOSE; actual callback and actual child
 close are independent facts. Retirement after an attempt requires `endReturned && endCallback
@@ -196,7 +228,10 @@ END_RETURN/END_THROW, EXIT_OK, CHILD_CLOSE, REAP, ENVELOPE_ABSENT and NO_INPUT m
 record new facts under their original
 ordering rules, as exceptions to the table's no-earlier-stop rule. Their clocks may only increase
 high-water; a late rollback refuses without recording the fact, while expiry permits passive
-fact recording. Neither clears the first reason. Any invalid late call refuses without altering
+fact recording. Neither clears the first reason. Passive `END_RETURN` and `END_THROW`
+additionally recompute attempted-input retirement exactly as their table row specifies,
+including when they arrive after a stop, so a settled input is recorded as retired without
+inventing a callback or child-close fact and without clearing the first reason. Any invalid late call refuses without altering
 the first reason. Recording these facts allows F3 retirement to be distinguished from abandonment; FINALIZE always refuses.
 No cleanup effect, signal, probe, escalation, retry, next attempt or authority reacquisition.
 After MODEL_COMPLETE every mutation returns REFUSED/CLOSED; read remains available.
@@ -248,6 +283,13 @@ All are future C1 tests, not executed evidence in this prose unit.
 | Malformed / over-cap | Extra field, accessor, symbol, Unicode identity, bad tick, wrong marker | fixed INPUT_REFUSED, no getter/echo/partial effect |
 | Late action / replay | GO twice, INPUT_BEGIN twice, GO after EXIT_OK/CHILD_CLOSE | UNKNOWN/ORDER_REFUSED; counters never exceed 1/1 |
 | Unsupported envelope | Claimed signal success or parent-only absence instead of admitted evidence | INPUT_REFUSED or UNSUPPORTED, never MODEL_COMPLETE |
+| Throw after close | ACQUIRE@1, GO@2, INPUT_BEGIN@3, END_OK@4, EXIT_OK@5, CHILD_CLOSE@6, END_THROW@7 | retired=false before END_THROW; END_THROW returns APPLIED/NONE and recomputes retirement; snapshot MODEL_UNKNOWN/INPUT_FAILED, highWater=7, deadline=100, acquired/go/attempted/endReturned/endCallback/flushed/exited/childClosed/retired=true, noInput/reaped/envelopeAbsent=false, goEffects=inputEffects=1; FINALIZE cannot complete |
+| Late throw after report loss | ACQUIRE@1, GO@2, INPUT_BEGIN@3, END_OK@4, EXIT_OK@5, CHILD_CLOSE@6, report.lost@7, END_THROW@8 | END_THROW returns APPLIED/NONE and recomputes retirement; snapshot MODEL_UNKNOWN/CONTROLLER_LOST, highWater=8, retired=true, first reason preserved, goEffects=inputEffects=1, no new effect; FINALIZE refuses |
+| Passive END_OK at deadline−1 | ACQUIRE@1, GO@2, INPUT_BEGIN@3, END_RETURN@4, EXIT_OK@5, CHILD_CLOSE@6, END_OK@99 | APPLIED/NONE; MODEL_PENDING/NONE; endCallback=true, flushed=true, retired=true, highWater=99; completion still needs REAP and ENVELOPE_ABSENT |
+| Passive END_OK at deadline | same trace, END_OK@100 | APPLIED/NONE; MODEL_UNKNOWN/EXPIRED; endCallback=true, flushed=true, retired=true, highWater=100; no FINALIZE success |
+| Passive END_OK past deadline | same trace, END_OK@101 | APPLIED/NONE; MODEL_UNKNOWN/EXPIRED; endCallback=true, flushed=true, retired=true, highWater=101; no FINALIZE success |
+| Passive END_OK after earlier UNKNOWN | ACQUIRE@1, GO@2, INPUT_BEGIN@3, END_RETURN@4, EXIT_OK@5, CHILD_CLOSE@6, report.lost@7, then END_OK@99 / @100 / @101 | APPLIED/NONE at each tick; endCallback=true, flushed=true, retired=true, highWater=99/100/101; first reason stays CONTROLLER_LOST, no new effect; FINALIZE refuses |
+| Passive END_OK after EXPIRED | ACQUIRE@1, GO@2, INPUT_BEGIN@3, END_RETURN@4, EXIT_OK@5, CHILD_CLOSE@6, report.lost@100 (latches EXPIRED, returns REFUSED/STOPPED), then END_OK@99 / @100 / @101 | END_OK@99 refuses CLOCK_ROLLBACK with no recorded fact, endCallback=false, retired=false; END_OK@100/@101 return APPLIED/NONE with endCallback=true, flushed=true, retired=true and first reason EXPIRED unchanged |
 
 C1 must first retain real behavior RED cases for GO-before-acquisition, callback-only/close-only
 retirement, controller-loss abandonment and completion-from-signal shortcuts, then GREEN without
