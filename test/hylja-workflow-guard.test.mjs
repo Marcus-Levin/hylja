@@ -44,6 +44,122 @@ async function installedHandler(record, ordinary = false) {
 	return handlers[0];
 }
 
+test('opt-in receipts use bound runtime callbacks, never extension factory actions', async () => {
+	const module = await import(guardPath);
+	const handlers = new Map();
+	const receipts = [];
+	let bound = false;
+	const pi = {
+		on(name, handler) { handlers.set(name, handler); },
+		appendEntry(type, data) {
+			assert.ok(bound, 'runtime actions require binding');
+			receipts.push({ type, data });
+		},
+	};
+	module.installHyljaWorkflowGuard(pi, approval(), true);
+	assert.equal(receipts.length, 0);
+	assert.equal(typeof handlers.get('session_start'), 'function');
+	assert.deepEqual(bash(handlers.get('tool_call'), VALIDATION_COMMANDS[0], 600).result,
+		{ block: true, reason: module.GUARD_RECEIPT_REFUSAL });
+	bound = true;
+	handlers.get('session_start')();
+	assert.deepEqual(receipts, [{ type: 'hylja-workflow-guard-ready', data: { version: 1 } }]);
+	const handler = handlers.get('tool_call');
+	assert.equal(bash(handler, VALIDATION_COMMANDS[0], 600).input.timeout, 600);
+	assert.deepEqual(receipts[1], { type: 'hylja-workflow-guard-timeout', data: { version: 1, effectiveSeconds: 600 } });
+	assert.equal(bash(handler, 'npm run build', 600).input.timeout, 300);
+	assert.deepEqual(receipts[2], { type: 'hylja-workflow-guard-timeout', data: { version: 1, effectiveSeconds: 300 } });
+	assert.deepEqual(bash(handler, '# SYNTHETIC-GUARD-PROBE; find /', 15).result,
+		{ block: true, reason: BLOCK_REASON_MACHINE_WIDE_SEARCH });
+	assert.deepEqual(bash(handler, VALIDATION_COMMANDS[0], 0).result,
+		{ block: true, reason: BLOCK_REASON_INVALID_TIMEOUT });
+	handler({ toolName: 'read', input: { path: 'synthetic-planted.invalid' } }, CHILD_CONTEXT);
+	assert.equal(receipts.length, 3);
+});
+
+test('receipt failure returns a fixed block even when a host would swallow hook exceptions', async () => {
+	const module = await import(guardPath);
+	for (const phase of ['startup', 'timeout']) {
+		const handlers = new Map();
+		let fail = phase === 'startup';
+		module.installHyljaWorkflowGuard({
+			on(name, handler) { handlers.set(name, handler); },
+			appendEntry() { if (fail) throw new Error('synthetic-receipt-failure.invalid'); },
+		}, approval(), true);
+		const refusal = { block: true, reason: module.GUARD_RECEIPT_REFUSAL };
+		assert.doesNotThrow(() => handlers.get('session_start')());
+		fail = true;
+		assert.deepEqual(bash(handlers.get('tool_call'), VALIDATION_COMMANDS[0], 600).result, refusal);
+		fail = false;
+		assert.deepEqual(bash(handlers.get('tool_call'), VALIDATION_COMMANDS[0], 600).result, refusal);
+		handlers.get('session_start')();
+		assert.deepEqual(bash(handlers.get('tool_call'), VALIDATION_COMMANDS[0], 600).result, refusal);
+	}
+});
+
+test('a snapshotted command window refuses expired, invalid and over-reserve admission', async () => {
+	const helper = await import('../.pi/lib/hylja-command-guard.mjs');
+	const record = { hardStopMs: 1000000, reserveSeconds: 180 };
+	const window = helper.snapshotCommandWindow(record);
+	record.hardStopMs = 2000000;
+	record.reserveSeconds = 0;
+	assert.deepEqual(window, { hardStopMs: 1000000, reserveSeconds: 180 });
+	assert.equal(Object.isFrozen(window), true);
+	assert.equal(helper.commandFitsWindow(window, 220000, 600), true);
+	assert.equal(helper.commandFitsWindow(window, 220001, 600), false);
+	assert.equal(helper.commandFitsWindow({ hardStopMs: Number.MAX_SAFE_INTEGER, reserveSeconds: 0 },
+		Number.MAX_SAFE_INTEGER, 0.0001), false);
+	for (const now of [1000000, 1000001, -1, NaN, Infinity, '220000'])
+		assert.equal(helper.commandFitsWindow(window, now, 15), false);
+	for (const seconds of [0, -1, NaN, Infinity, '600'])
+		assert.equal(helper.commandFitsWindow(window, 220000, seconds), false);
+	assert.equal(helper.snapshotCommandWindow(undefined), undefined);
+	let reads = 0;
+	for (const invalid of [null, {}, { ...window, extra: true }, { ...window, reserveSeconds: -1 },
+		{ ...window, reserveSeconds: Infinity }, { ...window, hardStopMs: 'synthetic-planted.invalid' },
+		{ ...window, hardStopMs: Number.MAX_SAFE_INTEGER + 1 },
+		{ get hardStopMs() { reads++; throw new Error('synthetic-planted.invalid'); }, reserveSeconds: 180 }]) {
+		assert.throws(() => helper.snapshotCommandWindow(invalid),
+			(error) => error instanceof Error && error.message === helper.INVALID_COMMAND_WINDOW);
+	}
+	assert.equal(reads, 0);
+});
+
+test('the real adapter refuses an expired window before applying timeout or recording', async () => {
+	const module = await import(guardPath);
+	const handlers = new Map();
+	module.installHyljaWorkflowGuard({ on(name, handler) { handlers.set(name, handler); } },
+		approval(), false, { hardStopMs: 1, reserveSeconds: 180 });
+	const input = { command: VALIDATION_COMMANDS[0], timeout: 600 };
+	assert.deepEqual(handlers.get('tool_call')({ toolName: 'bash', input }, CHILD_CONTEXT),
+		{ block: true, reason: module.GUARD_WINDOW_REFUSAL });
+	assert.equal(input.timeout, 600);
+	assert.equal(handlers.get('tool_call')({ toolName: 'read', input: {} }, CHILD_CONTEXT), undefined);
+});
+
+test('adapter window admits equality and closes permanently on late delivery or clock rollback', async () => {
+	const module = await import(guardPath);
+	const actualNow = Date.now;
+	try {
+		for (const phase of ['late', 'rollback']) {
+			let now = 220000;
+			Date.now = () => now;
+			const handlers = new Map();
+			module.installHyljaWorkflowGuard({ on(name, handler) { handlers.set(name, handler); } },
+				approval(), false, { hardStopMs: 1000000, reserveSeconds: 180 });
+			const handler = handlers.get('tool_call');
+			assert.equal(bash(handler, VALIDATION_COMMANDS[0], 600).result, undefined);
+			now += phase === 'late' ? 1 : -1;
+			const refusal = { block: true, reason: module.GUARD_WINDOW_REFUSAL };
+			assert.deepEqual(bash(handler, VALIDATION_COMMANDS[0], 600).result, refusal);
+			now = 220000;
+			assert.deepEqual(bash(handler, 'npm run build', 1).result, refusal);
+		}
+	} finally {
+		Date.now = actualNow;
+	}
+});
+
 function bash(handler, command, timeout, context = CHILD_CONTEXT) {
 	const input = { command, ...(timeout !== undefined ? { timeout } : {}) };
 	const result = handler({ toolName: 'bash', input }, context);
