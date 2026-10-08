@@ -1,0 +1,45 @@
+name: Synthetic pilot draft
+
+# Dedicated verification of the isolated public draft; no adoption or model traffic.
+on:
+  push:
+    paths:
+      - 'evaluations/synthetic-pilot-draft/**'
+      - 'docs/specs/synthetic-pilot*.md'
+      - 'docs/decisions/016-synthetic-multi-asset-pilot-draft.md'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/synthetic-pilot-draft.yml'
+  pull_request:
+    paths:
+      - 'evaluations/synthetic-pilot-draft/**'
+      - 'docs/specs/synthetic-pilot*.md'
+      - 'docs/decisions/016-synthetic-multi-asset-pilot-draft.md'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/synthetic-pilot-draft.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  public-draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.15.0'
+      - name: Pin canonical npm version
+        run: npm install --global npm@10.9.9
+      - run: npm run check:fixtures
+      - run: npm run check:docs
+      - run: npm ci --ignore-scripts --no-fund
+      - name: Check all pilot assertion diagnostics explicitly
+        run: node scripts/development/check-diagnostic-assertions.mjs evaluations/synthetic-pilot-draft/transform.test.mjs evaluations/synthetic-pilot-draft/owner.test.mjs evaluations/synthetic-pilot-draft/controller.test.mjs evaluations/synthetic-pilot-draft/responder.test.mjs evaluations/synthetic-pilot-draft/cli.test.mjs
+      - name: Reproduce public draft including actual stdin/stdout
+        run: npm run test:synthetic-pilot-draft

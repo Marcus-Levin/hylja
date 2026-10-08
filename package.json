@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run check:fixtures && npm run build && node --test --test-concurrency=1 test/*.test.mjs evaluations/candidates/reference.test.mjs evaluations/gym-annotation-schema.test.mjs evaluations/preparation-integrity.test.mjs",
     "test:e2e": "npm run check:fixtures && npm run build && node --test --test-concurrency=1 test/*.e2e.test.mjs",
+    "test:synthetic-pilot-draft": "node --test evaluations/synthetic-pilot-draft/transform.test.mjs evaluations/synthetic-pilot-draft/owner.test.mjs evaluations/synthetic-pilot-draft/controller.test.mjs evaluations/synthetic-pilot-draft/responder.test.mjs evaluations/synthetic-pilot-draft/cli.test.mjs",
     "test:coverage": "npm run check:fixtures && npm run build && node --test --test-concurrency=1 --experimental-test-coverage test/*.test.mjs evaluations/candidates/reference.test.mjs evaluations/gym-annotation-schema.test.mjs evaluations/preparation-integrity.test.mjs",
     "check:fixtures": "node scripts/check-fixtures.mjs",
     "check:docs": "node scripts/check-doc-links.mjs",

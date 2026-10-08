@@ -78,3 +78,63 @@ establishes no multi-reference whole-answer atomicity, CLI/stdin/stdout, actual 
 authenticated tenants, OS protection, private erasure, held-out scoring or human adoption.
 P3 must validate a complete reply before restoring, stage individual eligible values internally,
 and refuse the whole displayed answer/trace on any later owner denial, with no partial output.
+
+## P3 isolated controller, offline responder and reusable CLI contract
+
+The [separate P3 specification](../../docs/specs/synthetic-pilot-cli-draft.md) freezes
+`preparePilot(inputJson)` / `completePilot(inputJson,replyJson,controlsJson)`, independent
+per-reference public fixture owners, reference-only provider replies, whole-answer staging,
+and an explicitly OFFLINE deterministic `respondPilot(cloakedJson)`. Provider output never
+supplies purpose, grant, context, destination, revision or clock. Semantically incorrect but
+schema-valid replies are not silently recomputed. No complete-answer API accepts bare refs
+as a bulk-original lookup. Input is bounded closed public JSON, not arbitrary production logs.
+
+The CLI has exactly one verb `cloak`, `display` or `demo`, with one canonical compact ASCII
+stdin packet and optional single terminal LF. It takes NO path/options/provider credential,
+opens no file and makes no network/model calls. Stdout is one complete cloak or displayed
+answer JSON plus LF; logical refusal is exactly
+`{"status":"REFUSED","reason":"PILOT_CONTROLLER_REFUSED"}` plus LF, exit2. Success exits0;
+I/O exception exits1 without raw stderr. Logical late denial emits no answer prefix; OS
+failure after a write began may leave partial bytes and is not transactional rollback.
+Descriptor0/1 provenance, native blocking, authentication, confinement and erasure are unproven.
+
+From the repository root, pass the documented generic packets on stdin:
+
+```sh
+node evaluations/synthetic-pilot-draft/cli.mjs cloak
+node evaluations/synthetic-pilot-draft/cli.mjs display
+node evaluations/synthetic-pilot-draft/cli.mjs demo
+```
+
+`cloak` packet: `{version:1,inputJson:<public input JSON string>}`.
+`display` packet: `{version:1,inputJson:<input>,replyJson:<external response JSON string>,controlsJson:<independent controls JSON string>}`.
+`demo` packet: `{version:1,inputJson:<input>,controlsJson:<controls>}` uses only the deterministic
+offline responder. Field order and inner schemas/caps are specified in the P3 contract.
+For reusable public examples, `cases.mjs` exports12 immutable `{id,inputJson,controlsJson}`
+objects, without answers/ground truth. Example packet construction (no subject execution):
+
+```js
+import { pilotCases } from './evaluations/synthetic-pilot-draft/cases.mjs';
+const sample = pilotCases[3];
+const demoPacket = JSON.stringify({ version: 1, inputJson: sample.inputJson, controlsJson: sample.controlsJson });
+const cloakPacket = JSON.stringify({ version: 1, inputJson: sample.inputJson });
+// Send cloakPacket to cloak; supply returned cloak to your separately admitted responder.
+// Put its canonical reply in the replyJson field of a display packet; keep controls separate.
+```
+
+Dedicated verification explicitly enumerates all five pilot suites, including actual public
+stdin/stdout subprocess cases (not native model traffic):
+
+```sh
+npm run test:synthetic-pilot-draft
+```
+
+[Dedicated synthetic CI](../../.github/workflows/synthetic-pilot-draft.yml) runs these suites
+and explicitly guards all five assertion files with the unchanged diagnostic checker.
+Default product suite/diagnostic enumeration is unchanged; those defaults alone still do NOT
+verify the pilot. Actual published CI, independent review and native-model utility observations
+need their own receipts/gates; no local run or offline response is a substitute.
+Public preparation originals/cloaks are bounded below the planned8192-byte per-arm context
+cap, but future independent preparation must freeze complete blind prompts/ground truth and
+actual native subjects before model effects. No corpus tuning, authoritative scoring,
+held-out result, human adoption, merge, release or private production support is implied.
