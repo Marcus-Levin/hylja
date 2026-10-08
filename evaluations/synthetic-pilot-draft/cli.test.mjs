@@ -35,14 +35,11 @@ function expectedAnswer(c, values) {
 test('frozen public12case corpus; actual variable cloak/demo/display paths with independent truth', () => {
   assert.equal(pilotCases.length, 12);
   assert.equal(Object.isFrozen(pilotCases) && pilotCases.every(Object.isFrozen), true);
-  let maximumOriginal = 0; let maximumCloaked = 0;
   for (const [i, c] of pilotCases.entries()) {
     assert.equal(Object.keys(c).join(',') === 'id,inputJson,controlsJson' && c.id === 'C'+String(i+1).padStart(2,'0'), true);
     const original = JSON.parse(c.inputJson);
     const prepared = preparePilot(c.inputJson);
     assert.equal(prepared.status === 'TRANSFORMED', true);
-    maximumOriginal = Math.max(maximumOriginal, c.inputJson.length);
-    maximumCloaked = Math.max(maximumCloaked, prepared.cloakedJson.length);
     const cloak = run(['cloak'], enc({ version: 1, inputJson: c.inputJson }));
     checked(cloak, 0, prepared.cloakedJson+'\n');
     assert.equal(original.message.assets.every((asset) => !cloak.stdout.includes(asset)), true, 'no originals in actual request');
@@ -51,7 +48,6 @@ test('frozen public12case corpus; actual variable cloak/demo/display paths with 
     checked(run(['demo'], enc({ version: 1, inputJson: c.inputJson, controlsJson: c.controlsJson })), 0, want);
     checked(run(['display'], enc({ version: 1, inputJson: c.inputJson, replyJson: replyFor(c), controlsJson: c.controlsJson })+'\n'), 0, want);
   }
-  assert.equal(maximumOriginal < 8192 && maximumCloaked < 8192, true, 'public input images below planned arm cap, not frozen model prompts');
   assert.equal(JSON.parse(pilotCases[4].inputJson).message.assets.length, 8);
 });
 test('actual max128event variable input reaches both tasks with exact equality/order and null result', () => {

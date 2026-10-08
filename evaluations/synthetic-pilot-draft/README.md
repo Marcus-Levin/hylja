@@ -134,7 +134,9 @@ and explicitly guards all five assertion files with the unchanged diagnostic che
 Default product suite/diagnostic enumeration is unchanged; those defaults alone still do NOT
 verify the pilot. Actual published CI, independent review and native-model utility observations
 need their own receipts/gates; no local run or offline response is a substitute.
-Public preparation originals/cloaks are bounded below the planned8192-byte per-arm context
-cap, but future independent preparation must freeze complete blind prompts/ground truth and
-actual native subjects before model effects. No corpus tuning, authoritative scoring,
-held-out result, human adoption, merge, release or private production support is implied.
+The P3 contract imposes no experiment-specific whole-arm request byte cap. Independent
+preparation must freeze complete blind prompts (including operational instructions), separate
+ground truth and actual native subjects before model effects. Provider context limits,
+admitted time/token budgets and CLI/parser safety bounds remain unchanged. No corpus tuning,
+authoritative scoring, held-out result, human adoption, merge, release or private production
+support is implied.

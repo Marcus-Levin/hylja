@@ -123,10 +123,13 @@ expiresAt100, revision1, now20, revokeJson:null. Each event below is in listed i
 | C11 first | A,1000000,ERROR,STOP; A,0,ERROR,START |
 | C12 first | A,1,INFO,START |
 
-No corpus/prompt tuning after future observations. Future independently prepared ORIGINAL
-and CLOAKED requests have planned cap8192 per arm and separate blind native contexts; this
-corpus is not yet admitted model context. Ground truth stays separate and never shown to
-responders. Public cases/tests are unscored, not held-out/promotion/release evidence.
+No corpus/prompt tuning after future observations. Independently prepared ORIGINAL and
+CLOAKED requests have no experiment-specific whole-arm byte cap and use separate blind
+native contexts. Freeze complete requests, including operational instructions, before model
+traffic; provider context limits and admitted time/token budgets still apply. This does not
+remove P1/P2/controller/CLI input, reply or control bounds or automatically admit the corpus
+as model context. Ground truth stays separate and never shown to responders. Public
+cases/tests are unscored, not held-out/promotion/release evidence.
 
 ## Verification boundary
 
