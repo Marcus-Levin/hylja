@@ -7,10 +7,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        Developer tooling only, not a security or evaluation authority. No real customer, employee,
-        infrastructure, credential or production data. A section left vague blocks admission to a
-        delegation lane. Never weaken an existing security contract or a proposed/human gate to fit
-        a plan.
+        Use docs/development/pipeline.md for admission and execution. Complete this brief for one
+        outcome; task/session restrictions override pipeline defaults. This form grants no security,
+        evaluation or human-adoption authority. Use synthetic data only.
 
   - type: input
     id: outcome
@@ -25,9 +24,8 @@ body:
     attributes:
       label: Pointers
       description: >-
-        Relevant source files, contracts, specs and decisions, with their status lines. A test-only
-        join of unchanged accepted-v1 seams points at its test, the seam sources it exercises and the
-        shared [synthetic-e2e.md](../../docs/development/synthetic-e2e.md) limits.
+        Exact source, contract/spec and decision paths with status lines. For a test-only join of
+        unchanged accepted-v1 seams, include the exercised sources and docs/development/synthetic-e2e.md.
     validations:
       required: true
 
@@ -35,7 +33,7 @@ body:
     id: scope
     attributes:
       label: Scope and non-goals
-      description: In scope (paths/behavior) and explicitly out of scope.
+      description: In-scope paths/behavior, permitted routine actions, exclusions and who owns publication.
     validations:
       required: true
 
@@ -44,9 +42,9 @@ body:
     attributes:
       label: Acceptance
       description: >-
-        Executable examples or observable checks, each naming the behavior or refusal that must go
-        RED first and the existing test file that asserts it. For a serialization change, name the
-        writer-reader round trip and the admitted byte extremes. Prefer these over a written plan.
+        Observable checks; for behavior changes, name the RED-first case and test path. For
+        serialization, include the writer-reader round trip and admitted byte extremes. Prose-only
+        changes need document checks, not text-grep tests.
     validations:
       required: true
 
@@ -62,7 +60,18 @@ body:
     id: verification
     attributes:
       label: Exact verification commands
-      description: The exact commands, in order, that must pass before review.
+      description: Exact commands in order, per-command caps and required receipts. Match checks to the changed surface.
+    validations:
+      required: true
+
+  - type: textarea
+    id: budget
+    attributes:
+      label: Delivery budget and retry policy
+      description: >-
+        State start/absolute UTC deadline (or no task deadline), validation/review/publication
+        reserve, resource limits and pipeline-default or stricter retry/fallback policy. Setup,
+        waits and recovery consume the same window; a deadline is not an estimate.
     validations:
       required: true
 
