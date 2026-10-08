@@ -16,10 +16,11 @@ requested settings are not evidence of the model, tools or extensions that actua
    unchanged invariants, exact checks, prerequisites, human gates and delivery budget. Defer adjacent
    work; an unmet human gate on the critical path blocks admission.
 2. **Reserve the finish.** Before the first setup attempt, record the task's start and absolute UTC
-   deadline, command caps, time reserved for validation, review and publication, and applicable
-   [retry policy](pipeline-reference.md#retry-and-fallback-policy). Setup, contact, waits and recovery
-   consume that same window. A lane's hard stop is the earliest applicable task, role or native runtime
-   deadline; a resume or new child does not renew the task window or an expired lane. Re-scope before
+   deadline if imposed, otherwise "no task deadline"; record role/native lane limits separately.
+   Record command caps, finishing reserves and [retry policy](pipeline-reference.md#retry-and-fallback-policy).
+   Setup, contact, waits and recovery count toward applicable task/lane limits. A lane's hard stop is
+   the earliest applicable task, role or native runtime deadline; a resume or new child does not renew
+   the task window or an expired lane. Re-scope before
    dispatch if the complete outcome cannot fit; required checks are not optional work.
 3. **Prepare setup.** Allocate a branch/worktree per issue. In the effective child checkout, verify
    base, owned state, executable agent discovery, required paths, dependencies and pinned toolchain.
