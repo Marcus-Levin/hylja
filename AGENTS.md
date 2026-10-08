@@ -1,6 +1,6 @@
 # Working on Hylja
 
-This file guides agents developing this repository. It keeps Hylja's authority, security, and evaluation requirements and adds the practical workflow discipline adapted from Pi's agent guide: read before you edit, run the real pinned commands, stage explicit paths, report honest evidence, and review the exact head independently. See [Attribution](#attribution) for the pinned upstream source and the scope of the adaptation.
+Standing authority, security and development rules for Hylja. See [Attribution](#attribution) for the adapted upstream guidance.
 
 ## Find the relevant authority
 
@@ -8,7 +8,7 @@ Before implementation, read [docs/charter.md](docs/charter.md), [docs/architectu
 
 One fact has one authoritative home. What is implemented and its limits belong only in [docs/capabilities.md](docs/capabilities.md); work status, priority and dependency order belong only in GitHub issues ([#36](https://github.com/Marcus-Levin/hylja/issues/36) is the roadmap checklist); dated measurements and their attribution live with the pull request or research record that produced them. Do not copy any of these into architecture, README, or research documents; link to the home instead. Research is evidence, not authority. Accepted design changes get a new decision record rather than silently rewriting history.
 
-A record marked **proposed** has no authority until a human accepts it. Do not wire a proposed decision, draft taxonomy, or draft information model into accepted runtime classification or policy, an adapter, or authoritative evaluation labels, scoring, and promotion, and do not weaken an accepted v1 contract or the held-out protocol to make a draft fit. An isolated, clearly labeled, non-enforcing draft module or test on synthetic data is allowed while its proposed status stays visible in its own record. Check the status line of every decision record you rely on.
+A record marked **proposed** has no authority until a human accepts it. Do not wire a proposed decision, draft taxonomy, or draft information model into accepted runtime classification or policy, an adapter, or authoritative evaluation labels, scoring, and promotion, and do not weaken an accepted v1 contract or the held-out protocol to make a draft fit. An isolated, clearly labeled, non-enforcing draft module or test on synthetic data is allowed while its proposed status stays visible in its own record.
 
 ## Security invariants
 
@@ -34,7 +34,7 @@ A record marked **proposed** has no authority until a human accepts it. Do not w
 
 ## Inspect before you edit
 
-- Read files in full before wide-ranging changes, before editing a file you have not fully inspected, and when investigating or auditing. Search snippets are for locating code, not for judging it.
+- Read files in full before wide-ranging changes, before editing a file you have not fully inspected, and when investigating or auditing. Search snippets locate code, not judge it. Retain full-file understanding while source identity and retained context are unchanged; a digest never substitutes for reading.
 - Check installed type declarations in `node_modules` (and the repository's own `src/*.d.ts` shims) for external API shapes; do not guess.
 - Ask before deleting functionality that looks intentional. This repository is unreleased, so removing a contract is a design change, not a compatibility chore — but say so explicitly rather than dropping it quietly.
 - Keep TypeScript strict and its syntax narrow: no `any` unless unavoidable, no dynamic type imports, no `enum`, `namespace`/`module`, `import =` or `export =`, and no loosening `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, or `verbatimModuleSyntax` to make code compile. The constructor parameter properties in the existing fixed-code error classes are accepted; `erasableSyntaxOnly` is deliberately not enabled, so do not rewrite boundary error classes for style.
@@ -96,8 +96,8 @@ Multiple sessions may work on this repository at once, each in its own branch an
 
 ## Delegation, review, merge, and issues
 
-- Keep implementation and review separate. When review is delegated, it must be a different agent working from the pushed or shared state, not the author's own summary.
-- The delegated implementer/reviewer lanes for this repository are documented in [docs/development/pipeline.md](docs/development/pipeline.md), entered through [.agents/skills/hylja-development/SKILL.md](.agents/skills/hylja-development/SKILL.md) and the two role agents in [.pi/agents/](.pi/agents/hylja-implementer.md). That path adds process only: it changes no rule in this file and no contract.
+- Execute directly unless delegation is authorized. Keep implementation and review separate; a delegated reviewer works independently from the pushed or shared state, not the author's summary.
+- Before planning delegated work, dispatching or handing off a lane, read [docs/development/pipeline.md](docs/development/pipeline.md). [.agents/skills/hylja-development/SKILL.md](.agents/skills/hylja-development/SKILL.md) is its entrypoint; the procedure changes no runtime contract or security invariant.
 - Review and approve an exact head SHA. A reviewed SHA that has since changed is not a review of the current head.
 - Report the exact SHA, the commands you actually ran with their results, and the honest remaining limits. Never manufacture approval, and never present AI review as the human design gate.
 - Merge only with the user's explicit authorization, exact-head approval, and green CI at that head. Proposed design (decision records, drafts, contracts, taxonomies) needs human review before it is wired in.
@@ -106,7 +106,7 @@ Multiple sessions may work on this repository at once, each in its own branch an
 
 ## Instruction precedence
 
-Current user and session instructions, and the task's stated authorization, govern. Standing authorization for ordinary work — implement, test, and commit on your own branch — persists across steps; do not ask again before each routine action. Do all concrete, reversible work the authorization already covers before asking anything. Ask only where the needed authorization or an actual human adoption gate is missing, or where the action would destroy another session's work or history. Dependencies and contract changes are reviewed code inside an authorized scope, not a reason to stop. Higher-priority instructions always win over this file.
+Current user and session instructions and the task's authorization govern; higher-priority instructions win. Work toward one observable outcome within scope. Ordinary implementation, tests and commits on your own branch remain authorized across steps: complete that reversible work without renewed permission prompts. Escalate missing authority, human adoption gates or risks to another session's work or history. Protect time for validation, required independent review and publication; a deadline is not an estimate. Dependencies and contract changes are reviewed code within authorized scope, not automatic stops.
 
 ## Attribution
 
