@@ -12,7 +12,8 @@ or build scope (`tsconfig.json` includes `src/**/*.ts`). It exists because one r
 on `find / -name hylja-implementer.md` after the exact path had been supplied; a prompt alone did not
 prevent the recurrence.
 
-Two protections—search scope and bash timeout arguments—decided before execution, logged nowhere:
+Two protections—search scope and bash timeout arguments—decided before execution. Ordinary
+installation logs neither:
 
 | Call | Decision |
 |---|---|
@@ -29,10 +30,10 @@ A coordinator-owned run wrapper may explicitly import `installHyljaWorkflowGuard
 adapter and call `installHyljaWorkflowGuard(pi, { cwd, commands })` instead of installing the default.
 The approval is one exact absolute session cwd (at most 4096 characters, no control characters) and
 one or two distinct nonempty whole command strings (at most 16384 characters each, no NUL).
-The intended two commands are standalone canonical `npm test` and `npm run test:coverage` invocations,
-possibly with coordinator-owned fixed PATH, log, exit and elapsed recording; do not chain other
-validation commands into them. This intended command safety is a coordinator obligation, not parsed
-or verified by the guard. There is no general ceiling option, config discovery, environment inference,
+Validation commands are standalone canonical `npm test` or `npm run test:coverage` invocations,
+possibly with coordinator-owned fixed PATH, log, exit and elapsed recording. Setup may reserve one
+slot for the harmless qualification probe below; do not chain validation commands into any slot.
+Command safety is a coordinator obligation, not parsed or verified by the guard. There is no general ceiling option, config discovery, environment inference,
 repository marker or model-supplied authorization.
 
 Installation validates and privately snapshots the record and array once. Missing approval keeps
@@ -46,6 +47,35 @@ find remain refused even for an approved string. The same helper owns all refusa
 The guard authenticates nobody and cannot verify shell safety or coordinator authority; trusted
 run-owned configuration is not a new authorization boundary. Root owns native-load smoke and any
 subsequent expensive validation; these tests execute no approved shell commands.
+
+**Native qualification.** A run wrapper can opt into fixed startup and applied-timeout receipts with
+`installHyljaWorkflowGuard(pi, { cwd, commands }, true)`. The factory registers callbacks only;
+`appendEntry` belongs in `session_start` or `tool_call`, after Pi binds its runtime. Receipt failure
+sticks for that installation and returns a fixed bash block; it does not rely on the host propagating
+hook exceptions. Receipts contain a version and, for allowed bash calls, the applied numeric timeout;
+no command, raw argument, output, cwd or protected value is recorded. Other tools remain untouched.
+The receipt describes this adapter's decision, not later hooks, hard preemption or descendant closure.
+
+A fourth argument `{ hardStopMs, reserveSeconds }` adds executable admission against a snapshotted
+absolute UTC stop: `hardStopMs` is a positive safe-integer epoch millisecond; `reserveSeconds` is an
+integer from 0 through 86400 including remaining required work and reporting margin. The adapter
+reads fresh UTC at each allowed bash call and requires its applied cap plus that fixed reserve to fit
+(rounding fractional milliseconds up). Exhaustion, invalid time or clock rollback closes the window
+permanently for that installation. Other tools remain untouched. Root must choose the stop within all
+applicable deadlines and a conservative reserve; this does not discover native deadlines, track
+completed work, enforce the final backend launch time, preempt a running command or prove cleanup.
+
+Before expensive work, inspect available load errors and qualify the same native installation with
+finite positive timeout inputs. `# SYNTHETIC-GUARD-PROBE; find /` with 15 s must receive the guard's
+fixed machine-wide-search refusal; it is entirely a shell comment if the guard is absent. A zero
+timeout can be rejected by Pi itself and proves no hook execution. For an approved 600 s ceiling,
+reserve one exact command slot for a fixed harmless `printf` probe and bind its runtime receipt and
+successful result from the same unchanged installation; configuration or a mock receipt is not native
+execution. A probe is an explicit setup effect, never an extra validation grant. Check fresh UTC again
+before the real command.
+When native deadline fields are unavailable, provide a conservative absolute lane stop whose bound
+is earlier than every applicable native cap; record the derivation before dispatch rather than waiting
+for a field the public API does not expose. Unknown qualification still stops dependent effects.
 
 Wiring: the adapter takes the `tool_call` handler context and forwards `ctx.cwd` as the session
 directory, because a foreground child runs inside the parent process where `process.cwd()` is the
@@ -77,8 +107,9 @@ allowed on purpose, so the guard cannot block scoped repository discovery or the
 Evidence: `node --test test/hylja-workflow-guard.test.mjs` exercises the helper and the adapter
 directly, including the exact command shape that failed, quoted and absolute-executable variants, scoped
 discovery, the timeout default, preservation, ordinary and approved clamps, exact-command/cwd mismatches,
-malformed setup refusal, snapshot mutation and independent forbidden-find refusal, that no other tool is mutated, and that
-each role profile's declared path resolves to an existing file. The load path itself is proven by a
+malformed setup refusal, snapshot mutation, independent forbidden-find refusal, opt-in receipt lifecycle
+and sticky receipt failure, window snapshots, equality/late admission and sticky clock rollback,
+that no other tool is mutated, and that each role profile's declared path resolves to an existing file. The load path itself is proven by a
 native smoke run, not by this document.
 
 ## Install and use
