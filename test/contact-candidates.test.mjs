@@ -485,6 +485,155 @@ test('dotted runs have a single email start and stay within a bounded-work budge
   }
 });
 
+// #37 constructor snapshot seam: a dictionary is a single-read structural snapshot of a trusted
+// configuration. The helpers below derive fixed booleans/counts only, so a failing assertion can never
+// print a planted exception message or a caller object.
+function fixedDictionaryError(call) {
+  try { call(); return false; } catch (error) {
+    return error instanceof TypeError && error.message === 'Invalid name dictionary';
+  }
+}
+const dictionarySpans = (text, names) => spans(text, run(text, { names }));
+
+test('a counting scope getter cannot retarget the dictionary after validation', () => {
+  const reads = { tenantRef: 0, projectRef: 0 };
+  const diverted = Object.create({});
+  Object.defineProperty(diverted, 'tenantRef', { enumerable: true,
+    get() { reads.tenantRef++; return reads.tenantRef === 1 ? 'tenant-a.invalid' : 'tenant-x.invalid'; } });
+  Object.defineProperty(diverted, 'projectRef', { enumerable: true,
+    get() { reads.projectRef++; return reads.projectRef === 1 ? 'project-a.invalid' : 'project-x.invalid'; } });
+  const text = 'Orla Synthetica joined the review';
+  const names = createNameDictionary(diverted, ['Orla Synthetica']);
+  // Each scope field is read once: the value validated is the value bound.
+  assert.deepEqual(reads, { tenantRef: 1, projectRef: 1 });
+  const validated = generateContactCandidates({ text, inputRef: 'field-a.invalid',
+    scope: { tenantRef: 'tenant-a.invalid', projectRef: 'project-a.invalid' }, names });
+  assert.deepEqual(spans(text, validated), [['NAME', 'Orla Synthetica']]);
+  assert.equal(validated.status, 'COMPLETE');
+  // The tuple a second read would have produced never becomes the bound scope.
+  const retargeted = generateContactCandidates({ text, inputRef: 'field-a.invalid',
+    scope: { tenantRef: 'tenant-x.invalid', projectRef: 'project-x.invalid' }, names });
+  assert.deepEqual(spans(text, retargeted), []);
+  assert.ok(retargeted.reasons.includes('NAME_DICTIONARY_SCOPE_MISMATCH'));
+});
+
+test('names are snapshotted by index: a hostile iterator never runs to copy them', () => {
+  const hostiles = [];
+  for (const source of [['Orla Synthetica'], Object.freeze(['Orla Synthetica'])]) {
+    const names = source.slice();
+    Object.defineProperty(names, Symbol.iterator, { configurable: true,
+      value() { hostiles.push(true); return [][Symbol.iterator](); } });
+    const names2 = createNameDictionary(scopeA, names);
+    assert.equal(hostiles.length, 0);
+    assert.deepEqual(dictionarySpans('Orla Synthetica joined', names2), [['NAME', 'Orla Synthetica']]);
+  }
+});
+
+test('each name entry is read exactly once, and a lying length cannot re-enumerate', () => {
+  const reads = [0, 0];
+  const names = ['Orla Synthetica', 'Brannick Testvold'];
+  for (const index of [0, 1]) {
+    Object.defineProperty(names, String(index), { configurable: true,
+      get() { reads[index]++; return index === 0 ? 'Orla Synthetica' : 'Brannick Testvold'; } });
+  }
+  const text = 'Orla Synthetica and Brannick Testvold';
+  assert.deepEqual(dictionarySpans(text, createNameDictionary(scopeA, names)),
+    [['NAME', 'Orla Synthetica'], ['NAME', 'Brannick Testvold']]);
+  assert.deepEqual(reads, [1, 1]);
+  // A length that claims entries the array never holds is refused once, with the length read once.
+  // The proxy stands in for an array whose length lies: Array.isArray still approves it, so the one
+  // trusted read of its length and indices is what decides, never its iterator.
+  let lengthReads = 0;
+  const lying = new Proxy(['Orla Synthetica'], { get(target, key) {
+    if (key === 'length') { lengthReads++; return 2; }
+    return Reflect.get(target, key);
+  } });
+  assert.equal(Array.isArray(lying), true);
+  assert.equal(fixedDictionaryError(() => createNameDictionary(scopeA, lying)), true);
+  assert.equal(lengthReads, 1);
+});
+
+test('a throwing scope field, names length or name accessor fails with the fixed dictionary error', () => {
+  const throwingLength = new Proxy(['Orla Synthetica'], { get(target, key) {
+    if (key === 'length') throw new Error('synthetic-planted-length.invalid');
+    return Reflect.get(target, key);
+  } });
+  const throwingIndex = new Proxy(['Orla Synthetica'], { get(target, key) {
+    if (key === '0') throw new Error('synthetic-planted-index.invalid');
+    return Reflect.get(target, key);
+  } });
+  const hostileScope = {};
+  Object.defineProperty(hostileScope, 'tenantRef', { enumerable: true,
+    get() { throw new Error('synthetic-planted-scope.invalid'); } });
+  Object.defineProperty(hostileScope, 'projectRef', { enumerable: true, value: 'project-a.invalid' });
+  for (const call of [
+    () => createNameDictionary(hostileScope, ['Orla Synthetica']),
+    () => createNameDictionary(scopeA, throwingLength),
+    () => createNameDictionary(scopeA, throwingIndex),
+    () => createNameDictionary(scopeA, ['Orla Synthetica', , 'Brannick Testvold']),
+  ]) assert.equal(fixedDictionaryError(call), true);
+});
+
+test('ordinary, frozen, null-prototype, inherited-accessor and accessor scopes and arrays still construct', () => {
+  const scopes = [
+    scopeA,
+    Object.freeze({ tenantRef: scopeA.tenantRef, projectRef: scopeA.projectRef }),
+    Object.assign(Object.create(null), { tenantRef: scopeA.tenantRef, projectRef: scopeA.projectRef }),
+    Object.create({ get tenantRef() { return scopeA.tenantRef; }, get projectRef() { return scopeA.projectRef; } }),
+    { get tenantRef() { return scopeA.tenantRef; }, get projectRef() { return scopeA.projectRef; } },
+  ];
+  const nameLists = [
+    ['Orla Synthetica'],
+    Object.freeze(['Orla Synthetica']),
+    Object.assign(['Orla Synthetica'], Object.create(null)),
+  ];
+  for (const scope of scopes) {
+    for (const list of nameLists) {
+      const names = createNameDictionary(scope, list);
+      const text = 'Orla Synthetica joined';
+      const result = generateContactCandidates({ text, inputRef: 'field-a.invalid', scope: scopeA, names });
+      assert.deepEqual(spans(text, result), [['NAME', 'Orla Synthetica']]);
+      assert.equal(result.status, 'COMPLETE');
+    }
+  }
+  // An entry read through an accessor keeps its exact UTF and regex-literal spelling.
+  const utf = 'Caf\u00e9 Synthetic', literal = 'A.B (Synthetic)';
+  const accessed = [utf, literal];
+  Object.defineProperty(accessed, '0', { configurable: true, get() { return utf; } });
+  Object.defineProperty(accessed, '1', { configurable: true, get() { return literal; } });
+  const dict = createNameDictionary(scopeA, accessed);
+  const text = 'A.B (Synthetic) and Caf\u00e9 Synthetic';
+  assert.deepEqual(dictionarySpans(text, dict), [['NAME', 'A.B (Synthetic'], ['NAME', 'Caf\u00e9 Synthetic']]);
+});
+
+test('mutating the caller scope or names after construction cannot retarget the snapshot', () => {
+  const scope = { tenantRef: scopeA.tenantRef, projectRef: scopeA.projectRef };
+  const names = ['Orla Synthetica'];
+  const text = 'Orla Synthetica and Quillon Fakeworth';
+  const names1 = createNameDictionary(scope, names);
+  scope.tenantRef = 'tenant-b.invalid';
+  scope.projectRef = 'project-b.invalid';
+  names.push('Quillon Fakeworth');
+  names[0] = 'Quillon Fakeworth';
+  assert.deepEqual(dictionarySpans(text, names1), [['NAME', 'Orla Synthetica']]);
+});
+
+test('fresh two-handle dictionaries stay isolated in both scope directions', () => {
+  const text = 'Orla Synthetica joined';
+  const a = createNameDictionary(scopeA, ['Orla Synthetica']);
+  const b = createNameDictionary(scopeB, ['Orla Synthetica']);
+  const underA = generateContactCandidates({ text, inputRef: 'field-a.invalid', scope: scopeA, names: a });
+  const bUnderA = generateContactCandidates({ text, inputRef: 'field-a.invalid', scope: scopeA, names: b });
+  const aUnderB = generateContactCandidates({ text, inputRef: 'field-a.invalid', scope: scopeB, names: a });
+  assert.deepEqual(spans(text, underA), [['NAME', 'Orla Synthetica']]);
+  assert.deepEqual(spans(text, bUnderA), []);
+  assert.deepEqual(spans(text, aUnderB), []);
+  for (const result of [bUnderA, aUnderB]) {
+    assert.ok(result.reasons.includes('NAME_DICTIONARY_SCOPE_MISMATCH'));
+    assert.equal(result.status, 'PARTIAL');
+  }
+});
+
 test('second rereview regressions: leading dots and invisible marks do not hide contacts', () => {
   for (const [text, expected] of [
     ['.john@example.com', ['john@example.com']], ["'.john@example.com", ['john@example.com']], ['Contact me...john@example.com', ['john@example.com']],
