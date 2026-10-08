@@ -1,9 +1,8 @@
 # Development pipeline reference
 
-Disclosed detail for the coordinator procedure in [pipeline.md](pipeline.md). Read the section that
-the pipeline page points you to, and skip this file on a routine lane: a worker needs its role body,
-its pointers and its commands, nothing here. Guard behaviour, installation, evidence lookup and the
-historical #147 proposal are the branches this file holds.
+On-demand reference for [pipeline.md](pipeline.md). Read only the named branch: guard, installation,
+retry policy, native lane CLI or evidence lookup. The historical #147 proposal is not a dispatch gate.
+Workers need only their role body and supplied inputs, unless the brief names a section here.
 
 ## Workflow guard
 
@@ -13,7 +12,7 @@ or build scope (`tsconfig.json` includes `src/**/*.ts`). It exists because one r
 on `find / -name hylja-implementer.md` after the exact path had been supplied; a prompt alone did not
 prevent the recurrence.
 
-Two guarantees, both decided before the tool executes, both logged nowhere:
+Two protections—search scope and bash timeout arguments—decided before execution, logged nowhere:
 
 | Call | Decision |
 |---|---|
@@ -60,19 +59,11 @@ providers and the builtin tools still resolve. The relative entry resolves again
 directory, which is what pi-subagents does for a path-like `extensions` entry; the profiles' other
 settings are unchanged.
 
-Operating rules that the guard does not enforce, because a prompt alone did not stop the recurrence:
-
-- The handoff uses the exact entry points already supplied: brief pointers, decision paths,
-  `.pi/agents/`, the project skill, the pipeline documents and the three installed principle paths.
-  Do not rediscover them by searching the machine.
-- Search a filesystem only when a pointer is absent, and then only inside the repository worktree or a
-  root named in the brief or in those paths, for example the home directory holding the installed
-  skills. Scoped `find .`, `find src` and `grep` stay allowed.
-- A guard refusal is a setup finding: use the exact path you were given, or report that the pointer is
-  missing. Never retry the same search in another quoting, wrapper or executable form.
-- Root owns the wall clock. Watch public tool progress in the session and stop a command that has run
-  past its named budget instead of waiting for the deadline; the guard's timeout bounds a single call,
-  not the lane budget.
+Search discipline remains a prompt obligation: use supplied entry points; when a pointer is absent,
+search only the worktree or a brief-named root. Scoped `find .`, `find src` and `grep` remain allowed.
+Treat a refusal as a setup finding, not an invitation to retry through another quoting, wrapper or
+executable. The [coordinator procedure](pipeline.md#coordinator-procedure) owns the delivery clock;
+the guard adjusts a single call's timeout, not the lane budget.
 
 Limits, stated so no one reads more into it: it is a workflow guard, not a shell sandbox, a command
 parser or an enforcement boundary. It splits a command textually on control separators and whitespace,
@@ -106,17 +97,30 @@ they live outside the tracked build and typecheck scope, and they add no new pac
 - Headless: `--no-skills --skill .agents/skills/hylja-development` loads only that skill; without
   `--no-skills`, every discovered global skill is also eligible for automatic selection.
 - Grant project trust once: `/trust`, or `--approve`.
-- Launch: `subagent({ agent: "hylja-implementer", task: <brief>, cwd: <worktree>, async: false })`. Both
-  role profiles set `async: false`, so a lane is a foreground native child and its result returns
-  in-session. Each profile's `extensions:` value is an allowlist rather than empty, so ambient extension
-  loading stays disabled in the child while the project workflow guard loads; builtin tools, the
-  providers the host registered, and host-required child extensions still load.
+- Launch according to the [coordinator procedure](pipeline.md#coordinator-procedure). Leaf profiles
+  retain `async: false`; a top-level async workflow does not change those pins. Each profile's
+  `extensions:` allowlist disables ambient extensions while retaining the project guard, builtin
+  tools, registered providers and host-required child extensions.
 - Another checkout needs no installer: copy each `principle-*/SKILL.md` from the pinned upstream
   pstack commit into `~/.agents/skills/<name>/`, MIT license kept.
 
-`async: true` is an optional mode, not the pipeline default: the single background run in this
-installation exceeded its budget without a result, so no background lifecycle, ordering or timing is
-promised.
+The historical background run exceeded its budget without a result. Coordinator workflow mode is
+not evidence of child completion, ordering or timely closure; inspect actual terminal receipts.
+
+## Retry and fallback policy
+
+The handoff states the applicable policy; task/session restrictions override these standing defaults.
+Recovery preserves the original delivery window and failed-round count, not a fresh budget.
+
+- A transient provider error waits 2.5 s and retries unchanged in the same session, provider and model;
+  record an unresolved failure with its message. A stricter no-retry task disables this default.
+- Only root may explicitly dispatch the dedicated writer fallback after the default writer route
+  actually failed and its child settled. Exit 2, INCOMPLETE or missing acceptance evidence is not a
+  provider outage. Preserve the prior worktree and uncommitted work; use fresh context and evidence
+  paths. A task forbidding fallback overrides this exception. No child or CLI selects it automatically.
+- A launch, extension, tooling or workflow failure blocks that lane. Preserve its partial diff and
+  report the exact failure and run/cwd/ref before a permitted same-protocol retry. Switching to the
+  native lane CLI or another execution protocol requires explicit owner authorization.
 
 ## Native lane CLI
 
@@ -129,25 +133,13 @@ fixed input the controller answers, and the one structured foreground delegation
 and a run under this CLI is still one lane: no model override, no background mode, no automatic role
 fallback, no nesting, and no child that launches another lane.
 
-**The dedicated writer fallback** is a third role profile,
-[`.pi/agents/hylja-implementer-sol61.md`](../../.pi/agents/hylja-implementer-sol61.md): the writer's own
-body, principles, tool allowlist, workflow-guard allowlist, fresh context, foreground, non-nesting
-settings and 20-minute ceiling, with `model: openai-codex/gpt-6.1-sol:medium` in place of the default
-writer's route. `agent` admits it, and both model checks — `checkInstall` and `verifyArtifacts` — accept
-exact-pin only this role: both model checks admit it at that exact Sol 6.1 medium string and refuse any
-other route or budget for it. The default writer and the reviewer keep their existing `:max` suffix
-admission rather than an exact pin, so a foreign `:max` route passes that check for them; they are bound
-only by the profile, preflight and metadata model equality the verification half already enforces. The
-fallback is therefore an auditable third role rather than a general failover.
-Nothing automatic reaches it: the CLI never retries, re-routes or carries a prior attempt forward, and
-a refused or timed-out lane leaves its artifacts and any uncommitted work exactly where they are. Root
-dispatches it explicitly, and only after the default writer route has actually failed and the previous
-child has settled; exit 2 and an INCOMPLETE verdict are evidence problems, not provider outages. The
-fallback is a writer lane, so `writerAcceptanceGate` reports it the same honest way the default writer
-is reported and `acceptanceProvesApproval` stays `false`; root admits a fallback writer lane by
-verifying its clean committed scoped paths and its evidence, exactly as for the default writer. A lane
-launched under this role needs fresh evidence paths like any other, because the earlier lane's evidence
-is preserved rather than reused.
+The [dedicated writer fallback](../../.pi/agents/hylja-implementer-sol61.md) is admitted by `agent`.
+Both `checkInstall` and `verifyArtifacts` require its exact model pin; the default writer/reviewer
+checks require only a `:max` suffix plus profile/preflight/metadata equality, so the suffix check alone
+admits a foreign `:max` route. This is not general failover. The CLI never retries, re-routes or carries
+an attempt forward, and leaves refused/timed-out work and evidence intact. Dispatch permission belongs
+to [Retry and fallback policy](#retry-and-fallback-policy). Like the default writer, this role's
+`writerAcceptanceGate` is not approval and `acceptanceProvesApproval` stays `false`.
 
 The config is root-owned, bounded and absolute. Every path field must start with `/`; `key` and `task`
 are non-empty text (`task` capped at 1 MiB); `agent` is `hylja-implementer`, `hylja-reviewer` or
@@ -297,9 +289,10 @@ which a record count alone did not establish. An ordinary lane with ordinary met
 binds before the record count does, so that oversized tail is deliberately not byte-identical to what
 a count-only window persisted. Cancellation reaches only the exact owned tuple
 persisted at dispatch, inside the running process.
-Owned shutdown is finite: the watchdog latches the deadline and stops the CLI's own child one minute
-past the native request timeout, sends SIGTERM, then SIGKILL after 10 s, then waits at most 10 s more
-for `close` — never an indefinite wait.
+Shutdown schedule: the watchdog latches the deadline and stops the CLI's own child one minute
+past the native request timeout, sends SIGTERM, then SIGKILL after 10 s, then schedules at most 10 s
+more for `close`. These timer/signal steps do not prove hard preemption of a stalled event loop,
+all-descendant closure or private erasure.
 
 **When `softBudgetMs` is configured** (and only then): the child learns the two numbers once, in its
 initial task, as one role-aware paragraph — reviewer: report a literal verdict and stay read-only;
@@ -313,9 +306,8 @@ displaces are dropped from the oldest end, so neither bound is raised, the survi
 their chronological order and the newest updates are the ones kept. Pinning it costs the window
 nothing it was already allowed to keep, and it is a warning for the reader and nothing more: it is
 never delivered to the running child, and
-it never cancels, kills, deletes, resets or approves anything. The hard path is unchanged and finite —
-native request timeout, plus the one-minute watchdog, SIGTERM, SIGKILL after 10 s, at most 10 s more
-for `close`. A lane that reaches it reports INCOMPLETE with `deadlineExceeded: true`, keeps its
+it never cancels, kills, deletes, resets or approves anything. The shutdown schedule above is
+unchanged. A lane that reaches it reports INCOMPLETE with `deadlineExceeded: true`, keeps its
 worktree, receipt, dispatch, progress and artifact files for recovery, and is never an approval; a
 recovery handoff must name the exact source SHA whose tree the resumed lane runs, so a resumed lane is
 provably the same code and not a re-implementation of it.
@@ -349,23 +341,19 @@ and not approval.
 
 ## Evidence lookup
 
-One run searched `~/.pi` while its launch carried an explicit `--session-dir`, then reported the model
-and run ID unavailable; the metadata was in that session's `subagent-artifacts/` all along. Read the
-paths the launch supplied. Never rebuild an artifact filename from a remembered pattern: a guessed one
-misses a run that exists and reads as absent evidence.
+Use returned paths rather than rebuilding filenames or searching a session store. Run-id prefixes
+and artifact suffixes vary; unavailable evidence is not permission for a machine-wide search.
 
 - The handoff carries what the launch or the run returned: the files named by `outputReference`,
   `outputPathMapping` or `artifactPaths`; otherwise the session directory the launch actually used,
   `sessionDir` or an external `--session-dir`, together with the child's `runId` and agent name.
 - Given returned paths, open exactly those. Given only a session directory, list
   `{sessionDir}/subagent-artifacts/` once and take the entries whose name starts with
-  `{runId}_{agent}`; the rest of each name comes from that listing, never from a schema. One run wrote
-  `..._hylja-implementer_0_output.md` and a sibling `_0_meta.json`, so the assumed
-  `{runId}_{agent}_output.md` names a file that does not exist.
+  `{runId}_{agent}`; take the remaining suffix from that listing, never from an assumed schema.
 - The `*_output.md` entry is the child's public final artifact and the `*_meta.json` entry its
   metadata: `runId`, `agent`, timing, usage, exit code, the resolved model and the resolved acceptance
-  ledger. Those two plus the child's returned output are the evidence surface; the `.jsonl` entry, the
-  raw native session transcript and provider reasoning blocks, stays closed.
+  ledger. These and the returned output are the routine evidence surface; raw native sessions and
+  provider reasoning stay closed.
 - A supplied path that resolves to nothing is reported as unavailable, not replaced by a wider search.
 
 A review handoff states, before the reviewer is dispatched, the exact retained paths of the RED and
@@ -377,7 +365,7 @@ Three reported figures stay distinct when the metadata is written up:
 
 | Figure | Read it from |
 |---|---|
-| model that ran | the `model` field of the run's `*_meta.json`; its `requestedModel` is the request, and the `model:` frontmatter of [`hylja-implementer.md`](../../.pi/agents/hylja-implementer.md) declares an intent. Neither is runtime evidence |
+| resolved model | the run's `*_meta.json` `model` field; `requestedModel` and profile frontmatter are intent. A resolved launch without a successful serving receipt does not establish actual serving or effort; report that limit |
 | usage | the cumulative input, output and cache counters in that same metadata, or `/subagent-cost` for parent-plus-child totals |
 | context size | a live window figure read as such, never a usage counter: a cumulative total bills every turn of the run, so quoting it as the context window overstates it |
 

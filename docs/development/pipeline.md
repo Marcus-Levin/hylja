@@ -1,102 +1,83 @@
 # Development pipeline
 
-Delegating Hylja development work to independent native Pi subagents: one implementer, one reviewer,
-coordinated by the root session. Developer tooling, not runtime core and not a security boundary:
-`src/` imports nothing from it, it adds no dependency, executable or policy, and changes no contract,
-security invariant or evaluation protocol. See [capabilities.md](../capabilities.md); rules stay in
-[AGENTS.md](../../AGENTS.md).
+Coordinator procedure for authorized Hylja delegation: one implementer, one independent reviewer.
+Ordinary direct execution remains the default in [AGENTS.md](../../AGENTS.md). This procedure adds no
+runtime contract, security boundary or evaluation authority.
 
-This page is the coordinator procedure. Installation, workflow-guard behaviour, evidence-lookup
-detail and the historical #147 proposal are disclosed in
-[pipeline-reference.md](pipeline-reference.md) and are read only on those branches. Role pins,
-deadlines, tool allowlists and the workflow-guard wiring are the frontmatter of
-[`.pi/agents/hylja-implementer.md`](../../.pi/agents/hylja-implementer.md),
-[`.pi/agents/hylja-reviewer.md`](../../.pi/agents/hylja-reviewer.md) and the dedicated writer
-fallback [`.pi/agents/hylja-implementer-sol61.md`](../../.pi/agents/hylja-implementer-sol61.md).
-
-## Roles and principle loading
-
-Each role works in its own worktree with its own profile pins, and `bash` is the reviewer's
-validation tool rather than an OS sandbox, which is why its prompt forbids mutating tracked files. The
-three principle files carry `disable-model-invocation: true`, so `buildSkillInjection` filters them
-out of every child prompt and a `skills:` entry delivers a name and no content. Both prompts name the
-three installed paths and require a full read of each before task work, with INCOMPLETE when one is
-missing. **Explicit reading is the mechanism; automatic injection is neither fixed nor relied on.**
+Configuration belongs in the frontmatter of [hylja-implementer.md](../../.pi/agents/hylja-implementer.md),
+[hylja-reviewer.md](../../.pi/agents/hylja-reviewer.md) and the dedicated
+[writer fallback](../../.pi/agents/hylja-implementer-sol61.md). Read those profiles before launch;
+requested settings are not evidence of the model, tools or extensions that actually ran.
 
 ## Coordinator procedure
 
-1. **Confirm setup.** The coordinator session shows the workflow guard loaded once (`pi list`). An
-   absent guard is a setup failure, not a silently weaker run.
-2. **Admit.** Take only issues whose brief states outcome, pointers with decision status lines, scope
-   and non-goals, acceptance as executable examples, invariants that must not change, exact
-   verification commands, prerequisites and human gates:
-   [.github/ISSUE_TEMPLATE/agent-task.yml](../../.github/ISSUE_TEMPLATE/agent-task.yml). Admit only
-   independent issues with no unmet human gate on the critical path.
-3. **Hand off.** Each handoff carries outcome, pointers, scope, exact commands, budget, retained
-   evidence paths and human gates. A worker reads its role body, `AGENTS.md`, its named pointers and
-   its commands; it needs neither this page nor the skill to do the work you handed it.
-4. **Dispatch.** `subagent({ agent: "hylja-implementer", task: <brief>, cwd: <worktree>, async: false })`
-   in a fresh branch and worktree per issue, never reused with unreviewed work. Run admitted lanes
-   concurrently where the host supports concurrent native sessions; gated work runs one lane at a
-   time, and parallelism is never faked. One branch and worktree per issue keeps lanes isolated. The
-   implementer lane ends only with a green run of every brief-specified command plus a commit; a known
-   failure, a partial build or a missing prerequisite ends it INCOMPLETE with its reason.
-5. **Review.** After the implementer commit exists, one independent review of that exact SHA:
-   `subagent({ agent: "hylja-reviewer", task: <SHA, brief, changed surface>, cwd: <worktree>, async: false })`.
-   It confirms `git rev-parse HEAD`, reads the diff and changed sources, trusts source over the
-   author's summary, reuses prior-round evidence only where identity (SHA, blob, path, contract
-   version) is unchanged, and returns every actionable finding of the round at once, separating an
-   introduced regression from a pre-existing follow-up. A blocker cites a contract clause, a source
-   location or a reproduction; no open-ended probe sweep. A wider panel only for a concrete contested
-   design question. **Reviewed surface:** review binds the final clean source SHA and the scoped
-   base-to-head diff. Unpublished intermediate document history is not a publication gate: root does
-   not amend, squash, rebase or reopen a settled decision just to polish intermediate commits when the
-   final artifact and its acceptance proof are correct. A real merge conflict, a lost blob or an
-   unmet acceptance criterion still blocks. Source refs and failed-round evidence are preserved either
-   way, and the exact-head, green-CI and owned-cleanup requirements of step 8 are unchanged.
-6. **Verdict.** `APPROVED`, `CHANGES REQUESTED` or `INCOMPLETE`. The run deadline is terminal, so an
-   expired review has no verdict and the coordinator records INCOMPLETE. Silence, a timeout or an
-   unresolved provider error is never approval.
-7. **Stop conditions.** Two failed review rounds on one task end the patch loop: reframe, root-cause,
-   or take the design question to a human, and keep the failed-round count across a fresh run. A
-   transient provider error waits 2.5 s and retries unchanged, same session, provider and model, with
-   no fallback; record an unresolved failure with its message. One exception is authorized and
-   explicit: after the default writer route has actually failed, not merely returned exit 2 or an
-   INCOMPLETE verdict, and the previous child has settled, root may dispatch
-   `subagent({ agent: "hylja-implementer-sol61", ... })` in a fresh lane. It preserves the failed
-   lane's worktree evidence and its uncommitted work, uses fresh context and fresh evidence paths, and
-   never re-routes a run by itself. Root owns the wall clock and stops a command that passes its named
-   budget. A user pause cancels owned work and preserves evidence and
-   worktrees; setup never resumes product work.
-8. **Publish and close.** Root publishes alone. An authorized reviewable draft pull request is created
-   and published for review before approval and CI; merging or releasing it still requires the user's
-   explicit authorization, approval of the exact head and green CI at that head. That approval binds
-   the whole published tree at that head, not the shape of the commits underneath it. Close an issue
-   only when its acceptance criteria are satisfied. After the merged content is verified to have
-   landed, root
-   removes only the branches and worktrees it owns, preserving commits, evidence and needed commit
-   references, and leaving unmerged work in place.
-9. **Report.** Record in the pull request evidence: author and reviewer minutes, command durations,
-   retries, rounds and per-round states; the model that ran, read from the run metadata's `model`
-   field rather than a requested model or a frontmatter intent; and usage counters kept apart from a
-   live context-window figure. Claim no unmeasured throughput, cost or defect-rate gain.
+1. **Admit one outcome.** Use the [issue brief](../../.github/ISSUE_TEMPLATE/agent-task.yml): observable
+   outcome, source pointers and decision status lines, scope and non-goals, behavioral acceptance,
+   unchanged invariants, exact checks, prerequisites, human gates and delivery budget. Defer adjacent
+   work; an unmet human gate on the critical path blocks admission.
+2. **Reserve the finish.** Before the first setup attempt, record the task's start and absolute UTC
+   deadline, command caps, time reserved for validation, review and publication, and applicable
+   [retry policy](pipeline-reference.md#retry-and-fallback-policy). Setup, contact, waits and recovery
+   consume that same window. A lane's hard stop is the earliest applicable task, role or native runtime
+   deadline; a resume or new child does not renew the task window or an expired lane. Re-scope before
+   dispatch if the complete outcome cannot fit; required checks are not optional work.
+3. **Prepare setup.** Allocate a branch/worktree per issue. In the effective child checkout, verify
+   base, owned state, executable agent discovery, required paths, dependencies and pinned toolchain.
+   Reuse an unreviewed tree only through an explicit recovery handoff binding its exact source and
+   retained failures. Plan one initial in-lane guard qualification: coordinator `pi list`, profile
+   declarations and source composition alone do not qualify a child. Setup failure stops dependent
+   work, not by substituting another model, provider or harness.
+4. **Hand off once.** Supply the admitted brief, exact cwd/base, permitted routine actions, remaining
+   clock and finishing reserve, applicable retry policy and returned evidence paths. Declare any
+   expected missing evidence. Resolve prerequisites before launch, rather than making the worker
+   repeatedly ask for paths or ordinary permissions. Workers read their role body, `AGENTS.md`,
+   principles and relevant inputs before dependent steps; they need neither this page nor the skill.
+5. **Execute.** For authorized multi-step or parallel delegation, use one top-level native async
+   workflow; children launch inside it under their declared profiles. Isolate concurrent writers;
+   dependency-gated work is sequential. Qualify the guard's native load and
+   [effective command ceiling](pipeline-reference.md#workflow-guard) in the initial setup before
+   expensive validation. Consume native completion notifications without polling or automatic
+   successor launches. Before admitting each command, observe current UTC and require
+   `now + command cap + remaining required lane work + reporting margin <= lane hard stop`;
+   also require remaining delivery work (including review/publication) to fit the task deadline, if
+   imposed. Recheck at delivery: an expired conditional approval is refusal, not permission. If the
+   remaining outcome no longer fits, stop and report it; no silent deadline or budget reset.
+6. **Check readiness, then review.** Inspect the author's actual terminal receipt, scoped committed
+   tree and complete required-check evidence. A report, `ok: true` or partial green run alone is not
+   readiness; required native acceptance must actually have been evaluated and passed. Only then
+   dispatch a fresh independent reviewer of the exact clean SHA and scoped base-to-head diff, with
+   the brief and retained RED/GREEN paths. Reviewer behavior and verdict criteria live in its role
+   body. A wider panel needs a concrete contested design question, not routine validation.
+7. **Close the loop.** Record APPROVED, CHANGES REQUESTED or INCOMPLETE with the actual reason. An
+   expired review, unresolved provider error or missing required evidence is INCOMPLETE, never
+   approval. Two failed review rounds end the patch loop; retain that count across recovery and
+   reframe, root-cause or escalate the design question. Preserve failed evidence and source refs.
+   Review binds the final tree: cosmetic intermediate history is not a new gate; lost blobs, merge
+   conflicts and unmet acceptance still block. Stop over-budget owned work through supported exact
+   handles; on user pause preserve work and evidence, and let setup grant no restart authority.
+8. **Publish and report.** Root publishes alone. An authorized reviewable draft PR may precede
+   approval and CI; merge/release still requires explicit user authorization, exact-head approval and
+   green CI there. Close issues only when acceptance is satisfied. Keep a compact evidence record in
+   the PR or owning research record: SHA and outcome, command exits/counts/durations, raw receipt
+   paths, author/reviewer time, retries/rounds, actual serving metadata, separate usage counters and
+   unproven surface. Checkpoints report working, committed/reviewed, blocking and remaining-fit
+   facts—not tool-call volume. Verify merged content before cleaning only owned branches/worktrees;
+   leave unmerged work preserved.
 
-## Evidence lookup
+## Disclosed reference
 
-Read the exact paths the launch supplied, never a filename rebuilt from a remembered pattern. A
-supplied path that resolves to nothing is reported as unavailable, not replaced by a wider search.
-[Handoff and artifact detail](pipeline-reference.md#evidence-lookup).
+Read only the branch needed:
 
-## Optional: the native lane CLI
-
-Root may instead run one lane through `node scripts/development/run-native-lane.mjs --config <absolute
-config.json>`, which launches Pi itself, so no coordinator model turn carries the lane. Its config,
-the evidence it requires, and its bounds are
-[Native lane CLI](pipeline-reference.md#native-lane-cli), read only on that branch. It adds no
-authority, invariant or gate: completed is not approved, and no speedup has been measured.
+- [Install and use](pipeline-reference.md#install-and-use): skill invocation and installation.
+- [Workflow guard](pipeline-reference.md#workflow-guard): native load and exact-command approval.
+- [Retry and fallback policy](pipeline-reference.md#retry-and-fallback-policy): standing defaults,
+  overridden by task/session restrictions; no automatic role fallback.
+- [Evidence lookup](pipeline-reference.md#evidence-lookup): returned artifact paths and attribution.
+- [Native lane CLI](pipeline-reference.md#native-lane-cli): optional root-owned single-lane transport,
+  not a fallback for a failed governed workflow without explicit authorization.
 
 ## Limits
 
-Nothing here is measured. Pins, deadlines and verdicts are configuration and prompt contracts, not
-enforcement boundaries. The workflow guard removes one observed stall; it is not a measured gain and
-not a safety property. [Guard behaviour and its stated limits](pipeline-reference.md#workflow-guard).
+The clock checks above are coordinator obligations, not new executable guards. Existing tool caps and
+native timeouts do not prove hard preemption, descendant closure or private containment. No speedup
+has been measured; completed is not approved, and AI review is not human design adoption.
