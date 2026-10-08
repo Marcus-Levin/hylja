@@ -73,9 +73,15 @@ reserve one exact command slot for a fixed harmless `printf` probe and bind its 
 successful result from the same unchanged installation; configuration or a mock receipt is not native
 execution. A probe is an explicit setup effect, never an extra validation grant. Check fresh UTC again
 before the real command.
-When native deadline fields are unavailable, provide a conservative absolute lane stop whose bound
-is earlier than every applicable native cap; record the derivation before dispatch rather than waiting
-for a field the public API does not expose. Unknown qualification still stops dependent effects.
+For an authorized single review, `.pi/workflows/hylja-timed-review.js` derives its 12-minute phase
+stop inside native workflow execution immediately before delegation, within the fixed 15-minute native
+cap. Supply public-only `task`, exact selected `model`, absolute managed `output`, and `mode: 'review'`.
+An imposed task deadline is `taskStopMs`; stale or insufficient time refuses with zero child requests,
+never an extension. `mode: 'check'` exercises the native clock without a child. A timestamp observed
+before model deliberation or tool delivery does not establish freshness at dispatch. The template
+protects this delegation-request point, not queue latency, clock accuracy, actual child start or hard
+preemption; the child still checks its effective stop before commands. Existing task deadlines and
+elapsed setup remain charged. Unknown qualification still stops dependent effects.
 
 Wiring: the adapter takes the `tool_call` handler context and forwards `ctx.cwd` as the session
 directory, because a foreground child runs inside the parent process where `process.cwd()` is the
