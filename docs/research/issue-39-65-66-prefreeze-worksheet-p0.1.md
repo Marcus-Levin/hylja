@@ -1,6 +1,6 @@
 # Worksheet: what #65 and #66 must settle before a #39 synthetic v0 lock
 
-**PUBLIC WORKSHEET — questions, not a taxonomy, accepted specification, human sign-off, benchmark lock or score.** Hylja is testing whether an engineering assistant can retain useful task information while private details are hidden before reaching an AI model. Only made-up local development examples exist. For actual implementation status, use [docs/capabilities.md](../capabilities.md) and the GitHub issues, not this worksheet; the dated record for this line of work is the retired plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not current state.
+**PUBLIC WORKSHEET — questions, not a taxonomy, accepted specification, human sign-off, benchmark lock or score.** Hylja is testing whether an engineering assistant can retain useful task information while private details are hidden before reaching an AI model. Only made-up local development examples exist. For actual implementation status, use [docs/capabilities.md](../capabilities.md) and the GitHub issues, not this worksheet; the dated record for this line of work is the [frozen plan snapshot @f838fc2](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not current state.
 
 ## Review roles — acceptance and independence are pending
 
