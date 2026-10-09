@@ -64,6 +64,13 @@ Install exactly as CI does: `npm ci --ignore-scripts --no-fund` (Node 24, npm 10
 
 No test or script may call a real provider API, use real credentials, reach the network for model traffic, or read private or held-out data. Put ad-hoc scratch scripts in a temp file, run them, and delete them; do not embed long scripts inline in shell commands.
 
+### Execution time budgets
+
+- Run development commands without arbitrary preset timeouts when the harness supports it. When a timeout is needed, use a recorded successful runtime for comparable work on the current toolchain and allow **5–10×** that duration. Without reliable timing evidence, prefer no command timeout; a timed-out run provides only a lower bound, not a completed-runtime measurement.
+- Apply this rule to command, tool, agent and workflow limits together. Check the effective limits before starting expensive validation; a larger requested timeout is useless if an extension silently clamps it. Use an authorized configuration that accommodates the work, preserving search and security guards.
+- After a timeout, preserve output and owned changes, inspect progress and process state, diagnose the limiting layer, and continue authorized recovery without repeating successful unchanged checks or asking again for routine permission. Record the successful duration for the next run.
+- Genuine task deadlines, user stops and security bounds still apply. This rule does not relax product timeouts, behavioral assertions, private-data containment or required validation gates; it prevents development tooling from interrupting valid work with an unsupported estimate.
+
 ## Tests and evidence
 
 Every security-sensitive feature ships with evaluation evidence: deterministic tests for known invariants, property-based tests for transformations and tenant isolation, adversarial cases for bypasses, and end-to-end utility tests where cloaking can change reasoning. A skipped or placeholder cross-tenant test is not foundation evidence.
