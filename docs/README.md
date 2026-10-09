@@ -52,6 +52,7 @@ Each row is the starting point for one kind of work, not a status list. [Capabil
 | Proposed information dimensions or task fidelity (#65/#66/#68) | [decision 010](decisions/010-separate-information-dimensions-and-task-fidelity.md) - read its **status line first** | [information-model-draft.md](contracts/information-model-draft.md), [transformation-semantics-draft.md](contracts/transformation-semantics-draft.md), [`src/information-model-draft.ts`](../src/information-model-draft.ts), [`src/taxonomy-draft.ts`](../src/taxonomy-draft.ts) | TypeScript, **proposed/unwired** |
 | The human annotation/active-learning proposal | [specs/gym-annotation-design.md](specs/gym-annotation-design.md) | [`evaluations/gym-annotation-schema.mjs`](../evaluations/gym-annotation-schema.mjs) | JavaScript, **proposed/unwired** |
 | Comparative, reuse or adoption evidence | [research/](research/) dated records (evidence, not authority) | the issue it supports: [#38](https://github.com/Marcus-Levin/hylja/issues/38), [#39](https://github.com/Marcus-Levin/hylja/issues/39), [#48](https://github.com/Marcus-Levin/hylja/issues/48) | Markdown records |
+| Retired development-plan history | [docs/plan.md](plan.md) | the immutable snapshot it links; pinned #39 preparation files link here and must stay byte-identical | Markdown, frozen |
 
 The core is TypeScript on Node.js and provider- and harness-independent. Python appears only in the pinned upstream Presidio worker and in research-only Python helpers; neither is part of the core, `npm test` or CI. `npm run test:e2e` is a focused developer shortcut over the `test/*.e2e.test.mjs` glob ([synthetic E2E route](development/synthetic-e2e.md)); those files also run in `npm test` and CI, so it replaces neither gate. Proposed drafts are **not** accepted: read the status line of every decision and draft you rely on, and never wire one into accepted classification v1, policy, an adapter or authoritative labels.
 
@@ -73,4 +74,8 @@ Synthetic examples only. Examples illustrate expected behavior but do not establ
 
 ## Research - `research/`
 
-Investigations and source records, dated and attributed. Research may motivate a decision but is not itself authority. The pre-2026-10-04 development plan was retired; its dated evidence is preserved byte-for-byte at immutable Git commit [`f838fc2dc8da0402338d4dfd1c028392a9f4b9ee`](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), a historical snapshot, not current state.
+Investigations and source records, dated and attributed. Research may motivate a decision but is not itself authority. Five #39 preparation files are hash-pinned by [`evaluations/preparation-integrity.mjs`](../evaluations/preparation-integrity.mjs); they must stay byte-identical unless the pinned manifest is deliberately re-pinned, and three of them link the retired plan stub below, which exists to keep those links resolving.
+
+## Retired - `plan.md`
+
+[Development plan](plan.md) was retired. Its dated evidence is preserved byte-for-byte at an immutable Git commit that `plan.md` links; it is a historical snapshot, not current state.
