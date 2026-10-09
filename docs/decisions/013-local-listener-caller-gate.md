@@ -74,9 +74,7 @@ Whole-message masking proves privacy mechanics, not reasoning utility.
 
 Listener before [#17](https://github.com/Marcus-Levin/hylja/issues/17) is a bounded proof
 choice: irreversible KEEP/MASK resolves no mappings. Parent #21 dependencies remain unchanged.
-The [planning brief](../development/proposals/2026-10-05/local-listener.md) remains a
-historical proposal, not the live task authority. The admitted child issue supplies runtime
-scope, prerequisites and acceptance; this record changes no runtime behavior by itself.
+The 2026-10-05 planning brief that preceded this record was a proposal, not authority; this record is the accepted gate. The admitted child issue supplies runtime scope, prerequisites and acceptance; this record changes no runtime behavior by itself.
 
 ## Acceptance scope and intended product proof
 

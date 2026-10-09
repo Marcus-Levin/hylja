@@ -1,6 +1,6 @@
 # Egress send-point fixture evidence (E2)
 
-Status: bounded **public synthetic development evidence** produced by [test/egress-sendpoint.e2e.test.mjs](../../test/egress-sendpoint.e2e.test.mjs) for [#154](https://github.com/Marcus-Levin/hylja/issues/154), the E2 slice of [the E2E critical-path proposal](proposals/2026-10-04/e2e-critical-path.md). It is **not** a held-out result, **not** a production adapter, **not** a gateway or a managed egress boundary, and **not** an authentication proof. It does not close, re-tick or satisfy parent [#19](https://github.com/Marcus-Levin/hylja/issues/19); implementation status still lives only in [capabilities.md](../capabilities.md).
+Status: bounded **public synthetic development evidence** produced by [test/egress-sendpoint.e2e.test.mjs](../../test/egress-sendpoint.e2e.test.mjs) for [#154](https://github.com/Marcus-Levin/hylja/issues/154), the egress-sentinel slice of the gated synthetic path described in [synthetic-e2e.md](synthetic-e2e.md). It is **not** a held-out result, **not** a production adapter, **not** a gateway or a managed egress boundary, and **not** an authentication proof. It does not close, re-tick or satisfy parent [#19](https://github.com/Marcus-Levin/hylja/issues/19); implementation status still lives only in [capabilities.md](../capabilities.md).
 
 ## Command
 

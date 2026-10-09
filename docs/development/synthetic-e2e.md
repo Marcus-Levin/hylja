@@ -127,16 +127,13 @@ compose** over a fixture and that every other outcome sends or releases nothing.
 **gated path where a transformation, a vault and a gateway decide effects at real boundaries** with a
 real transport behind them. Those two are not interchangeable, and no passing run above closes the gap.
 
-The dated [E2E critical-path
-proposal](proposals/2026-10-04/e2e-critical-path.md) sequences that path (M1 irreversible-only text
-cloaking, M2 encrypted scoped reversibility, M3 local gateway and authorized round trip) and names the
-gate each milestone needs before an integrated passing run. It is a **proposal dated 2026-10-04, not
-current authority**; read it for sequencing, not for state. Remaining work stays at its live parent
-issues [#13](https://github.com/Marcus-Levin/hylja/issues/13) through
-[#22](https://github.com/Marcus-Levin/hylja/issues/22). The related specs are drafts: [slice
-1](../specs/slice-1-text-cloaking-proof.md), [slice
-2](../specs/slice-2-vault-and-reversible-identities.md), [slice
-3](../specs/slice-3-openai-compatible-gateway.md).
+The remaining path sequences three gated milestones - M1 irreversible-only text cloaking
+([slice 1](../specs/slice-1-text-cloaking-proof.md)), M2 encrypted scoped reversibility
+([slice 2](../specs/slice-2-vault-and-reversible-identities.md)), and M3 a local gateway with an
+authorized round trip ([slice 3](../specs/slice-3-openai-compatible-gateway.md)) - each needing
+accepted semantics and real boundaries before an integrated passing run. Remaining work stays at its
+live parent issues [#13](https://github.com/Marcus-Levin/hylja/issues/13) through
+[#22](https://github.com/Marcus-Levin/hylja/issues/22). All three specs are drafts.
 
 ## Human gates, separate from runnable evidence
 
