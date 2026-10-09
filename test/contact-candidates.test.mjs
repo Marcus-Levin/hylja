@@ -582,18 +582,23 @@ test('ordinary, frozen, null-prototype, inherited-accessor and accessor scopes a
     Object.create({ get tenantRef() { return scopeA.tenantRef; }, get projectRef() { return scopeA.projectRef; } }),
     { get tenantRef() { return scopeA.tenantRef; }, get projectRef() { return scopeA.projectRef; } },
   ];
+  const nullPrototypeNames = Object.setPrototypeOf(['Orla Synthetica'], null);
+  assert.equal(Array.isArray(nullPrototypeNames), true);
+  assert.equal(Object.getPrototypeOf(nullPrototypeNames) === null, true);
   const nameLists = [
     ['Orla Synthetica'],
     Object.freeze(['Orla Synthetica']),
-    Object.assign(['Orla Synthetica'], Object.create(null)),
+    nullPrototypeNames,
+    Object.setPrototypeOf(Array(1), { get 0() { return 'Orla Synthetica'; } }),
   ];
   for (const scope of scopes) {
     for (const list of nameLists) {
       const names = createNameDictionary(scope, list);
       const text = 'Orla Synthetica joined';
       const result = generateContactCandidates({ text, inputRef: 'field-a.invalid', scope: scopeA, names });
-      assert.deepEqual(spans(text, result), [['NAME', 'Orla Synthetica']]);
-      assert.equal(result.status, 'COMPLETE');
+      assert.equal(result.candidates.length, 1);
+      assert.equal(result.candidates.every((c) => c.subtype === 'NAME' && c.start === 0 && c.end === 15), true);
+      assert.equal(result.status === 'COMPLETE', true);
     }
   }
   // An entry read through an accessor keeps its exact UTF and regex-literal spelling.
@@ -632,6 +637,196 @@ test('fresh two-handle dictionaries stay isolated in both scope directions', () 
     assert.ok(result.reasons.includes('NAME_DICTIONARY_SCOPE_MISMATCH'));
     assert.equal(result.status, 'PARTIAL');
   }
+});
+
+test('construction-time mutations cannot retarget already captured scope fields or name entries', () => {
+  const duringScope = { ...scopeA };
+  let projectReads = 0;
+  Object.defineProperty(duringScope, 'projectRef', { get() {
+    projectReads++;
+    duringScope.tenantRef = scopeB.tenantRef;
+    return scopeA.projectRef;
+  } });
+  const scopeHandle = createNameDictionary(duringScope, ['Orla Synthetica']);
+  const scopeOwn = run('Orla Synthetica', { names: scopeHandle });
+  const scopeForeign = run('Orla Synthetica', { names: scopeHandle,
+    scope: { tenantRef: scopeB.tenantRef, projectRef: scopeA.projectRef } });
+  assert.equal(projectReads, 1);
+  assert.equal(scopeOwn.status === 'COMPLETE', true);
+  assert.equal(scopeOwn.candidates.length, 1);
+  assert.equal(scopeForeign.status === 'PARTIAL', true);
+  assert.equal(scopeForeign.reasons.includes('NAME_DICTIONARY_SCOPE_MISMATCH'), true);
+  assert.equal(scopeForeign.candidates.length, 0);
+
+  const mutableScope = { ...scopeA };
+  const source = ['Orla Synthetica', 'Brannick Testvold'];
+  let firstReads = 0, secondReads = 0;
+  Object.defineProperty(source, '0', { configurable: true, get() {
+    firstReads++;
+    mutableScope.tenantRef = scopeB.tenantRef;
+    mutableScope.projectRef = scopeB.projectRef;
+    return 'Orla Synthetica';
+  } });
+  Object.defineProperty(source, '1', { configurable: true, get() {
+    secondReads++;
+    Object.defineProperty(source, '0', { configurable: true, value: 'Quillon Fakeworth' });
+    source.push('Quillon Fakeworth');
+    return 'Brannick Testvold';
+  } });
+  const names = createNameDictionary(mutableScope, source);
+  Object.defineProperty(source, '1', { configurable: true, value: 'Quillon Fakeworth' });
+  source.length = 1;
+  const text = 'Orla Synthetica and Brannick Testvold and Quillon Fakeworth';
+  const own = generateContactCandidates({ text, inputRef: 'mutation.invalid', scope: scopeA, names });
+  assert.equal(firstReads, 1);
+  assert.equal(secondReads, 1);
+  assert.equal(own.status === 'COMPLETE', true);
+  assert.equal(own.candidates.length, 2);
+  assert.equal(own.candidates.every((c) => c.subtype === 'NAME' &&
+    (c.start === 0 && c.end === 15 || c.start === 20 && c.end === 37)), true);
+  const foreign = generateContactCandidates({ text, inputRef: 'mutation.invalid', scope: scopeB, names });
+  assert.equal(foreign.status === 'PARTIAL', true);
+  assert.equal(foreign.reasons.includes('NAME_DICTIONARY_SCOPE_MISMATCH'), true);
+  assert.equal(foreign.candidates.length, 0);
+});
+
+test('generated hostile constructors keep two independent handles isolated across two tenants and projects', () => {
+  const scopes = ['tenant-a.invalid', 'tenant-b.invalid'].flatMap((tenantRef) =>
+    ['project-a.invalid', 'project-b.invalid'].map((projectRef) => ({ tenantRef, projectRef })));
+  let constructors = 0, refusals = 0;
+  for (let round = 0; round < 16; round++) {
+    for (let left = 0; left < scopes.length; left++) {
+      for (let right = 0; right < scopes.length; right++) {
+        if (left === right) continue;
+        const ownNames = [`Synthleft${round} Scope${left}`, `Synthright${round} Scope${right}`];
+        const pair = [left, right].map((scopeIndex, side) => {
+          const bound = scopes[scopeIndex];
+          const opposite = scopes[side === 0 ? right : left];
+          const reads = { tenant: 0, project: 0, length: 0, index: 0, iterator: 0 };
+          const mutableScope = { ...bound };
+          const hostileScope = Object.create({
+            get tenantRef() { reads.tenant++; return reads.tenant === 1 ? mutableScope.tenantRef : opposite.tenantRef; },
+            get projectRef() { reads.project++; return reads.project === 1 ? mutableScope.projectRef : opposite.projectRef; },
+          });
+          const source = [ownNames[side]];
+          const hostileNames = new Proxy(source, { get(target, key) {
+            if (key === 'length') { reads.length++; return reads.length === 1 ? 1 : 10_001; }
+            if (key === Symbol.iterator) { reads.iterator++; throw new Error('synthetic-iterator.invalid'); }
+            if (key === '0') {
+              reads.index++;
+              const value = target[0];
+              Object.assign(mutableScope, opposite);
+              target[0] = ownNames[1 - side];
+              return reads.index === 1 ? value : ownNames[1 - side];
+            }
+            return Reflect.get(target, key);
+          } });
+          const handle = createNameDictionary(hostileScope, hostileNames);
+          source.push(ownNames[1 - side]);
+          constructors++;
+          assert.equal(reads.tenant, 1);
+          assert.equal(reads.project, 1);
+          assert.equal(reads.length, 1);
+          assert.equal(reads.index, 1);
+          assert.equal(reads.iterator, 0);
+          return handle;
+        });
+        assert.equal(pair[0] === pair[1], false);
+        const text = ownNames.join(' and ');
+        for (let side = 0; side < 2; side++) {
+          const ownScope = scopes[side === 0 ? left : right];
+          const foreignScope = scopes[side === 0 ? right : left];
+          const expectedStart = side === 0 ? 0 : ownNames[0].length + 5;
+          const own = generateContactCandidates({ text, inputRef: 'generated-constructor.invalid',
+            scope: ownScope, names: pair[side] });
+          assert.equal(own.status === 'COMPLETE', true);
+          assert.equal(own.candidates.length, 1);
+          assert.equal(own.candidates.every((c) => c.subtype === 'NAME' && c.start === expectedStart &&
+            c.end === expectedStart + ownNames[side].length), true);
+          const foreign = generateContactCandidates({ text, inputRef: 'generated-constructor.invalid',
+            scope: foreignScope, names: pair[side] });
+          assert.equal(foreign.status === 'PARTIAL', true);
+          assert.equal(foreign.reasons.includes('NAME_DICTIONARY_SCOPE_MISMATCH'), true);
+          assert.equal(foreign.candidates.length, 0);
+          refusals++;
+        }
+      }
+    }
+  }
+  assert.equal(constructors, 384);
+  assert.equal(refusals, 384);
+});
+
+test('the single approved array length bounds index reads and ignores hostile iterator access', () => {
+  let lengthReads = 0, indexReads = 0, iteratorReads = 0;
+  const names = new Proxy(['Orla Synthetica', 'Brannick Testvold'], { get(target, key) {
+    if (key === 'length') { lengthReads++; return lengthReads === 1 ? 1 : 10_001; }
+    if (key === Symbol.iterator) { iteratorReads++; throw new Error('synthetic-iterator.invalid'); }
+    if (key === '0') { indexReads++; return indexReads === 1 ? target[0] : 'Quillon Fakeworth'; }
+    if (key === '1') { indexReads++; throw new Error('synthetic-outside-bound.invalid'); }
+    return Reflect.get(target, key);
+  } });
+  const handle = createNameDictionary(scopeA, names);
+  const result = run('Orla Synthetica and Brannick Testvold and Quillon Fakeworth', { names: handle });
+  assert.equal(lengthReads, 1);
+  assert.equal(indexReads, 1);
+  assert.equal(iteratorReads, 0);
+  assert.equal(result.status === 'COMPLETE', true);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates.every((c) => c.subtype === 'NAME' && c.start === 0 && c.end === 15), true);
+});
+
+test('invalid length shapes and over-bound counts refuse before indices; holes and non-strings refuse', () => {
+  for (const length of [-1, 1.5, NaN, Infinity, '1', 1n, null, undefined, 10_001, Number.MAX_SAFE_INTEGER]) {
+    let lengthReads = 0, indexReads = 0;
+    const names = new Proxy(['Orla Synthetica'], { get(target, key) {
+      if (key === 'length') { lengthReads++; return length; }
+      if (key === '0') { indexReads++; return target[0]; }
+      return Reflect.get(target, key);
+    } });
+    assert.equal(fixedDictionaryError(() => createNameDictionary(scopeA, names)), true);
+    assert.equal(lengthReads, 1);
+    assert.equal(indexReads, 0);
+  }
+  for (const names of [Array(1), ['Orla Synthetica', , 'Brannick Testvold'],
+    [undefined], [null], [42], [false], [{}], [Symbol('synthetic.invalid')], [new String('Orla Synthetica')]]) {
+    assert.equal(fixedDictionaryError(() => createNameDictionary(scopeA, names)), true);
+  }
+  const empty = createNameDictionary(scopeA, []);
+  assert.equal(run('Orla Synthetica', { names: empty }).candidates.length, 0);
+});
+
+test('caller errors are replaced with fresh fixed TypeErrors without reading hostile error accessors', () => {
+  const matching = new TypeError('Invalid name dictionary');
+  const reads = { message: 0, name: 0, cause: 0, stack: 0 };
+  const hostile = Object.create(TypeError.prototype);
+  for (const key of Object.keys(reads)) {
+    Object.defineProperty(hostile, key, { get() { reads[key]++; throw new Error('synthetic-error-access.invalid'); } });
+  }
+  for (const planted of [matching, hostile]) {
+    for (const boundary of ['tenantRef', 'projectRef', 'length', 'index']) {
+      const scope = { ...scopeA };
+      const names = new Proxy(['Orla Synthetica'], { get(target, key) {
+        if (boundary === 'length' && key === 'length' || boundary === 'index' && key === '0') throw planted;
+        return Reflect.get(target, key);
+      } });
+      if (boundary === 'tenantRef' || boundary === 'projectRef') {
+        Object.defineProperty(scope, boundary, { get() { throw planted; } });
+      }
+      let previous;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let caught;
+        try { createNameDictionary(scope, names); } catch (error) { caught = error; }
+        const fresh = caught !== undefined && caught !== planted && caught !== previous;
+        assert.equal(fresh, true);
+        // Short-circuit before inspecting anything if a planted error escaped.
+        assert.equal(fresh && caught instanceof TypeError && caught.message === 'Invalid name dictionary', true);
+        assert.equal(fresh && !Object.hasOwn(caught, 'cause'), true);
+        previous = caught;
+      }
+    }
+  }
+  for (const count of Object.values(reads)) assert.equal(count, 0);
 });
 
 test('second rereview regressions: leading dots and invisible marks do not hide contacts', () => {
