@@ -1,7 +1,7 @@
 // Hylja development workflow guard.
 //
 // Behavioral tests for the two guarantees the guard makes to a Pi session: a machine-wide `find` never
-// executes, and every builtin bash call carries a finite positive timeout. Cases call the real helper
+// executes, and builtin bash calls retain explicit caps or have no arbitrary timeout. Cases call the real helper
 // and the real Pi adapter (loaded through Node's own type stripping), so a wiring regression fails.
 // No case runs a shell, touches a filesystem root, reads outside the repository, or logs anything: the
 // blocked commands below are strings that never leave this process.
@@ -14,8 +14,6 @@ import { fileURLToPath } from 'node:url';
 import {
 	BLOCK_REASON_INVALID_TIMEOUT,
 	BLOCK_REASON_MACHINE_WIDE_SEARCH,
-	DEFAULT_COMMAND_TIMEOUT_SECONDS,
-	MAX_COMMAND_TIMEOUT_SECONDS,
 	INVALID_VALIDATION_APPROVAL,
 	evaluateBashToolInput,
 } from '../.pi/lib/hylja-command-guard.mjs';
@@ -66,15 +64,23 @@ test('opt-in receipts use bound runtime callbacks, never extension factory actio
 	assert.deepEqual(receipts, [{ type: 'hylja-workflow-guard-ready', data: { version: 1 } }]);
 	const handler = handlers.get('tool_call');
 	assert.equal(bash(handler, VALIDATION_COMMANDS[0], 600).input.timeout, 600);
-	assert.deepEqual(receipts[1], { type: 'hylja-workflow-guard-timeout', data: { version: 1, effectiveSeconds: 600 } });
-	assert.equal(bash(handler, 'npm run build', 600).input.timeout, 300);
-	assert.deepEqual(receipts[2], { type: 'hylja-workflow-guard-timeout', data: { version: 1, effectiveSeconds: 300 } });
+	assert.deepEqual(receipts[1], { type: 'hylja-workflow-guard-timeout', data: { version: 1, effectiveSeconds: 600, validationApproved: true } });
+	assert.equal(bash(handler, 'npm run build', 9000).input.timeout, 9000);
+	assert.deepEqual(receipts[2], { type: 'hylja-workflow-guard-timeout', data: { version: 1, effectiveSeconds: 9000, validationApproved: false } });
+	for (const timeout of [undefined, null]) {
+		const unbounded = bash(handler, VALIDATION_COMMANDS[0], timeout);
+		assert.equal(unbounded.result, undefined);
+		assert.equal(Object.hasOwn(unbounded.input, 'timeout'), false);
+	}
+	assert.deepEqual(receipts.slice(3), Array.from({ length: 2 }, () => ({
+		type: 'hylja-workflow-guard-timeout', data: { version: 1, effectiveSeconds: null, validationApproved: true },
+	})));
 	assert.deepEqual(bash(handler, '# SYNTHETIC-GUARD-PROBE; find /', 15).result,
 		{ block: true, reason: BLOCK_REASON_MACHINE_WIDE_SEARCH });
 	assert.deepEqual(bash(handler, VALIDATION_COMMANDS[0], 0).result,
 		{ block: true, reason: BLOCK_REASON_INVALID_TIMEOUT });
 	handler({ toolName: 'read', input: { path: 'synthetic-planted.invalid' } }, CHILD_CONTEXT);
-	assert.equal(receipts.length, 3);
+	assert.equal(receipts.length, 5);
 });
 
 test('receipt failure returns a fixed block even when a host would swallow hook exceptions', async () => {
@@ -111,7 +117,7 @@ test('a snapshotted command window refuses expired, invalid and over-reserve adm
 		Number.MAX_SAFE_INTEGER, 0.0001), false);
 	for (const now of [1000000, 1000001, -1, NaN, Infinity, '220000'])
 		assert.equal(helper.commandFitsWindow(window, now, 15), false);
-	for (const seconds of [0, -1, NaN, Infinity, '600'])
+	for (const seconds of [undefined, null, 0, -1, NaN, Infinity, '600'])
 		assert.equal(helper.commandFitsWindow(window, 220000, seconds), false);
 	assert.equal(helper.snapshotCommandWindow(undefined), undefined);
 	let reads = 0;
@@ -160,6 +166,34 @@ test('adapter window admits equality and closes permanently on late delivery or 
 	}
 });
 
+test('finite command windows refuse unbounded and oversized caps without mutation or receipts', async () => {
+	const module = await import(guardPath);
+	const actualNow = Date.now;
+	try {
+		Date.now = () => 220000;
+		for (const timeout of [undefined, null, 9000]) {
+			const handlers = new Map();
+			const receipts = [];
+			module.installHyljaWorkflowGuard({
+				on(name, handler) { handlers.set(name, handler); },
+				appendEntry(type, data) { receipts.push({ type, data }); },
+			}, approval(), true, { hardStopMs: 1000000, reserveSeconds: 180 });
+			handlers.get('session_start')();
+			const handler = handlers.get('tool_call');
+			const call = bash(handler, VALIDATION_COMMANDS[0], timeout);
+			assert.deepEqual(call.result, { block: true, reason: module.GUARD_WINDOW_REFUSAL });
+			assert.equal(call.input.timeout, timeout);
+			assert.equal(Object.hasOwn(call.input, 'timeout'), timeout !== undefined);
+			assert.equal(receipts.length, 1);
+			// A refused admission closes the installation rather than silently renewing its window.
+			assert.deepEqual(bash(handler, VALIDATION_COMMANDS[0], 1).result,
+				{ block: true, reason: module.GUARD_WINDOW_REFUSAL });
+		}
+	} finally {
+		Date.now = actualNow;
+	}
+});
+
 function bash(handler, command, timeout, context = CHILD_CONTEXT) {
 	const input = { command, ...(timeout !== undefined ? { timeout } : {}) };
 	const result = handler({ toolName: 'bash', input }, context);
@@ -179,14 +213,21 @@ const OPTIONS = { home: '/home/synthetic-lancer', cwd: '/home/synthetic-lancer/w
 /** The exact command shape that burned eight minutes before the exact paths were used. */
 const KNOWN_FAILURE = 'find / -name hylja-implementer.md | head -20';
 
-test('approved and ordinary adapters retain timeout defaults, bounds, malformed refusals and other tools', async () => {
+test('approved and ordinary adapters preserve finite caps and normalize omitted/null to no cap', async () => {
 	for (const ordinary of [false, true]) {
 		const handler = await installedHandler(approval(), ordinary);
 		for (const command of VALIDATION_COMMANDS) {
-			for (const [requested, expected] of [[undefined, 120], [0.5, 0.5], [300, 300], [600, ordinary ? 300 : 600], [9000, ordinary ? 300 : 600]]) {
-				assert.equal(bash(handler, command, requested).input.timeout, expected);
+			for (const requested of [0.5, 300, 600, 9000, Number.MAX_VALUE]) {
+				const call = bash(handler, command, requested);
+				assert.equal(call.result, undefined);
+				assert.equal(call.input.timeout, requested);
 			}
-			for (const timeout of [null, 0, -1, '600', NaN, Infinity, {}]) {
+			for (const requested of [undefined, null]) {
+				const call = bash(handler, command, requested);
+				assert.equal(call.result, undefined);
+				assert.equal(Object.hasOwn(call.input, 'timeout'), false);
+			}
+			for (const timeout of [0, -1, '600', NaN, Infinity, {}]) {
 				assert.deepEqual(bash(handler, command, timeout).result, { block: true, reason: BLOCK_REASON_INVALID_TIMEOUT });
 			}
 		}
@@ -195,32 +236,45 @@ test('approved and ordinary adapters retain timeout defaults, bounds, malformed 
 		assert.equal(input.timeout, 9000);
 	}
 	const missing = await installedHandler(undefined);
-	assert.equal(bash(missing, VALIDATION_COMMANDS[0], 600).input.timeout, 300);
+	assert.equal(bash(missing, VALIDATION_COMMANDS[0], 600).input.timeout, 600);
 });
 
-test('approval requires exact whole command and exact session cwd with no inference', async () => {
-	const handler = await installedHandler(approval());
+test('approval requires exact whole command and exact session cwd with no inference', () => {
+	const record = approval();
+	const approved = (command, cwd = CHILD_CWD) => evaluateBashToolInput({ command, timeout: 9000 },
+		{ cwd, validationApproval: record }).validationApproved;
 	const command = VALIDATION_COMMANDS[0];
+	assert.equal(approved(command), true);
 	for (const altered of [command + '; npm run build', command + '\necho synthetic', 'echo synthetic; ' + command,
 		command + ' ', ' ' + command, command.replace('synthetic-test.log', 'synthetic-other.log'),
 		'npm test', 'npm run test:coverage', 'npm run build']) {
-		assert.equal(bash(handler, altered, 600).input.timeout, 300);
+		assert.equal(approved(altered), false);
 	}
 	for (const cwd of [CHILD_CWD + '/', CHILD_CWD + '/child', '/srv/synthetic-other/worktree', undefined]) {
-		assert.equal(bash(handler, command, 600, { cwd }).input.timeout, 300);
+		assert.equal(evaluateBashToolInput({ command, timeout: 9000 },
+			{ cwd, validationApproval: record }).validationApproved, false);
 	}
 });
 
 test('installation snapshots approval and command array without later widening', async () => {
+	const module = await import(guardPath);
+	const handlers = new Map();
+	const receipts = [];
 	const record = approval();
-	const handler = await installedHandler(record);
+	module.installHyljaWorkflowGuard({
+		on(name, handler) { handlers.set(name, handler); },
+		appendEntry(type, data) { receipts.push({ type, data }); },
+	}, record, true);
+	handlers.get('session_start')();
+	const handler = handlers.get('tool_call');
 	record.cwd = '/srv/synthetic-other/worktree';
 	record.commands[0] = 'npm run build';
 	record.commands.push('npm test');
 	assert.equal(bash(handler, VALIDATION_COMMANDS[0], 600).input.timeout, 600);
-	assert.equal(bash(handler, 'npm run build', 600).input.timeout, 300);
-	assert.equal(bash(handler, 'npm test', 600).input.timeout, 300);
-	assert.equal(bash(handler, VALIDATION_COMMANDS[0], 600, { cwd: record.cwd }).input.timeout, 300);
+	assert.equal(bash(handler, 'npm run build', 600).input.timeout, 600);
+	assert.equal(bash(handler, 'npm test', 600).input.timeout, 600);
+	assert.equal(bash(handler, VALIDATION_COMMANDS[0], 600, { cwd: record.cwd }).input.timeout, 600);
+	assert.deepEqual(receipts.slice(1).map((receipt) => receipt.data.validationApproved), [true, false, false, false]);
 });
 
 test('malformed approval fails installation whole with fixed non-echoing setup error', async () => {
@@ -299,26 +353,29 @@ test('a missing or non-string command is allowed and never throws', () => {
 	for (const input of [{}, { command: '' }, { command: 42 }, null, undefined]) {
 		const decision = evaluateBashToolInput(input, OPTIONS);
 		assert.equal(decision.allowed, true);
-		assert.equal(decision.timeout, DEFAULT_COMMAND_TIMEOUT_SECONDS);
+		assert.equal(decision.timeout, undefined);
 	}
 });
 
-test('an omitted timeout gets the guard default', () => {
-	assert.equal(evaluateBashToolInput({ command: 'npm test' }, OPTIONS).timeout, DEFAULT_COMMAND_TIMEOUT_SECONDS);
+test('omitted and null timeouts select no guard cap', () => {
+	for (const timeout of [undefined, null]) {
+		const decision = evaluateBashToolInput({ command: 'npm test', timeout }, OPTIONS);
+		assert.equal(decision.allowed, true);
+		assert.equal(decision.timeout, undefined);
+	}
 });
 
-test('a tighter explicit timeout is preserved and an excessive one is clamped', () => {
-	assert.equal(evaluateBashToolInput({ command: 'npm test', timeout: 30 }, OPTIONS).timeout, 30);
-	assert.equal(evaluateBashToolInput({ command: 'npm test', timeout: 0.5 }, OPTIONS).timeout, 0.5);
-	assert.equal(evaluateBashToolInput({ command: 'npm test', timeout: MAX_COMMAND_TIMEOUT_SECONDS }, OPTIONS).timeout,
-		MAX_COMMAND_TIMEOUT_SECONDS);
-	assert.equal(evaluateBashToolInput({ command: 'npm test', timeout: 3600 }, OPTIONS).timeout,
-		MAX_COMMAND_TIMEOUT_SECONDS);
+test('finite positive timeout requests survive unchanged without silent clamping', () => {
+	for (const timeout of [0.5, 30, 300, 600, 3600, 9000, Number.MAX_VALUE]) {
+		const decision = evaluateBashToolInput({ command: 'npm test', timeout }, OPTIONS);
+		assert.equal(decision.allowed, true);
+		assert.equal(decision.timeout, timeout);
+	}
 });
 
 test('a malformed timeout is refused with the fixed reason, never the value', () => {
 	const planted = 'synthetic-planted-timeout.invalid';
-	for (const timeout of [0, -5, '120', planted, Number.NaN, Number.POSITIVE_INFINITY, null, {}]) {
+	for (const timeout of [0, -5, '120', planted, Number.NaN, Number.POSITIVE_INFINITY, {}]) {
 		const decision = evaluateBashToolInput({ command: 'npm test', timeout }, OPTIONS);
 		assert.equal(decision.allowed, false, String(timeout));
 		assert.equal(decision.reason, BLOCK_REASON_INVALID_TIMEOUT);
@@ -339,7 +396,7 @@ test('the adapter checks the child session directory, not the parent process dir
 
 	const scoped = { command: `find ${CHILD_CWD}/src -name "*.ts"` };
 	assert.equal(handler({ toolName: 'bash', toolCallId: 'call-c1', input: scoped }, CHILD_CONTEXT), undefined);
-	assert.equal(scoped.timeout, DEFAULT_COMMAND_TIMEOUT_SECONDS);
+	assert.equal(Object.hasOwn(scoped, 'timeout'), false);
 
 	const tighter = { command: `find ${CHILD_CWD} -name "*.ts"`, timeout: 45 };
 	handler({ toolName: 'bash', toolCallId: 'call-c2', input: tighter }, CHILD_CONTEXT);
@@ -372,11 +429,11 @@ test('the adapter blocks the known search, sets the timeout, and leaves other to
 
 	const allowedInput = { command: 'npm test' };
 	assert.equal(handler({ toolName: 'bash', toolCallId: 'call-2', input: allowedInput }, CHILD_CONTEXT), undefined);
-	assert.equal(allowedInput.timeout, DEFAULT_COMMAND_TIMEOUT_SECONDS);
+	assert.equal(Object.hasOwn(allowedInput, 'timeout'), false);
 
-	const clampedInput = { command: 'npm test', timeout: 9000 };
-	handler({ toolName: 'bash', toolCallId: 'call-3', input: clampedInput }, CHILD_CONTEXT);
-	assert.equal(clampedInput.timeout, MAX_COMMAND_TIMEOUT_SECONDS);
+	const finiteInput = { command: 'npm test', timeout: 9000 };
+	handler({ toolName: 'bash', toolCallId: 'call-3', input: finiteInput }, CHILD_CONTEXT);
+	assert.equal(finiteInput.timeout, 9000);
 
 	const readInput = { path: 'src/policy.ts' };
 	assert.equal(handler({ toolName: 'read', toolCallId: 'call-4', input: readInput }, CHILD_CONTEXT), undefined);
