@@ -17,7 +17,9 @@ requested settings are not evidence of the model, tools or extensions that actua
    work; an unmet human gate on the critical path blocks admission.
 2. **Reserve the finish.** Before the first setup attempt, record the task's start and absolute UTC
    deadline if imposed, otherwise "no task deadline"; record role/native lane limits separately.
-   Record command caps, finishing reserves and [retry policy](pipeline-reference.md#retry-and-fallback-policy).
+   Record finite or unbounded effective command limits, finishing reserves and
+   [retry policy](pipeline-reference.md#retry-and-fallback-policy). Do not insert arbitrary command caps;
+   follow [AGENTS.md](../../AGENTS.md#execution-time-budgets).
    Setup, contact, waits and recovery count toward applicable task/lane limits. A lane's hard stop is
    the earliest applicable task, role or native runtime deadline; a resume or new child does not renew
    the task window or an expired lane. Re-scope before
@@ -36,12 +38,13 @@ requested settings are not evidence of the model, tools or extensions that actua
 5. **Execute.** For authorized multi-step or parallel delegation, use one top-level native async
    workflow; children launch inside it under their declared profiles. Isolate concurrent writers;
    dependency-gated work is sequential. Qualify the guard's native load and
-   [effective command ceiling](pipeline-reference.md#workflow-guard) in the initial setup before
-   expensive validation. Consume native completion notifications without polling or automatic
-   successor launches. Before admitting each command, observe current UTC and require
-   `now + command cap + remaining required lane work + reporting margin <= lane hard stop`;
-   also require remaining delivery work (including review/publication) to fit the task deadline, if
-   imposed. Recheck at delivery: an expired conditional approval is refusal, not permission. If the
+   [effective finite or unbounded command limit](pipeline-reference.md#workflow-guard) in the initial
+   setup before expensive validation. Consume native completion notifications without polling or
+   automatic successor launches. Before admitting each finite-capped command, observe current UTC
+   and require `now + command cap + remaining required lane work + reporting margin <= lane hard stop`.
+   An unbounded call cannot satisfy an explicitly installed finite command window; do not bypass it.
+   With or without a command cap, require remaining delivery work (including review/publication) to
+   fit the task deadline, if imposed; an unbounded limit is not a successful timing baseline. Recheck at delivery: an expired conditional approval is refusal, not permission. If the
    remaining outcome no longer fits, stop and report it; no silent deadline or budget reset.
 6. **Check readiness, then review.** Inspect the author's actual terminal receipt, scoped committed
    tree and complete required-check evidence. A report, `ok: true` or partial green run alone is not

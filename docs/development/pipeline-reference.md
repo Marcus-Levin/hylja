@@ -18,10 +18,8 @@ installation logs neither:
 | Call | Decision |
 |---|---|
 | `find` with a machine-wide absolute root | blocked with a fixed reason naming the allowed roots |
-| `timeout` omitted on a builtin bash call | set to 120 s, Pi's builtin bash having no default |
-| `timeout` present, 0 < t <= 300 | preserved unchanged |
-| `timeout` > 300 s, ordinary installation or unmatched approval | clamped to 300 s |
-| exact approved session cwd and whole command, explicit `timeout` > 300 s | clamped to 600 s |
+| `timeout` omitted or null on a builtin bash call | omitted before execution: no guard cap, Pi's builtin bash having no default |
+| `timeout` finite and > 0 | preserved unchanged, ordinary or approved; no silent clamping |
 | `timeout` malformed, non-finite or <= 0 | blocked with a fixed reason |
 | any other tool | untouched, and no timeout applied |
 
@@ -34,16 +32,20 @@ Validation commands are standalone canonical `npm test` or `npm run test:coverag
 possibly with coordinator-owned fixed PATH, log, exit and elapsed recording. Setup may reserve one
 slot for the harmless qualification probe below; do not chain validation commands into any slot.
 Command safety is a coordinator obligation, not parsed or verified by the guard. There is no general ceiling option, config discovery, environment inference,
-repository marker or model-supplied authorization.
+repository marker or model-supplied authorization. Approval remains a compatible scoped record, not
+permission to alter timeouts or bypass search, malformed-input, window or receipt refusals.
 
 Installation validates and privately snapshots the record and array once. Missing approval keeps
 ordinary behaviour; malformed approval throws the fixed `Invalid Hylja validation approval` before
 registering any handler, with no partial grant or input echoed. Mutation after installation cannot
-widen the snapshot. Only exact equality of `ctx.cwd` and the entire command string selects the fixed
-600 s explicit ceiling: no normalization, shell parsing, substring or wrapper inference. Whitespace,
-extra commands, changed logging and a different cwd all retain 300 s. Omitted timeout remains 120 s,
-positive values through 300 s remain unchanged, and malformed timeout and forbidden machine-wide
-find remain refused even for an approved string. The same helper owns all refusal decisions.
+widen the snapshot. Only exact equality of `ctx.cwd` and the entire command string marks the call
+approved in opt-in receipts: no normalization, shell parsing, substring or wrapper inference.
+Whitespace, extra commands, changed logging and a different cwd are unmatched. Approval does not
+change effective limits: omitted/null selects no cap, every finite positive request stays unchanged,
+and malformed timeout and forbidden machine-wide find remain refused even for an approved string.
+The same helper owns all refusal decisions. The installed Pi Bash API accepts an optional number,
+not null, so the adapter deletes the timeout property for an unbounded call. Its backend may independently
+refuse requests beyond its supported timer range; the guard does not silently reduce them.
 The guard authenticates nobody and cannot verify shell safety or coordinator authority; trusted
 run-owned configuration is not a new authorization boundary. Root owns native-load smoke and any
 subsequent expensive validation; these tests execute no approved shell commands.
@@ -52,15 +54,20 @@ subsequent expensive validation; these tests execute no approved shell commands.
 `installHyljaWorkflowGuard(pi, { cwd, commands }, true)`. The factory registers callbacks only;
 `appendEntry` belongs in `session_start` or `tool_call`, after Pi binds its runtime. Receipt failure
 sticks for that installation and returns a fixed bash block; it does not rely on the host propagating
-hook exceptions. Receipts contain a version and, for allowed bash calls, the applied numeric timeout;
+hook exceptions. Receipts contain a version and, for allowed bash calls, `effectiveSeconds` (the
+unchanged finite number or null explicitly meaning unbounded) and a `validationApproved` boolean;
 no command, raw argument, output, cwd or protected value is recorded. Other tools remain untouched.
 The receipt describes this adapter's decision, not later hooks, hard preemption or descendant closure.
+Changing the source does not change an already loaded extension: reload or a fresh launch is required
+before claiming the new limits, and Root owns that native qualification.
 
 A fourth argument `{ hardStopMs, reserveSeconds }` adds executable admission against a snapshotted
 absolute UTC stop: `hardStopMs` is a positive safe-integer epoch millisecond; `reserveSeconds` is an
 integer from 0 through 86400 including remaining required work and reporting margin. The adapter
-reads fresh UTC at each allowed bash call and requires its applied cap plus that fixed reserve to fit
-(rounding fractional milliseconds up). Exhaustion, invalid time or clock rollback closes the window
+reads fresh UTC at each allowed bash call and requires its finite requested cap plus that fixed reserve
+to fit (rounding fractional milliseconds up). An unbounded call cannot fit that finite window and is
+refused with the existing fixed window reason before input mutation or timeout receipt. Exhaustion,
+invalid time or clock rollback closes the window
 permanently for that installation. Other tools remain untouched. Root must choose the stop within all
 applicable deadlines and a conservative reserve; this does not discover native deadlines, track
 completed work, enforce the final backend launch time, preempt a running command or prove cleanup.
@@ -68,10 +75,10 @@ completed work, enforce the final backend launch time, preempt a running command
 Before expensive work, inspect available load errors and qualify the same native installation with
 finite positive timeout inputs. `# SYNTHETIC-GUARD-PROBE; find /` with 15 s must receive the guard's
 fixed machine-wide-search refusal; it is entirely a shell comment if the guard is absent. A zero
-timeout can be rejected by Pi itself and proves no hook execution. For an approved 600 s ceiling,
-reserve one exact command slot for a fixed harmless `printf` probe and bind its runtime receipt and
-successful result from the same unchanged installation; configuration or a mock receipt is not native
-execution. A probe is an explicit setup effect, never an extra validation grant. Check fresh UTC again
+timeout can be rejected by Pi itself and proves no hook execution. To qualify a requested finite limit,
+reserve one exact command slot for a fixed harmless `printf` probe and bind its unchanged runtime
+receipt and successful result from the same installation; configuration or a mock receipt is not native
+execution. An unbounded receipt proves no completed timing baseline. A probe is an explicit setup effect, never an extra validation grant. Check fresh UTC again
 before the real command.
 For an authorized single review, `.pi/workflows/hylja-timed-review.js` derives its 12-minute phase
 stop inside native workflow execution immediately before delegation, within the fixed 15-minute native
@@ -99,7 +106,8 @@ Search discipline remains a prompt obligation: use supplied entry points; when a
 search only the worktree or a brief-named root. Scoped `find .`, `find src` and `grep` remain allowed.
 Treat a refusal as a setup finding, not an invitation to retry through another quoting, wrapper or
 executable. The [coordinator procedure](pipeline.md#coordinator-procedure) owns the delivery clock;
-the guard adjusts a single call's timeout, not the lane budget.
+the guard preserves a single call's finite or unbounded limit, not the lane budget. Genuine task,
+product, test-security and native deadlines remain unchanged.
 
 Limits, stated so no one reads more into it: it is a workflow guard, not a shell sandbox, a command
 parser or an enforcement boundary. It splits a command textually on control separators and whitespace,
@@ -112,9 +120,9 @@ allowed on purpose, so the guard cannot block scoped repository discovery or the
 
 Evidence: `node --test test/hylja-workflow-guard.test.mjs` exercises the helper and the adapter
 directly, including the exact command shape that failed, quoted and absolute-executable variants, scoped
-discovery, the timeout default, preservation, ordinary and approved clamps, exact-command/cwd mismatches,
+discovery, omitted/null unbounded limits, unchanged finite requests, exact-command/cwd approval mismatches,
 malformed setup refusal, snapshot mutation, independent forbidden-find refusal, opt-in receipt lifecycle
-and sticky receipt failure, window snapshots, equality/late admission and sticky clock rollback,
+and sticky receipt failure, window snapshots, unbounded/oversized refusal, equality/late admission and sticky clock rollback,
 that no other tool is mutated, and that each role profile's declared path resolves to an existing file. The load path itself is proven by a
 native smoke run, not by this document.
 

@@ -13,7 +13,7 @@
 
 import { commandFitsWindow, evaluateBashToolInput, snapshotCommandWindow, snapshotValidationApproval } from '../lib/hylja-command-guard.mjs';
 
-// Existing discovery/profile entry point always installs the ordinary 300s guard.
+// Existing discovery/profile entry point adds no arbitrary command cap.
 export default function hyljaWorkflowGuard(pi) {
 	installHyljaWorkflowGuard(pi);
 }
@@ -55,9 +55,13 @@ export function installHyljaWorkflowGuard(pi, approval = undefined, recordReceip
 			}
 			lastObservedAt = now;
 		}
-		event.input.timeout = decision.timeout;
+		// Installed Pi accepts an optional number, not null; omission means no backend timer.
+		if (decision.timeout === undefined) delete event.input.timeout;
+		else event.input.timeout = decision.timeout;
 		if (recording) try {
-			pi.appendEntry('hylja-workflow-guard-timeout', { version: 1, effectiveSeconds: decision.timeout });
+			pi.appendEntry('hylja-workflow-guard-timeout', {
+				version: 1, effectiveSeconds: decision.timeout ?? null, validationApproved: decision.validationApproved,
+			});
 		} catch {
 			receiptState = 'failed';
 			return { block: true, reason: GUARD_RECEIPT_REFUSAL };
