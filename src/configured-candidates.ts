@@ -195,11 +195,13 @@ const registry = new WeakMap<object, Compiled>();
 export function createCandidateConfig(scope: CandidateScope, config: CandidateConfig): CandidateConfigHandle {
   const invalid = (): never => { throw new TypeError('Invalid candidate configuration'); };
   try {
-    if (!scope || !label(scope.tenantRef) || !label(scope.projectRef) || !config || typeof config !== 'object') invalid();
+    if (!scope) invalid();
+    const { tenantRef, projectRef } = scope;
+    if (!label(tenantRef) || !label(projectRef) || !config || typeof config !== 'object') invalid();
     const { terms = [], patterns = [], fieldHints = [] } = config;
     if (!Array.isArray(terms) || !Array.isArray(patterns) || !Array.isArray(fieldHints) || terms.length > MAX_TERMS ||
       patterns.length > MAX_PATTERNS || fieldHints.length > MAX_HINTS) invalid();
-    const compiled: Compiled = { scope: Object.freeze({ tenantRef: scope.tenantRef, projectRef: scope.projectRef }), entries: [],
+    const compiled: Compiled = { scope: Object.freeze({ tenantRef, projectRef }), entries: [],
       root: { next: new Map() }, patterns: [], hints: [] };
     for (const entry of terms as unknown[]) {
       const meta = classified(entry);
