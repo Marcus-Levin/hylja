@@ -1,4 +1,4 @@
-// #154 / E2 of docs/development/proposals/2026-10-04/e2e-critical-path.md: the shipped deterministic
+// #154 / E2 evidence per docs/development/synthetic-e2e.md: the shipped deterministic
 // policy seam (`decidePolicy`) and the shipped independent sentinel (`checkEgress`,
 // `createStreamGate`, `sentinelUnavailable`) run over one serialized synthetic fixture release, and a
 // real loopback TCP sink bound to an OS-assigned ephemeral port records the exact bytes it receives.

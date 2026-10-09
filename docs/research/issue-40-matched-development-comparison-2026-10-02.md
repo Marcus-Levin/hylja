@@ -3,9 +3,8 @@
 **Dated research evidence, 2026-10-02. Corrected and re-run on 2026-10-02 after an independent review
 returned REQUEST_CHANGES for `b3af062a`; section 1 and section 8 record what that review changed and
 what it superseded. Not a benchmark, not a score, not #39 v0, not a freeze, not a held-out result, not
-an adoption decision and not a #40 closure.** Current capabilities and limits live only in
-[docs/capabilities.md](../capabilities.md) and live run status only in the GitHub issues; the dated run record is the
-retired plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not
+an adoption decision and not a #40 closure.** Capabilities/limits: [docs/capabilities.md](../capabilities.md); task status: GitHub issues; the dated run record is the
+[frozen plan snapshot @f838fc2](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not
 current state. This document separates what was **measured**, what is a
 **source claim** and what remains an **explicit unknown**. The full issue text is
 [#40](https://github.com/Marcus-Levin/hylja/issues/40); the reuse question it feeds is
@@ -519,4 +518,4 @@ reporting both claims as untested for every arm).
 * `docs/plan.md` — the single dated status paragraph for this work, and the #113/#113-reopened state root
   owned. That document has since been retired and its content is frozen at
   [`f838fc2…:docs/plan.md`](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state);
-  current capabilities and limits are in [`docs/capabilities.md`](../capabilities.md).
+  capabilities/limits live in [docs/capabilities.md](../capabilities.md); task status: GitHub issues.

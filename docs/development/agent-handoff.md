@@ -16,7 +16,7 @@ authoritative classification, policy decision, evaluation label or adoption reco
 ```sh
 npm run --silent agent:handoff -- capabilities
 npm run --silent agent:handoff -- project-github --input response.json --kind issue
-npm run --silent agent:handoff -- compare HEAD:docs/plan.md docs/plan.md
+npm run --silent agent:handoff -- compare HEAD:docs/capabilities.md docs/capabilities.md
 npm run --silent agent:handoff -- session-handoff --input inventory.jsonl
 node scripts/development/agent-handoff.mjs --help
 ```

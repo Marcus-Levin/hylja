@@ -1,5 +1,7 @@
 /**
  * One bound audited revocation owner for exactly one opaque mapping reference (issue #238).
+ * Normative expansion: docs/contracts/mapping-revocation.md - the contract owns the normative order, codes and
+ * limits; this header is the working summary.
  *
  * `createBoundMappingRevocation(host)` binds one reference, one tenant/project/session scope, the
  * current-record registry, the audit substrate, one pinned administrative purpose and one pinned

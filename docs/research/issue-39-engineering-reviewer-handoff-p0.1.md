@@ -28,6 +28,6 @@ H01–H04 are **planning IDs**, not existing cases. Authoring future hidden *syn
 
 - [Public development fixtures](issue-39-public-development-fixtures-p0.1.json) and [task/rubric proposal](issue-39-public-rubric-p0.1.md).
 - [#39 open-gates packet](issue-39-v0-open-gates-p0.1.md) and [#39 issue](https://github.com/Marcus-Levin/hylja/issues/39) — required reviews and the #65/#66 dependency.
-- Current capabilities and limits: [docs/capabilities.md](../capabilities.md). Live task status: the GitHub issues. Dated record: the retired plan's [frozen snapshot](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not current state.
+- Current capabilities and limits: [docs/capabilities.md](../capabilities.md). Live task status: the GitHub issues. Dated record: the [frozen plan snapshot @f838fc2](https://github.com/Marcus-Levin/hylja/blob/f838fc2dc8da0402338d4dfd1c028392a9f4b9ee/docs/plan.md#current-state), not current state.
 
 This invitation neither approves where information may be sent nor permits scored #40–#47 comparisons or a #48 product choice. It does not prove production interception, safe release or restoration.

@@ -5,6 +5,8 @@
  * ([openai-keep-receiver.ts](openai-keep-receiver.ts)) - it does not replace either, and it decides
  * nothing about classification, policy, treatment or authorization. One request, one bounded complete
  * reply, one guarded application release, or one fixed refusal.
+ * Normative expansion: docs/contracts/openai-local-conversation.md - the contract owns the normative order, codes and
+ * limits; this header is the working summary.
  *
  * What this is NOT. It is not a gateway, a listener, a launcher, a provider client, a credential or
  * vault path, a redirect/ retry/ streaming design, an authentication implementation or a production
