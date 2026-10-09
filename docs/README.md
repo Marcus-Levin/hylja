@@ -76,6 +76,8 @@ Synthetic examples only. Examples illustrate expected behavior but do not establ
 
 Investigations and source records, dated and attributed. Research may motivate a decision but is not itself authority.
 
+- [Envelope-only source inspection — 2026-10-09](research/issue-45-envelope-source-inspection-2026-10-09.md) - preliminary dated source evidence.
+
 ## Retired - `plan.md`
 
 [Development plan](plan.md) was retired. Its dated evidence is preserved byte-for-byte at an immutable Git commit that `plan.md` links; it is a historical snapshot, not current state.
