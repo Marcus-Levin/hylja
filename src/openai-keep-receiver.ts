@@ -5,6 +5,8 @@
  * every variable field of the image, one real deterministic `SEND` policy decision per unit, the real
  * fixed-worker egress sentinel child process over those exact bytes, and exactly one trusted release
  * of the sentinel's own private `ALLOW` copy.
+ * Normative expansion: docs/contracts/openai-keep-receiver.md - the contract owns the normative order, codes and
+ * limits; this header is the working summary.
  *
  * What this is NOT. It is not a gateway, a listener, a server, a provider client, an authentication
  * implementation, a credential or vault path, a transformation engine, a streaming design or a hosted
