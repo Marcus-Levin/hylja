@@ -186,7 +186,9 @@ function list(value: unknown, max: number): readonly unknown[] | null {
 export function createContactSensitivity(scope: CandidateScope, entries: readonly ContactSensitivityEntry[]): ContactSensitivityHandle {
   const invalid = (): never => { throw new TypeError('Invalid contact sensitivity configuration'); };
   try {
-    if (!scope || !label(scope.tenantRef) || !label(scope.projectRef)) return invalid();
+    if (!scope) return invalid();
+    const { tenantRef, projectRef } = scope;
+    if (!label(tenantRef) || !label(projectRef)) return invalid();
     const rows = list(entries, CONTACT_SUBTYPES.length);
     if (!rows) return invalid();
     const bySubtype = new Map<string, Sensitivity>();
@@ -198,7 +200,7 @@ export function createContactSensitivity(scope: CandidateScope, entries: readonl
       bySubtype.set(entry.subtype, entry.sensitivity);
     }
     const handle = Object.freeze(Object.create(null)) as ContactSensitivityHandle;
-    sensitivityRegistry.set(handle, { scope: Object.freeze({ tenantRef: scope.tenantRef, projectRef: scope.projectRef }),
+    sensitivityRegistry.set(handle, { scope: Object.freeze({ tenantRef, projectRef }),
       bySubtype: new Map(bySubtype) });
     return handle;
   } catch { return invalid(); }
