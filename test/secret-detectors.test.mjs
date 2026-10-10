@@ -408,6 +408,48 @@ test('#88 existing reference placeholders stay denied', () => {
   }
 });
 
+/* #88 second false-positive item: a comma-separated list of short digit-bearing identifier variants
+ * (`UTF8ToUTF16LE,UTF8ToUTF32LE`, `SHA256RSA,SHA384RSA`) names converters or signature algorithms, not a
+ * credential. The shape is narrow: every part is a short identifier carrying a digit, and the parts share
+ * an alphabetic prefix of at least three letters. Lists whose parts share no such prefix stay detected,
+ * because a shared-prefix digit-bearing pair is the weakest evidence available and a real credential must
+ * not be suppressed by it. */
+const LIST_FPS = [
+  'password=UTF8ToUTF16LE,UTF8ToUTF32LE',
+  'encodings=UTF8ToUTF16LE, UTF8ToUTF32LE, UTF8ToUTF8',
+  '--signature-algorithms SHA256RSA,SHA384RSA',
+  'transforms=UTF16LEToUTF8,UTF32ToUTF8',
+];
+const LIST_CONTROLS = [
+  'password=hunter2,secret',
+  'password=Pass1234,Word5678',
+  'password=UTF8ToUTF16LE',
+  'password=UTF8ToUTF16LE-hunter2',
+];
+test('#88 identifier-variant lists are not credential values', () => {
+  for (const text of LIST_FPS) {
+    const result = run(`${text}\n`);
+    assert.equal(result.status, 'COMPLETE', text);
+    assert.deepEqual(result.candidates, [], text);
+  }
+});
+test('#88 lists without a shared digit-bearing prefix stay detected', () => {
+  for (const text of LIST_CONTROLS) {
+    const result = run(`${text}\n`);
+    assert.equal(result.status, 'COMPLETE', text);
+    assert.equal(result.candidates.length, 1, text);
+  }
+});
+/* Accepted residual, pinned rather than hidden: a same-prefix digit-bearing identifier pair is
+ * shape-identical to the converter lists, so it is suppressed too. The comma-list shape itself is the
+ * signal this rule trusts; a credential carried inside such a list is not a shape this repository has
+ * ever observed, and the alternative is the false-positive family #88 asked to reduce. */
+test('#88 same-prefix digit-bearing identifier pairs are the accepted residual', () => {
+  const result = run('token=abc123def,abc456ghi\n');
+  assert.equal(result.status, 'COMPLETE');
+  assert.deepEqual(result.candidates, []);
+});
+
 /* Generated public-synthetic controls: no source import or last-byte escape predicate. A boundary quote
  * closes after an EVEN backslash run; an ODD run escapes it. Each negative is a separate test so a RED
  * assertion in one caller/key/edge case does not suppress the other generated cases. */

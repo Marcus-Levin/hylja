@@ -90,6 +90,28 @@ function isReference(value: string): boolean {
     ANNOTATION_WORD.test(value);
 }
 const SCHEME_WORD = /^(?:Bearer|Basic|Token|Digest|Negotiate)$/iu;
+/** A comma-separated list of short digit-bearing identifier variants that share an alphabetic prefix
+ *  (`UTF8ToUTF16LE,UTF8ToUTF32LE`, `SHA256RSA,SHA384RSA`) names converters or algorithms, not a credential.
+ *  The shape is the signal: the comma list itself, with every part a short digit-bearing identifier under a
+ *  shared prefix, is a configuration enumeration. Its accepted residual - a same-prefix digit-bearing pair
+ *  that is really a credential - is pinned in the focused tests; suppressing that unlikely shape is the
+ *  price of the false-positive reduction #88 asked for, and a single value or a prefix-free list is never
+ *  denied by it. */
+function identifierList(value: string): boolean {
+  const parts = value.split(',');
+  if (parts.length < 2) return false;
+  let prefix: string | null = null;
+  for (const part of parts) {
+    if (!/^[A-Za-z][A-Za-z0-9]{1,31}$/u.test(part) || !/\d/u.test(part)) return false;
+    const head = /^[A-Za-z]+/u.exec(part)?.[0] ?? '';
+    if (prefix === null) { prefix = head; continue; }
+    let shared = 0;
+    while (shared < prefix.length && shared < head.length && prefix[shared] === head[shared]) shared += 1;
+    if (shared < 3) return false;
+    prefix = head;
+  }
+  return true;
+}
 
 /* ---------- Format rules (bounded; each anchored by a literal prefix) ---------- */
 
@@ -266,7 +288,8 @@ function assignmentCandidates(text: string, out: Found[]): void {
     if (!value) continue;
     const raw = text.slice(value.start, value.end);
     // Only an Authorization *header* key makes a bare scheme word empty; elsewhere `password=Basic` is a value.
-    if (isReference(raw) || subtype === 'ACCESS_TOKEN' && /authorization/iu.test(match[3]!) && SCHEME_WORD.test(raw)) continue;
+    if (isReference(raw) || identifierList(raw) ||
+      subtype === 'ACCESS_TOKEN' && /authorization/iu.test(match[3]!) && SCHEME_WORD.test(raw)) continue;
     // `PWD=/home/...` in an env dump is the working directory, not a password.
     if (/^pwd$/iu.test(match[3]!) && /^[/~]/u.test(raw)) continue;
     add(out, { subtype, rule: 'context.key-assignment', basis: 'CONTEXT', ...value });
@@ -295,7 +318,7 @@ function spacedCandidates(text: string, out: Found[]): void {
       if (!subtype) continue;
       if (pattern === NETRC && !NETRC_BEFORE.test(text.slice(Math.max(0, match.index - 512), match.index))) continue;
       const value = readValue(text, match.index + match[0].length, 'inline');
-      if (value && !isReference(text.slice(value.start, value.end))) {
+      if (value && !isReference(text.slice(value.start, value.end)) && !identifierList(text.slice(value.start, value.end))) {
         add(out, { subtype, rule, basis: 'CONTEXT', ...value });
         pattern.lastIndex = Math.max(pattern.lastIndex, value.end);
       }
@@ -335,7 +358,7 @@ function xmlCandidates(text: string, out: Found[]): void {
       const end = match.index + match[0].length - 1;
       value = match[2] ? { start: end - match[2].length, end } : null;
     } else value = readValue(text, match.index + match[0].length, 'line');
-    if (value && !isReference(text.slice(value.start, value.end))) {
+    if (value && !isReference(text.slice(value.start, value.end)) && !identifierList(text.slice(value.start, value.end))) {
       add(out, { subtype, rule: 'context.named-value', basis: 'CONTEXT', ...value });
     }
   }
