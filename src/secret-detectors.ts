@@ -80,9 +80,14 @@ export function subtypeForKey(key: string): SecretSubtype | null {
  * Whole values that reference a secret rather than contain one: env/template references, Hylja
  * placeholders and explicit masks. The *entire* value must match; `${X}rest` is not a reference.
  */
+/** Fixed words that annotate a credential field instead of carrying a secret (`secret: required`).
+ *  A plausible secret value is never in this set: `pass` and `changeme` stay detected, because
+ *  suppressing a real credential would make protected egress less restrictive than a false positive. */
+const ANNOTATION_WORD = /^(?:required|optional|mandatory|enabled|disabled|unset)$/iu;
 function isReference(value: string): boolean {
   return /^(?:\$\{[A-Za-z_][\w.-]*\}|\$[A-Z_][A-Z0-9_]*|%[A-Z_][A-Z0-9_]*%|\{\{\s*[\w.-]+\s*\}\}|\[hylja:protected:[A-Z0-9_]+\])$/u.test(value) ||
-    /^(?:\*{3,}|<(?:redacted|hidden|masked|secret|password|token|api[-_ ]?key|your[-_ ][\w -]{1,30})>|null|none|true|false)$/iu.test(value);
+    /^(?:\*{3,}|<(?:redacted|hidden|masked|secret|password|token|api[-_ ]?key|your[-_ ][\w -]{1,30})>|null|none|true|false)$/iu.test(value) ||
+    ANNOTATION_WORD.test(value);
 }
 const SCHEME_WORD = /^(?:Bearer|Basic|Token|Digest|Negotiate)$/iu;
 
