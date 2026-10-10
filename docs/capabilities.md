@@ -108,6 +108,20 @@ it does not own:
 
 The credential-context quoted-value reader in [`src/secret-detectors.ts`](../src/secret-detectors.ts) scans a window of **65536 UTF-16 code units, counting the opener**; this is not a maximum for all secret detection. It honors escapes, including backslash parity at the boundary: an unescaped matching quote exactly at the boundary closes the full value, while true EOF within the window keeps full coverage of unterminated content. An unresolved suffix beyond the window returns `FAILURE` / `QUOTE_WINDOW_EXCEEDED`, with no candidates or fingerprints from that failed scan, including earlier findings. [`src/normalized-detection.ts`](../src/normalized-detection.ts) records `SECRET_QUOTE_WINDOW_EXCEEDED` and opaque coverage as `PARTIAL`, which [`src/classification-units.ts`](../src/classification-units.ts) carries through; independently legitimate full-field or other-source candidates may remain, but do not make the incomplete inspection complete.
 
+### Configured name dictionary snapshot
+
+`createNameDictionary` in [`src/contact-candidates.ts`](../src/contact-candidates.ts) captures each
+validated primitive tenant/project field once, reads one validated array length bounded to `10000`,
+and copies caller names by index once without using the caller array's iterator. Later caller mutation
+cannot retarget the stored dictionary. Ordinary, frozen and null-prototype inputs, inherited scope
+accessors and inherited array indices remain supported; callers need not freeze their inputs. Malformed
+input or a finite throwing accessor/proxy path produces a fresh fixed
+`TypeError('Invalid name dictionary')`, without forwarding caller exception identity, message, cause,
+stack or values. The [focused test](../test/contact-candidates.test.mjs) exercises this local
+structural-snapshot property of trusted configuration: it is not authentication, an atomic world
+snapshot, preemption of a nonreturning getter, protection for other constructors, protected-egress
+safety or a deployed service.
+
 ### No adapter sits at a real send point
 
 There is no transport interceptor, no vault, no authorization broker, no KMS/HSM binding and no runtime-enforced Policy Engine in this repository. Concretely:

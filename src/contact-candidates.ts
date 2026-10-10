@@ -114,30 +114,50 @@ const edge = (sep: string, token: string): string => `${sep}\u0000${token}`;
  * Trusted configuration: bind configured names to exactly one tenant and project. Names match as token
  * sequences, case-insensitively, with the same separators between tokens (whitespace runs are equal);
  * punctuation before the first or after the last token is ignored.
+ *
+ * The scope and the names are read as one structural snapshot: each scope field is read once and the value
+ * validated is the value bound, and the names are copied by index from the one approved array length, so a
+ * caller cannot retarget the dictionary after validation, a hostile `Symbol.iterator` never runs to copy
+ * names, and an accessor that runs does so exactly once. Every malformed or throwing path fails closed with
+ * the same fixed `TypeError`, which can never carry a caller exception's identity, message, cause, stack or
+ * values. This seam authenticates nothing; it only keeps one trusted configuration bound to one scope.
  */
 export function createNameDictionary(scope: CandidateScope, names: readonly string[]): NameDictionary {
-  if (!scope || !label(scope.tenantRef) || !label(scope.projectRef) || !Array.isArray(names) ||
-    names.length > MAX_NAMES) throw new TypeError('Invalid name dictionary');
-  const root: TrieNode = { terminal: false, next: new Map() };
-  for (const name of names) {
-    if (!label(name, 128) || !/\p{L}/u.test(name)) throw new TypeError('Invalid name dictionary');
-    const folded = fold(name).text;
-    const tokens = [...folded.matchAll(TOKEN)];
-    if (!tokens.length || tokens.length > MAX_NAME_TOKENS) throw new TypeError('Invalid name dictionary');
-    let node = root;
-    tokens.forEach((token, index) => {
-      const previous = tokens[index - 1];
-      const key = edge(previous ? separator(folded.slice(previous.index + previous[0].length, token.index)) : '',
-        token[0]);
-      let child = node.next.get(key);
-      if (!child) node.next.set(key, child = { terminal: false, next: new Map() });
-      node = child;
-    });
-    node.terminal = true;
+  try {
+    const tenantRef: unknown = scope.tenantRef;
+    const projectRef: unknown = scope.projectRef;
+    if (!label(tenantRef) || !label(projectRef) || !Array.isArray(names)) throw new TypeError('Invalid name dictionary');
+    // One length read, validated once; entries are then snapshotted by index, so no caller iterator runs
+    // and no repeated length or element enumeration can change what is copied mid-construction.
+    const count = names.length;
+    if (!Number.isSafeInteger(count) || count < 0 || count > MAX_NAMES) throw new TypeError('Invalid name dictionary');
+    const snapshot: unknown[] = [];
+    for (let index = 0; index < count; index++) snapshot.push(names[index]);
+    const root: TrieNode = { terminal: false, next: new Map() };
+    for (const name of snapshot) {
+      if (!label(name, 128) || !/\p{L}/u.test(name)) throw new TypeError('Invalid name dictionary');
+      const folded = fold(name).text;
+      const tokens = [...folded.matchAll(TOKEN)];
+      if (!tokens.length || tokens.length > MAX_NAME_TOKENS) throw new TypeError('Invalid name dictionary');
+      let node = root;
+      tokens.forEach((token, index) => {
+        const previous = tokens[index - 1];
+        const key = edge(previous ? separator(folded.slice(previous.index + previous[0].length, token.index)) : '',
+          token[0]);
+        let child = node.next.get(key);
+        if (!child) node.next.set(key, child = { terminal: false, next: new Map() });
+        node = child;
+      });
+      node.terminal = true;
+    }
+    const handle = Object.freeze(Object.create(null)) as NameDictionary;
+    dictionaries.set(handle, { scope: Object.freeze({ tenantRef: tenantRef, projectRef: projectRef }) as CandidateScope, root });
+    return handle;
+  } catch {
+    // Unconditional normalization: a caller accessor, iterator or proxy failure becomes the same fixed
+    // refusal, so no hostile error identity, message, cause, stack or value escapes this seam.
+    throw new TypeError('Invalid name dictionary');
   }
-  const handle = Object.freeze(Object.create(null)) as NameDictionary;
-  dictionaries.set(handle, { scope: Object.freeze({ tenantRef: scope.tenantRef, projectRef: scope.projectRef }), root });
-  return handle;
 }
 /** Longest configured name at each token start; non-overlapping, O(tokens x MAX_NAME_TOKENS). */
 function matchNames(text: string, root: TrieNode): { start: number; end: number }[] {
