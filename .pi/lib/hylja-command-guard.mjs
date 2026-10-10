@@ -8,9 +8,9 @@
  * Two decisions, both pure and total:
  * 1. Block a `find` whose search root is a machine-wide absolute root. Scoped and relative roots, the
  *    caller's home directory and the current worktree stay allowed.
- * 2. Guarantee a finite positive `timeout` for every bash call that reaches this guard: a default when
- *    the caller omits it, a tighter explicit value preserved, an excessive value clamped, and a
- *    malformed value refused.
+ * 2. Preserve explicit finite positive `timeout` values without clamping; omission or null selects
+ *    no tool cap. Malformed values are refused. A declared finite command window still requires
+ *    a finite cap that fits its stop and finish reserve.
  *
  * Neither decision parses shell. The command string is split on control separators and whitespace,
  * quotes are stripped, and only the leading tokens of each segment are inspected: environment
@@ -18,8 +18,8 @@
  * (`$(...)`, backticks, variables), `eval`, aliases, a wrapper that takes a value argument
  * (`sudo -u other find /`), `find` invoked indirectly, and any other API that reaches a shell are
  * outside this guard by construction. Treat a pass here as a workflow speed bump, never as proof that a
- * command is safe, bounded or correct. The timeout decision bounds only calls that reach this guard's
- * builtin `bash` handling; other tools and other APIs receive no bound from here.
+ * command is safe, bounded or correct. The timeout decision applies only to calls that reach this
+ * guard's builtin `bash` handling; it adds no bound to other tools or APIs.
  *
  * Optional command-window helpers snapshot a declared stop and reserve, then check supplied UTC;
  * they do not observe a native deadline or prove final backend execution timing.
@@ -27,12 +27,6 @@
  */
 
 import { homedir } from 'node:os';
-
-/** Applied when the model omits `timeout`; Pi's builtin bash has no default of its own. */
-export const DEFAULT_COMMAND_TIMEOUT_SECONDS = 120;
-
-/** Ceiling for an explicit request; a larger value is clamped, never granted. */
-export const MAX_COMMAND_TIMEOUT_SECONDS = 300;
 
 /** Fixed, non-echoing setup refusal; approval is trusted coordinator configuration, not authentication. */
 export const INVALID_VALIDATION_APPROVAL = 'Invalid Hylja validation approval';
@@ -97,7 +91,7 @@ export function snapshotValidationApproval(record) {
 /**
  * Top-level absolute roots that mean "the whole machine", matched on the first path segment. `/tmp`,
  * `/var/tmp` and unlisted absolute roots are deliberately absent: this project keeps scratch work in
- * a temp file, and the timeout default already bounds any scan.
+ * a temp file. Allowed roots do not imply a bounded or safe scan.
  */
 export const MACHINE_WIDE_ROOT_SEGMENTS = new Set([
 	'Applications', 'Library', 'System', 'Users', 'Volumes',
@@ -124,7 +118,7 @@ export const BLOCK_REASON_MACHINE_WIDE_SEARCH =
 
 export const BLOCK_REASON_INVALID_TIMEOUT =
 	'Hylja workflow guard refused this call: the bash timeout must be a finite number of seconds greater than zero. '
-	+ `Omit it to accept the ${DEFAULT_COMMAND_TIMEOUT_SECONDS}s guard default, or pass a positive number of seconds. `
+	+ 'Omit it or pass null for no tool cap, or pass a positive number of seconds. '
 	+ 'The guard logs no command, argument or output.';
 
 /** Strips surrounding quote characters from a token, including an unterminated one. */
@@ -204,14 +198,11 @@ export function isMachineWideFindRoot(rawRoot, options = {}) {
 	return MACHINE_WIDE_ROOT_SEGMENTS.has(first);
 }
 
-/**
- * Decides the timeout for one bash call: default when absent, explicit tighter value preserved,
- * excessive value clamped, malformed value refused.
- */
-export function resolveCommandTimeout(value, validationApproved = false) {
-	if (value === undefined) return { allowed: true, seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS };
+/** Preserve a finite positive request; omission/null selects no cap, never a timing baseline. */
+export function resolveCommandTimeout(value) {
+	if (value === undefined || value === null) return { allowed: true, seconds: undefined };
 	if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return { allowed: false, seconds: undefined };
-	return { allowed: true, seconds: Math.min(value, validationApproved === true ? 600 : MAX_COMMAND_TIMEOUT_SECONDS) };
+	return { allowed: true, seconds: value };
 }
 
 /**
@@ -219,8 +210,10 @@ export function resolveCommandTimeout(value, validationApproved = false) {
  *
  * @param input - the bash tool input, mutated by the caller with the returned timeout.
  * @param options - named roots plus an installation-snapshotted validation approval; defaults to
- * the real home and working directory. Approval selects only the fixed 600s explicit ceiling.
- * @returns `{ allowed: false, reason }` to block, or `{ allowed: true, timeout }` to apply.
+ * the real home and working directory. Exact approval scope is retained as receipt metadata;
+ * approval no longer changes the requested timeout or bypasses any refusal.
+ * @returns `{ allowed: false, reason }` to block, or `{ allowed: true, timeout, validationApproved }`.
+ * An undefined timeout must be omitted before calling Pi's optional-number Bash API.
  */
 export function evaluateBashToolInput(input, options = {}) {
 	const command = input !== null && typeof input === 'object' && typeof input.command === 'string' ? input.command : '';
@@ -233,7 +226,7 @@ export function evaluateBashToolInput(input, options = {}) {
 	// Exact whole-string comparison only; this does not verify shell safety or coordinator authority.
 	const approved = options.validationApproval !== undefined && options.cwd === options.validationApproval.cwd &&
 		options.validationApproval.commands.includes(command);
-	const timeout = resolveCommandTimeout(input !== null && typeof input === 'object' ? input.timeout : undefined, approved);
+	const timeout = resolveCommandTimeout(input !== null && typeof input === 'object' ? input.timeout : undefined);
 	if (!timeout.allowed) return { allowed: false, reason: BLOCK_REASON_INVALID_TIMEOUT };
-	return { allowed: true, timeout: timeout.seconds };
+	return { allowed: true, timeout: timeout.seconds, validationApproved: approved };
 }

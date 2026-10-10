@@ -25,10 +25,10 @@ Pure, in-process TypeScript. Every row is a **seam with an interface and a contr
 | Bounded scope-bound mapping AEAD **primitive only**: fixed AES-256-GCM seal/open of small byte payloads under an independently supplied expected scope; no vault, broker, store, index or key management | [`src/mapping-aead.ts`](../src/mapping-aead.ts) | [mapping-aead.md](contracts/mapping-aead.md) | [`test/mapping-aead.test.mjs`](../test/mapping-aead.test.mjs) | [#162](https://github.com/Marcus-Levin/hylja/issues/162) |
 | Infrastructure, network, cloud and filesystem identifiers | [`src/infrastructure-identifiers.ts`](../src/infrastructure-identifiers.ts) | [classification-contract.md](contracts/classification-contract.md) | [`test/infrastructure-identifiers.test.mjs`](../test/infrastructure-identifiers.test.mjs) | [#9](https://github.com/Marcus-Levin/hylja/issues/9) |
 | Keyed, scope-bound opaque entity reference derivation (pure, no resolution, no authority) | [`src/scoped-entity-reference.ts`](../src/scoped-entity-reference.ts) (limits in its module header) | [scoped-entity-reference.md](contracts/scoped-entity-reference.md) | [`test/scoped-entity-reference.test.mjs`](../test/scoped-entity-reference.test.mjs) | [#168](https://github.com/Marcus-Levin/hylja/issues/168) |
-| Configured customer, project and engineering candidate sources | [`src/configured-candidates.ts`](../src/configured-candidates.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/configured-candidates.test.mjs`](../test/configured-candidates.test.mjs) | [#10](https://github.com/Marcus-Levin/hylja/issues/10) |
+| Configured customer, project and engineering candidate sources | [`src/configured-candidates.ts`](../src/configured-candidates.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/configured-candidates.test.mjs`](../test/configured-candidates.test.mjs), [`test/configured-scope-snapshot.test.mjs`](../test/configured-scope-snapshot.test.mjs) | [#10](https://github.com/Marcus-Levin/hylja/issues/10) |
 | Pure synthetic engineering-reference admission and session recommendation, with no mapping or effect authority | [`src/synthetic-engineering-admission.ts`](../src/synthetic-engineering-admission.ts) | [synthetic-engineering-admission.md](contracts/synthetic-engineering-admission.md), accepted [decision 012](decisions/012-synthetic-engineering-custody-preconditions.md) | [`test/synthetic-engineering-admission.test.mjs`](../test/synthetic-engineering-admission.test.mjs) | [#248](https://github.com/Marcus-Levin/hylja/issues/248) |
 | PERSON/EMAIL/PHONE candidate generation | [`src/contact-candidates.ts`](../src/contact-candidates.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/contact-candidates.test.mjs`](../test/contact-candidates.test.mjs) | [#37](https://github.com/Marcus-Levin/hylja/issues/37) |
-| Accepted-v1 classification units per occurrence | [`src/classification-units.ts`](../src/classification-units.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/configured-units.test.mjs`](../test/configured-units.test.mjs) | [#37](https://github.com/Marcus-Levin/hylja/issues/37), [#10](https://github.com/Marcus-Levin/hylja/issues/10) |
+| Accepted-v1 classification units per occurrence | [`src/classification-units.ts`](../src/classification-units.ts) | [classification-unit-contract.md](contracts/classification-unit-contract.md) | [`test/configured-units.test.mjs`](../test/configured-units.test.mjs), [`test/contact-sensitivity-scope-snapshot.test.mjs`](../test/contact-sensitivity-scope-snapshot.test.mjs) | [#37](https://github.com/Marcus-Levin/hylja/issues/37), [#10](https://github.com/Marcus-Levin/hylja/issues/10) |
 | Deterministic source-to-sink policy seam | [`src/policy.ts`](../src/policy.ts) | [policy-contract.md](contracts/policy-contract.md) | [`test/policy.test.mjs`](../test/policy.test.mjs) | [#4](https://github.com/Marcus-Levin/hylja/issues/4) |
 
 `decidePolicy` in `src/policy.ts` is the **only** decision identity that selects a treatment. Every other module either calls it or simulates it against a candidate bundle. An adapter that wants a different answer must change policy, not bypass it.
@@ -75,6 +75,16 @@ These compile, are property-tested and are reachable only from their own tests. 
 [Decision 010](decisions/010-separate-information-dimensions-and-task-fidelity.md) is **proposed**. The separation of semantic, privacy-attribute, sensitivity, trust and task-fidelity dimensions exists only as that draft; accepted classification v1 keeps its current vocabulary. Do not wire a draft into accepted classification, policy, an adapter or authoritative labels.
 
 ## Material limits
+
+### Scope-bound configuration handles
+
+`createCandidateConfig` and `createContactSensitivity` capture each tenant/project label once inside
+existing error containment, validate the captured primitive values and bind those same values to the
+private handle. Later getter/Proxy answers or caller mutation cannot retarget that stored scope.
+Ordinary, null-prototype and inherited scope properties remain supported; finite throwing reads
+produce fresh fixed TypeErrors without forwarding the caller's exception. This is a pure snapshot
+property, not authentication, an atomic-world snapshot, preemption of a nonreturning getter,
+array/entry snapshotting or whole-constructor safety.
 
 ### Pure core seams and host-backed runtime effect owners, and what neither proves
 
