@@ -1,14 +1,7 @@
 # Working on Hylja
 
-Standing authority, security and development rules for Hylja. See [Attribution](#attribution) for the adapted upstream guidance.
-
-## Find the relevant authority
-
-Before implementation, read [docs/charter.md](docs/charter.md), [docs/architecture.md](docs/architecture.md), [docs/security-model.md](docs/security-model.md), [docs/threat-model.md](docs/threat-model.md), [docs/evaluation.md](docs/evaluation.md), and what the software implements today in [docs/capabilities.md](docs/capabilities.md). Then use the [task route map](docs/README.md#task-route-map) to reach the exact slice, contract, decision, source and test for your task. Read the current slice in [docs/specs](docs/specs/) and the **status line** of every decision in [docs/decisions](docs/decisions/) you rely on.
-
-One fact has one authoritative home. What is implemented and its limits belong only in [docs/capabilities.md](docs/capabilities.md); work status, priority and dependency order belong only in GitHub issues ([#36](https://github.com/Marcus-Levin/hylja/issues/36) is the roadmap checklist); dated measurements and their attribution live with the pull request or research record that produced them. Do not copy any of these into architecture, README, or research documents; link to the home instead. Research is evidence, not authority. Accepted design changes get a new decision record rather than silently rewriting history.
-
-A record marked **proposed** has no authority until a human accepts it. Do not wire a proposed decision, draft taxonomy, or draft information model into accepted runtime classification or policy, an adapter, or authoritative evaluation labels, scoring, and promotion, and do not weaken an accepted v1 contract or the held-out protocol to make a draft fit. An isolated, clearly labeled, non-enforcing draft module or test on synthetic data is allowed while its proposed status stays visible in its own record.
+Standing rules for Hylja work. Product knowledge lives in the docs tree; start from
+[docs/README.md](docs/README.md). Attribution at the end.
 
 ## Security invariants
 
@@ -26,94 +19,67 @@ A record marked **proposed** has no authority until a human accepts it. Do not w
 ## Communication
 
 - Keep answers short, direct, and technical. No fluff, no emoji in commits, issues, PR comments, or code.
-- Explain a non-trivial design or defect as problem, concrete example or short trace, then solution. Say why the solution is required and separate it from optional complexity.
 - When the user asks a question, answer it first, then make edits or run commands.
-- When responding to feedback or a review, state explicitly whether you agree or disagree before describing what you changed.
-- Work in the harness and with the model the user selected for the run, and name what actually served the request, including any fallback or routing. Never claim a review, run, or model you did not perform.
-- Report limits honestly. "Not proven here" is a valid, expected result.
+- On feedback or a review, state whether you agree or disagree before describing what you changed.
+- Never claim a review, run, or model you did not perform. Report limits honestly; "not proven here" is a valid result.
 
-## Inspect before you edit
+## Working rules
 
-- Read files in full before wide-ranging changes, before editing a file you have not fully inspected, and when investigating or auditing. Search snippets locate code, not judge it. Retain full-file understanding while source identity and retained context are unchanged; a digest never substitutes for reading.
-- Check installed type declarations in `node_modules` (and the repository's own `src/*.d.ts` shims) for external API shapes; do not guess.
-- Ask before deleting functionality that looks intentional. This repository is unreleased, so removing a contract is a design change, not a compatibility chore — but say so explicitly rather than dropping it quietly.
-- Keep TypeScript strict and its syntax narrow: no `any` unless unavoidable, no dynamic type imports, no `enum`, `namespace`/`module`, `import =` or `export =`, and no loosening `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, or `verbatimModuleSyntax` to make code compile. The constructor parameter properties in the existing fixed-code error classes are accepted; `erasableSyntaxOnly` is deliberately not enabled, so do not rewrite boundary error classes for style.
-- Treat untrusted input at the boundary: validate once, snapshot what you will inspect repeatedly (do not re-enumerate a caller object you already capped), bound sizes, and return fixed, non-echoing errors that never carry planted values back to the caller.
+- Read files in full before wide-ranging changes and before editing a file you have not fully inspected. Search snippets locate code, not judge it.
+- Check installed type declarations in `node_modules` (and the repository's `src/*.d.ts` shims) for external API shapes; do not guess.
+- Ask before deleting functionality that looks intentional. Removing a contract is a design change, so say so explicitly rather than dropping it quietly.
+- Keep TypeScript strict and narrow: no `any` unless unavoidable, no `enum`, no `namespace`/`module`, no `import =`/`export =`, and never loosen `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, or `verbatimModuleSyntax` to make code compile.
+- Validate untrusted input once at the boundary, snapshot what you inspect repeatedly, bound sizes, and return fixed non-echoing errors.
 
 ## Boundaries
 
-Hylja is TypeScript on Node.js. Keep the core provider- and harness-independent: the harness you happen to work in is a property of the run, never a product dependency. Model, MCP, shell, file, skill, and harness integrations live behind narrow adapters; an adapter translates a native surface into normalized interaction events and owns no privacy policy. Prefer pure functions for parsing, classification composition, policy, and transformations so they can be property-tested and replayed.
-
-A core module is not an enforcement boundary by itself. A pure policy, audit, or sentinel module that authenticates nothing and sends no bytes is evidence for a seam, not proof of protected-egress safety; say which one you delivered.
+Hylja is TypeScript on Node.js. The core stays provider- and harness-independent: the harness you work in is a property of the run, not a product dependency. Model, MCP, shell, file, skill, and harness integrations live behind narrow adapters that own no privacy policy. A pure module that authenticates nothing and sends no bytes is evidence for a seam, not proof of protected-egress safety; say which one you delivered.
 
 ## Commands
 
-Install exactly as CI does: `npm ci --ignore-scripts --no-fund` (Node 24, npm 10, lockfile-driven, no lifecycle scripts).
+Install exactly as CI does: `npm ci --ignore-scripts --no-fund` (Node 24, npm 10).
 
-- `npm run check:fixtures` — tracked-path and synthetic-fixture guard. Run it before committing anything touching `test/fixtures/**`, `.gitignore`, or generated output.
-- `npm run check:diagnostic-assertions` — refuses assertion shapes whose printed value could carry captured subprocess output into a test log. See [docs/development/diagnostic-assertion-guard.md](docs/development/diagnostic-assertion-guard.md).
-- `npm run build` — compiles `src/**/*.ts` into `dist/`. Tests import `../dist/*.js`, so build before running any test.
-- `npm run typecheck` — `tsc --noEmit` under the same strict config.
-- `npm test` — fixture guard, build, then `node --test` over the suite list in [package.json](package.json). Read the script before quoting a count; the suite list changes.
-- `npm run test:coverage` — the same tests with Node coverage. These numbers measure contract exercise, not enforcement, coverage of production traffic, or release safety.
+- `npm test` — fixture guard, build, then `node --test` over the suite in package.json; read the script before quoting a count.
+- `npm run test:coverage` — same with coverage; contract exercise, not production coverage.
+- `npm run build`, `npm run typecheck` — compile `src/**/*.ts` and typecheck under the strict config.
+- `npm run check:fixtures`, `npm run check:docs`, `npm run check:diagnostic-assertions` — static gates.
+- `npm run audit:deps`, `npm run sbom`, `npm run check:sbom` — CI gates; never commit generated output.
 - `node --test test/<name>.test.mjs` — bounded focused run while iterating, after a build.
-- `node evaluations/preparation-integrity.mjs` — the public, non-enforcing preparation scaffold. Intact state exits 0 with `PREPARATION_VALID_BUT_NOT_ELIGIBLE / PUBLIC_DRAFT_ONLY`; that status never authorizes scoring, custody, a freeze, or release.
-- `npm run audit:deps`, `npm run sbom` and `npm run check:sbom` — CI gates. The SBOM is ephemeral; never commit it or other generated output (`dist/`, `coverage/`, `artifacts/` are ignored).
 
-[package.json](package.json) `scripts` is the one canonical command list and [.github/workflows/ci.yml](.github/workflows/ci.yml) the one canonical step sequence; verify any command you document here against both before writing it down, and quote CI run links rather than asserting a green run you did not see.
-
-No test or script may call a real provider API, use real credentials, reach the network for model traffic, or read private or held-out data. Put ad-hoc scratch scripts in a temp file, run them, and delete them; do not embed long scripts inline in shell commands.
-
-### Execution time budgets
-
-- Run development commands without arbitrary preset timeouts when the harness supports it. When a timeout is needed, use a recorded successful runtime for comparable work on the current toolchain and allow **5–10×** that duration. Without reliable timing evidence, prefer no command timeout; a timed-out run provides only a lower bound, not a completed-runtime measurement.
-- Apply this rule to command, tool, agent and workflow limits together. Check the effective limits before starting expensive validation; a larger requested timeout is useless if an extension silently clamps it. Use an authorized configuration that accommodates the work, preserving search and security guards.
-- After a timeout, preserve output and owned changes, inspect progress and process state, diagnose the limiting layer, and continue authorized recovery without repeating successful unchanged checks or asking again for routine permission. Record the successful duration for the next run.
-- Genuine task deadlines, user stops and security bounds still apply. This rule does not relax product timeouts, behavioral assertions, private-data containment or required validation gates; it prevents development tooling from interrupting valid work with an unsupported estimate.
+[package.json](package.json) `scripts` and [.github/workflows/ci.yml](.github/workflows/ci.yml) are canonical. No test or script may call a real provider API, use real credentials, reach the network for model traffic, or read private or held-out data. Put ad-hoc scratch scripts in a temp file, run them, and delete them.
 
 ## Tests and evidence
 
-Every security-sensitive feature ships with evaluation evidence: deterministic tests for known invariants, property-based tests for transformations and tenant isolation, adversarial cases for bypasses, and end-to-end utility tests where cloaking can change reasoning. A skipped or placeholder cross-tenant test is not foundation evidence.
-
-- Write the failing behavior test first when you add or change a contract, and keep the red checkpoint as evidence of what the test actually caught.
-- Validate the change you made: focused file first, then the full CI sequence when the change touches shared core, policy, crypto, provenance, or serialized bytes. Do not run broad suites for prose-only changes.
-- Prose-only changes need no new test, and a test that greps implementation or documentation text is not evidence for a document.
-- Fixtures stay obviously synthetic and non-routable. Under the guard, only `test/fixtures/synthetic-golden/` may contain credential-like assignments, and only with obviously synthetic values (`synthetic-*.invalid`).
-- Record what you actually ran, the real pass counts, and the explicit unproven surface. Report it in the pull request or the research record that owns the work; update [docs/capabilities.md](docs/capabilities.md) only when the implementation or a durable limit itself changed.
-- Public docs, public fixtures, and public research are **not** a held-out suite. Do not optimize a detector against the held-out suite: never tune questions, thresholds, or detectors against held-out data. A production miss becomes a sanitized regression case; it does not automatically alter policy.
+- Write the failing behavior test first when you add or change a contract, and keep the red checkpoint as evidence of what the test caught.
+- Validate focused file first, then the full CI sequence when the change touches shared core, policy, crypto, provenance, or serialized bytes.
+- Fixtures stay obviously synthetic; only `test/fixtures/synthetic-golden/` may contain credential-like assignments, and only with `synthetic-*.invalid` values.
+- Record what you actually ran, the real pass counts, and the explicit unproven surface. Update [docs/capabilities.md](docs/capabilities.md) only when implemented behavior or a durable limit itself changed.
 
 ## Dependencies
 
-- Keep direct dependencies pinned to exact versions (no `^` or `~`). Treat dependency and `package-lock.json` diffs as reviewed code.
-- Refresh lockfile metadata with `npm install --package-lock-only --ignore-scripts`; never run lifecycle scripts unless the user asks.
-- Read the release notes for an update whose behavior change could affect parsing, crypto, or policy, and evaluate the effect before applying it.
-- Keep CI action references pinned. Do not add a dependency to make a test easier without saying why the existing toolchain cannot.
+- Keep direct dependencies pinned to exact versions; treat dependency and lockfile diffs as reviewed code. Refresh metadata with `npm install --package-lock-only --ignore-scripts`; never run lifecycle scripts unless the user asks.
+- Read the release notes for an update whose behavior change could affect parsing, crypto, or policy. Keep CI action references pinned.
 
 ## Git, worktrees, and parallel sessions
 
-Multiple sessions may work on this repository at once, each in its own branch and worktree. Any git operation that touches unstaged, staged, or untracked files outside your own changes can destroy someone else's work.
+Multiple sessions may work on this repository at once, each in its own branch and worktree. Any git operation that touches files outside your own changes can destroy someone else's work.
 
-- Work on the branch and worktree assigned to you. Do not switch, reset, or rebase another session's worktree.
-- Stage explicit paths (`git add <path> <path>`); never `git add -A` or `git add .`. Run `git status` before committing and confirm you staged only your files.
-- Never run `git reset --hard`, `git checkout .`, `git clean -fd`, a blanket `git stash` without a pathspec, `git commit --no-verify`, or force-push, and never stage or discard unrelated unowned uncommitted work. Assigned read-only inspection of another session's commits or shared authorized inputs is expected, not a violation.
-- If you own a specific in-progress change that is blocking you, preserve just those paths reversibly (`git stash push -- <path>`) and name them. Restore them when you resume that work, or record that the preservation is superseded; do not reapply it over newer published state just to clear the record. Never blanket-stash or blanket-reset, and never treat a stash as a place to park another session's work.
-- On rebase or merge conflicts, resolve only files you modified, and only inside your own checkout. If a conflict lands in a file you did not modify, leave that file alone, record the exact path, branch, and commit, then coordinate with the owner or orchestrator and continue the rest of your authorized integration work instead of stalling. Escalate only genuine ownership ambiguity, a destructive choice, or an accepted design change beyond your authorization.
-- Commit messages are concise and technical (`docs:`, `fix:`, `feat:`), no emoji, and state the behavior change. Never commit generated artifacts or lockfile churn you did not cause.
-- Clean up only what you own: a branch or worktree may be removed once its accepted evidence is merged or recorded in its pull request and issue. Preserve commits, evidence references, and linked issue/PR numbers.
+- Work on the branch and worktree assigned to you; never switch, reset, or rebase another session's worktree.
+- Stage explicit paths; never `git add -A` or `git add .`. Run `git status` before committing and confirm you staged only your files.
+- Never run `git reset --hard`, `git checkout .`, `git clean -fd`, a blanket `git stash`, `git commit --no-verify`, or force-push, and never stage or discard unowned uncommitted work.
+- On conflicts, resolve only files you modified. A conflict in a file you did not modify stays untouched; record path, branch, and commit, then coordinate.
+- Commit messages are concise and technical (`docs:`, `fix:`, `feat:`), no emoji, and state the behavior change. Clean up only branches and worktrees you own.
 
-## Delegation, review, merge, and issues
+## Delegation and merge
 
-- Execute directly unless delegation is authorized. Keep implementation and review separate; a delegated reviewer works independently from the pushed or shared state, not the author's summary.
-- Before planning delegated work, dispatching or handing off a lane, read [docs/development/pipeline.md](docs/development/pipeline.md). [.agents/skills/hylja-development/SKILL.md](.agents/skills/hylja-development/SKILL.md) is its entrypoint; the procedure changes no runtime contract or security invariant.
-- Review and approve an exact head SHA. A reviewed SHA that has since changed is not a review of the current head.
-- Report the exact SHA, the commands you actually ran with their results, and the honest remaining limits. Never manufacture approval, and never present AI review as the human design gate.
-- Merge only with the user's explicit authorization, exact-head approval, and green CI at that head. Proposed design (decision records, drafts, contracts, taxonomies) needs human review before it is wired in.
-- Close an issue only when its acceptance criteria are satisfied, and reference issues explicitly (`closes #N`, one keyword per issue) so closure is not accidental.
-- Never push, open or merge a PR, or close or edit issues when the task assigns those actions to someone else; prepare the evidence and hand it over.
+- Execute directly unless delegation is authorized. Delegated lane roles are configured in `.pi/agents/`; keep implementation and review separate, and a reviewer works from the pushed or shared state, not the author's summary.
+- Review and approve an exact head SHA. A SHA that has since changed is not a review of the current head.
+- Merge only with the user's explicit authorization, exact-head approval, and green CI at that head. Never present AI review as the human design gate.
+- Close an issue only when its acceptance criteria are satisfied, with an explicit `closes #N` reference. When a task assigns publication to someone else, prepare the evidence and hand it over; never push, merge, or edit issues on their behalf.
 
 ## Instruction precedence
 
-Current user and session instructions and the task's authorization govern; higher-priority instructions win. Work toward one observable outcome within scope. Ordinary implementation, tests and commits on your own branch remain authorized across steps: complete that reversible work without renewed permission prompts. Escalate missing authority, human adoption gates or risks to another session's work or history. Protect time for validation, required independent review and publication; a deadline is not an estimate. Dependencies and contract changes are reviewed code within authorized scope, not automatic stops.
+Current user and session instructions and the task's authorization govern; higher-priority instructions win. Work toward one observable outcome within scope. Ordinary implementation, tests, and commits on your own branch remain authorized across steps: complete that reversible work without renewed permission prompts. Escalate missing authority, human adoption gates, and risks to another session's work or history.
 
 ## Attribution
 

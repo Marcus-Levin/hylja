@@ -5,6 +5,8 @@
  * cannot interrupt them. It is NOT a model gateway, an authenticated effect boundary, an OS sandbox, a
  * memory or RSS cap, or a policy decision. It never sends a byte and it never decides to release: an
  * `ALLOW` here is the sentinel's own result plus a private copy of the bytes the parent snapshotted.
+ * Normative expansion: docs/contracts/egress-sentinel-process.md - the contract owns the normative order, codes and
+ * limits; this header is the working summary.
  *
  * The premise of this design is narrow on purpose. Cancellation is runner-owned (`runner.cancel()`),
  * never a caller-supplied `AbortSignal`, option bag, callback or worker hook: the accepted request

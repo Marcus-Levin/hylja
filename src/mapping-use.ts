@@ -1,5 +1,7 @@
 /**
  * One bound runtime `USE` executor for exactly one opaque mapping reference (issue #211).
+ * Normative expansion: docs/contracts/mapping-use.md - the contract owns the normative order, codes and
+ * limits; this header is the working summary.
  *
  * `createBoundMappingUse(trustedHost)` binds one reference, one tenant/project/session scope, one
  * entity, one registry, one audit substrate, one pinned policy handoff and one **private synchronous

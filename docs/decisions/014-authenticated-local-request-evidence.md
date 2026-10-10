@@ -2,7 +2,7 @@
 
 Status: **accepted bounded technical design** by explicit project-owner acceptance, 2026-10-06, of choices 1 and 2 below only. Implementation requires separately admitted units and unresolved prerequisites; this records no implemented authenticator, deployed gateway, renewed proof, merge/release authorization, production adoption or change to decision 013.
 
-Design admission: [#263](https://github.com/Marcus-Levin/hylja/issues/263), child of [#21](https://github.com/Marcus-Levin/hylja/issues/21). The [next-unit proposal](../development/proposals/2026-10-06/authenticated-local-request.md) partitions implementation and its executable gates. Live follow-up issues, not this record, own implementation status; [capabilities](../capabilities.md) alone owns implemented behavior and limits.
+Design admission: [#263](https://github.com/Marcus-Levin/hylja/issues/263), child of [#21](https://github.com/Marcus-Levin/hylja/issues/21). The dated next-unit proposal that preceded this record partitioned implementation and its executable gates; live follow-up issues, not this record, own implementation status. [capabilities](../capabilities.md) alone owns implemented behavior and limits.
 
 ## Problem and concrete trace
 

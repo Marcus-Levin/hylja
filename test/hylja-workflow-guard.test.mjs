@@ -336,7 +336,7 @@ test('scoped discovery and the verification commands the pipeline needs stay all
 		'find . -name "*.test.mjs"',
 		'find src -maxdepth 2 -type f',
 		'find .. -maxdepth 3 -name hylja-implementer.md',
-		'find docs/development -name pipeline.md',
+		'find docs/development -name synthetic-e2e.md',
 		'find /home/synthetic-lancer/worktree/src -name "*.ts"',
 		'find /home/synthetic-lancer/.agents/skills -name SKILL.md',
 		'find ~ -maxdepth 4 -name hylja-implementer.md',

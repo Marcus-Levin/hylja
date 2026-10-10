@@ -5,6 +5,8 @@
  * policy decision per unit, a private per-unit plan, the rebuilt final image when real policy selected
  * `MASK` for a message, the real fixed-worker egress sentinel child process over those exact final
  * bytes, and exactly one trusted transport dispatch.
+ * Normative expansion: docs/contracts/openai-text-sender.md - the contract owns the normative order, codes and
+ * limits; this header is the working summary.
  *
  * What this is NOT. It is not a gateway, a listener, a provider client, an authentication
  * implementation, a credential or vault path, a general transformation engine or a response release.
