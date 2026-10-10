@@ -34,8 +34,7 @@ Any future concrete API needs exact version/source and complete relied-on bodies
 its separate native gate. No new source acquisition or host capability inspection is implied.
 [Accepted012](../decisions/012-synthetic-engineering-custody-preconditions.md) gives no custody,
 key or CREATE authority. [Accepted014](../decisions/014-authenticated-local-request-evidence.md)
-and its [staged proposal](../development/proposals/2026-10-06/authenticated-local-request.md)
-do not adopt this owner. Existing accepted v1 and decisions 013/014 stay unchanged.
+and the dated next-unit proposal that preceded it do not adopt this owner. Existing accepted v1 and decisions 013/014 stay unchanged.
 
 ## Supported abstract world and ownership
 
