@@ -367,6 +367,47 @@ test('#8 quote window: an over-window reference/mask-looking prefix cannot be ex
   assert.equal(keyed.candidates.length, 0, 'keyed-over-window');
 });
 
+/* #88 first false-positive item: annotation-like values in credential assignments describe the field,
+ * not a secret (`secret: required`, `password: optional`). The denied set is fixed and tiny; a plausible
+ * secret value (`pass`, `changeme`) stays detected, because suppressing detection would make protected
+ * egress less restrictive than an occasional false positive. */
+const ANNOTATION_FPS = [
+  'secret: required',
+  'password: optional',
+  'api_key: mandatory',
+  'token: enabled',
+  'PASSWORD: disabled',
+  'auth_token: unset',
+  'secret=required',
+  '--password required',
+];
+const FAIL_CLOSED_VALUES = [
+  'password=pass',
+  'secret: changeme',
+  'token=required2',
+  'password=hunter2',
+  'api_key=requiredly',
+];
+test('#88 annotation values in credential assignments are not candidates', () => {
+  for (const text of ANNOTATION_FPS) {
+    const result = run(`${text}\nx: 1\n`);
+    assert.equal(result.status, 'COMPLETE', text);
+    assert.deepEqual(result.candidates, [], text);
+  }
+});
+test('#88 plausible secret values stay detected beside the denied annotation words', () => {
+  for (const text of FAIL_CLOSED_VALUES) {
+    const result = run(`${text}\n`);
+    assert.equal(result.status, 'COMPLETE', text);
+    assert.equal(result.candidates.length, 1, text);
+  }
+});
+test('#88 existing reference placeholders stay denied', () => {
+  for (const text of ['password=${SECRET_ENV}', 'token: null', 'password=none', 'secret: <redacted>']) {
+    assert.deepEqual(run(`${text}\n`).candidates, [], text);
+  }
+});
+
 /* Generated public-synthetic controls: no source import or last-byte escape predicate. A boundary quote
  * closes after an EVEN backslash run; an ODD run escapes it. Each negative is a separate test so a RED
  * assertion in one caller/key/edge case does not suppress the other generated cases. */
