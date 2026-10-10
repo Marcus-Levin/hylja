@@ -286,3 +286,185 @@ test('third review: CDATA is linear, later keys survive a stray quote, short num
     assert.deepEqual(run(text).candidates.map((c) => text.slice(c.start, c.end)), [], text);
   }
 });
+
+/* ---------- #8 quoted-window correction (RED-first): an uninspected quoted suffix fails closed ---------- */
+// QUOTE_WINDOW is module-private and deliberately NOT imported here. Its 65536 bound, opening quote counted,
+// is reproduced as a fixed literal only to size obviously-synthetic inputs; no realistic credential exists.
+const QWIN = 65536; /* units counted from the opening quote, opening quote included */
+const qc = (n) => `password="${'S'.repeat(n)}"\n`; /* closed quoted assignment, n content units */
+const qo = (n) => `password="${'S'.repeat(n)}`; /* unterminated, true EOF, n content units */
+const FULL = [QWIN - 2, QWIN - 1]; /* content fits the window -> stays fully covered COMPLETE */
+const PAST = [QWIN, QWIN + 1, 70000]; /* content runs past the window -> FAILURE/QUOTE_WINDOW_EXCEEDED */
+
+test('#8 quote window: content up to the bound keeps full coverage as COMPLETE (closed, EOF-at-edge, escaped)', () => {
+  for (const n of FULL) {
+    for (const maker of [qc, qo]) {
+      const result = run(maker(n));
+      assert.equal(result.status, 'COMPLETE', `full ${n}`);
+      // Full coverage: the one assigned PASSWORD spans all n content units, never a short prefix span.
+      assert.equal(result.candidates.length, 1, `full count ${n}`);
+      assert.equal(result.candidates[0].subtype, 'PASSWORD', `full subtype ${n}`);
+      assert.equal(result.candidates[0].end - result.candidates[0].start, n, `full span ${n}`);
+    }
+  }
+  // A closing quote exactly at the edge (position QWIN from the opener) closes the whole content, not a prefix.
+  const edge = run(qc(QWIN - 1));
+  assert.equal(edge.status, 'COMPLETE');
+  assert.equal(edge.candidates[0].end - edge.candidates[0].start, QWIN - 1);
+  // An escaped quote inside the window still closes; the fix preserves existing escaping behaviour.
+  const escText = 'password="a\\"bc"';
+  const esc = run(escText);
+  assert.equal(esc.status, 'COMPLETE');
+  assert.equal(esc.candidates.length, 1);
+  assert.equal(escText.slice(esc.candidates[0].start, esc.candidates[0].end), 'a\\"bc');
+});
+
+test('#8 quote window: a quoted value past the bound fails closed as QUOTE_WINDOW_EXCEEDED (assignment, CLI/spaced, Kubernetes name/value)', () => {
+  const callers = {
+    assignment: { closed: (n) => `password="${'S'.repeat(n)}"`, eof: (n) => `password="${'S'.repeat(n)}` },
+    'cli-flag': { closed: (n) => `--password "${'S'.repeat(n)}"`, eof: (n) => `--password "${'S'.repeat(n)}` },
+    'k8s-named-value': { closed: (n) => `name: DB_PASSWORD\nvalue: "${'S'.repeat(n)}"`, eof: (n) => `name: DB_PASSWORD\nvalue: "${'S'.repeat(n)}` },
+  };
+  for (const n of PAST) {
+    for (const [name, forms] of Object.entries(callers)) {
+      for (const [form, make] of Object.entries(forms)) {
+        const text = form === 'closed' ? `${make(n)} synthtail` : make(n);
+        const result = run(text);
+        assert.equal(result.status, 'FAILURE', `${name} ${n} ${form}`);
+        assert.deepEqual(result.reasons, ['QUOTE_WINDOW_EXCEEDED'], `${name} ${n} ${form}`);
+        // Nothing is reported: no candidate, so no prefix span, prefix fingerprint or success-shaped reason.
+        assert.equal(result.candidates.length, 0, `${name} ${n} ${form}`);
+        assert.equal(JSON.stringify(result).includes('synthtail'), false, `${name} ${n} ${form}`);
+      }
+    }
+  }
+});
+
+test('#8 quote window: an escaped quote at the edge is not a close, and a backslash over the edge is not closure', () => {
+  // The window holds 65535 content units; a backslash at edge-1 escapes the quote at the edge, so the value is
+  // not closed there and the tail that follows is uninspected.
+  const escEdge = ['password="', 'S'.repeat(QWIN - 2), '\\', '"', 'synthtail', '"'].join('');
+  const result = run(escEdge);
+  assert.equal(result.status, 'FAILURE', 'escaped-edge');
+  assert.deepEqual(result.reasons, ['QUOTE_WINDOW_EXCEEDED'], 'escaped-edge');
+  assert.equal(result.candidates.length, 0, 'escaped-edge');
+  assert.equal(JSON.stringify(result).includes('synthtail'), false, 'escaped-edge-privacy');
+});
+
+test('#8 quote window: an over-window reference/mask-looking prefix cannot be excluded to hide an uninspected tail', () => {
+  // The visible window is exactly the content width and looks like a mask (a reference), but real content
+  // continues past the window. Excluding the prefix as a reference must not read as a silent COMPLETE.
+  const masked = ['password="', '*'.repeat(QWIN - 1), 'synthsecret-tail', '"'].join('');
+  const result = run(masked);
+  assert.equal(result.status, 'FAILURE', 'masked-over-window');
+  assert.deepEqual(result.reasons, ['QUOTE_WINDOW_EXCEEDED'], 'masked-over-window');
+  assert.equal(result.candidates.length, 0, 'masked-over-window');
+  assert.equal(JSON.stringify(result).includes('synthsecret-tail'), false, 'masked-over-window-privacy');
+  // Even with a tenant fingerprint key present, a failure yields no prefix fingerprint and no candidate.
+  const keyed = run(`password="${'S'.repeat(70000)}"`, { fingerprintKey: new Uint8Array(32).fill(5) });
+  assert.equal(keyed.status, 'FAILURE', 'keyed-over-window');
+  assert.deepEqual(keyed.reasons, ['QUOTE_WINDOW_EXCEEDED'], 'keyed-over-window');
+  assert.equal(keyed.candidates.length, 0, 'keyed-over-window');
+});
+
+/* Generated public-synthetic controls: no source import or last-byte escape predicate. A boundary quote
+ * closes after an EVEN backslash run; an ODD run escapes it. Each negative is a separate test so a RED
+ * assertion in one caller/key/edge case does not suppress the other generated cases. */
+const quoteCallers = [
+  { name: 'assignment', prefix: 'password=', rule: 'context.key-assignment' },
+  { name: 'cli', prefix: '--password ', rule: 'context.cli-flag' },
+  { name: 'kubernetes', prefix: 'name: DB_PASSWORD\nvalue: ', rule: 'context.named-value' },
+];
+const quoteKeys = [
+  { name: 'unkeyed', options: {}, keyed: false },
+  { name: 'keyed', options: { fingerprintKey: new Uint8Array(32).fill(9) }, keyed: true },
+];
+function fullQuoteFacts(result, start, length, rule, keyed) {
+  assert.equal(result.status, 'COMPLETE');
+  assert.equal(result.reasons.length, 0);
+  assert.equal(result.candidates.length, 1);
+  const candidate = result.candidates[0];
+  assert.equal(candidate.start, start);
+  assert.equal(candidate.end, start + length);
+  assert.equal(candidate.subtype, 'PASSWORD');
+  assert.equal(candidate.rule, rule);
+  assert.equal(candidate.evidence.claim.sensitivity, 'SECRET');
+  assert.equal(candidate.evidence.claim.reversible, false);
+  assert.equal(Object.hasOwn(candidate, 'fingerprint'), keyed);
+  if (keyed) assert.equal(/^[0-9a-f]{32}$/u.test(candidate.fingerprint), true);
+}
+function quoteFailureFacts(result) {
+  assert.equal(result.status, 'FAILURE');
+  assert.deepEqual(result.reasons, ['QUOTE_WINDOW_EXCEEDED']);
+  assert.deepEqual(result.candidates, []);
+  assert.equal(JSON.stringify(result).includes('synthetic-uninspected-tail.invalid'), false);
+  assert.equal(JSON.stringify(result).includes('fingerprint'), false);
+}
+for (const caller of quoteCallers) {
+  for (const key of quoteKeys) {
+    const label = `#8 generated quote window: ${caller.name}/${key.name}`;
+    const start = caller.prefix.length + 1;
+    test(`${label} near-window closed and true-EOF positive controls`, () => {
+      for (const quote of ['"', "'", '`']) {
+        for (const length of [QWIN - 3, QWIN - 2, QWIN - 1]) {
+          const content = fill(length, 'SyntheticWindow0');
+          for (const ending of ['', `${quote}\nport=443`]) {
+            fullQuoteFacts(run(`${caller.prefix}${quote}${content}${ending}`, key.options),
+              start, length, caller.rule, key.keyed);
+          }
+        }
+      }
+    });
+    test(`${label} true EOF at the edge with odd/even trailing backslashes`, () => {
+      for (const slashCount of [1, 2, 3, 4]) {
+        const content = fill(QWIN - 1 - slashCount) + '\\'.repeat(slashCount);
+        fullQuoteFacts(run(`${caller.prefix}"${content}`, key.options),
+          start, QWIN - 1, caller.rule, key.keyed);
+      }
+    });
+    for (const slashCount of [0, 2, 4]) {
+      test(`${label} even backslash run ${slashCount} closes exactly at boundary`, () => {
+        for (const quote of ['"', "'", '`']) {
+          const content = fill(QWIN - 1 - slashCount) + '\\'.repeat(slashCount);
+          fullQuoteFacts(run(`${caller.prefix}${quote}${content}${quote}\nport=443`, key.options),
+            start, QWIN - 1, caller.rule, key.keyed);
+        }
+      });
+    }
+    test(`${label} odd/even backslash controls close inside the window`, () => {
+      for (const quote of ['"', "'", '`']) {
+        for (const slashCount of [1, 2, 3, 4]) {
+          const before = fill(QWIN - 6 - slashCount) + '\\'.repeat(slashCount);
+          const odd = slashCount % 2 === 1;
+          const content = odd ? `${before}${quote}S` : before;
+          fullQuoteFacts(run(`${caller.prefix}${quote}${content}${quote}\nport=443`, key.options),
+            start, content.length, caller.rule, key.keyed);
+        }
+      }
+    });
+    for (const length of [QWIN, QWIN + 1]) {
+      for (const form of ['closed', 'eof']) {
+        test(`${label} content length ${length}/${form} refuses uninspected suffix`, () => {
+          const ending = form === 'closed' ? '"\nport=443' : '';
+          quoteFailureFacts(run(`${caller.prefix}"${fill(length)}${ending}`, key.options));
+        });
+      }
+    }
+    for (const slashCount of [1, 3]) {
+      for (const quote of ['"', "'", '`']) {
+        test(`${label} odd backslash run ${slashCount}/${quote} escapes boundary quote`, () => {
+          const content = fill(QWIN - 1 - slashCount) + '\\'.repeat(slashCount);
+          quoteFailureFacts(run(`${caller.prefix}${quote}${content}${quote}synthetic-uninspected-tail.invalid${quote}`,
+            key.options));
+        });
+      }
+    }
+    test(`${label} backslash at boundary cannot hide a later escaped quote`, () => {
+      const content = fill(QWIN - 1);
+      quoteFailureFacts(run(`${caller.prefix}"${content}\\"synthetic-uninspected-tail.invalid"`, key.options));
+    });
+    test(`${label} mask-looking inspected prefix cannot hide a tail`, () => {
+      quoteFailureFacts(run(`${caller.prefix}"${'*'.repeat(QWIN - 1)}synthetic-uninspected-tail.invalid"`, key.options));
+    });
+  }
+}

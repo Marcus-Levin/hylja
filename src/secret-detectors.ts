@@ -157,13 +157,14 @@ function keyBlocks(text: string, out: Found[]): void {
   }
 }
 
-/** Longest quoted value followed across lines before it is treated as unterminated. */
+/** Bounded quote scan, counting the opener; uninspected suffixes fail closed. */
 const QUOTE_WINDOW = 1 << 16;
 
 /* ---------- Value reading: over-cover rather than stop inside a secret ---------- */
 
 interface Found { subtype: SecretSubtype; rule: string; basis: SecretCandidate['basis']; start: number; end: number }
 class TooMany extends Error {}
+class QuoteWindowExceeded extends Error {}
 /** Every rule adds through here, so the candidate cap bounds work while rules run, not only afterwards. */
 function add(out: Found[], found: Found): void {
   out.push(found);
@@ -207,7 +208,9 @@ function readValue(text: string, at: number, context: 'line' | 'json' | 'query' 
       if (text[index] === quote) break;
     }
     if (index < limit) return index > at + 1 ? { start: at + 1, end: index } : null;
-    // Unterminated within the window: over-cover the whole window (a truncated line still hides its secret).
+    // The skip index preserves escape parity: only exactly `limit` can be an unescaped boundary quote.
+    // Inspect that one boundary unit, never the tail. True EOF still covers all unterminated content.
+    if (limit < text.length && !(index === limit && text[limit] === quote)) throw new QuoteWindowExceeded();
     return limit - at > 1 ? { start: at + 1, end: limit } : null;
   }
   if ((quote === '|' || quote === '>') && /^[|>][+-]?[ \t]*$/u.test(text.slice(at, eol))) {
@@ -450,6 +453,7 @@ export function detectSecrets(request: SecretRequest): SecretResult {
     xmlCandidates(text, found);
   } catch (error) {
     if (error instanceof TooMany) return failure('TOO_MANY_CANDIDATES');
+    if (error instanceof QuoteWindowExceeded) return failure('QUOTE_WINDOW_EXCEEDED');
     throw error;
   } finally {
     lineMemo = null;
